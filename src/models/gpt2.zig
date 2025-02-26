@@ -702,6 +702,11 @@ pub const GPT2 = struct {
     // we would need to handle positions, attention masks, etc.
     // With reference counting, we don't need to worry as much about explicitly freeing tensors
     pub fn forward(self: *GPT2, input_ids: Tensor) !*Node {
+        // Safety check for absurdly large dimensions
+        if (input_ids.shape.dims[0] > 10000 or input_ids.shape.dims[1] > 10000) {
+            return error.InputDimensionsTooLarge;
+        }
+        
         // Assume input_ids is a batch of token IDs [batch, seq_len]
         const batch_size = input_ids.shape.dims[0];
         const seq_len = input_ids.shape.dims[1];
@@ -823,10 +828,10 @@ pub const GPT2 = struct {
         // We use the actual word embedding parameters (transposed) as the output layer
         // This ensures parameter sharing between input embeddings and output layer
         
-        // Create a node for the transposed embedding matrix
+        // Create a tensor for the transposed embedding matrix
         var final_wte_dims = [_]usize{ self.config.n_embd, self.config.vocab_size };
         var final_wte = try Tensor.zeros(self.allocator, &final_wte_dims, input_ids.dtype, input_ids.backend);
-        defer final_wte.deinit();
+        // Don't defer final_wte.deinit() here, as ownership will transfer to the variable node
         
         // Copy data from the full embeddings (transposed)
         const final_wte_buf = @as([*]f32, @ptrCast(@alignCast(final_wte.buffer.data.ptr)))[0..final_wte.shape.elemCount()];
@@ -841,6 +846,7 @@ pub const GPT2 = struct {
         }
         
         // Create a node for this final projection matrix (shares weights with embedding)
+        // autodiff.variable() takes ownership of the tensor
         const wte_t_node = try autodiff.variable(self.allocator, final_wte, true);
         defer wte_t_node.deinit();
         

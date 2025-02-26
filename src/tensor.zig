@@ -60,7 +60,17 @@ pub const Shape = struct {
     }
     
     pub fn bytesRequired(self: Shape, dtype: DType) usize {
-        return self.elemCount() * dtype.sizeInBytes();
+        const count = self.elemCount();
+        const size = dtype.sizeInBytes();
+        
+        // Check for potential overflow before multiplying
+        if (count > 0 and size > 0 and count > std.math.maxInt(usize) / size) {
+            std.debug.print("Warning: Potential integer overflow in bytesRequired: {} * {} would overflow\n", 
+                .{count, size});
+            return std.math.maxInt(usize);
+        }
+        
+        return count * size;
     }
     
     pub fn eql(self: Shape, other: Shape) bool {
@@ -113,6 +123,15 @@ pub const Tensor = struct {
     pub fn init(allocator: Allocator, dims: []const usize, dtype: DType, backend: BackendType) !Tensor {
         const shape = try Shape.init(allocator, dims);
         const buffer_size = shape.bytesRequired(dtype);
+        
+        // Check if we had an overflow
+        if (buffer_size == std.math.maxInt(usize)) {
+            // Clean up shape to avoid memory leak
+            var shape_copy = shape;
+            shape_copy.deinit();
+            return error.TensorTooLarge;
+        }
+        
         const buffer = try Buffer.init(allocator, buffer_size);
         
         // Create and initialize a reference count
@@ -218,6 +237,12 @@ pub const Tensor = struct {
     
     /// Decrement reference count and free resources if it reaches zero
     pub fn release(self: *const Tensor) void {
+        // Safety check: don't decrement if already zero
+        if (self.ref_count.* == 0) {
+            std.debug.print("Warning: Trying to release tensor with zero reference count\n", .{});
+            return;
+        }
+        
         self.ref_count.* -= 1;
         
         if (self.ref_count.* == 0) {

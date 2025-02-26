@@ -576,16 +576,8 @@ pub const Block = struct {
         std.debug.print("Block.forward: After attn.forward\n", .{});
         
         // Step 3: Add attention output to input (residual connection)
-        var res1: *Node = undefined;
-        if (norm1 == x_node) {
-            // If norm1 is the same as x_node (just passed through), we need to be careful
-            // to not free the same pointer twice later
-            res1 = try autodiff.add(self.allocator, x_node, attn);
-        } else {
-            // norm1 is a separate node from x_node
-            res1 = try autodiff.add(self.allocator, x_node, attn);
-            // in our case, this branch is never taken since our layer norm is a pass-through
-        }
+        // We need to be careful with ownership here - we want to avoid double-freeing
+        var res1 = try autodiff.add(self.allocator, x_node, attn);
         std.debug.print("Block.forward: After first residual connection\n", .{});
         
         // Step 4: Clean up the attention output after it's been used in res1
@@ -601,41 +593,23 @@ pub const Block = struct {
         std.debug.print("Block.forward: After mlp.forward\n", .{});
         
         // Step 7: Add MLP output to residual (second residual connection)
-        var res2: *Node = undefined;
-        if (norm2 == res1) {
-            // If norm2 is the same as res1 (just passed through), be careful
-            res2 = try autodiff.add(self.allocator, res1, mlp);
-        } else {
-            // norm2 is a separate node from res1
-            res2 = try autodiff.add(self.allocator, res1, mlp);
-            // in our case, this branch is never taken since our layer norm is a pass-through
-        }
+        // Again, we need to be careful with ownership
+        const res2 = try autodiff.add(self.allocator, res1, mlp);
         std.debug.print("Block.forward: After second residual connection\n", .{});
         
         // Step 8: Clean up MLP output after it's been used in res2
         mlp.deinit();
         std.debug.print("Block.forward: Cleaned up MLP output\n", .{});
         
-        // Step 9: Very carefully handle layer norm cleanup
-        // Since our layer norm just returns its input, we need to be especially careful
+        // Step 9: Since we're done with res1, clean it up.
+        // We're doing this after mlp is cleaned up to avoid potential issues.
+        res1.deinit();
+        std.debug.print("Block.forward: Cleaned up res1\n", .{});
         
-        // Only free norm1 if it's different from x_node and res1
-        // In our implementation, this check always fails because norm1 == x_node
-        if (norm1 != x_node and norm1 != res1) {
-            std.debug.print("Block.forward: Cleaning up norm1 (unusual)\n", .{});
-            norm1.deinit();
-        }
-        
-        // Only free norm2 if it's different from res1 and res2
-        // In our implementation, this check always fails because norm2 == res1
-        if (norm2 != res1 and norm2 != res2) {
-            std.debug.print("Block.forward: Cleaning up norm2 (unusual)\n", .{});
-            norm2.deinit();
-        }
-        
-        // Important: we DO NOT free res1 here because:
-        // 1. It's an input to res2's computation graph
-        // 2. The res2.deinit() should handle freeing res1 when appropriate
+        // Our layer norm implementation is a pass-through, so norm1 == x_node and norm2 == res1
+        // We already cleaned up res1, so we don't need to clean up norm2 separately.
+        // We don't clean up norm1 because it's the same as x_node,
+        // and x_node will be cleaned up by the caller.
         
         std.debug.print("Block.forward: Returning res2 with shape [{}, {}]\n", 
             .{res2.tensor.shape.dims[0], res2.tensor.shape.dims[1]});
@@ -708,6 +682,7 @@ pub const GPT2 = struct {
     // Forward pass with the model
     // Note: This is greatly simplified - in a real implementation 
     // we would need to handle positions, attention masks, etc.
+    // The function takes ownership of input_ids and is responsible for freeing it
     pub fn forward(self: *GPT2, input_ids: Tensor) !*Node {
         // Assume input_ids is a batch of token IDs [batch, seq_len]
         const batch_size = input_ids.shape.dims[0];
@@ -845,27 +820,23 @@ pub const GPT2 = struct {
         // Be more cautious with cleanup to prevent double-frees and integer overflows
         // We're returning logits to the caller who will be responsible for cleaning it up
         
-        // Clean up current node if it's not already cleaned up by another part of the code
-        // and if it's not the same as ln_output (which will be handled separately)
-        if (current != input_node and current != ln_output) {
-            std.debug.print("Safely cleaning up current node\n", .{});
-            current.deinit();
-        }
-        
-        // Clean up input_node if it's not already cleaned up and not needed anymore
-        if (input_node != ln_output and input_node != logits) {
-            std.debug.print("Safely cleaning up input node\n", .{});
-            input_node.deinit();
-        }
-        
-        // We need to be careful with ln_output since it might be part of the logits computation
-        // Only clean up if it's safely not needed anymore
-        if (ln_output != logits and ln_output != current and ln_output != input_node) {
-            std.debug.print("Safely cleaning up ln_output node\n", .{});
+        // Clean up ln_output if it's not the same as logits (which we'll return)
+        if (ln_output != logits) {
             ln_output.deinit();
         }
         
-        // We're returning logits, so the caller will be responsible for cleaning it up
+        // Clean up current only if it's different from both input_node and ln_output
+        if (current != input_node and current != ln_output) {
+            current.deinit();
+        }
+        
+        // Clean up input_node if we haven't already through current
+        if (input_node != current) {
+            input_node.deinit();
+        }
+        
+        // Clean up the input_ids tensor since we take ownership of it
+        input_ids.deinit();
         
         return logits;
     }

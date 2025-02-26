@@ -317,20 +317,25 @@ fn backwardSubtract(allocator: Allocator, node: *Node) !void {
             try b.initGrad();
             if (b.grad) |*b_grad| {
                 // For subtraction, the gradient for b is negated
-                const neg_grad = try ops.multiply(
+                // Create the constant tensor for -1.0
+                var negative_one = try Tensor.filled(
                     allocator,
-                    grad,
-                    try Tensor.filled(
-                        allocator,
-                        grad.shape.dims,
-                        grad.dtype,
-                        -1.0,
-                        grad.backend
-                    )
+                    grad.shape.dims,
+                    grad.dtype,
+                    -1.0,
+                    grad.backend
                 );
+                
+                // Negate the gradient
+                const neg_grad = try ops.multiply(allocator, grad, negative_one);
+                // Clean up the temporary tensor
+                negative_one.deinit();
                 
                 // Accumulate gradients
                 const temp = try ops.add(allocator, b_grad.*, neg_grad);
+                // Clean up the negated gradient tensor
+                neg_grad.deinit();
+                
                 b_grad.deinit();
                 b_grad.* = temp;
             }
@@ -352,6 +357,9 @@ fn backwardMultiply(allocator: Allocator, node: *Node) !void {
             if (a.grad) |*a_grad| {
                 const temp_grad = try ops.multiply(allocator, grad, b.tensor);
                 const temp = try ops.add(allocator, a_grad.*, temp_grad);
+                // Clean up the temporary gradient
+                temp_grad.deinit();
+                
                 a_grad.deinit();
                 a_grad.* = temp;
             }
@@ -363,6 +371,9 @@ fn backwardMultiply(allocator: Allocator, node: *Node) !void {
             if (b.grad) |*b_grad| {
                 const temp_grad = try ops.multiply(allocator, grad, a.tensor);
                 const temp = try ops.add(allocator, b_grad.*, temp_grad);
+                // Clean up the temporary gradient
+                temp_grad.deinit();
+                
                 b_grad.deinit();
                 b_grad.* = temp;
             }
@@ -384,7 +395,13 @@ fn backwardMatmul(allocator: Allocator, node: *Node) !void {
             if (a.grad) |*a_grad| {
                 const b_transpose = try ops.transpose(allocator, b.tensor);
                 const temp_grad = try ops.matmul(allocator, grad, b_transpose);
+                // Clean up the transposed tensor
+                b_transpose.deinit();
+                
                 const temp = try ops.add(allocator, a_grad.*, temp_grad);
+                // Clean up the temporary gradient
+                temp_grad.deinit();
+                
                 a_grad.deinit();
                 a_grad.* = temp;
             }
@@ -396,7 +413,13 @@ fn backwardMatmul(allocator: Allocator, node: *Node) !void {
             if (b.grad) |*b_grad| {
                 const a_transpose = try ops.transpose(allocator, a.tensor);
                 const temp_grad = try ops.matmul(allocator, a_transpose, grad);
+                // Clean up the transposed tensor
+                a_transpose.deinit();
+                
                 const temp = try ops.add(allocator, b_grad.*, temp_grad);
+                // Clean up the temporary gradient
+                temp_grad.deinit();
+                
                 b_grad.deinit();
                 b_grad.* = temp;
             }
@@ -426,7 +449,13 @@ fn backwardRelu(allocator: Allocator, node: *Node) !void {
                 
                 // Gradient is only passed where input was positive
                 const temp_grad = try ops.multiply(allocator, grad, mask);
+                // Clean up the mask tensor
+                mask.deinit();
+                
                 const temp = try ops.add(allocator, a_grad.*, temp_grad);
+                // Clean up the temporary gradient
+                temp_grad.deinit();
+                
                 a_grad.deinit();
                 a_grad.* = temp;
             }
@@ -481,6 +510,9 @@ fn backwardSoftmax(allocator: Allocator, node: *Node) !void {
                 
                 // Add to existing gradient
                 const temp = try ops.add(allocator, a_grad.*, new_grad);
+                // Clean up the new_grad tensor after use
+                new_grad.deinit();
+                
                 a_grad.deinit();
                 a_grad.* = temp;
             }

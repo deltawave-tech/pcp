@@ -621,8 +621,11 @@ pub fn main() !void {
                 // Wrap forward pass in a simpler try statement, with a fallback on catch
                 logits = blk: {
                     // First try the real model
-                    break :blk model.forward(input_copy) catch {
-                        // On error, fall back to a dummy tensor
+                    const result = model.forward(input_copy) catch {
+                        // On error, free input_copy to prevent memory leak
+                        input_copy.deinit();
+                        
+                        // Fall back to a dummy tensor
                         std.debug.print("Error in model forward pass, falling back to dummy tensor\n", .{});
                         
                         // Create a dummy tensor as fallback
@@ -632,6 +635,10 @@ pub fn main() !void {
                         // Make a variable node from the fallback tensor
                         break :blk try autodiff.variable(allocator, fallback_tensor, true);
                     };
+                    
+                    // If we get here, model.forward() succeeded, but input_copy is now owned by the model
+                    // and should not be freed here (the model handles cleanup).
+                    break :blk result;
                 };
             }
             

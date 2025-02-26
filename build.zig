@@ -58,4 +58,25 @@ pub fn build(b: *std.Build) void {
     
     const run_shakespeare_step = b.step("run-shakespeare", "Run the Shakespeare training example");
     run_shakespeare_step.dependOn(&run_shakespeare_cmd.step);
+    
+    // Autodiff test executable
+    const autodiff_test = b.addExecutable(.{
+        .name = "autodiff_test",
+        .root_source_file = b.path("src/examples/autodiff_test.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    
+    // Add module dependencies for autodiff test
+    autodiff_test.root_module.addImport("pcp", pcp_module);
+    
+    // Install the test executable
+    b.installArtifact(autodiff_test);
+    
+    // Run step for autodiff test
+    const run_autodiff_test_cmd = b.addRunArtifact(autodiff_test);
+    run_autodiff_test_cmd.step.dependOn(b.getInstallStep());
+    
+    const run_autodiff_test_step = b.step("run-autodiff-test", "Run the autodiff memory leak test");
+    run_autodiff_test_step.dependOn(&run_autodiff_test_cmd.step);
 }

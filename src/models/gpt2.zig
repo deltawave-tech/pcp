@@ -629,6 +629,10 @@ pub const GPT2 = struct {
     config: GPT2Config,
     allocator: Allocator,
     
+    // Parameter nodes for gradient tracking
+    wte_node: ?*Node, 
+    wpe_node: ?*Node,
+    
     pub fn init(allocator: Allocator, config: GPT2Config, backend: BackendType) !GPT2 {
         // Token embeddings (vocab_size x n_embd)
         const wte_dims = [_]usize{ config.vocab_size, config.n_embd };
@@ -666,10 +670,22 @@ pub const GPT2 = struct {
             .ln_f = ln_f,
             .config = config,
             .allocator = allocator,
+            .wte_node = null,
+            .wpe_node = null,
         };
     }
     
     pub fn deinit(self: *GPT2) void {
+        // Clean up parameter nodes if they exist
+        if (self.wte_node) |node| {
+            node.deinit();
+        }
+        
+        if (self.wpe_node) |node| {
+            node.deinit();
+        }
+        
+        // Clean up tensors
         self.wte.deinit();
         self.wpe.deinit();
         
@@ -690,22 +706,33 @@ pub const GPT2 = struct {
         const batch_size = input_ids.shape.dims[0];
         const seq_len = input_ids.shape.dims[1];
         
-        // Step 1: Implement proper embedding lookup
+        // Step 0: Create nodes for model parameters that need gradients
+        // Create embedding nodes only if they don't exist yet
+        if (self.wte_node == null) {
+            // Important: These nodes use the actual model parameters (not copies)
+            // so gradients will accumulate in the real model parameters
+            self.wte_node = try autodiff.variable(self.allocator, self.wte, true);
+            std.debug.print("Created wte_node for gradient tracking\n", .{});
+        }
+        
+        if (self.wpe_node == null) {
+            self.wpe_node = try autodiff.variable(self.allocator, self.wpe, true);
+            std.debug.print("Created wpe_node for gradient tracking\n", .{});
+        }
+        
         // Extract token IDs from the input tensor
         const input_buf = @as([*]f32, @ptrCast(@alignCast(input_ids.buffer.data.ptr)))[0..input_ids.shape.elemCount()];
         
         // Create a tensor to hold token embeddings: [batch_size, seq_len, embedding_dim]
         var token_embed_dims = [_]usize{ batch_size, seq_len, self.config.n_embd };
         var token_embeddings = try Tensor.zeros(self.allocator, &token_embed_dims, input_ids.dtype, input_ids.backend);
-        // With reference counting, we can use defer safely
         defer token_embeddings.deinit();
         
-        // Get the token embedding buffer - safe since we created it
+        // Get the token embedding buffer
         const token_embed_buf = @as([*]f32, @ptrCast(@alignCast(token_embeddings.buffer.data.ptr)))[0..token_embeddings.shape.elemCount()];
         
-        // Don't create a slice of the entire embedding matrix, as it could be very large
-        // Instead, we'll access elements directly using offsets
-        const wte_buf = @as([*]f32, @ptrCast(@alignCast(self.wte.buffer.data.ptr)));
+        // Get embeddings directly from the node's tensor 
+        const wte_buf = @as([*]f32, @ptrCast(@alignCast(self.wte_node.?.tensor.buffer.data.ptr)));
         
         // Lookup embeddings for each token ID
         for (0..batch_size) |b| {
@@ -725,9 +752,8 @@ pub const GPT2 = struct {
         }
         
         // Step 2: Add position embeddings
-        // Create a position indices tensor: [seq_len]
+        // Create position indices tensor: [seq_len]
         var pos_indices = try Tensor.zeros(self.allocator, &[_]usize{seq_len}, .f32, input_ids.backend);
-        // With reference counting, we can use defer safely
         defer pos_indices.deinit();
         
         // Fill position indices
@@ -738,11 +764,10 @@ pub const GPT2 = struct {
         
         // Create combined embeddings tensor: [batch_size, seq_len, embedding_dim]
         var embeddings = try Tensor.zeros(self.allocator, &token_embed_dims, input_ids.dtype, input_ids.backend);
-        // With reference counting, we can use defer safely
         defer embeddings.deinit();
         
-        // Get position embeddings buffer directly without slicing
-        const wpe_buf = @as([*]f32, @ptrCast(@alignCast(self.wpe.buffer.data.ptr)));
+        // Get position embeddings buffer directly from the node
+        const wpe_buf = @as([*]f32, @ptrCast(@alignCast(self.wpe_node.?.tensor.buffer.data.ptr)));
         const embeddings_buf = @as([*]f32, @ptrCast(@alignCast(embeddings.buffer.data.ptr)))[0..embeddings.shape.elemCount()];
         
         // Add token and position embeddings
@@ -762,9 +787,6 @@ pub const GPT2 = struct {
             }
         }
         
-        // With defer statements above, token_embeddings and pos_indices 
-        // will be cleaned up automatically when the function returns or they go out of scope
-        
         // Reshape to [batch_size*seq_len, embedding_dim] for model processing
         var reshaped_dims = [_]usize{ batch_size * seq_len, self.config.n_embd };
         var reshaped_embeddings = try Tensor.zeros(self.allocator, &reshaped_dims, input_ids.dtype, input_ids.backend);
@@ -776,8 +798,6 @@ pub const GPT2 = struct {
                 reshaped_buf[i * self.config.n_embd + e] = embeddings_buf[i * self.config.n_embd + e];
             }
         }
-        
-        // With defer statement above, embeddings will be cleaned up automatically
         
         // Convert embedded tensor to node
         const input_node = try autodiff.variable(self.allocator, reshaped_embeddings, true);
@@ -800,19 +820,17 @@ pub const GPT2 = struct {
         const ln_output = try self.ln_f.forward(current);
         
         // Apply language modeling head to get logits
-        // We need to reshape to [batch_size, seq_len, vocab_size] but keep as [batch_size*seq_len, vocab_size] for now
+        // We use the actual word embedding parameters (transposed) as the output layer
+        // This ensures parameter sharing between input embeddings and output layer
         
-        // For the language modeling head, we need a smaller embedding matrix
-        // to avoid potential integer overflow issues
-        
-        // Create a smaller version of the token embeddings for the final projection
+        // Create a node for the transposed embedding matrix
         var final_wte_dims = [_]usize{ self.config.n_embd, self.config.vocab_size };
         var final_wte = try Tensor.zeros(self.allocator, &final_wte_dims, input_ids.dtype, input_ids.backend);
         defer final_wte.deinit();
         
-        // Copy data from the full embeddings
+        // Copy data from the full embeddings (transposed)
         const final_wte_buf = @as([*]f32, @ptrCast(@alignCast(final_wte.buffer.data.ptr)))[0..final_wte.shape.elemCount()];
-        const orig_wte_buf = @as([*]f32, @ptrCast(@alignCast(self.wte.buffer.data.ptr)));
+        const orig_wte_buf = @as([*]f32, @ptrCast(@alignCast(self.wte_node.?.tensor.buffer.data.ptr)));
         
         // Copy transposed version of the weight matrix
         for (0..self.config.n_embd) |e| {
@@ -822,28 +840,22 @@ pub const GPT2 = struct {
             }
         }
         
-        // Create a node for this final projection matrix
+        // Create a node for this final projection matrix (shares weights with embedding)
         const wte_t_node = try autodiff.variable(self.allocator, final_wte, true);
-        defer wte_t_node.deinit(); // Safe with ref counting
+        defer wte_t_node.deinit();
         
-        // Project hidden states to vocabulary logits: [batch_size*seq_len, embedding_dim] @ [embedding_dim, vocab_size]
-        // = [batch_size*seq_len, vocab_size]
+        // Project hidden states to vocabulary logits
         const logits = try autodiff.matmul(self.allocator, ln_output, wte_t_node);
         
-        // With reference counting, we can simply clean up the nodes we're done with
-        // The tensors will only be freed when their reference count reaches zero
-        
-        // Clean up ln_output if it's not the same as logits (which we'll return)
+        // Cleanup intermediate nodes
         if (ln_output != logits) {
             ln_output.deinit();
         }
         
-        // Clean up current only if it's different from both input_node and ln_output
         if (current != input_node and current != ln_output) {
             current.deinit();
         }
         
-        // Clean up input_node if we haven't already through current
         if (input_node != current) {
             input_node.deinit();
         }

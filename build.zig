@@ -17,6 +17,17 @@ pub fn build(b: *std.Build) void {
     // Add dependency from GPT-2 to PCP
     gpt2_module.addImport("pcp", pcp_module);
     
+    // Add unit tests
+    const unit_tests = b.addTest(.{
+        .root_source_file = b.path("src/main.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    
+    // Create a step for running the tests
+    const test_step = b.step("test", "Run the unit tests");
+    test_step.dependOn(&b.addRunArtifact(unit_tests).step);
+    
     // GPT-2 training example executable
     const gpt2_example = b.addExecutable(.{
         .name = "gpt2_example",

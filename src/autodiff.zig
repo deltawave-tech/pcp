@@ -318,7 +318,7 @@ fn backwardSubtract(allocator: Allocator, node: *Node) !void {
             if (b.grad) |*b_grad| {
                 // For subtraction, the gradient for b is negated
                 // Create the constant tensor for -1.0
-                var negative_one = try Tensor.filled(
+                const negative_one = try Tensor.filled(
                     allocator,
                     grad.shape.dims,
                     grad.dtype,
@@ -524,16 +524,26 @@ test "variable creation" {
     const allocator = std.testing.allocator;
     var dims = [_]usize{ 2, 2 };
     
+    // Create a tensor that we'll copy for the variable
     var t = try Tensor.zeros(allocator, &dims, .f32, .cpu);
-    defer t.deinit();
     
     try t.setScalar(&[_]usize{0, 0}, 1.0);
     try t.setScalar(&[_]usize{0, 1}, 2.0);
     try t.setScalar(&[_]usize{1, 0}, 3.0);
     try t.setScalar(&[_]usize{1, 1}, 4.0);
     
-    var node = try variable(allocator, t, true);
+    // Create a copy for the variable since variable() takes ownership
+    const t_copy = try Tensor.init(allocator, t.shape.dims, t.dtype, t.backend);
+    
+    // Copy the data
+    @memcpy(t_copy.buffer.data, t.buffer.data[0..t.buffer.data.len]);
+    
+    // Now we can create the variable with our copy and keep the original
+    var node = try variable(allocator, t_copy, true);
     defer node.deinit();
+    
+    // Now we can safely use t
+    defer t.deinit();
     
     try std.testing.expect(node.requires_grad);
     try std.testing.expectEqual(@as(usize, 2), node.tensor.shape.rank());
@@ -557,9 +567,20 @@ test "simple addition and backward" {
     try b_tensor.setScalar(&[_]usize{1, 0}, 7.0);
     try b_tensor.setScalar(&[_]usize{1, 1}, 8.0);
     
-    // Create nodes
-    var a = try variable(allocator, a_tensor, true);
-    var b = try variable(allocator, b_tensor, true);
+    // Create copies of tensors for the variables
+    const a_tensor_copy = try Tensor.init(allocator, a_tensor.shape.dims, a_tensor.dtype, a_tensor.backend);
+    @memcpy(a_tensor_copy.buffer.data, a_tensor.buffer.data[0..a_tensor.buffer.data.len]);
+    
+    const b_tensor_copy = try Tensor.init(allocator, b_tensor.shape.dims, b_tensor.dtype, b_tensor.backend);
+    @memcpy(b_tensor_copy.buffer.data, b_tensor.buffer.data[0..b_tensor.buffer.data.len]);
+    
+    // Create nodes with the copies
+    var a = try variable(allocator, a_tensor_copy, true);
+    var b = try variable(allocator, b_tensor_copy, true);
+    
+    // Now we can safely use the original tensors
+    defer a_tensor.deinit();
+    defer b_tensor.deinit();
     
     // Forward pass: c = a + b
     var c = try add(allocator, a, b);
@@ -585,15 +606,11 @@ test "simple addition and backward" {
     try std.testing.expectEqual(@as(f32, 1.0), try b.grad.?.getScalar(&[_]usize{1, 1}));
     
     // Cleanup
+    // The nodes will clean up their tensors (a_tensor_copy, b_tensor_copy)
+    // and the gradients when they are deinited
     a.deinit();
     b.deinit();
     c.deinit();
-    
-    a_tensor.deinit();
-    b_tensor.deinit();
-    if (a.grad) |*g| g.deinit();
-    if (b.grad) |*g| g.deinit();
-    if (c.grad) |*g| g.deinit();
 }
 
 test "multiplication and backward" {
@@ -613,9 +630,20 @@ test "multiplication and backward" {
     try b_tensor.setScalar(&[_]usize{1, 0}, 1.5);
     try b_tensor.setScalar(&[_]usize{1, 1}, 2.0);
     
-    // Create nodes
-    var a = try variable(allocator, a_tensor, true);
-    var b = try variable(allocator, b_tensor, true);
+    // Create copies of tensors for the variables
+    const a_tensor_copy = try Tensor.init(allocator, a_tensor.shape.dims, a_tensor.dtype, a_tensor.backend);
+    @memcpy(a_tensor_copy.buffer.data, a_tensor.buffer.data[0..a_tensor.buffer.data.len]);
+    
+    const b_tensor_copy = try Tensor.init(allocator, b_tensor.shape.dims, b_tensor.dtype, b_tensor.backend);
+    @memcpy(b_tensor_copy.buffer.data, b_tensor.buffer.data[0..b_tensor.buffer.data.len]);
+    
+    // Create nodes with the copies
+    var a = try variable(allocator, a_tensor_copy, true);
+    var b = try variable(allocator, b_tensor_copy, true);
+    
+    // Now we can safely use the original tensors
+    defer a_tensor.deinit();
+    defer b_tensor.deinit();
     
     // Forward pass: c = a * b (element-wise)
     var c = try multiply(allocator, a, b);
@@ -641,14 +669,8 @@ test "multiplication and backward" {
     try std.testing.expectEqual(@as(f32, 4.0), try b.grad.?.getScalar(&[_]usize{1, 0}));
     try std.testing.expectEqual(@as(f32, 5.0), try b.grad.?.getScalar(&[_]usize{1, 1}));
     
-    // Cleanup
+    // Cleanup nodes (which will also clean up their tensors)
     a.deinit();
     b.deinit();
     c.deinit();
-    
-    a_tensor.deinit();
-    b_tensor.deinit();
-    if (a.grad) |*g| g.deinit();
-    if (b.grad) |*g| g.deinit();
-    if (c.grad) |*g| g.deinit();
 }

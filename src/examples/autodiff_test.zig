@@ -101,7 +101,60 @@ pub fn main() !void {
     var c5 = try autodiff.softmax(allocator, a5);
     try autodiff.backward(allocator, c5);
     
-    // Clean up
+    // Performance benchmark - 100 operations in sequence
+    std.debug.print("\nRunning performance benchmark\n", .{});
+    
+    // Create larger tensors for benchmark
+    const large_dims = [_]usize{ 100, 100 };
+    const bench_a = try Tensor.random(allocator, &large_dims, .f32, .cpu);
+    const bench_b = try Tensor.random(allocator, &large_dims, .f32, .cpu);
+    
+    // Convert to nodes
+    var node_a = try autodiff.variable(allocator, bench_a, true);
+    var node_b = try autodiff.variable(allocator, bench_b, true);
+    
+    // Time the operations
+    const start_time = std.time.milliTimestamp();
+    
+    // Run a series of operations
+    var result = node_a;
+    const iterations = 10;
+    
+    for (0..iterations) |i| {
+        // To avoid memory leaks in the benchmark, we need to clean up previous results
+        // except for the first iteration where result == node_a
+        if (i > 0) {
+            result.deinit();
+        }
+        
+        // Alternate between different operations
+        result = switch (i % 5) {
+            0 => try autodiff.add(allocator, node_a, node_b),
+            1 => try autodiff.subtract(allocator, node_a, node_b),
+            2 => try autodiff.multiply(allocator, node_a, node_b),
+            3 => try autodiff.relu(allocator, node_a),
+            4 => try autodiff.matmul(allocator, node_a, node_b),
+            else => unreachable,
+        };
+    }
+    
+    // Run backward pass on the final result
+    try autodiff.backward(allocator, result);
+    
+    const end_time = std.time.milliTimestamp();
+    const elapsed = end_time - start_time;
+    
+    std.debug.print("Benchmark completed in {d} ms\n", .{elapsed});
+    std.debug.print("Average time per operation: {d:.2} ms\n", .{@as(f32, @floatFromInt(elapsed)) / @as(f32, @floatFromInt(iterations))});
+    
+    // Clean up the benchmark
+    if (result != node_a) {
+        result.deinit();
+    }
+    node_a.deinit();
+    node_b.deinit();
+    
+    // Clean up other test objects
     std.debug.print("\nCleaning up all nodes\n", .{});
     a.deinit();
     b.deinit();

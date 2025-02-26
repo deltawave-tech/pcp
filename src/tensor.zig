@@ -172,9 +172,19 @@ pub const Tensor = struct {
     }
     
     /// Clean up resources
-    pub fn deinit(self: *Tensor) void {
-        self.shape.deinit();
-        self.buffer.deinit();
+    pub fn deinit(self: *const Tensor) void {
+        // Need to cast away const to make this work with both const and non-const pointers
+        var shape_copy = self.shape;
+        var buffer_copy = self.buffer;
+        
+        // Check if the memory is already freed (this is a simple check, not foolproof)
+        if (shape_copy.dims.len > 0) {
+            shape_copy.deinit();
+        }
+        
+        if (buffer_copy.data.len > 0) {
+            buffer_copy.deinit();
+        }
     }
     
     /// Set requires_grad flag for autograd

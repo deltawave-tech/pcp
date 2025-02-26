@@ -57,7 +57,14 @@ pub const Node = struct {
         if (self.grad) |*g| {
             g.deinit();
         }
-        // Note: we don't deinit self.tensor here as it might be owned externally
+        
+        // Deinit the tensor that belongs to this node
+        // We can safely deinit the tensor because when we create nodes via operations,
+        // the tensor is created specifically for this node and not shared externally
+        self.tensor.deinit();
+        
+        // Finally, deallocate the Node itself
+        self.allocator.destroy(self);
     }
     
     /// Create a gradient tensor with the same shape as this node's tensor
@@ -87,6 +94,8 @@ pub const Node = struct {
 };
 
 /// Create a computational graph node from a tensor
+/// This function takes ownership of the tensor, which will be freed when the node is deinited.
+/// If you need to keep the tensor alive separately, make a copy of it before passing to this function.
 pub fn variable(allocator: Allocator, t: Tensor, requires_grad: bool) !*Node {
     return Node.init(allocator, t, requires_grad);
 }

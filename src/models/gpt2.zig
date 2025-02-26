@@ -89,17 +89,65 @@ pub const Attention = struct {
     
     // Forward pass through the attention layer
     pub fn forward(self: *Attention, x_node: *Node) !*Node {
+        // Make copies of the tensors before converting to nodes, since variable() takes ownership
+        // of the tensor and will free it when the node is freed
+        const c_attn_weight_copy = try Tensor.init(
+            self.allocator, 
+            self.c_attn_weight.shape.dims, 
+            self.c_attn_weight.dtype, 
+            self.c_attn_weight.backend
+        );
+        
+        // Copy data
+        @memcpy(
+            c_attn_weight_copy.buffer.data,
+            self.c_attn_weight.buffer.data[0..self.c_attn_weight.buffer.data.len]
+        );
+        
+        const c_attn_bias_copy = try Tensor.init(
+            self.allocator, 
+            self.c_attn_bias.shape.dims, 
+            self.c_attn_bias.dtype, 
+            self.c_attn_bias.backend
+        );
+        @memcpy(
+            c_attn_bias_copy.buffer.data,
+            self.c_attn_bias.buffer.data[0..self.c_attn_bias.buffer.data.len]
+        );
+        
+        const c_proj_weight_copy = try Tensor.init(
+            self.allocator, 
+            self.c_proj_weight.shape.dims, 
+            self.c_proj_weight.dtype, 
+            self.c_proj_weight.backend
+        );
+        @memcpy(
+            c_proj_weight_copy.buffer.data,
+            self.c_proj_weight.buffer.data[0..self.c_proj_weight.buffer.data.len]
+        );
+        
+        const c_proj_bias_copy = try Tensor.init(
+            self.allocator, 
+            self.c_proj_bias.shape.dims, 
+            self.c_proj_bias.dtype, 
+            self.c_proj_bias.backend
+        );
+        @memcpy(
+            c_proj_bias_copy.buffer.data,
+            self.c_proj_bias.buffer.data[0..self.c_proj_bias.buffer.data.len]
+        );
+        
         // Convert tensors to nodes
-        const c_attn_weight_node = try autodiff.variable(self.allocator, self.c_attn_weight, true);
+        const c_attn_weight_node = try autodiff.variable(self.allocator, c_attn_weight_copy, true);
         defer c_attn_weight_node.deinit();
         
-        const c_attn_bias_node = try autodiff.variable(self.allocator, self.c_attn_bias, true);
+        const c_attn_bias_node = try autodiff.variable(self.allocator, c_attn_bias_copy, true);
         defer c_attn_bias_node.deinit();
         
-        const c_proj_weight_node = try autodiff.variable(self.allocator, self.c_proj_weight, true);
+        const c_proj_weight_node = try autodiff.variable(self.allocator, c_proj_weight_copy, true);
         defer c_proj_weight_node.deinit();
         
-        const c_proj_bias_node = try autodiff.variable(self.allocator, self.c_proj_bias, true);
+        const c_proj_bias_node = try autodiff.variable(self.allocator, c_proj_bias_copy, true);
         defer c_proj_bias_node.deinit();
         
         // Get batch size from input shape
@@ -110,12 +158,11 @@ pub const Attention = struct {
         defer qkv_proj.deinit();
         
         // Add bias
-        const qkv_bias_expanded = try Tensor.zeros(self.allocator, 
+        var qkv_bias_expanded = try Tensor.zeros(self.allocator, 
             &[_]usize{batch_size, 3 * self.n_embd}, 
             x_node.tensor.dtype, 
             x_node.tensor.backend
         );
-        defer qkv_bias_expanded.deinit();
         
         // Fill bias across batch dimension
         const qkv_bias_expanded_buf = @as([*]f32, @ptrCast(@alignCast(qkv_bias_expanded.buffer.data.ptr)))[0..qkv_bias_expanded.shape.elemCount()];
@@ -134,26 +181,23 @@ pub const Attention = struct {
         defer qkv.deinit();
         
         // Step 2: Split QKV into separate query, key, value tensors
-        const q_tensor = try Tensor.zeros(self.allocator, 
+        var q_tensor = try Tensor.zeros(self.allocator, 
             &[_]usize{batch_size, self.n_embd}, 
             qkv.tensor.dtype, 
             qkv.tensor.backend
         );
-        defer q_tensor.deinit();
         
-        const k_tensor = try Tensor.zeros(self.allocator, 
+        var k_tensor = try Tensor.zeros(self.allocator, 
             &[_]usize{batch_size, self.n_embd}, 
             qkv.tensor.dtype, 
             qkv.tensor.backend
         );
-        defer k_tensor.deinit();
         
-        const v_tensor = try Tensor.zeros(self.allocator, 
+        var v_tensor = try Tensor.zeros(self.allocator, 
             &[_]usize{batch_size, self.n_embd}, 
             qkv.tensor.dtype, 
             qkv.tensor.backend
         );
-        defer v_tensor.deinit();
         
         // Split the QKV tensor
         const qkv_buf = @as([*]f32, @ptrCast(@alignCast(qkv.tensor.buffer.data.ptr)))[0..qkv.tensor.shape.elemCount()];
@@ -185,7 +229,6 @@ pub const Attention = struct {
         // Step 4: Compute attention scores: Q @ K^T / sqrt(head_dim)
         // First transpose K: [batch_size, n_embd] -> [n_embd, batch_size]
         const k_transpose = try ops.transpose(self.allocator, k_node.tensor);
-        defer k_transpose.deinit();
         
         const k_transpose_node = try autodiff.variable(self.allocator, k_transpose, true);
         defer k_transpose_node.deinit();
@@ -197,22 +240,8 @@ pub const Attention = struct {
         // Scale by sqrt(head_dim)
         const scaling_factor = 1.0 / std.math.sqrt(@as(f32, @floatFromInt(self.head_dim)));
         
-        // Create a scaling tensor
-        const scaling_tensor = try Tensor.filled(
-            self.allocator, 
-            &[_]usize{1, 1}, 
-            attention_scores_raw.tensor.dtype, 
-            scaling_factor,
-            attention_scores_raw.tensor.backend
-        );
-        defer scaling_tensor.deinit();
-        
-        const scaling_node = try autodiff.variable(self.allocator, scaling_tensor, false);
-        defer scaling_node.deinit();
-        
-        // Apply scaling via broadcast multiplication
-        // For simplicity, we'll scale manually:
-        const attention_scores_tensor = try Tensor.zeros(
+        // Apply scaling manually instead of creating additional nodes
+        var attention_scores_tensor = try Tensor.zeros(
             self.allocator,
             attention_scores_raw.tensor.shape.dims,
             attention_scores_raw.tensor.dtype,
@@ -242,13 +271,12 @@ pub const Attention = struct {
         defer output_raw.deinit();
         
         // Expand bias for addition
-        const proj_bias_expanded = try Tensor.zeros(
+        var proj_bias_expanded = try Tensor.zeros(
             self.allocator,
             &[_]usize{batch_size, self.n_embd},
             output_raw.tensor.dtype,
             output_raw.tensor.backend
         );
-        defer proj_bias_expanded.deinit();
         
         // Fill bias across batch dimension
         const proj_bias_expanded_buf = @as([*]f32, @ptrCast(@alignCast(proj_bias_expanded.buffer.data.ptr)))[0..proj_bias_expanded.shape.elemCount()];
@@ -330,40 +358,130 @@ pub const MLP = struct {
     }
     
     pub fn forward(self: *MLP, x_node: *Node) !*Node {
+        // Make copies of the tensors before converting to nodes
+        const c_fc_weight_copy = try Tensor.init(
+            self.allocator, 
+            self.c_fc_weight.shape.dims, 
+            self.c_fc_weight.dtype, 
+            self.c_fc_weight.backend
+        );
+        @memcpy(
+            c_fc_weight_copy.buffer.data,
+            self.c_fc_weight.buffer.data[0..self.c_fc_weight.buffer.data.len]
+        );
+        
+        const c_fc_bias_copy = try Tensor.init(
+            self.allocator, 
+            self.c_fc_bias.shape.dims, 
+            self.c_fc_bias.dtype, 
+            self.c_fc_bias.backend
+        );
+        @memcpy(
+            c_fc_bias_copy.buffer.data,
+            self.c_fc_bias.buffer.data[0..self.c_fc_bias.buffer.data.len]
+        );
+        
+        const c_proj_weight_copy = try Tensor.init(
+            self.allocator, 
+            self.c_proj_weight.shape.dims, 
+            self.c_proj_weight.dtype, 
+            self.c_proj_weight.backend
+        );
+        @memcpy(
+            c_proj_weight_copy.buffer.data,
+            self.c_proj_weight.buffer.data[0..self.c_proj_weight.buffer.data.len]
+        );
+        
+        const c_proj_bias_copy = try Tensor.init(
+            self.allocator, 
+            self.c_proj_bias.shape.dims, 
+            self.c_proj_bias.dtype, 
+            self.c_proj_bias.backend
+        );
+        @memcpy(
+            c_proj_bias_copy.buffer.data,
+            self.c_proj_bias.buffer.data[0..self.c_proj_bias.buffer.data.len]
+        );
+        
         // Convert tensors to nodes
-        const c_fc_weight_node = try autodiff.variable(self.allocator, self.c_fc_weight, true);
-        const c_fc_bias_node = try autodiff.variable(self.allocator, self.c_fc_bias, true);
-        const c_proj_weight_node = try autodiff.variable(self.allocator, self.c_proj_weight, true);
-        const c_proj_bias_node = try autodiff.variable(self.allocator, self.c_proj_bias, true);
+        const c_fc_weight_node = try autodiff.variable(self.allocator, c_fc_weight_copy, true);
+        defer c_fc_weight_node.deinit();
         
-        // MLP computation
+        const c_fc_bias_node = try autodiff.variable(self.allocator, c_fc_bias_copy, true);
+        defer c_fc_bias_node.deinit();
         
-        // For our simplified implementation, we'll directly create an output tensor with the same shape as the input
-        var output_dims = [_]usize{ x_node.tensor.shape.dims[0], x_node.tensor.shape.dims[1] };
-        var output_tensor = try Tensor.zeros(self.allocator, &output_dims, x_node.tensor.dtype, x_node.tensor.backend);
+        const c_proj_weight_node = try autodiff.variable(self.allocator, c_proj_weight_copy, true);
+        defer c_proj_weight_node.deinit();
         
-        // Fill with random small values (simplified for demo)
-        const rand_seed = @as(u64, @bitCast(@as(i64, std.time.milliTimestamp())));
-        var prng = std.rand.DefaultPrng.init(rand_seed);
-        const rand = prng.random();
+        const c_proj_bias_node = try autodiff.variable(self.allocator, c_proj_bias_copy, true);
+        defer c_proj_bias_node.deinit();
         
-        const output_buf = @as([*]f32, @ptrCast(@alignCast(output_tensor.buffer.data.ptr)))[0..output_tensor.shape.elemCount()];
-        for (output_buf) |*value| {
-            value.* = rand.float(f32) * 0.1;
+        // MLP computation:
+        // 1. Linear(x, c_fc_weight, c_fc_bias)
+        // 2. GELU activation
+        // 3. Linear(result, c_proj_weight, c_proj_bias)
+        
+        // Step 1: First linear layer: x @ c_fc_weight + c_fc_bias
+        const fc_out = try autodiff.matmul(self.allocator, x_node, c_fc_weight_node);
+        defer fc_out.deinit();
+        
+        // Add bias
+        const batch_size = x_node.tensor.shape.dims[0];
+        
+        // Expand bias for batch dimension
+        var fc_bias_expanded = try Tensor.zeros(self.allocator, 
+            &[_]usize{batch_size, self.n_inner}, 
+            x_node.tensor.dtype, 
+            x_node.tensor.backend
+        );
+        
+        // Fill bias across batch dimension
+        const fc_bias_expanded_buf = @as([*]f32, @ptrCast(@alignCast(fc_bias_expanded.buffer.data.ptr)))[0..fc_bias_expanded.shape.elemCount()];
+        const c_fc_bias_buf = @as([*]f32, @ptrCast(@alignCast(self.c_fc_bias.buffer.data.ptr)))[0..self.c_fc_bias.shape.elemCount()];
+        
+        for (0..batch_size) |b| {
+            for (0..self.n_inner) |i| {
+                fc_bias_expanded_buf[b * self.n_inner + i] = c_fc_bias_buf[i];
+            }
         }
         
-        // Output tensor has the same shape as input
+        const fc_bias_node = try autodiff.variable(self.allocator, fc_bias_expanded, false);
+        defer fc_bias_node.deinit();
         
-        // Create a node for the output tensor
-        const output_node = try autodiff.variable(self.allocator, output_tensor, true);
+        const fc_biased = try autodiff.add(self.allocator, fc_out, fc_bias_node);
+        defer fc_biased.deinit();
         
-        // Clean up intermediate nodes
-        c_fc_weight_node.deinit();
-        c_fc_bias_node.deinit(); 
-        c_proj_weight_node.deinit();
-        c_proj_bias_node.deinit();
+        // Step 2: Apply activation (using ReLU for simplicity, could be GELU)
+        const fc_activated = try autodiff.relu(self.allocator, fc_biased);
+        defer fc_activated.deinit();
         
-        return output_node;
+        // Step 3: Second linear layer: activated @ c_proj_weight + c_proj_bias
+        const proj_out = try autodiff.matmul(self.allocator, fc_activated, c_proj_weight_node);
+        defer proj_out.deinit();
+        
+        // Add bias
+        var proj_bias_expanded = try Tensor.zeros(self.allocator, 
+            &[_]usize{batch_size, self.n_embd}, 
+            x_node.tensor.dtype, 
+            x_node.tensor.backend
+        );
+        
+        // Fill bias across batch dimension
+        const proj_bias_expanded_buf = @as([*]f32, @ptrCast(@alignCast(proj_bias_expanded.buffer.data.ptr)))[0..proj_bias_expanded.shape.elemCount()];
+        const c_proj_bias_buf = @as([*]f32, @ptrCast(@alignCast(self.c_proj_bias.buffer.data.ptr)))[0..self.c_proj_bias.shape.elemCount()];
+        
+        for (0..batch_size) |b| {
+            for (0..self.n_embd) |i| {
+                proj_bias_expanded_buf[b * self.n_embd + i] = c_proj_bias_buf[i];
+            }
+        }
+        
+        const proj_bias_node = try autodiff.variable(self.allocator, proj_bias_expanded, false);
+        defer proj_bias_node.deinit();
+        
+        const output = try autodiff.add(self.allocator, proj_out, proj_bias_node);
+        
+        return output;
     }
 };
 
@@ -403,16 +521,12 @@ pub const LayerNorm = struct {
     // This is a simplified placeholder
     pub fn forward(self: *LayerNorm, x_node: *Node) !*Node {
         // Real layer norm would compute mean and variance
-        // For now, we just scale by the weight (simplified)
-        const weight_node = try autodiff.variable(self.allocator, self.weight, true);
-        const bias_node = try autodiff.variable(self.allocator, self.bias, true);
+        // For now, we just pass through the input (simplified)
         
-        // Dummy: just pass through for now
-        // In real implementation, this would normalize
+        // We don't actually use weight and bias in this simplified implementation,
+        // and we're just returning the input node directly, so no need to make copies
         
-        weight_node.deinit();
-        bias_node.deinit();
-        
+        _ = self; // Use self parameter to avoid unused parameter warning
         return x_node;
     }
 };
@@ -448,23 +562,83 @@ pub const Block = struct {
     }
     
     pub fn forward(self: *Block, x_node: *Node) !*Node {
-        // Layer norm -> attention -> residual
+        // To fix memory leaks in Block.forward, we need to be very careful with ownership
+        std.debug.print("Block.forward: Starting with input shape [{}, {}]\n", 
+            .{x_node.tensor.shape.dims[0], x_node.tensor.shape.dims[1]});
+        
+        // Step 1: Layer norm -> attention
+        // In our simplified implementation, LayerNorm just passes through the input
         const norm1 = try self.ln_1.forward(x_node);
+        std.debug.print("Block.forward: After ln_1.forward\n", .{});
+        
+        // Step 2: Apply attention to normalized input
         const attn = try self.attn.forward(norm1);
-        const res1 = try autodiff.add(self.allocator, x_node, attn);
+        std.debug.print("Block.forward: After attn.forward\n", .{});
         
-        // Layer norm -> MLP -> residual
-        const norm2 = try self.ln_2.forward(res1);
-        const mlp = try self.mlp.forward(norm2);
-        const res2 = try autodiff.add(self.allocator, res1, mlp);
+        // Step 3: Add attention output to input (residual connection)
+        var res1: *Node = undefined;
+        if (norm1 == x_node) {
+            // If norm1 is the same as x_node (just passed through), we need to be careful
+            // to not free the same pointer twice later
+            res1 = try autodiff.add(self.allocator, x_node, attn);
+        } else {
+            // norm1 is a separate node from x_node
+            res1 = try autodiff.add(self.allocator, x_node, attn);
+            // in our case, this branch is never taken since our layer norm is a pass-through
+        }
+        std.debug.print("Block.forward: After first residual connection\n", .{});
         
-        // Clean up intermediate nodes
-        norm1.deinit();
+        // Step 4: Clean up the attention output after it's been used in res1
         attn.deinit();
-        res1.deinit();
-        norm2.deinit();
-        mlp.deinit();
+        std.debug.print("Block.forward: Cleaned up attention output\n", .{});
         
+        // Step 5: Layer norm on residual output
+        const norm2 = try self.ln_2.forward(res1);
+        std.debug.print("Block.forward: After ln_2.forward\n", .{});
+        
+        // Step 6: Apply MLP to normalized residual
+        const mlp = try self.mlp.forward(norm2);
+        std.debug.print("Block.forward: After mlp.forward\n", .{});
+        
+        // Step 7: Add MLP output to residual (second residual connection)
+        var res2: *Node = undefined;
+        if (norm2 == res1) {
+            // If norm2 is the same as res1 (just passed through), be careful
+            res2 = try autodiff.add(self.allocator, res1, mlp);
+        } else {
+            // norm2 is a separate node from res1
+            res2 = try autodiff.add(self.allocator, res1, mlp);
+            // in our case, this branch is never taken since our layer norm is a pass-through
+        }
+        std.debug.print("Block.forward: After second residual connection\n", .{});
+        
+        // Step 8: Clean up MLP output after it's been used in res2
+        mlp.deinit();
+        std.debug.print("Block.forward: Cleaned up MLP output\n", .{});
+        
+        // Step 9: Very carefully handle layer norm cleanup
+        // Since our layer norm just returns its input, we need to be especially careful
+        
+        // Only free norm1 if it's different from x_node and res1
+        // In our implementation, this check always fails because norm1 == x_node
+        if (norm1 != x_node and norm1 != res1) {
+            std.debug.print("Block.forward: Cleaning up norm1 (unusual)\n", .{});
+            norm1.deinit();
+        }
+        
+        // Only free norm2 if it's different from res1 and res2
+        // In our implementation, this check always fails because norm2 == res1
+        if (norm2 != res1 and norm2 != res2) {
+            std.debug.print("Block.forward: Cleaning up norm2 (unusual)\n", .{});
+            norm2.deinit();
+        }
+        
+        // Important: we DO NOT free res1 here because:
+        // 1. It's an input to res2's computation graph
+        // 2. The res2.deinit() should handle freeing res1 when appropriate
+        
+        std.debug.print("Block.forward: Returning res2 with shape [{}, {}]\n", 
+            .{res2.tensor.shape.dims[0], res2.tensor.shape.dims[1]});
         return res2;
     }
 };
@@ -546,7 +720,7 @@ pub const GPT2 = struct {
         // Create a tensor to hold token embeddings: [batch_size, seq_len, embedding_dim]
         var token_embed_dims = [_]usize{ batch_size, seq_len, self.config.n_embd };
         var token_embeddings = try Tensor.zeros(self.allocator, &token_embed_dims, input_ids.dtype, input_ids.backend);
-        defer token_embeddings.deinit();
+        // Don't defer deinit here as we'll handle it manually 
         
         // Get the token embedding buffer
         const token_embed_buf = @as([*]f32, @ptrCast(@alignCast(token_embeddings.buffer.data.ptr)))[0..token_embeddings.shape.elemCount()];
@@ -571,7 +745,7 @@ pub const GPT2 = struct {
         // Step 2: Add position embeddings
         // Create a position indices tensor: [seq_len]
         var pos_indices = try Tensor.zeros(self.allocator, &[_]usize{seq_len}, .f32, input_ids.backend);
-        defer pos_indices.deinit();
+        // We handle cleanup manually
         
         // Fill position indices
         const pos_indices_buf = @as([*]f32, @ptrCast(@alignCast(pos_indices.buffer.data.ptr)))[0..pos_indices.shape.elemCount()];
@@ -581,6 +755,7 @@ pub const GPT2 = struct {
         
         // Create combined embeddings tensor: [batch_size, seq_len, embedding_dim]
         var embeddings = try Tensor.zeros(self.allocator, &token_embed_dims, input_ids.dtype, input_ids.backend);
+        // Managed manually
         
         // Get position embeddings buffer
         const wpe_buf = @as([*]f32, @ptrCast(@alignCast(self.wpe.buffer.data.ptr)))[0..self.wpe.shape.elemCount()];
@@ -600,6 +775,10 @@ pub const GPT2 = struct {
             }
         }
         
+        // We can safely deinit token_embeddings and pos_indices now as we've processed them
+        token_embeddings.deinit();
+        pos_indices.deinit();
+        
         // Reshape to [batch_size*seq_len, embedding_dim] for model processing
         var reshaped_dims = [_]usize{ batch_size * seq_len, self.config.n_embd };
         var reshaped_embeddings = try Tensor.zeros(self.allocator, &reshaped_dims, input_ids.dtype, input_ids.backend);
@@ -611,6 +790,9 @@ pub const GPT2 = struct {
                 reshaped_buf[i * self.config.n_embd + e] = embeddings_buf[i * self.config.n_embd + e];
             }
         }
+        
+        // We can safely deinit embeddings now as we've copied its data to reshaped_embeddings
+        embeddings.deinit();
         
         // Convert embedded tensor to node
         const input_node = try autodiff.variable(self.allocator, reshaped_embeddings, true);
@@ -630,16 +812,61 @@ pub const GPT2 = struct {
         }
         
         // Final layer norm
-        const output = try self.ln_f.forward(current);
+        const ln_output = try self.ln_f.forward(current);
         
-        // Clean up
-        if (current != input_node) {
+        // Apply language modeling head to get logits
+        // We need to reshape to [batch_size, seq_len, vocab_size] but keep as [batch_size*seq_len, vocab_size] for now
+        
+        // Make a copy of the token embeddings for the language modeling head
+        const wte_copy = try Tensor.init(
+            self.allocator, 
+            self.wte.shape.dims, 
+            self.wte.dtype, 
+            self.wte.backend
+        );
+        @memcpy(
+            wte_copy.buffer.data,
+            self.wte.buffer.data[0..self.wte.buffer.data.len]
+        );
+        
+        // Create a node for the token embeddings
+        const wte_node = try autodiff.variable(self.allocator, wte_copy, true);
+        defer wte_node.deinit();
+        
+        // Transpose the wte to [embedding_dim, vocab_size]
+        const wte_transposed = try ops.transpose(self.allocator, wte_node.tensor);
+        const wte_t_node = try autodiff.variable(self.allocator, wte_transposed, true);
+        defer wte_t_node.deinit();
+        
+        // Project hidden states to vocabulary logits: [batch_size*seq_len, embedding_dim] @ [embedding_dim, vocab_size]
+        // = [batch_size*seq_len, vocab_size]
+        const logits = try autodiff.matmul(self.allocator, ln_output, wte_t_node);
+        
+        // Be more cautious with cleanup to prevent double-frees and integer overflows
+        // We're returning logits to the caller who will be responsible for cleaning it up
+        
+        // Clean up current node if it's not already cleaned up by another part of the code
+        // and if it's not the same as ln_output (which will be handled separately)
+        if (current != input_node and current != ln_output) {
+            std.debug.print("Safely cleaning up current node\n", .{});
             current.deinit();
         }
         
-        // Clean up (embeddings is consumed by reshaped_embeddings)
-        embeddings.deinit();
+        // Clean up input_node if it's not already cleaned up and not needed anymore
+        if (input_node != ln_output and input_node != logits) {
+            std.debug.print("Safely cleaning up input node\n", .{});
+            input_node.deinit();
+        }
         
-        return output;
+        // We need to be careful with ln_output since it might be part of the logits computation
+        // Only clean up if it's safely not needed anymore
+        if (ln_output != logits and ln_output != current and ln_output != input_node) {
+            std.debug.print("Safely cleaning up ln_output node\n", .{});
+            ln_output.deinit();
+        }
+        
+        // We're returning logits, so the caller will be responsible for cleaning it up
+        
+        return logits;
     }
 };

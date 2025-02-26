@@ -196,8 +196,8 @@ const Dataset = struct {
                 inputs_buf[batch_idx * seq_length + seq_idx] = @floatFromInt(token_id);
                 
                 // Target token (next token prediction)
-                const next_seq_idx = (seq_idx + 1) % seq_length;
-                const next_batch_idx = if (next_seq_idx == 0) (batch_idx + 1) % batch_size else batch_idx;
+                // const next_seq_idx = (seq_idx + 1) % seq_length;
+                // const next_batch_idx = if (next_seq_idx == 0) (batch_idx + 1) % batch_size else batch_idx;
                 const next_token_idx = @min(seq_idx + 1, tokens.len - 1);
                 
                 targets_buf[batch_idx * seq_length + seq_idx] = @floatFromInt(
@@ -214,7 +214,7 @@ const Dataset = struct {
             }
             
             // If we've filled the dataset, we're done
-            if (batch_idx == 0 && seq_idx == 0) break;
+            if (batch_idx == 0 and seq_idx == 0) break;
         }
         
         return Dataset{
@@ -402,7 +402,7 @@ fn computeCrossEntropy(allocator: Allocator, logits: *Node, targets: Tensor) !*N
         // Compute negative log probability with numerical stability
         const epsilon = 1e-10;
         const safe_prob = @max(prob, epsilon);
-        loss_buf[i] = -std.math.log(safe_prob);
+        loss_buf[i] = -std.math.log10(safe_prob) / std.math.log10(@as(f32, std.math.e));
     }
     
     // Average the loss across all tokens
@@ -513,7 +513,7 @@ pub fn train() !void {
         // Apply gradients to all parameters
         // We now have actual gradients from backpropagation!
         if (model.wte.requires_grad) {
-            var wte_grad = model.wte;
+            const wte_grad = model.wte;
             
             // Ensure we have gradients
             if (logits.grad != null) {
@@ -528,7 +528,7 @@ pub fn train() !void {
             std.debug.print("\nValidation Test (Epoch {}):\n", .{epoch + 1});
             
             // Generate a short validation sample
-            var texts = [_][]const u8{"abc", "123", "hello"};
+            const texts = [_][]const u8{"abc", "123", "hello"};
             
             for (texts) |text| {
                 // Tokenize the test text

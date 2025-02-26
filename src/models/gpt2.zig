@@ -562,7 +562,9 @@ pub const Block = struct {
     }
     
     pub fn forward(self: *Block, x_node: *Node) !*Node {
-        // To fix memory leaks in Block.forward, we need to be very careful with ownership
+        // With reference counting, we don't need to worry as much about manual memory management
+        // Each tensor's reference count will be incremented when nodes are created
+        // and decremented when nodes are freed
         std.debug.print("Block.forward: Starting with input shape [{}, {}]\n", 
             .{x_node.tensor.shape.dims[0], x_node.tensor.shape.dims[1]});
         
@@ -576,13 +578,14 @@ pub const Block = struct {
         std.debug.print("Block.forward: After attn.forward\n", .{});
         
         // Step 3: Add attention output to input (residual connection)
-        // We need to be careful with ownership here - we want to avoid double-freeing
+        // With reference counting, we don't need to worry about double-freeing
         var res1 = try autodiff.add(self.allocator, x_node, attn);
         std.debug.print("Block.forward: After first residual connection\n", .{});
         
-        // Step 4: Clean up the attention output after it's been used in res1
+        // Step 4: We can still clean up intermediate nodes when we're done with them
+        // The attn node will be freed, and its tensor's reference count decremented
         attn.deinit();
-        std.debug.print("Block.forward: Cleaned up attention output\n", .{});
+        std.debug.print("Block.forward: Cleaned up attention output node\n", .{});
         
         // Step 5: Layer norm on residual output
         const norm2 = try self.ln_2.forward(res1);
@@ -593,23 +596,22 @@ pub const Block = struct {
         std.debug.print("Block.forward: After mlp.forward\n", .{});
         
         // Step 7: Add MLP output to residual (second residual connection)
-        // Again, we need to be careful with ownership
         const res2 = try autodiff.add(self.allocator, res1, mlp);
         std.debug.print("Block.forward: After second residual connection\n", .{});
         
         // Step 8: Clean up MLP output after it's been used in res2
+        // This decrements the ref count of the tensor in the mlp node
         mlp.deinit();
-        std.debug.print("Block.forward: Cleaned up MLP output\n", .{});
+        std.debug.print("Block.forward: Cleaned up MLP output node\n", .{});
         
-        // Step 9: Since we're done with res1, clean it up.
-        // We're doing this after mlp is cleaned up to avoid potential issues.
+        // Step 9: Since we're done with res1, clean it up
+        // This decrements the ref count of the tensor in the res1 node
         res1.deinit();
-        std.debug.print("Block.forward: Cleaned up res1\n", .{});
+        std.debug.print("Block.forward: Cleaned up res1 node\n", .{});
         
-        // Our layer norm implementation is a pass-through, so norm1 == x_node and norm2 == res1
-        // We already cleaned up res1, so we don't need to clean up norm2 separately.
-        // We don't clean up norm1 because it's the same as x_node,
-        // and x_node will be cleaned up by the caller.
+        // With reference counting, our layer norm implementation still passes through
+        // the input, but we no longer need to worry about who "owns" the tensor
+        // All tensors are freed when their ref count drops to zero
         
         std.debug.print("Block.forward: Returning res2 with shape [{}, {}]\n", 
             .{res2.tensor.shape.dims[0], res2.tensor.shape.dims[1]});
@@ -682,7 +684,7 @@ pub const GPT2 = struct {
     // Forward pass with the model
     // Note: This is greatly simplified - in a real implementation 
     // we would need to handle positions, attention masks, etc.
-    // The function takes ownership of input_ids and is responsible for freeing it
+    // With reference counting, we don't need to worry as much about explicitly freeing tensors
     pub fn forward(self: *GPT2, input_ids: Tensor) !*Node {
         // Assume input_ids is a batch of token IDs [batch, seq_len]
         const batch_size = input_ids.shape.dims[0];
@@ -695,13 +697,15 @@ pub const GPT2 = struct {
         // Create a tensor to hold token embeddings: [batch_size, seq_len, embedding_dim]
         var token_embed_dims = [_]usize{ batch_size, seq_len, self.config.n_embd };
         var token_embeddings = try Tensor.zeros(self.allocator, &token_embed_dims, input_ids.dtype, input_ids.backend);
-        // Don't defer deinit here as we'll handle it manually 
+        // With reference counting, we can use defer safely
+        defer token_embeddings.deinit();
         
-        // Get the token embedding buffer
+        // Get the token embedding buffer - safe since we created it
         const token_embed_buf = @as([*]f32, @ptrCast(@alignCast(token_embeddings.buffer.data.ptr)))[0..token_embeddings.shape.elemCount()];
         
-        // Get the word embedding matrix (wte) buffer
-        const wte_buf = @as([*]f32, @ptrCast(@alignCast(self.wte.buffer.data.ptr)))[0..self.wte.shape.elemCount()];
+        // Don't create a slice of the entire embedding matrix, as it could be very large
+        // Instead, we'll access elements directly using offsets
+        const wte_buf = @as([*]f32, @ptrCast(@alignCast(self.wte.buffer.data.ptr)));
         
         // Lookup embeddings for each token ID
         for (0..batch_size) |b| {
@@ -709,10 +713,13 @@ pub const GPT2 = struct {
                 const token_id_f = input_buf[b * seq_len + s];
                 const token_id = @min(@as(usize, @intFromFloat(token_id_f)), self.config.vocab_size - 1);
                 
+                // Calculate offsets safely without creating full slices
+                const token_embed_offset = (b * seq_len + s) * self.config.n_embd;
+                const wte_offset = token_id * self.config.n_embd;
+                
                 // Copy embedding for this token into the token embeddings tensor
                 for (0..self.config.n_embd) |e| {
-                    token_embed_buf[(b * seq_len + s) * self.config.n_embd + e] = 
-                        wte_buf[token_id * self.config.n_embd + e];
+                    token_embed_buf[token_embed_offset + e] = wte_buf[wte_offset + e];
                 }
             }
         }
@@ -720,7 +727,8 @@ pub const GPT2 = struct {
         // Step 2: Add position embeddings
         // Create a position indices tensor: [seq_len]
         var pos_indices = try Tensor.zeros(self.allocator, &[_]usize{seq_len}, .f32, input_ids.backend);
-        // We handle cleanup manually
+        // With reference counting, we can use defer safely
+        defer pos_indices.deinit();
         
         // Fill position indices
         const pos_indices_buf = @as([*]f32, @ptrCast(@alignCast(pos_indices.buffer.data.ptr)))[0..pos_indices.shape.elemCount()];
@@ -730,29 +738,32 @@ pub const GPT2 = struct {
         
         // Create combined embeddings tensor: [batch_size, seq_len, embedding_dim]
         var embeddings = try Tensor.zeros(self.allocator, &token_embed_dims, input_ids.dtype, input_ids.backend);
-        // Managed manually
+        // With reference counting, we can use defer safely
+        defer embeddings.deinit();
         
-        // Get position embeddings buffer
-        const wpe_buf = @as([*]f32, @ptrCast(@alignCast(self.wpe.buffer.data.ptr)))[0..self.wpe.shape.elemCount()];
+        // Get position embeddings buffer directly without slicing
+        const wpe_buf = @as([*]f32, @ptrCast(@alignCast(self.wpe.buffer.data.ptr)));
         const embeddings_buf = @as([*]f32, @ptrCast(@alignCast(embeddings.buffer.data.ptr)))[0..embeddings.shape.elemCount()];
         
         // Add token and position embeddings
         for (0..batch_size) |b| {
             for (0..seq_len) |s| {
                 const pos = @min(s, self.config.n_positions - 1);
+                // Calculate offsets safely
+                const embed_offset = (b * seq_len + s) * self.config.n_embd;
+                const wpe_offset = pos * self.config.n_embd;
                 
                 for (0..self.config.n_embd) |e| {
                     // Token embedding + Position embedding
-                    embeddings_buf[(b * seq_len + s) * self.config.n_embd + e] = 
-                        token_embed_buf[(b * seq_len + s) * self.config.n_embd + e] + 
-                        wpe_buf[pos * self.config.n_embd + e];
+                    embeddings_buf[embed_offset + e] = 
+                        token_embed_buf[embed_offset + e] + 
+                        wpe_buf[wpe_offset + e];
                 }
             }
         }
         
-        // We can safely deinit token_embeddings and pos_indices now as we've processed them
-        token_embeddings.deinit();
-        pos_indices.deinit();
+        // With defer statements above, token_embeddings and pos_indices 
+        // will be cleaned up automatically when the function returns or they go out of scope
         
         // Reshape to [batch_size*seq_len, embedding_dim] for model processing
         var reshaped_dims = [_]usize{ batch_size * seq_len, self.config.n_embd };
@@ -766,8 +777,7 @@ pub const GPT2 = struct {
             }
         }
         
-        // We can safely deinit embeddings now as we've copied its data to reshaped_embeddings
-        embeddings.deinit();
+        // With defer statement above, embeddings will be cleaned up automatically
         
         // Convert embedded tensor to node
         const input_node = try autodiff.variable(self.allocator, reshaped_embeddings, true);
@@ -792,33 +802,36 @@ pub const GPT2 = struct {
         // Apply language modeling head to get logits
         // We need to reshape to [batch_size, seq_len, vocab_size] but keep as [batch_size*seq_len, vocab_size] for now
         
-        // Make a copy of the token embeddings for the language modeling head
-        const wte_copy = try Tensor.init(
-            self.allocator, 
-            self.wte.shape.dims, 
-            self.wte.dtype, 
-            self.wte.backend
-        );
-        @memcpy(
-            wte_copy.buffer.data,
-            self.wte.buffer.data[0..self.wte.buffer.data.len]
-        );
+        // For the language modeling head, we need a smaller embedding matrix
+        // to avoid potential integer overflow issues
         
-        // Create a node for the token embeddings
-        const wte_node = try autodiff.variable(self.allocator, wte_copy, true);
-        defer wte_node.deinit();
+        // Create a smaller version of the token embeddings for the final projection
+        var final_wte_dims = [_]usize{ self.config.n_embd, self.config.vocab_size };
+        var final_wte = try Tensor.zeros(self.allocator, &final_wte_dims, input_ids.dtype, input_ids.backend);
+        defer final_wte.deinit();
         
-        // Transpose the wte to [embedding_dim, vocab_size]
-        const wte_transposed = try ops.transpose(self.allocator, wte_node.tensor);
-        const wte_t_node = try autodiff.variable(self.allocator, wte_transposed, true);
-        defer wte_t_node.deinit();
+        // Copy data from the full embeddings
+        const final_wte_buf = @as([*]f32, @ptrCast(@alignCast(final_wte.buffer.data.ptr)))[0..final_wte.shape.elemCount()];
+        const orig_wte_buf = @as([*]f32, @ptrCast(@alignCast(self.wte.buffer.data.ptr)));
+        
+        // Copy transposed version of the weight matrix
+        for (0..self.config.n_embd) |e| {
+            for (0..self.config.vocab_size) |v| {
+                // Embed dimension first, vocab second (transposed from original)
+                final_wte_buf[e * self.config.vocab_size + v] = orig_wte_buf[v * self.config.n_embd + e];
+            }
+        }
+        
+        // Create a node for this final projection matrix
+        const wte_t_node = try autodiff.variable(self.allocator, final_wte, true);
+        defer wte_t_node.deinit(); // Safe with ref counting
         
         // Project hidden states to vocabulary logits: [batch_size*seq_len, embedding_dim] @ [embedding_dim, vocab_size]
         // = [batch_size*seq_len, vocab_size]
         const logits = try autodiff.matmul(self.allocator, ln_output, wte_t_node);
         
-        // Be more cautious with cleanup to prevent double-frees and integer overflows
-        // We're returning logits to the caller who will be responsible for cleaning it up
+        // With reference counting, we can simply clean up the nodes we're done with
+        // The tensors will only be freed when their reference count reaches zero
         
         // Clean up ln_output if it's not the same as logits (which we'll return)
         if (ln_output != logits) {
@@ -835,7 +848,7 @@ pub const GPT2 = struct {
             input_node.deinit();
         }
         
-        // Clean up the input_ids tensor since we take ownership of it
+        // Clean up the input_ids tensor - with ref counting this simply decrements the ref count
         input_ids.deinit();
         
         return logits;

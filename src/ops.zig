@@ -43,6 +43,8 @@ pub fn add(allocator: Allocator, a: Tensor, b: Tensor) !Tensor {
         },
         // Implement other dtype cases as needed
         else => {
+            // Clean up the result tensor on error
+            result.deinit();
             return OpError.UnsupportedDataType;
         }
     }
@@ -171,7 +173,7 @@ pub fn matmul(allocator: Allocator, a: Tensor, b: Tensor) !Tensor {
     
     // Result dimensions: [a.dims[0], b.dims[1]]
     const result_dims = [_]usize{ a.shape.dims[0], b.shape.dims[1] };
-    const result = try Tensor.zeros(allocator, &result_dims, a.dtype, a.backend);
+    var result = try Tensor.zeros(allocator, &result_dims, a.dtype, a.backend);
     
     switch (a.dtype) {
         .f32 => {
@@ -196,6 +198,8 @@ pub fn matmul(allocator: Allocator, a: Tensor, b: Tensor) !Tensor {
         },
         // Implement other dtype cases as needed
         else => {
+            // Clean up the result tensor on error
+            result.deinit();
             return OpError.UnsupportedDataType;
         }
     }

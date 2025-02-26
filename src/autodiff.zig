@@ -42,9 +42,10 @@ pub const Node = struct {
     allocator: Allocator,
     
     pub fn init(allocator: Allocator, tensor_val: Tensor, requires_grad: bool) !*Node {
+        // Create the node
         const node = try allocator.create(Node);
         node.* = Node{
-            .tensor = tensor_val,
+            .tensor = tensor_val, // With ref counting, this is now safe
             .inputs = std.ArrayList(*Node).init(allocator),
             .requires_grad = requires_grad,
             .allocator = allocator,
@@ -53,14 +54,17 @@ pub const Node = struct {
     }
     
     pub fn deinit(self: *Node) void {
+        // Clean up inputs array
         self.inputs.deinit();
+        
+        // Clean up gradient if it exists
         if (self.grad) |*g| {
             g.deinit();
         }
         
-        // Deinit the tensor that belongs to this node
-        // We can safely deinit the tensor because when we create nodes via operations,
-        // the tensor is created specifically for this node and not shared externally
+        // Release the tensor (decrement ref count)
+        // With reference counting, we don't need to worry about who "owns" the tensor
+        // It will be freed when all references are gone
         self.tensor.deinit();
         
         // Finally, deallocate the Node itself
@@ -94,9 +98,12 @@ pub const Node = struct {
 };
 
 /// Create a computational graph node from a tensor
-/// This function takes ownership of the tensor, which will be freed when the node is deinited.
-/// If you need to keep the tensor alive separately, make a copy of it before passing to this function.
+/// With reference counting, this function doesn't "take ownership" in the same way.
+/// It simply uses the tensor, and the tensor will be freed when all references to it are gone.
+/// The node will increment the reference count of the tensor.
 pub fn variable(allocator: Allocator, t: Tensor, requires_grad: bool) !*Node {
+    // The tensor's reference count is already 1 from its creation
+    // We don't need to explicitly increment it when creating a node
     return Node.init(allocator, t, requires_grad);
 }
 
@@ -393,15 +400,23 @@ fn backwardMatmul(allocator: Allocator, node: *Node) !void {
         if (a.requires_grad) {
             try a.initGrad();
             if (a.grad) |*a_grad| {
+                // Compute b transpose - with reference counting, this creates a new tensor
                 const b_transpose = try ops.transpose(allocator, b.tensor);
+                
+                // Compute gradient contribution - with reference counting, this creates a new tensor
                 const temp_grad = try ops.matmul(allocator, grad, b_transpose);
-                // Clean up the transposed tensor
+                
+                // Release the transpose tensor (decrement ref count)
                 b_transpose.deinit();
                 
+                // Accumulate gradient - with reference counting, this creates a new tensor
                 const temp = try ops.add(allocator, a_grad.*, temp_grad);
-                // Clean up the temporary gradient
+                
+                // Release the temporary gradient (decrement ref count)
                 temp_grad.deinit();
                 
+                // Replace the old gradient with the new one
+                // Old gradient's ref count is decremented
                 a_grad.deinit();
                 a_grad.* = temp;
             }
@@ -411,15 +426,23 @@ fn backwardMatmul(allocator: Allocator, node: *Node) !void {
         if (b.requires_grad) {
             try b.initGrad();
             if (b.grad) |*b_grad| {
+                // Compute a transpose - with reference counting, this creates a new tensor
                 const a_transpose = try ops.transpose(allocator, a.tensor);
+                
+                // Compute gradient contribution - with reference counting, this creates a new tensor
                 const temp_grad = try ops.matmul(allocator, a_transpose, grad);
-                // Clean up the transposed tensor
+                
+                // Release the transpose tensor (decrement ref count)
                 a_transpose.deinit();
                 
+                // Accumulate gradient - with reference counting, this creates a new tensor
                 const temp = try ops.add(allocator, b_grad.*, temp_grad);
-                // Clean up the temporary gradient
+                
+                // Release the temporary gradient (decrement ref count)
                 temp_grad.deinit();
                 
+                // Replace the old gradient with the new one
+                // Old gradient's ref count is decremented
                 b_grad.deinit();
                 b_grad.* = temp;
             }

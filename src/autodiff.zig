@@ -42,6 +42,9 @@ pub const Node = struct {
     // Allocator for managing memory
     allocator: Allocator,
     
+    // Track if tensor has already been released (for debugging)
+    tensor_released: bool = false,
+    
     pub fn init(allocator: Allocator, tensor_val: Tensor, requires_grad: bool) !*Node {
         // Create the node
         const node = try allocator.create(Node);
@@ -50,12 +53,24 @@ pub const Node = struct {
             .inputs = std.ArrayList(*Node).init(allocator),
             .requires_grad = requires_grad,
             .allocator = allocator,
+            .tensor_released = false,
         };
         return node;
     }
     
     pub fn deinit(self: *Node) void {
-        // Clean up inputs array
+        // In embedding_lookup, we store the indices node as a direct input,
+        // so we need to properly clean up input nodes first
+        if (self.op_type == .embedding_lookup and self.inputs.items.len == 2) {
+            // The second input is the indices_node
+            if (self.inputs.items.len > 1) {
+                // Clean up the indices node
+                const indices_node = self.inputs.items[1];
+                indices_node.deinit();
+            }
+        }
+        
+        // Clean up inputs array without cleaning up the nodes themselves
         self.inputs.deinit();
         
         // Clean up gradient if it exists
@@ -63,10 +78,16 @@ pub const Node = struct {
             g.deinit();
         }
         
-        // Release the tensor (decrement ref count)
-        // With reference counting, we don't need to worry about who "owns" the tensor
-        // It will be freed when all references are gone
-        self.tensor.deinit();
+        // Check if tensor has already been released
+        if (!self.tensor_released) {
+            // Release the tensor (decrement ref count)
+            // With reference counting, we don't need to worry about who "owns" the tensor
+            // It will be freed when all references are gone
+            self.tensor.deinit();
+            self.tensor_released = true;
+        } else {
+            std.debug.print("Warning: Node tensor already released\n", .{});
+        }
         
         // Finally, deallocate the Node itself
         self.allocator.destroy(self);
@@ -253,7 +274,25 @@ pub fn embedding_lookup(allocator: Allocator, params: *Node, indices: Tensor) !*
     var result_dims = [_]usize{ batch_size, seq_len, embed_dim };
     var result_tensor = try Tensor.zeros(allocator, &result_dims, params.tensor.dtype, params.tensor.backend);
     
-    // Get data buffers
+    // Get data buffers with safe bounds checking
+    if (params.tensor.shape.elemCount() == 0) {
+        // Clean up the result tensor on error
+        result_tensor.deinit();
+        return error.EmptyTensor;
+    }
+    
+    if (indices.shape.elemCount() == 0) {
+        // Clean up the result tensor on error
+        result_tensor.deinit();
+        return error.EmptyTensor;
+    }
+    
+    if (result_tensor.shape.elemCount() == 0) {
+        // Clean up the result tensor on error
+        result_tensor.deinit();
+        return error.EmptyTensor;
+    }
+    
     const params_buf = @as([*]f32, @ptrCast(@alignCast(params.tensor.buffer.data.ptr)))[0..params.tensor.shape.elemCount()];
     const indices_buf = @as([*]f32, @ptrCast(@alignCast(indices.buffer.data.ptr)))[0..indices.shape.elemCount()];
     const result_buf = @as([*]f32, @ptrCast(@alignCast(result_tensor.buffer.data.ptr)))[0..result_tensor.shape.elemCount()];
@@ -269,6 +308,12 @@ pub fn embedding_lookup(allocator: Allocator, params: *Node, indices: Tensor) !*
                 index_pos = b * seq_len + s;
             }
             
+            if (index_pos >= indices_buf.len) {
+                std.debug.print("Warning: Index out of bounds in embedding_lookup: {}/{}\n", 
+                    .{index_pos, indices_buf.len});
+                continue;
+            }
+            
             const token_id_f = indices_buf[index_pos];
             // Safely convert to int and bound to vocab size
             const token_id_i = @as(i32, @intFromFloat(token_id_f));
@@ -278,6 +323,20 @@ pub fn embedding_lookup(allocator: Allocator, params: *Node, indices: Tensor) !*
             for (0..embed_dim) |d| {
                 const src_idx = token_id * embed_dim + d;
                 const dst_idx = (b * seq_len + s) * embed_dim + d;
+                
+                // Add bounds checking
+                if (src_idx >= params_buf.len) {
+                    std.debug.print("Warning: Source index out of bounds in embedding_lookup: {}/{}\n", 
+                        .{src_idx, params_buf.len});
+                    continue;
+                }
+                
+                if (dst_idx >= result_buf.len) {
+                    std.debug.print("Warning: Destination index out of bounds in embedding_lookup: {}/{}\n", 
+                        .{dst_idx, result_buf.len});
+                    continue;
+                }
+                
                 result_buf[dst_idx] = params_buf[src_idx];
             }
         }
@@ -293,12 +352,13 @@ pub fn embedding_lookup(allocator: Allocator, params: *Node, indices: Tensor) !*
     // Save input nodes for backward pass
     try result.inputs.append(params);
     
-    // Also save indices tensor information as a field
-    const indices_copy = try Tensor.init(allocator, indices.shape.dims, indices.dtype, indices.backend);
-    @memcpy(indices_copy.buffer.data, indices.buffer.data[0..indices.buffer.data.len]);
+    // Create a copy of the indices tensor that we'll own
+    // First, increase the reference count of the original indices tensor
+    const indices_for_copy = indices.retain();
     
     // Store indices in a new node (without requiring gradients)
-    const indices_node = try Node.init(allocator, indices_copy, false);
+    // Pass ownership of the retained tensor to this node
+    const indices_node = try Node.init(allocator, indices_for_copy, false);
     try result.inputs.append(indices_node);
     
     return result;
@@ -445,10 +505,30 @@ fn backwardEmbeddingLookup(allocator: Allocator, node: *Node) !void {
                     seq_len = indices.shape.dims[1];
                 }
                 
-                // Get data buffers
+                // Safety checks for empty tensors
+                if (indices.shape.elemCount() == 0) {
+                    std.debug.print("Warning: Empty indices tensor in backwardEmbeddingLookup\n", .{});
+                    return;
+                }
+                
+                if (grad.shape.elemCount() == 0) {
+                    std.debug.print("Warning: Empty gradient tensor in backwardEmbeddingLookup\n", .{});
+                    return;
+                }
+                
+                if (params_grad.*.shape.elemCount() == 0) {
+                    std.debug.print("Warning: Empty params_grad tensor in backwardEmbeddingLookup\n", .{});
+                    return;
+                }
+                
+                // Get data buffers with bounds checking
                 const indices_buf = @as([*]f32, @ptrCast(@alignCast(indices.buffer.data.ptr)))[0..indices.shape.elemCount()];
                 const grad_buf = @as([*]f32, @ptrCast(@alignCast(grad.buffer.data.ptr)))[0..grad.shape.elemCount()];
                 const params_grad_buf = @as([*]f32, @ptrCast(@alignCast(params_grad.*.buffer.data.ptr)))[0..params_grad.*.shape.elemCount()];
+                
+                // Print debug info
+                std.debug.print("Embedding backward: batch_size={}, seq_len={}, embed_dim={}, vocab_size={}\n", 
+                    .{batch_size, seq_len, embed_dim, vocab_size});
                 
                 // For each token in the batch, accumulate gradients back to the embedding table
                 for (0..batch_size) |b| {
@@ -461,6 +541,13 @@ fn backwardEmbeddingLookup(allocator: Allocator, node: *Node) !void {
                             index_pos = b * seq_len + s;
                         }
                         
+                        // Bounds check
+                        if (index_pos >= indices_buf.len) {
+                            std.debug.print("Warning: Index out of bounds in backwardEmbeddingLookup: {}/{}\n", 
+                                .{index_pos, indices_buf.len});
+                            continue;
+                        }
+                        
                         // Get token ID, clamping to vocab size
                         const token_id_f = indices_buf[index_pos];
                         const token_id_i = @as(i32, @intFromFloat(token_id_f));
@@ -471,10 +558,26 @@ fn backwardEmbeddingLookup(allocator: Allocator, node: *Node) !void {
                             const grad_pos = (b * seq_len + s) * embed_dim + d;
                             const param_pos = token_id * embed_dim + d;
                             
+                            // Bounds checking
+                            if (grad_pos >= grad_buf.len) {
+                                std.debug.print("Warning: Grad pos out of bounds in backwardEmbeddingLookup: {}/{}\n", 
+                                    .{grad_pos, grad_buf.len});
+                                continue;
+                            }
+                            
+                            if (param_pos >= params_grad_buf.len) {
+                                std.debug.print("Warning: Param pos out of bounds in backwardEmbeddingLookup: {}/{}\n", 
+                                    .{param_pos, params_grad_buf.len});
+                                continue;
+                            }
+                            
                             params_grad_buf[param_pos] += grad_buf[grad_pos];
                         }
                     }
                 }
+                
+                // Debug info
+                std.debug.print("Embedding backward completed successfully\n", .{});
                 
                 // No need for tensor replacement, since we directly updated the gradient tensor
             }

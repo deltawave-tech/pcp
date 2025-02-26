@@ -232,6 +232,12 @@ pub const Tensor = struct {
     /// Increment reference count
     pub fn retain(self: Tensor) Tensor {
         self.ref_count.* += 1;
+        // Debug info
+        std.debug.print("Tensor retained: ref_count = {}, shape = [", .{self.ref_count.*});
+        for (self.shape.dims) |dim| {
+            std.debug.print("{}, ", .{dim});
+        }
+        std.debug.print("]\n", .{});
         return self;
     }
     
@@ -239,7 +245,13 @@ pub const Tensor = struct {
     pub fn release(self: *const Tensor) void {
         // Safety check: don't decrement if already zero
         if (self.ref_count.* == 0) {
+            // Add more debug info to help track down the issue
             std.debug.print("Warning: Trying to release tensor with zero reference count\n", .{});
+            std.debug.print("  Shape: [", .{});
+            for (self.shape.dims) |dim| {
+                std.debug.print("{}, ", .{dim});
+            }
+            std.debug.print("]\n", .{});
             return;
         }
         

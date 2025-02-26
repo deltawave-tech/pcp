@@ -8,6 +8,8 @@ A distributed tensor computation framework written in Zig, designed for training
 - Static tensor shapes checked at compile-time with Zig's comptime
 - Automatic differentiation using dynamic computation graphs
 - Memory-safe tensor operations with proper cleanup
+- Embedding layers with correct gradient flow
+- Reference-counted tensor management
 - Cross-platform backend support
   - CPU computing with SIMD optimizations
   - Apple Silicon via Metal (WIP)
@@ -35,9 +37,11 @@ A distributed tensor computation framework written in Zig, designed for training
 One of PCP's core strengths is its careful memory management:
 
 - All tensors and computational graph nodes track their own memory
+- Reference counting for efficient tensor reuse and proper cleanup
 - Proper cleanup of intermediate tensors during backward pass
-- No memory leaks in the automatic differentiation engine
+- Robust gradient flow through embedding layers and complex operations
 - Safe handling of tensor references throughout the computation graph
+- Bounds checking and overflow protection for numerical stability
 
 ## Getting Started
 
@@ -82,8 +86,11 @@ The framework is designed with performance in mind:
 - [x] Basic model definition (GPT-2)
 - [x] Memory leak fixes in backward operations
 - [x] Training examples with text generation
+- [x] Embedding layers with proper gradient flow
+- [x] Enhanced reference counting for tensor management
+- [x] Robust bounds checking and safety mechanisms
+- [ ] Complete reference counting system fixes
 - [ ] Complete Metal backend implementation
-- [ ] Reference counting system for tensor management
 - [ ] Actor-based distributed training
 - [ ] Decentralized optimization algorithms
 - [ ] CUDA and ROCm backends

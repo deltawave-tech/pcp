@@ -1,0 +1,34 @@
+# Zig build files and cache
+zig-cache/
+zig-out/
+build/
+build-*/
+
+# Compiled binary files
+*.o
+*.obj
+*.exe
+*.out
+*.app
+*.dll
+*.so
+*.dylib
+
+# Dependency directories
+deps/
+
+# Editor and system files
+.DS_Store
+.vscode/
+.idea/
+*.swp
+*~
+
+# Debug files
+*.dSYM/
+*.su
+*.idb
+*.pdb
+
+# Custom ignore
+notes.md

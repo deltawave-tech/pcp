@@ -18,6 +18,7 @@ pub const OpType = enum {
     relu,
     softmax,
     transpose,
+    embedding_lookup,
     // More operations will be added
 };
 
@@ -207,6 +208,102 @@ pub fn softmax(allocator: Allocator, a: *Node) !*Node {
     return result;
 }
 
+/// Transpose a node
+pub fn transpose(allocator: Allocator, a: *Node) !*Node {
+    // Perform the operation
+    var result_tensor = try ops.transpose(allocator, a.tensor);
+    result_tensor.requires_grad = a.requires_grad;
+    
+    // Create the result node
+    var result = try Node.init(allocator, result_tensor, result_tensor.requires_grad);
+    result.op_type = .transpose;
+    
+    // Save input node for backward pass
+    try result.inputs.append(a);
+    
+    return result;
+}
+
+/// Embedding lookup operation
+/// Takes a parameters tensor (embedding table) and index tensor, returns embeddings
+pub fn embedding_lookup(allocator: Allocator, params: *Node, indices: Tensor) !*Node {
+    // Validate input - params must be 2D tensor: [vocab_size, embedding_dim]
+    if (params.tensor.shape.rank() != 2) {
+        return error.InvalidEmbeddingShape;
+    }
+    
+    // Get vocab size and embedding dimensions
+    const vocab_size = params.tensor.shape.dims[0];
+    const embed_dim = params.tensor.shape.dims[1];
+    
+    // Parse indices - can be 1D or 2D
+    var batch_size: usize = 1;
+    var seq_len: usize = 1;
+    
+    if (indices.shape.rank() == 1) {
+        seq_len = indices.shape.dims[0];
+    } else if (indices.shape.rank() == 2) {
+        batch_size = indices.shape.dims[0];
+        seq_len = indices.shape.dims[1];
+    } else {
+        return error.InvalidIndicesShape;
+    }
+    
+    // Create output tensor with shape [batch_size, seq_len, embed_dim]
+    var result_dims = [_]usize{ batch_size, seq_len, embed_dim };
+    var result_tensor = try Tensor.zeros(allocator, &result_dims, params.tensor.dtype, params.tensor.backend);
+    
+    // Get data buffers
+    const params_buf = @as([*]f32, @ptrCast(@alignCast(params.tensor.buffer.data.ptr)))[0..params.tensor.shape.elemCount()];
+    const indices_buf = @as([*]f32, @ptrCast(@alignCast(indices.buffer.data.ptr)))[0..indices.shape.elemCount()];
+    const result_buf = @as([*]f32, @ptrCast(@alignCast(result_tensor.buffer.data.ptr)))[0..result_tensor.shape.elemCount()];
+    
+    // Perform lookup
+    for (0..batch_size) |b| {
+        for (0..seq_len) |s| {
+            // Get the token id from indices, safely convert to int
+            var index_pos: usize = 0;
+            if (indices.shape.rank() == 1) {
+                index_pos = s;
+            } else {
+                index_pos = b * seq_len + s;
+            }
+            
+            const token_id_f = indices_buf[index_pos];
+            // Safely convert to int and bound to vocab size
+            const token_id_i = @as(i32, @intFromFloat(token_id_f));
+            const token_id = @as(usize, @intCast(@max(0, @min(token_id_i, @as(i32, @intCast(vocab_size - 1))))));
+            
+            // Copy embedding for this token - embed_dim values
+            for (0..embed_dim) |d| {
+                const src_idx = token_id * embed_dim + d;
+                const dst_idx = (b * seq_len + s) * embed_dim + d;
+                result_buf[dst_idx] = params_buf[src_idx];
+            }
+        }
+    }
+    
+    // Set requires_grad based on the parameters
+    result_tensor.requires_grad = params.requires_grad;
+    
+    // Create the result node
+    var result = try Node.init(allocator, result_tensor, result_tensor.requires_grad);
+    result.op_type = .embedding_lookup;
+    
+    // Save input nodes for backward pass
+    try result.inputs.append(params);
+    
+    // Also save indices tensor information as a field
+    const indices_copy = try Tensor.init(allocator, indices.shape.dims, indices.dtype, indices.backend);
+    @memcpy(indices_copy.buffer.data, indices.buffer.data[0..indices.buffer.data.len]);
+    
+    // Store indices in a new node (without requiring gradients)
+    const indices_node = try Node.init(allocator, indices_copy, false);
+    try result.inputs.append(indices_node);
+    
+    return result;
+}
+
 /// Compute gradients through the computational graph
 pub fn backward(allocator: Allocator, node: *Node) !void {
     // Initialize gradient of the output node to ones
@@ -222,6 +319,9 @@ pub fn backward(allocator: Allocator, node: *Node) !void {
     // DFS to build topological sort
     try buildTopoSort(node, &visited, &topo_order);
     
+    // Print the number of nodes in the computation graph for debugging
+    std.debug.print("Backward pass: found {} nodes in computation graph\n", .{topo_order.items.len});
+    
     // Backward pass in reverse topological order
     var i: usize = topo_order.items.len;
     while (i > 0) {
@@ -230,6 +330,10 @@ pub fn backward(allocator: Allocator, node: *Node) !void {
         
         // Skip nodes that don't require gradients
         if (!current.requires_grad) continue;
+        
+        // Debug print the current node
+        std.debug.print("Processing node {} with op_type {any}\n", 
+            .{i, current.op_type});
         
         // Process according to operation type
         if (current.op_type) |op| {
@@ -240,8 +344,106 @@ pub fn backward(allocator: Allocator, node: *Node) !void {
                 .matmul => try backwardMatmul(allocator, current),
                 .relu => try backwardRelu(allocator, current),
                 .softmax => try backwardSoftmax(allocator, current),
+                .transpose => try backwardTranspose(allocator, current),
+                .embedding_lookup => try backwardEmbeddingLookup(allocator, current),
                 // Add more operation types as they are implemented
                 else => return error.UnsupportedOperationBackward,
+            }
+        } else {
+            // If this is a variable node with no operation, we might need to handle 
+            // special cases like parameter nodes
+            std.debug.print("Skipping variable node with no operation\n", .{});
+        }
+    }
+}
+
+/// Backward pass for transpose
+fn backwardTranspose(allocator: Allocator, node: *Node) !void {
+    if (node.inputs.items.len != 1) return error.InvalidInputCount;
+    
+    const a = node.inputs.items[0];
+    
+    if (node.grad) |grad| {
+        if (a.requires_grad) {
+            try a.initGrad();
+            if (a.grad) |*a_grad| {
+                // For transpose, we need to transpose the gradient
+                const transposed_grad = try ops.transpose(allocator, grad);
+                
+                // Accumulate gradients
+                const temp = try ops.add(allocator, a_grad.*, transposed_grad);
+                // Clean up temporary
+                transposed_grad.deinit();
+                
+                a_grad.deinit();
+                a_grad.* = temp;
+            }
+        }
+    }
+}
+
+/// Backward pass for embedding lookup
+fn backwardEmbeddingLookup(allocator: Allocator, node: *Node) !void {
+    _ = allocator; // Used in error handling and gradient initialization
+    if (node.inputs.items.len != 2) return error.InvalidInputCount;
+    
+    const params = node.inputs.items[0]; // Embedding parameters
+    const indices_node = node.inputs.items[1]; // Indices tensor node
+    
+    if (node.grad) |grad| {
+        if (params.requires_grad) {
+            try params.initGrad();
+            if (params.grad) |*params_grad| {
+                // Extract dimensions
+                const vocab_size = params.tensor.shape.dims[0];
+                const embed_dim = params.tensor.shape.dims[1];
+                
+                // Get the indices tensor
+                const indices = indices_node.tensor;
+                
+                // Parse indices dimensions
+                var batch_size: usize = 1;
+                var seq_len: usize = 1;
+                
+                if (indices.shape.rank() == 1) {
+                    seq_len = indices.shape.dims[0];
+                } else if (indices.shape.rank() == 2) {
+                    batch_size = indices.shape.dims[0];
+                    seq_len = indices.shape.dims[1];
+                }
+                
+                // Get data buffers
+                const indices_buf = @as([*]f32, @ptrCast(@alignCast(indices.buffer.data.ptr)))[0..indices.shape.elemCount()];
+                const grad_buf = @as([*]f32, @ptrCast(@alignCast(grad.buffer.data.ptr)))[0..grad.shape.elemCount()];
+                const params_grad_buf = @as([*]f32, @ptrCast(@alignCast(params_grad.*.buffer.data.ptr)))[0..params_grad.*.shape.elemCount()];
+                
+                // For each token in the batch, accumulate gradients back to the embedding table
+                for (0..batch_size) |b| {
+                    for (0..seq_len) |s| {
+                        // Get index of current token
+                        var index_pos: usize = 0;
+                        if (indices.shape.rank() == 1) {
+                            index_pos = s;
+                        } else {
+                            index_pos = b * seq_len + s;
+                        }
+                        
+                        // Get token ID, clamping to vocab size
+                        const token_id_f = indices_buf[index_pos];
+                        const token_id_i = @as(i32, @intFromFloat(token_id_f));
+                        const token_id = @as(usize, @intCast(@max(0, @min(token_id_i, @as(i32, @intCast(vocab_size - 1))))));
+                        
+                        // Accumulate gradients for this embedding
+                        for (0..embed_dim) |d| {
+                            const grad_pos = (b * seq_len + s) * embed_dim + d;
+                            const param_pos = token_id * embed_dim + d;
+                            
+                            params_grad_buf[param_pos] += grad_buf[grad_pos];
+                        }
+                    }
+                }
+                
+                // No need for tensor replacement, since we directly updated the gradient tensor
             }
         }
     }

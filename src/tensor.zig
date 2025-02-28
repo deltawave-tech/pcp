@@ -177,7 +177,7 @@ pub const Tensor = struct {
         switch (dtype) {
             .f32 => {
                 const val: f32 = @floatCast(value);
-                const f32_buf = @as([*]f32, @ptrCast(@alignCast(tensor.buffer.data.ptr)))[0..tensor.shape.elemCount()];
+                const f32_buf = @ptrCast([*]f32, tensor.buffer.data.ptr)[0..tensor.shape.elemCount()];
                 for (f32_buf) |*ptr| {
                     ptr.* = val;
                 }
@@ -208,12 +208,12 @@ pub const Tensor = struct {
         const tensor = try init(allocator, dims, dtype, backend);
         // Use a timestamp cast to unsigned value for seed
         const seed = @as(u64, @bitCast(@as(i64, std.time.milliTimestamp())));
-        var prng = std.rand.DefaultPrng.init(seed);
+        var prng = std.Random.DefaultPrng.init(seed);
         const rand = prng.random();
         
         switch (dtype) {
             .f32 => {
-                const f32_buf = @as([*]f32, @ptrCast(@alignCast(tensor.buffer.data.ptr)))[0..tensor.shape.elemCount()];
+                const f32_buf = @ptrCast([*]f32, tensor.buffer.data.ptr)[0..tensor.shape.elemCount()];
                 for (f32_buf) |*ptr| {
                     ptr.* = rand.float(f32);
                 }
@@ -305,7 +305,7 @@ pub const Tensor = struct {
         
         switch (self.dtype) {
             .f32 => {
-                const f32_buf = @as([*]f32, @ptrCast(@alignCast(self.buffer.data.ptr)));
+                const f32_buf = @ptrCast([*]f32, self.buffer.data.ptr);
                 return f32_buf[linear_idx];
             },
             // Implement other dtype cases as needed
@@ -337,7 +337,7 @@ pub const Tensor = struct {
         
         switch (self.dtype) {
             .f32 => {
-                const f32_buf = @as([*]f32, @ptrCast(@alignCast(self.buffer.data.ptr)));
+                const f32_buf = @ptrCast([*]f32, self.buffer.data.ptr);
                 f32_buf[linear_idx] = @floatCast(value);
             },
             // Implement other dtype cases as needed

@@ -45,7 +45,7 @@ pub const Attention = struct {
         const c_attn_weight = try Tensor.random(allocator, &c_attn_weight_dims, .f32, backend);
         
         // Scale the random initialization
-        const c_attn_weight_ptr = @as([*]f32, @ptrCast(@alignCast(c_attn_weight.buffer.data.ptr)))[0..c_attn_weight.shape.elemCount()];
+        const c_attn_weight_ptr = @ptrCast([*]f32, c_attn_weight.buffer.data.ptr)[0..c_attn_weight.shape.elemCount()];
         for (c_attn_weight_ptr) |*val| {
             val.* *= config.initializer_range;
         }
@@ -59,7 +59,7 @@ pub const Attention = struct {
         const c_proj_weight = try Tensor.random(allocator, &c_proj_weight_dims, .f32, backend);
         
         // Scale the random initialization
-        const c_proj_weight_ptr = @as([*]f32, @ptrCast(@alignCast(c_proj_weight.buffer.data.ptr)))[0..c_proj_weight.shape.elemCount()];
+        const c_proj_weight_ptr = @ptrCast([*]f32, c_proj_weight.buffer.data.ptr)[0..c_proj_weight.shape.elemCount()];
         for (c_proj_weight_ptr) |*val| {
             val.* *= config.initializer_range;
         }

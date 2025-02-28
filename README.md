@@ -47,8 +47,17 @@ One of PCP's core strengths is its careful memory management:
 
 ### Prerequisites
 
-- Zig compiler (0.11.0 or newer)
+- Zig compiler (0.12.0 - 0.14.x)
 - For Metal backend: macOS with an Apple Silicon or compatible GPU
+
+### Zig Version Compatibility
+
+This project is compatible with Zig 0.14.x as of the latest update. The following changes were made:
+
+1. Updated `std.rand` to `std.Random` for random number generation
+2. Updated pointer cast syntax:
+   - Old: `@as([*]f32, @ptrCast(@alignCast(ptr)))[0..len]`
+   - New: `@ptrCast([*]f32, ptr)[0..len]`
 
 ### Building and Running
 

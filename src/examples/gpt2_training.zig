@@ -59,10 +59,10 @@ const Adam = struct {
         var v = self.v_map.get(parameter).?;
         
         // Get pointers to the data
-        const param_buf = @as([*]f32, @ptrCast(@alignCast(parameter.buffer.data.ptr)))[0..parameter.shape.elemCount()];
-        const grad_buf = @as([*]f32, @ptrCast(@alignCast(gradient.buffer.data.ptr)))[0..gradient.shape.elemCount()];
-        const m_buf = @as([*]f32, @ptrCast(@alignCast(m.buffer.data.ptr)))[0..m.shape.elemCount()];
-        const v_buf = @as([*]f32, @ptrCast(@alignCast(v.buffer.data.ptr)))[0..v.shape.elemCount()];
+        const param_buf = @ptrCast([*]f32, parameter.buffer.data.ptr)[0..parameter.shape.elemCount()];
+        const grad_buf = @ptrCast([*]f32, gradient.buffer.data.ptr)[0..gradient.shape.elemCount()];
+        const m_buf = @ptrCast([*]f32, m.buffer.data.ptr)[0..m.shape.elemCount()];
+        const v_buf = @ptrCast([*]f32, v.buffer.data.ptr)[0..v.shape.elemCount()];
         
         // Update parameters using Adam update rule
         const lr = self.learning_rate;

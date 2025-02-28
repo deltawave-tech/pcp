@@ -1,6 +1,12 @@
 const std = @import("std");
 const tensor = @import("tensor.zig");
 
+/// Helper function for pointer casting
+fn ptrCastHelper(comptime T: type, ptr: anytype) T {
+    // We still need to use alignCast for pointers that require higher alignment
+    return @ptrCast(@alignCast(ptr));
+}
+
 const Allocator = std.mem.Allocator;
 const Tensor = tensor.Tensor;
 const DType = tensor.DType;
@@ -33,9 +39,9 @@ pub fn add(allocator: Allocator, a: Tensor, b: Tensor) !Tensor {
     
     switch (a.dtype) {
         .f32 => {
-            const a_buf = @ptrCast([*]f32, a.buffer.data.ptr)[0..a.shape.elemCount()];
-            const b_buf = @ptrCast([*]f32, b.buffer.data.ptr)[0..b.shape.elemCount()];
-            const result_buf = @ptrCast([*]f32, result.buffer.data.ptr)[0..result.shape.elemCount()];
+            const a_buf = ptrCastHelper([*]f32, a.buffer.data.ptr)[0..a.shape.elemCount()];
+            const b_buf = ptrCastHelper([*]f32, b.buffer.data.ptr)[0..b.shape.elemCount()];
+            const result_buf = ptrCastHelper([*]f32, result.buffer.data.ptr)[0..result.shape.elemCount()];
             
             for (a_buf, 0..) |a_val, i| {
                 result_buf[i] = a_val + b_buf[i];
@@ -69,9 +75,9 @@ pub fn subtract(allocator: Allocator, a: Tensor, b: Tensor) !Tensor {
     
     switch (a.dtype) {
         .f32 => {
-            const a_buf = @ptrCast([*]f32, a.buffer.data.ptr)[0..a.shape.elemCount()];
-            const b_buf = @ptrCast([*]f32, b.buffer.data.ptr)[0..b.shape.elemCount()];
-            const result_buf = @ptrCast([*]f32, result.buffer.data.ptr)[0..result.shape.elemCount()];
+            const a_buf = ptrCastHelper([*]f32, a.buffer.data.ptr)[0..a.shape.elemCount()];
+            const b_buf = ptrCastHelper([*]f32, b.buffer.data.ptr)[0..b.shape.elemCount()];
+            const result_buf = ptrCastHelper([*]f32, result.buffer.data.ptr)[0..result.shape.elemCount()];
             
             for (a_buf, 0..) |a_val, i| {
                 result_buf[i] = a_val - b_buf[i];
@@ -103,9 +109,9 @@ pub fn multiply(allocator: Allocator, a: Tensor, b: Tensor) !Tensor {
     
     switch (a.dtype) {
         .f32 => {
-            const a_buf = @ptrCast([*]f32, a.buffer.data.ptr)[0..a.shape.elemCount()];
-            const b_buf = @ptrCast([*]f32, b.buffer.data.ptr)[0..b.shape.elemCount()];
-            const result_buf = @ptrCast([*]f32, result.buffer.data.ptr)[0..result.shape.elemCount()];
+            const a_buf = ptrCastHelper([*]f32, a.buffer.data.ptr)[0..a.shape.elemCount()];
+            const b_buf = ptrCastHelper([*]f32, b.buffer.data.ptr)[0..b.shape.elemCount()];
+            const result_buf = ptrCastHelper([*]f32, result.buffer.data.ptr)[0..result.shape.elemCount()];
             
             for (a_buf, 0..) |a_val, i| {
                 result_buf[i] = a_val * b_buf[i];
@@ -137,9 +143,9 @@ pub fn divide(allocator: Allocator, a: Tensor, b: Tensor) !Tensor {
     
     switch (a.dtype) {
         .f32 => {
-            const a_buf = @ptrCast([*]f32, a.buffer.data.ptr)[0..a.shape.elemCount()];
-            const b_buf = @ptrCast([*]f32, b.buffer.data.ptr)[0..b.shape.elemCount()];
-            const result_buf = @ptrCast([*]f32, result.buffer.data.ptr)[0..result.shape.elemCount()];
+            const a_buf = ptrCastHelper([*]f32, a.buffer.data.ptr)[0..a.shape.elemCount()];
+            const b_buf = ptrCastHelper([*]f32, b.buffer.data.ptr)[0..b.shape.elemCount()];
+            const result_buf = ptrCastHelper([*]f32, result.buffer.data.ptr)[0..result.shape.elemCount()];
             
             for (a_buf, 0..) |a_val, i| {
                 // Division by zero check could be added here
@@ -177,9 +183,9 @@ pub fn matmul(allocator: Allocator, a: Tensor, b: Tensor) !Tensor {
     
     switch (a.dtype) {
         .f32 => {
-            const a_buf = @ptrCast([*]f32, a.buffer.data.ptr);
-            const b_buf = @ptrCast([*]f32, b.buffer.data.ptr);
-            const result_buf = @ptrCast([*]f32, result.buffer.data.ptr);
+            const a_buf = ptrCastHelper([*]f32, a.buffer.data.ptr);
+            const b_buf = ptrCastHelper([*]f32, b.buffer.data.ptr);
+            const result_buf = ptrCastHelper([*]f32, result.buffer.data.ptr);
             
             const m = a.shape.dims[0];
             const n = a.shape.dims[1]; // also b.shape.dims[0]
@@ -213,8 +219,8 @@ pub fn relu(allocator: Allocator, a: Tensor) !Tensor {
     
     switch (a.dtype) {
         .f32 => {
-            const a_buf = @ptrCast([*]f32, a.buffer.data.ptr)[0..a.shape.elemCount()];
-            const result_buf = @ptrCast([*]f32, result.buffer.data.ptr)[0..result.shape.elemCount()];
+            const a_buf = ptrCastHelper([*]f32, a.buffer.data.ptr)[0..a.shape.elemCount()];
+            const result_buf = ptrCastHelper([*]f32, result.buffer.data.ptr)[0..result.shape.elemCount()];
             
             for (a_buf, 0..) |a_val, i| {
                 result_buf[i] = if (a_val > 0) a_val else 0;
@@ -239,8 +245,8 @@ pub fn softmax(allocator: Allocator, a: Tensor) !Tensor {
     
     switch (a.dtype) {
         .f32 => {
-            const a_buf = @ptrCast([*]f32, a.buffer.data.ptr);
-            const result_buf = @ptrCast([*]f32, result.buffer.data.ptr);
+            const a_buf = ptrCastHelper([*]f32, a.buffer.data.ptr);
+            const result_buf = ptrCastHelper([*]f32, result.buffer.data.ptr);
             
             const batch_size = a.shape.dims[0];
             const feature_size = a.shape.dims[1];
@@ -289,8 +295,8 @@ pub fn transpose(allocator: Allocator, a: Tensor) !Tensor {
     
     switch (a.dtype) {
         .f32 => {
-            const a_buf = @ptrCast([*]f32, a.buffer.data.ptr);
-            const result_buf = @ptrCast([*]f32, result.buffer.data.ptr);
+            const a_buf = ptrCastHelper([*]f32, a.buffer.data.ptr);
+            const result_buf = ptrCastHelper([*]f32, result.buffer.data.ptr);
             
             const rows = a.shape.dims[0];
             const cols = a.shape.dims[1];

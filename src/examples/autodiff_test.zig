@@ -4,6 +4,12 @@ const tensorModule = pcp.tensor;
 const ops = pcp.ops;
 const autodiff = pcp.autodiff;
 
+/// Helper function for pointer casting
+fn ptrCastHelper(comptime T: type, ptr: anytype) T {
+    // We still need to use alignCast for pointers that require higher alignment
+    return @ptrCast(@alignCast(ptr));
+}
+
 const Allocator = std.mem.Allocator;
 const Tensor = tensorModule.Tensor;
 const DType = tensorModule.DType;
@@ -11,7 +17,7 @@ const Node = autodiff.Node;
 
 // Helper function to print tensor contents
 fn printTensor(t: Tensor) void {
-    const buf = @ptrCast([*]f32, t.buffer.data.ptr)[0..t.shape.elemCount()];
+    const buf = ptrCastHelper([*]f32, t.buffer.data.ptr)[0..t.shape.elemCount()];
     
     std.debug.print("Shape: [", .{});
     for (t.shape.dims) |dim| {
@@ -193,7 +199,7 @@ fn testEmbeddings(allocator: Allocator) !void {
     var embeddings = try Tensor.zeros(allocator, &embed_dims, .f32, .cpu);
     
     // Fill with test values
-    var embed_buf = @ptrCast([*]f32, embeddings.buffer.data.ptr)[0..embeddings.shape.elemCount()];
+    var embed_buf = ptrCastHelper([*]f32, embeddings.buffer.data.ptr)[0..embeddings.shape.elemCount()];
     // Word 0: [0.1, 0.2, 0.3]
     embed_buf[0] = 0.1;
     embed_buf[1] = 0.2;
@@ -286,8 +292,8 @@ fn testEmbeddings(allocator: Allocator) !void {
         var batch_slice_dims = [_]usize{1, lookup_result.tensor.shape.dims[1], lookup_result.tensor.shape.dims[2]};
         var batch_slice = try Tensor.zeros(allocator, &batch_slice_dims, .f32, .cpu);
         
-        const diff_squared_buf = @ptrCast([*]f32, diff_squared.tensor.buffer.data.ptr)[0..diff_squared.tensor.shape.elemCount()];
-        const batch_slice_buf = @ptrCast([*]f32, batch_slice.buffer.data.ptr)[0..batch_slice.shape.elemCount()];
+        const diff_squared_buf = ptrCastHelper([*]f32, diff_squared.tensor.buffer.data.ptr)[0..diff_squared.tensor.shape.elemCount()];
+        const batch_slice_buf = ptrCastHelper([*]f32, batch_slice.buffer.data.ptr)[0..batch_slice.shape.elemCount()];
         
         // Copy data for this batch
         const start_idx = b * lookup_result.tensor.shape.dims[1] * lookup_result.tensor.shape.dims[2];
@@ -353,7 +359,7 @@ fn testComplexModel(allocator: Allocator) !void {
     var wte = try Tensor.random(allocator, &wte_dims, .f32, .cpu);
     
     // Scale down random values
-    const wte_ptr = @ptrCast([*]f32, wte.buffer.data.ptr)[0..wte.shape.elemCount()];
+    const wte_ptr = ptrCastHelper([*]f32, wte.buffer.data.ptr)[0..wte.shape.elemCount()];
     for (wte_ptr) |*val| {
         val.* *= 0.1;
     }
@@ -363,7 +369,7 @@ fn testComplexModel(allocator: Allocator) !void {
     var wpe = try Tensor.random(allocator, &wpe_dims, .f32, .cpu);
     
     // Scale down random values
-    const wpe_ptr = @ptrCast([*]f32, wpe.buffer.data.ptr)[0..wpe.shape.elemCount()];
+    const wpe_ptr = ptrCastHelper([*]f32, wpe.buffer.data.ptr)[0..wpe.shape.elemCount()];
     for (wpe_ptr) |*val| {
         val.* *= 0.1;
     }
@@ -420,11 +426,11 @@ fn testComplexModel(allocator: Allocator) !void {
     var pos_embeds_flat = try Tensor.zeros(allocator, &flat_dims, .f32, .cpu);
     
     // Copy data
-    const token_embeds_buf = @ptrCast([*]f32, token_embeds.tensor.buffer.data.ptr)[0..token_embeds.tensor.shape.elemCount()];
-    const pos_embeds_buf = @ptrCast([*]f32, pos_embeds.tensor.buffer.data.ptr)[0..pos_embeds.tensor.shape.elemCount()];
+    const token_embeds_buf = ptrCastHelper([*]f32, token_embeds.tensor.buffer.data.ptr)[0..token_embeds.tensor.shape.elemCount()];
+    const pos_embeds_buf = ptrCastHelper([*]f32, pos_embeds.tensor.buffer.data.ptr)[0..pos_embeds.tensor.shape.elemCount()];
     
-    const token_flat_buf = @ptrCast([*]f32, token_embeds_flat.buffer.data.ptr)[0..token_embeds_flat.shape.elemCount()];
-    const pos_flat_buf = @ptrCast([*]f32, pos_embeds_flat.buffer.data.ptr)[0..pos_embeds_flat.shape.elemCount()];
+    const token_flat_buf = ptrCastHelper([*]f32, token_embeds_flat.buffer.data.ptr)[0..token_embeds_flat.shape.elemCount()];
+    const pos_flat_buf = ptrCastHelper([*]f32, pos_embeds_flat.buffer.data.ptr)[0..pos_embeds_flat.shape.elemCount()];
     
     for (0..batch_size) |b| {
         for (0..seq_len) |s| {
@@ -449,7 +455,7 @@ fn testComplexModel(allocator: Allocator) !void {
     var proj = try Tensor.random(allocator, &proj_dims, .f32, .cpu);
     
     // Scale down
-    const proj_ptr = @ptrCast([*]f32, proj.buffer.data.ptr)[0..proj.shape.elemCount()];
+    const proj_ptr = ptrCastHelper([*]f32, proj.buffer.data.ptr)[0..proj.shape.elemCount()];
     for (proj_ptr) |*val| {
         val.* *= 0.1;
     }
@@ -470,7 +476,7 @@ fn testComplexModel(allocator: Allocator) !void {
     var targets = try Tensor.zeros(allocator, &targets_dims, .f32, .cpu);
     
     // Set target values (just set position 0 to 1.0 for each example)
-    const targets_buf = @ptrCast([*]f32, targets.buffer.data.ptr)[0..targets.shape.elemCount()];
+    const targets_buf = ptrCastHelper([*]f32, targets.buffer.data.ptr)[0..targets.shape.elemCount()];
     for (0..batch_size * seq_len) |i| {
         targets_buf[i * 10] = 1.0;
     }

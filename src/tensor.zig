@@ -1,6 +1,12 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
+/// Helper function for pointer casting
+fn ptrCastHelper(comptime T: type, ptr: anytype) T {
+    // We still need to use alignCast for pointers that require higher alignment
+    return @ptrCast(@alignCast(ptr));
+}
+
 /// Supported data types for tensors
 pub const DType = enum {
     f16,
@@ -177,7 +183,7 @@ pub const Tensor = struct {
         switch (dtype) {
             .f32 => {
                 const val: f32 = @floatCast(value);
-                const f32_buf = @ptrCast([*]f32, tensor.buffer.data.ptr)[0..tensor.shape.elemCount()];
+                const f32_buf = ptrCastHelper([*]f32, tensor.buffer.data.ptr)[0..tensor.shape.elemCount()];
                 for (f32_buf) |*ptr| {
                     ptr.* = val;
                 }
@@ -213,7 +219,7 @@ pub const Tensor = struct {
         
         switch (dtype) {
             .f32 => {
-                const f32_buf = @ptrCast([*]f32, tensor.buffer.data.ptr)[0..tensor.shape.elemCount()];
+                const f32_buf = ptrCastHelper([*]f32, tensor.buffer.data.ptr)[0..tensor.shape.elemCount()];
                 for (f32_buf) |*ptr| {
                     ptr.* = rand.float(f32);
                 }
@@ -305,7 +311,7 @@ pub const Tensor = struct {
         
         switch (self.dtype) {
             .f32 => {
-                const f32_buf = @ptrCast([*]f32, self.buffer.data.ptr);
+                const f32_buf = ptrCastHelper([*]f32, self.buffer.data.ptr);
                 return f32_buf[linear_idx];
             },
             // Implement other dtype cases as needed
@@ -337,7 +343,7 @@ pub const Tensor = struct {
         
         switch (self.dtype) {
             .f32 => {
-                const f32_buf = @ptrCast([*]f32, self.buffer.data.ptr);
+                const f32_buf = ptrCastHelper([*]f32, self.buffer.data.ptr);
                 f32_buf[linear_idx] = @floatCast(value);
             },
             // Implement other dtype cases as needed

@@ -47,17 +47,21 @@ One of PCP's core strengths is its careful memory management:
 
 ### Prerequisites
 
-- Zig compiler (0.12.0 - 0.14.x)
+- Zig compiler (0.14.x)
 - For Metal backend: macOS with an Apple Silicon or compatible GPU
 
 ### Zig Version Compatibility
 
-This project is compatible with Zig 0.14.x as of the latest update. The following changes were made:
+This project is compatible with Zig 0.14.x. The following changes were made to ensure compatibility:
 
-1. Updated `std.rand` to `std.Random` for random number generation
-2. Updated pointer cast syntax:
-   - Old: `@as([*]f32, @ptrCast(@alignCast(ptr)))[0..len]`
-   - New: `@ptrCast([*]f32, ptr)[0..len]`
+1. Updated all code to use the Zig 0.14 `std.Random` module for random number generation
+2. Standardized pointer casting with a helper function:
+   ```zig
+   fn ptrCastHelper(comptime T: type, ptr: anytype) T {
+       // We still need to use alignCast for pointers that require higher alignment
+       return @ptrCast(@alignCast(ptr));
+   }
+   ```
 
 ### Building and Running
 

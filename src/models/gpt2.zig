@@ -4,6 +4,12 @@ const tensor = pcp.tensor;
 const ops = pcp.ops;
 const autodiff = pcp.autodiff;
 
+/// Helper function for pointer casting
+fn ptrCastHelper(comptime T: type, ptr: anytype) T {
+    // We still need to use alignCast for pointers that require higher alignment
+    return @ptrCast(@alignCast(ptr));
+}
+
 const Allocator = std.mem.Allocator;
 const Tensor = tensor.Tensor;
 const DType = tensor.DType;
@@ -45,7 +51,7 @@ pub const Attention = struct {
         const c_attn_weight = try Tensor.random(allocator, &c_attn_weight_dims, .f32, backend);
         
         // Scale the random initialization
-        const c_attn_weight_ptr = @ptrCast([*]f32, c_attn_weight.buffer.data.ptr)[0..c_attn_weight.shape.elemCount()];
+        const c_attn_weight_ptr = ptrCastHelper([*]f32, c_attn_weight.buffer.data.ptr)[0..c_attn_weight.shape.elemCount()];
         for (c_attn_weight_ptr) |*val| {
             val.* *= config.initializer_range;
         }
@@ -59,7 +65,7 @@ pub const Attention = struct {
         const c_proj_weight = try Tensor.random(allocator, &c_proj_weight_dims, .f32, backend);
         
         // Scale the random initialization
-        const c_proj_weight_ptr = @ptrCast([*]f32, c_proj_weight.buffer.data.ptr)[0..c_proj_weight.shape.elemCount()];
+        const c_proj_weight_ptr = ptrCastHelper([*]f32, c_proj_weight.buffer.data.ptr)[0..c_proj_weight.shape.elemCount()];
         for (c_proj_weight_ptr) |*val| {
             val.* *= config.initializer_range;
         }
@@ -165,8 +171,8 @@ pub const Attention = struct {
         );
         
         // Fill bias across batch dimension
-        const qkv_bias_expanded_buf = @as([*]f32, @ptrCast(@alignCast(qkv_bias_expanded.buffer.data.ptr)))[0..qkv_bias_expanded.shape.elemCount()];
-        const c_attn_bias_buf = @as([*]f32, @ptrCast(@alignCast(self.c_attn_bias.buffer.data.ptr)))[0..self.c_attn_bias.shape.elemCount()];
+        const qkv_bias_expanded_buf = ptrCastHelper([*]f32, qkv_bias_expanded.buffer.data.ptr)[0..qkv_bias_expanded.shape.elemCount()];
+        const c_attn_bias_buf = ptrCastHelper([*]f32, self.c_attn_bias.buffer.data.ptr)[0..self.c_attn_bias.shape.elemCount()];
         
         for (0..batch_size) |b| {
             for (0..3 * self.n_embd) |i| {
@@ -200,10 +206,10 @@ pub const Attention = struct {
         );
         
         // Split the QKV tensor
-        const qkv_buf = @as([*]f32, @ptrCast(@alignCast(qkv.tensor.buffer.data.ptr)))[0..qkv.tensor.shape.elemCount()];
-        const q_buf = @as([*]f32, @ptrCast(@alignCast(q_tensor.buffer.data.ptr)))[0..q_tensor.shape.elemCount()];
-        const k_buf = @as([*]f32, @ptrCast(@alignCast(k_tensor.buffer.data.ptr)))[0..k_tensor.shape.elemCount()];
-        const v_buf = @as([*]f32, @ptrCast(@alignCast(v_tensor.buffer.data.ptr)))[0..v_tensor.shape.elemCount()];
+        const qkv_buf = ptrCastHelper([*]f32, qkv.tensor.buffer.data.ptr)[0..qkv.tensor.shape.elemCount()];
+        const q_buf = ptrCastHelper([*]f32, q_tensor.buffer.data.ptr)[0..q_tensor.shape.elemCount()];
+        const k_buf = ptrCastHelper([*]f32, k_tensor.buffer.data.ptr)[0..k_tensor.shape.elemCount()];
+        const v_buf = ptrCastHelper([*]f32, v_tensor.buffer.data.ptr)[0..v_tensor.shape.elemCount()];
         
         for (0..batch_size) |b| {
             for (0..self.n_embd) |i| {
@@ -248,8 +254,8 @@ pub const Attention = struct {
             attention_scores_raw.tensor.backend
         );
         
-        const scores_raw_buf = @as([*]f32, @ptrCast(@alignCast(attention_scores_raw.tensor.buffer.data.ptr)))[0..attention_scores_raw.tensor.shape.elemCount()];
-        const scores_buf = @as([*]f32, @ptrCast(@alignCast(attention_scores_tensor.buffer.data.ptr)))[0..attention_scores_tensor.shape.elemCount()];
+        const scores_raw_buf = ptrCastHelper([*]f32, attention_scores_raw.tensor.buffer.data.ptr)[0..attention_scores_raw.tensor.shape.elemCount()];
+        const scores_buf = ptrCastHelper([*]f32, attention_scores_tensor.buffer.data.ptr)[0..attention_scores_tensor.shape.elemCount()];
         
         for (0..attention_scores_tensor.shape.elemCount()) |i| {
             scores_buf[i] = scores_raw_buf[i] * scaling_factor;
@@ -279,8 +285,8 @@ pub const Attention = struct {
         );
         
         // Fill bias across batch dimension
-        const proj_bias_expanded_buf = @as([*]f32, @ptrCast(@alignCast(proj_bias_expanded.buffer.data.ptr)))[0..proj_bias_expanded.shape.elemCount()];
-        const c_proj_bias_buf = @as([*]f32, @ptrCast(@alignCast(self.c_proj_bias.buffer.data.ptr)))[0..self.c_proj_bias.shape.elemCount()];
+        const proj_bias_expanded_buf = ptrCastHelper([*]f32, proj_bias_expanded.buffer.data.ptr)[0..proj_bias_expanded.shape.elemCount()];
+        const c_proj_bias_buf = ptrCastHelper([*]f32, self.c_proj_bias.buffer.data.ptr)[0..self.c_proj_bias.shape.elemCount()];
         
         for (0..batch_size) |b| {
             for (0..self.n_embd) |i| {
@@ -318,7 +324,7 @@ pub const MLP = struct {
         const c_fc_weight = try Tensor.random(allocator, &c_fc_weight_dims, .f32, backend);
         
         // Scale the random initialization
-        const c_fc_weight_ptr = @as([*]f32, @ptrCast(@alignCast(c_fc_weight.buffer.data.ptr)))[0..c_fc_weight.shape.elemCount()];
+        const c_fc_weight_ptr = ptrCastHelper([*]f32, c_fc_weight.buffer.data.ptr)[0..c_fc_weight.shape.elemCount()];
         for (c_fc_weight_ptr) |*val| {
             val.* *= config.initializer_range;
         }
@@ -331,7 +337,7 @@ pub const MLP = struct {
         const c_proj_weight = try Tensor.random(allocator, &c_proj_weight_dims, .f32, backend);
         
         // Scale the random initialization
-        const c_proj_weight_ptr = @as([*]f32, @ptrCast(@alignCast(c_proj_weight.buffer.data.ptr)))[0..c_proj_weight.shape.elemCount()];
+        const c_proj_weight_ptr = ptrCastHelper([*]f32, c_proj_weight.buffer.data.ptr)[0..c_proj_weight.shape.elemCount()];
         for (c_proj_weight_ptr) |*val| {
             val.* *= config.initializer_range;
         }
@@ -436,8 +442,8 @@ pub const MLP = struct {
         );
         
         // Fill bias across batch dimension
-        const fc_bias_expanded_buf = @as([*]f32, @ptrCast(@alignCast(fc_bias_expanded.buffer.data.ptr)))[0..fc_bias_expanded.shape.elemCount()];
-        const c_fc_bias_buf = @as([*]f32, @ptrCast(@alignCast(self.c_fc_bias.buffer.data.ptr)))[0..self.c_fc_bias.shape.elemCount()];
+        const fc_bias_expanded_buf = ptrCastHelper([*]f32, fc_bias_expanded.buffer.data.ptr)[0..fc_bias_expanded.shape.elemCount()];
+        const c_fc_bias_buf = ptrCastHelper([*]f32, self.c_fc_bias.buffer.data.ptr)[0..self.c_fc_bias.shape.elemCount()];
         
         for (0..batch_size) |b| {
             for (0..self.n_inner) |i| {
@@ -467,8 +473,8 @@ pub const MLP = struct {
         );
         
         // Fill bias across batch dimension
-        const proj_bias_expanded_buf = @as([*]f32, @ptrCast(@alignCast(proj_bias_expanded.buffer.data.ptr)))[0..proj_bias_expanded.shape.elemCount()];
-        const c_proj_bias_buf = @as([*]f32, @ptrCast(@alignCast(self.c_proj_bias.buffer.data.ptr)))[0..self.c_proj_bias.shape.elemCount()];
+        const proj_bias_expanded_buf = ptrCastHelper([*]f32, proj_bias_expanded.buffer.data.ptr)[0..proj_bias_expanded.shape.elemCount()];
+        const c_proj_bias_buf = ptrCastHelper([*]f32, self.c_proj_bias.buffer.data.ptr)[0..self.c_proj_bias.shape.elemCount()];
         
         for (0..batch_size) |b| {
             for (0..self.n_embd) |i| {
@@ -639,7 +645,7 @@ pub const GPT2 = struct {
         const wte = try Tensor.random(allocator, &wte_dims, .f32, backend);
         
         // Scale the random initialization
-        const wte_ptr = @as([*]f32, @ptrCast(@alignCast(wte.buffer.data.ptr)))[0..wte.shape.elemCount()];
+        const wte_ptr = ptrCastHelper([*]f32, wte.buffer.data.ptr)[0..wte.shape.elemCount()];
         for (wte_ptr) |*val| {
             val.* *= config.initializer_range;
         }
@@ -649,7 +655,7 @@ pub const GPT2 = struct {
         const wpe = try Tensor.random(allocator, &wpe_dims, .f32, backend);
         
         // Scale the random initialization
-        const wpe_ptr = @as([*]f32, @ptrCast(@alignCast(wpe.buffer.data.ptr)))[0..wpe.shape.elemCount()];
+        const wpe_ptr = ptrCastHelper([*]f32, wpe.buffer.data.ptr)[0..wpe.shape.elemCount()];
         for (wpe_ptr) |*val| {
             val.* *= config.initializer_range;
         }
@@ -726,7 +732,7 @@ pub const GPT2 = struct {
         }
         
         // Extract token IDs from the input tensor
-        const input_buf = @as([*]f32, @ptrCast(@alignCast(input_ids.buffer.data.ptr)))[0..input_ids.shape.elemCount()];
+        const input_buf = ptrCastHelper([*]f32, input_ids.buffer.data.ptr)[0..input_ids.shape.elemCount()];
         
         // Create a tensor to hold token embeddings: [batch_size, seq_len, embedding_dim]
         var token_embed_dims = [_]usize{ batch_size, seq_len, self.config.n_embd };
@@ -734,10 +740,10 @@ pub const GPT2 = struct {
         defer token_embeddings.deinit();
         
         // Get the token embedding buffer
-        const token_embed_buf = @as([*]f32, @ptrCast(@alignCast(token_embeddings.buffer.data.ptr)))[0..token_embeddings.shape.elemCount()];
+        const token_embed_buf = ptrCastHelper([*]f32, token_embeddings.buffer.data.ptr)[0..token_embeddings.shape.elemCount()];
         
         // Get embeddings directly from the node's tensor 
-        const wte_buf = @as([*]f32, @ptrCast(@alignCast(self.wte_node.?.tensor.buffer.data.ptr)));
+        const wte_buf = ptrCastHelper([*]f32, self.wte_node.?.tensor.buffer.data.ptr);
         
         // Lookup embeddings for each token ID
         for (0..batch_size) |b| {
@@ -762,7 +768,7 @@ pub const GPT2 = struct {
         defer pos_indices.deinit();
         
         // Fill position indices
-        const pos_indices_buf = @as([*]f32, @ptrCast(@alignCast(pos_indices.buffer.data.ptr)))[0..pos_indices.shape.elemCount()];
+        const pos_indices_buf = ptrCastHelper([*]f32, pos_indices.buffer.data.ptr)[0..pos_indices.shape.elemCount()];
         for (0..seq_len) |i| {
             pos_indices_buf[i] = @floatFromInt(i);
         }
@@ -772,8 +778,8 @@ pub const GPT2 = struct {
         defer embeddings.deinit();
         
         // Get position embeddings buffer directly from the node
-        const wpe_buf = @as([*]f32, @ptrCast(@alignCast(self.wpe_node.?.tensor.buffer.data.ptr)));
-        const embeddings_buf = @as([*]f32, @ptrCast(@alignCast(embeddings.buffer.data.ptr)))[0..embeddings.shape.elemCount()];
+        const wpe_buf = ptrCastHelper([*]f32, self.wpe_node.?.tensor.buffer.data.ptr);
+        const embeddings_buf = ptrCastHelper([*]f32, embeddings.buffer.data.ptr)[0..embeddings.shape.elemCount()];
         
         // Add token and position embeddings
         for (0..batch_size) |b| {
@@ -797,7 +803,7 @@ pub const GPT2 = struct {
         var reshaped_embeddings = try Tensor.zeros(self.allocator, &reshaped_dims, input_ids.dtype, input_ids.backend);
         
         // Copy data to reshaped tensor
-        const reshaped_buf = @as([*]f32, @ptrCast(@alignCast(reshaped_embeddings.buffer.data.ptr)))[0..reshaped_embeddings.shape.elemCount()];
+        const reshaped_buf = ptrCastHelper([*]f32, reshaped_embeddings.buffer.data.ptr)[0..reshaped_embeddings.shape.elemCount()];
         for (0..batch_size * seq_len) |i| {
             for (0..self.config.n_embd) |e| {
                 reshaped_buf[i * self.config.n_embd + e] = embeddings_buf[i * self.config.n_embd + e];
@@ -834,8 +840,8 @@ pub const GPT2 = struct {
         // Don't defer final_wte.deinit() here, as ownership will transfer to the variable node
         
         // Copy data from the full embeddings (transposed)
-        const final_wte_buf = @as([*]f32, @ptrCast(@alignCast(final_wte.buffer.data.ptr)))[0..final_wte.shape.elemCount()];
-        const orig_wte_buf = @as([*]f32, @ptrCast(@alignCast(self.wte_node.?.tensor.buffer.data.ptr)));
+        const final_wte_buf = ptrCastHelper([*]f32, final_wte.buffer.data.ptr)[0..final_wte.shape.elemCount()];
+        const orig_wte_buf = ptrCastHelper([*]f32, self.wte_node.?.tensor.buffer.data.ptr);
         
         // Copy transposed version of the weight matrix
         for (0..self.config.n_embd) |e| {

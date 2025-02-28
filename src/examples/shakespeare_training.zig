@@ -5,6 +5,12 @@ const ops = pcp.ops;
 const autodiff = pcp.autodiff;
 const gpt2 = @import("gpt2");
 
+/// Helper function for pointer casting
+fn ptrCastHelper(comptime T: type, ptr: anytype) T {
+    // We still need to use alignCast for pointers that require higher alignment
+    return @ptrCast(@alignCast(ptr));
+}
+
 const Allocator = std.mem.Allocator;
 const Tensor = tensorModule.Tensor;
 const DType = tensorModule.DType;
@@ -59,10 +65,10 @@ const Adam = struct {
         var v = self.v_map.get(parameter).?;
         
         // Get pointers to the data
-        const param_buf = @ptrCast([*]f32, parameter.buffer.data.ptr)[0..parameter.shape.elemCount()];
-        const grad_buf = @ptrCast([*]f32, gradient.buffer.data.ptr)[0..gradient.shape.elemCount()];
-        const m_buf = @ptrCast([*]f32, m.buffer.data.ptr)[0..m.shape.elemCount()];
-        const v_buf = @ptrCast([*]f32, v.buffer.data.ptr)[0..v.shape.elemCount()];
+        const param_buf = ptrCastHelper([*]f32, parameter.buffer.data.ptr)[0..parameter.shape.elemCount()];
+        const grad_buf = ptrCastHelper([*]f32, gradient.buffer.data.ptr)[0..gradient.shape.elemCount()];
+        const m_buf = ptrCastHelper([*]f32, m.buffer.data.ptr)[0..m.shape.elemCount()];
+        const v_buf = ptrCastHelper([*]f32, v.buffer.data.ptr)[0..v.shape.elemCount()];
         
         // Update parameters using Adam update rule
         const lr = self.learning_rate;
@@ -212,11 +218,11 @@ const Dataset = struct {
         var targets = try Tensor.zeros(self.allocator, &target_dims, self.targets.dtype, self.targets.backend);
         
         // Copy data to the batch tensors
-        const full_inputs_buf = @as([*]f32, @ptrCast(@alignCast(self.inputs.buffer.data.ptr)))[0..self.inputs.shape.elemCount()];
-        const full_targets_buf = @as([*]f32, @ptrCast(@alignCast(self.targets.buffer.data.ptr)))[0..self.targets.shape.elemCount()];
+        const full_inputs_buf = ptrCastHelper([*]f32, self.inputs.buffer.data.ptr)[0..self.inputs.shape.elemCount()];
+        const full_targets_buf = ptrCastHelper([*]f32, self.targets.buffer.data.ptr)[0..self.targets.shape.elemCount()];
         
-        const batch_inputs_buf = @as([*]f32, @ptrCast(@alignCast(inputs.buffer.data.ptr)))[0..inputs.shape.elemCount()];
-        const batch_targets_buf = @as([*]f32, @ptrCast(@alignCast(targets.buffer.data.ptr)))[0..targets.shape.elemCount()];
+        const batch_inputs_buf = ptrCastHelper([*]f32, inputs.buffer.data.ptr)[0..inputs.shape.elemCount()];
+        const batch_targets_buf = ptrCastHelper([*]f32, targets.buffer.data.ptr)[0..targets.shape.elemCount()];
         
         const seq_len = self.inputs.shape.dims[1];
         
@@ -261,8 +267,8 @@ fn loadShakespeareDataset(allocator: Allocator, filepath: []const u8, seq_length
     var targets = try Tensor.zeros(allocator, &target_dims, .f32, .cpu);
     
     // Fill the tensors
-    const inputs_buf = @as([*]f32, @ptrCast(@alignCast(inputs.buffer.data.ptr)))[0..inputs.shape.elemCount()];
-    const targets_buf = @as([*]f32, @ptrCast(@alignCast(targets.buffer.data.ptr)))[0..targets.shape.elemCount()];
+    const inputs_buf = ptrCastHelper([*]f32, inputs.buffer.data.ptr)[0..inputs.shape.elemCount()];
+    const targets_buf = ptrCastHelper([*]f32, targets.buffer.data.ptr)[0..targets.shape.elemCount()];
     
     for (0..num_sequences) |i| {
         const start_idx = i * seq_length;
@@ -316,8 +322,8 @@ fn computeCrossEntropy(allocator: Allocator, logits: *Node, targets: Tensor) !*N
     std.debug.print("Total elements: {}, Vocab size: {}\n", .{total_elements, vocab_size});
     
     // Extract data buffers
-    const logits_buf = @as([*]f32, @ptrCast(@alignCast(logits.tensor.buffer.data.ptr)))[0..logits.tensor.shape.elemCount()];
-    const targets_buf = @as([*]f32, @ptrCast(@alignCast(targets.buffer.data.ptr)))[0..targets.shape.elemCount()];
+    const logits_buf = ptrCastHelper([*]f32, logits.tensor.buffer.data.ptr)[0..logits.tensor.shape.elemCount()];
+    const targets_buf = ptrCastHelper([*]f32, targets.buffer.data.ptr)[0..targets.shape.elemCount()];
     
     // Compute improved loss (approximate sparse categorical cross-entropy)
     var total_loss: f32 = 0.0;
@@ -456,9 +462,9 @@ pub fn main() !void {
     
     // Show a sample from the dataset
     std.debug.print("\nDataset Sample:\n", .{});
-    const input_buf = @as([*]f32, @ptrCast(@alignCast(dataset.inputs.buffer.data.ptr)))[0..seq_length];
+    const input_buf = ptrCastHelper([*]f32, dataset.inputs.buffer.data.ptr)[0..seq_length];
     // Unused variable - we only need input_buf for the example
-    // const target_buf = @as([*]f32, @ptrCast(@alignCast(dataset.targets.buffer.data.ptr)))[0..seq_length];
+    // const target_buf = ptrCastHelper([*]f32, dataset.targets.buffer.data.ptr)[0..seq_length];
     
     var input_tokens = std.ArrayList(usize).init(allocator);
     defer input_tokens.deinit();
@@ -509,7 +515,7 @@ pub fn main() !void {
                 var dummy_tensor = try Tensor.zeros(allocator, &dummy_dims, .f32, .cpu);
                 
                 // Fill with small random values
-                const dummy_buf = @as([*]f32, @ptrCast(@alignCast(dummy_tensor.buffer.data.ptr)))[0..dummy_tensor.shape.elemCount()];
+                const dummy_buf = ptrCastHelper([*]f32, dummy_tensor.buffer.data.ptr)[0..dummy_tensor.shape.elemCount()];
                 for (dummy_buf) |*value| {
                     value.* = 0.01;
                 }
@@ -524,8 +530,8 @@ pub fn main() !void {
                 var input_copy = try Tensor.zeros(allocator, &input_dims, batch.inputs.dtype, batch.inputs.backend);
                 
                 // Copy data from batch.inputs to input_copy
-                const input_copy_buf = @as([*]f32, @ptrCast(@alignCast(input_copy.buffer.data.ptr)))[0..input_copy.shape.elemCount()];
-                const batch_input_buf = @as([*]f32, @ptrCast(@alignCast(batch.inputs.buffer.data.ptr)))[0..batch.inputs.shape.elemCount()];
+                const input_copy_buf = ptrCastHelper([*]f32, input_copy.buffer.data.ptr)[0..input_copy.shape.elemCount()];
+                const batch_input_buf = ptrCastHelper([*]f32, batch.inputs.buffer.data.ptr)[0..batch.inputs.shape.elemCount()];
                 for (batch_input_buf, 0..) |val, i| {
                     input_copy_buf[i] = val;
                 }
@@ -560,7 +566,7 @@ pub fn main() !void {
             defer loss.deinit();
             
             // Extract loss value from the tensor
-            const loss_buf = @as([*]f32, @ptrCast(@alignCast(loss.tensor.buffer.data.ptr)));
+            const loss_buf = ptrCastHelper([*]f32, loss.tensor.buffer.data.ptr);
             const loss_value = loss_buf[0];
             
             total_loss += loss_value;
@@ -658,7 +664,7 @@ pub fn main() !void {
                             defer synthetic_grad.deinit();
                             
                             // Scale the gradients to be small (like 0.0001)
-                            const grad_buf = @as([*]f32, @ptrCast(@alignCast(synthetic_grad.buffer.data.ptr)))[0..synthetic_grad.shape.elemCount()];
+                            const grad_buf = ptrCastHelper([*]f32, synthetic_grad.buffer.data.ptr)[0..synthetic_grad.shape.elemCount()];
                             for (grad_buf) |*val| {
                                 val.* *= 0.0001;
                             }
@@ -692,7 +698,7 @@ pub fn main() !void {
                             defer synthetic_grad.deinit();
                             
                             // Scale the gradients to be small (like 0.0001)
-                            const grad_buf = @as([*]f32, @ptrCast(@alignCast(synthetic_grad.buffer.data.ptr)))[0..synthetic_grad.shape.elemCount()];
+                            const grad_buf = ptrCastHelper([*]f32, synthetic_grad.buffer.data.ptr)[0..synthetic_grad.shape.elemCount()];
                             for (grad_buf) |*val| {
                                 val.* *= 0.0001;
                             }

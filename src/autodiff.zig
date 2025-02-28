@@ -2,6 +2,12 @@ const std = @import("std");
 const tensor = @import("tensor.zig");
 const ops = @import("ops.zig");
 
+/// Helper function for pointer casting
+fn ptrCastHelper(comptime T: type, ptr: anytype) T {
+    // We still need to use alignCast for pointers that require higher alignment
+    return @ptrCast(@alignCast(ptr));
+}
+
 const Allocator = std.mem.Allocator;
 const Tensor = tensor.Tensor;
 const DType = tensor.DType;
@@ -293,9 +299,9 @@ pub fn embedding_lookup(allocator: Allocator, params: *Node, indices: Tensor) !*
         return error.EmptyTensor;
     }
     
-    const params_buf = @ptrCast([*]f32, params.tensor.buffer.data.ptr)[0..params.tensor.shape.elemCount()];
-    const indices_buf = @ptrCast([*]f32, indices.buffer.data.ptr)[0..indices.shape.elemCount()];
-    const result_buf = @ptrCast([*]f32, result_tensor.buffer.data.ptr)[0..result_tensor.shape.elemCount()];
+    const params_buf = ptrCastHelper([*]f32, params.tensor.buffer.data.ptr)[0..params.tensor.shape.elemCount()];
+    const indices_buf = ptrCastHelper([*]f32, indices.buffer.data.ptr)[0..indices.shape.elemCount()];
+    const result_buf = ptrCastHelper([*]f32, result_tensor.buffer.data.ptr)[0..result_tensor.shape.elemCount()];
     
     // Perform lookup
     for (0..batch_size) |b| {
@@ -385,7 +391,7 @@ pub fn backward(allocator: Allocator, node: *Node) !void {
                         try embedding_param.initGrad();
                         if (embedding_param.grad) |*grad| {
                             // Fill with small random values
-                            const grad_buf = @ptrCast([*]f32, grad.*.buffer.data.ptr)[0..grad.*.shape.elemCount()];
+                            const grad_buf = ptrCastHelper([*]f32, grad.*.buffer.data.ptr)[0..grad.*.shape.elemCount()];
                             
                             for (grad_buf) |*val| {
                                 val.* = 0.0001; // Small positive gradient
@@ -522,9 +528,9 @@ fn backwardEmbeddingLookup(allocator: Allocator, node: *Node) !void {
                 }
                 
                 // Get data buffers with bounds checking
-                const indices_buf = @ptrCast([*]f32, indices.buffer.data.ptr)[0..indices.shape.elemCount()];
-                const grad_buf = @ptrCast([*]f32, grad.buffer.data.ptr)[0..grad.shape.elemCount()];
-                const params_grad_buf = @ptrCast([*]f32, params_grad.*.buffer.data.ptr)[0..params_grad.*.shape.elemCount()];
+                const indices_buf = ptrCastHelper([*]f32, indices.buffer.data.ptr)[0..indices.shape.elemCount()];
+                const grad_buf = ptrCastHelper([*]f32, grad.buffer.data.ptr)[0..grad.shape.elemCount()];
+                const params_grad_buf = ptrCastHelper([*]f32, params_grad.*.buffer.data.ptr)[0..params_grad.*.shape.elemCount()];
                 
                 // Print debug info
                 std.debug.print("Embedding backward: batch_size={}, seq_len={}, embed_dim={}, vocab_size={}\n", 
@@ -805,8 +811,8 @@ fn backwardRelu(allocator: Allocator, node: *Node) !void {
                 // Create ReLU derivative mask: 1 where input > 0, 0 elsewhere
                 const mask = try Tensor.zeros(allocator, a.tensor.shape.dims, a.tensor.dtype, a.tensor.backend);
                 
-                const input_buf = @ptrCast([*]f32, a.tensor.buffer.data.ptr)[0..a.tensor.shape.elemCount()];
-                const mask_buf = @ptrCast([*]f32, mask.buffer.data.ptr)[0..mask.shape.elemCount()];
+                const input_buf = ptrCastHelper([*]f32, a.tensor.buffer.data.ptr)[0..a.tensor.shape.elemCount()];
+                const mask_buf = ptrCastHelper([*]f32, mask.buffer.data.ptr)[0..mask.shape.elemCount()];
                 
                 for (input_buf, 0..) |val, i| {
                     mask_buf[i] = if (val > 0) 1.0 else 0.0;
@@ -849,9 +855,9 @@ fn backwardSoftmax(allocator: Allocator, node: *Node) !void {
                 // Create a new tensor for the gradients
                 const new_grad = try Tensor.zeros(allocator, a.tensor.shape.dims, a.tensor.dtype, a.tensor.backend);
                 
-                const softmax_out = @ptrCast([*]f32, node.tensor.buffer.data.ptr);
-                const upstream_grad = @ptrCast([*]f32, grad.buffer.data.ptr);
-                const new_grad_buf = @ptrCast([*]f32, new_grad.buffer.data.ptr);
+                const softmax_out = ptrCastHelper([*]f32, node.tensor.buffer.data.ptr);
+                const upstream_grad = ptrCastHelper([*]f32, grad.buffer.data.ptr);
+                const new_grad_buf = ptrCastHelper([*]f32, new_grad.buffer.data.ptr);
                 
                 // For each batch item
                 for (0..batch_size) |b_idx| {

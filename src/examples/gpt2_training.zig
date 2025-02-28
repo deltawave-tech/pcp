@@ -5,6 +5,12 @@ const ops = pcp.ops;
 const autodiff = pcp.autodiff;
 const gpt2 = @import("gpt2");
 
+/// Helper function for pointer casting
+fn ptrCastHelper(comptime T: type, ptr: anytype) T {
+    // We still need to use alignCast for pointers that require higher alignment
+    return @ptrCast(@alignCast(ptr));
+}
+
 const Allocator = std.mem.Allocator;
 const Tensor = tensorModule.Tensor;
 const DType = tensorModule.DType;
@@ -59,10 +65,10 @@ const Adam = struct {
         var v = self.v_map.get(parameter).?;
         
         // Get pointers to the data
-        const param_buf = @ptrCast([*]f32, parameter.buffer.data.ptr)[0..parameter.shape.elemCount()];
-        const grad_buf = @ptrCast([*]f32, gradient.buffer.data.ptr)[0..gradient.shape.elemCount()];
-        const m_buf = @ptrCast([*]f32, m.buffer.data.ptr)[0..m.shape.elemCount()];
-        const v_buf = @ptrCast([*]f32, v.buffer.data.ptr)[0..v.shape.elemCount()];
+        const param_buf = ptrCastHelper([*]f32, parameter.buffer.data.ptr)[0..parameter.shape.elemCount()];
+        const grad_buf = ptrCastHelper([*]f32, gradient.buffer.data.ptr)[0..gradient.shape.elemCount()];
+        const m_buf = ptrCastHelper([*]f32, m.buffer.data.ptr)[0..m.shape.elemCount()];
+        const v_buf = ptrCastHelper([*]f32, v.buffer.data.ptr)[0..v.shape.elemCount()];
         
         // Update parameters using Adam update rule
         const lr = self.learning_rate;
@@ -175,8 +181,8 @@ const Dataset = struct {
         var tokenizer = Tokenizer.init(allocator, vocab_size);
         
         // Fill with token IDs from the corpus
-        const inputs_buf = @as([*]f32, @ptrCast(@alignCast(inputs.buffer.data.ptr)))[0..inputs.shape.elemCount()];
-        const targets_buf = @as([*]f32, @ptrCast(@alignCast(targets.buffer.data.ptr)))[0..targets.shape.elemCount()];
+        const inputs_buf = ptrCastHelper([*]f32, inputs.buffer.data.ptr)[0..inputs.shape.elemCount()];
+        const targets_buf = ptrCastHelper([*]f32, targets.buffer.data.ptr)[0..targets.shape.elemCount()];
         
         var batch_idx: usize = 0;
         var seq_idx: usize = 0;
@@ -277,8 +283,8 @@ fn generateTargetData(allocator: Allocator, input_data: Tensor) !Tensor {
     var target = try Tensor.zeros(allocator, &target_dims, input_data.dtype, input_data.backend);
     
     // Copy input data with a small shift to create a target pattern
-    const input_buf = @as([*]f32, @ptrCast(@alignCast(input_data.buffer.data.ptr)))[0..input_data.shape.elemCount()];
-    const target_buf = @as([*]f32, @ptrCast(@alignCast(target.buffer.data.ptr)))[0..target.shape.elemCount()];
+    const input_buf = ptrCastHelper([*]f32, input_data.buffer.data.ptr)[0..input_data.shape.elemCount()];
+    const target_buf = ptrCastHelper([*]f32, target.buffer.data.ptr)[0..target.shape.elemCount()];
     
     // For the old model, we just add 0.1 to each value
     for (target_buf, 0..) |*value, i| {
@@ -307,8 +313,8 @@ fn computeMSE(allocator: Allocator, logits: *Node, targets: Tensor) !*Node {
     var reshaped_target = try Tensor.zeros(allocator, &reshaped_target_dims, targets.dtype, targets.backend);
     
     // Extract input and target data
-    const targets_buf = @as([*]f32, @ptrCast(@alignCast(targets.buffer.data.ptr)))[0..targets.shape.elemCount()];
-    const reshaped_target_buf = @as([*]f32, @ptrCast(@alignCast(reshaped_target.buffer.data.ptr)))[0..reshaped_target.shape.elemCount()];
+    const targets_buf = ptrCastHelper([*]f32, targets.buffer.data.ptr)[0..targets.shape.elemCount()];
+    const reshaped_target_buf = ptrCastHelper([*]f32, reshaped_target.buffer.data.ptr)[0..reshaped_target.shape.elemCount()];
     
     // Fill target embedding - for our simplified case, we'll create one-hot embeddings
     // corresponding to the token IDs
@@ -341,7 +347,7 @@ fn computeMSE(allocator: Allocator, logits: *Node, targets: Tensor) !*Node {
     
     // 3. Compute the sum of all squared differences
     // Since we don't have a reduce_sum operation yet, we'll manually sum
-    const sq_diff_buf = @as([*]f32, @ptrCast(@alignCast(squared_diff.tensor.buffer.data.ptr)))[0..squared_diff.tensor.shape.elemCount()];
+    const sq_diff_buf = ptrCastHelper([*]f32, squared_diff.tensor.buffer.data.ptr)[0..squared_diff.tensor.shape.elemCount()];
     var total_error: f32 = 0.0;
     
     for (sq_diff_buf) |val| {
@@ -463,7 +469,7 @@ pub fn train() !void {
         var loss = try computeCrossEntropy(allocator, logits, dataset.targets);
         
         // Get loss value
-        const loss_buf = @as([*]f32, @ptrCast(@alignCast(loss.tensor.buffer.data.ptr)));
+        const loss_buf = ptrCastHelper([*]f32, loss.tensor.buffer.data.ptr);
         const loss_value = loss_buf[0];
         std.debug.print("Epoch {} Loss: {d:.6}\n", .{epoch + 1, loss_value});
         
@@ -511,7 +517,7 @@ pub fn train() !void {
                 defer val_input.deinit();
                 
                 // Fill with token IDs
-                const val_input_buf = @as([*]f32, @ptrCast(@alignCast(val_input.buffer.data.ptr)))[0..val_input.shape.elemCount()];
+                const val_input_buf = ptrCastHelper([*]f32, val_input.buffer.data.ptr)[0..val_input.shape.elemCount()];
                 for (tokens, 0..) |token, i| {
                     if (i >= val_input.shape.dims[1]) break;
                     val_input_buf[i] = @floatFromInt(token);
@@ -522,7 +528,7 @@ pub fn train() !void {
                 defer val_logits.deinit();
                 
                 // Extract the predictions
-                const val_output_buf = @as([*]f32, @ptrCast(@alignCast(val_logits.tensor.buffer.data.ptr)))[0..val_logits.tensor.shape.elemCount()];
+                const val_output_buf = ptrCastHelper([*]f32, val_logits.tensor.buffer.data.ptr)[0..val_logits.tensor.shape.elemCount()];
                 
                 // Find the top predicted token for each position
                 std.debug.print("Input: \"{s}\" -> Next token predictions: ", .{text});

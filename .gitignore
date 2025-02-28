@@ -3,6 +3,7 @@ zig-cache/
 zig-out/
 build/
 build-*/
+.zig-cache
 
 # Compiled binary files
 *.o

@@ -17,7 +17,7 @@ A comprehensive guide to the PCP tensor computation framework with automatic dif
    - [Error Handling](#error-handling)
    - [Embedding Implementation](#embedding-implementation)
    - [Neural Network Training](#neural-network-training)
-6. [Compatibility Notes](#compatibility-notes)
+6. [Zig Version](#zig-version)
 7. [Examples](#examples)
 
 ## Introduction
@@ -423,7 +423,7 @@ pub fn getScalar(self: Tensor, indices: []const usize) !f32 {
     
     switch (self.dtype) {
         .f32 => {
-            const f32_buf = @ptrCast([*]f32, self.buffer.data.ptr);
+            const f32_buf = ptrCastHelper([*]f32, self.buffer.data.ptr);
             return f32_buf[linear_idx];
         },
         else => {
@@ -552,10 +552,10 @@ pub fn step(self: *Adam, parameter: *Tensor, gradient: Tensor) !void {
     var v = self.v_map.get(parameter).?;
     
     // Get pointers to the data
-    const param_buf = @ptrCast([*]f32, parameter.buffer.data.ptr)[0..parameter.shape.elemCount()];
-    const grad_buf = @ptrCast([*]f32, gradient.buffer.data.ptr)[0..gradient.shape.elemCount()];
-    const m_buf = @ptrCast([*]f32, m.buffer.data.ptr)[0..m.shape.elemCount()];
-    const v_buf = @ptrCast([*]f32, v.buffer.data.ptr)[0..v.shape.elemCount()];
+    const param_buf = ptrCastHelper([*]f32, parameter.buffer.data.ptr)[0..parameter.shape.elemCount()];
+    const grad_buf = ptrCastHelper([*]f32, gradient.buffer.data.ptr)[0..gradient.shape.elemCount()];
+    const m_buf = ptrCastHelper([*]f32, m.buffer.data.ptr)[0..m.shape.elemCount()];
+    const v_buf = ptrCastHelper([*]f32, v.buffer.data.ptr)[0..v.shape.elemCount()];
     
     // Update parameters using Adam update rule
     const lr = self.learning_rate;
@@ -579,17 +579,17 @@ pub fn step(self: *Adam, parameter: *Tensor, gradient: Tensor) !void {
 }
 ```
 
-## Compatibility Notes
+## Zig Version
 
-The project supports multiple versions of Zig with recent compatibility updates:
+This project requires Zig 0.14.x or later.
 
-- Compatible with Zig 0.12.0 through 0.14.x
-- Updated `std.rand` to `std.Random` for random number generation
-- Updated pointer cast syntax:
-  - Old: `@as([*]f32, @ptrCast(@alignCast(ptr)))[0..len]`
-  - New: `@ptrCast([*]f32, ptr)[0..len]`
-
-These changes maintain backward compatibility while enabling the code to work with newer Zig versions.
+- The codebase uses Zig 0.14's `std.Random` module for random number generation
+- Pointer casting uses a helper function for consistent syntax and proper alignment:
+  ```zig
+  fn ptrCastHelper(comptime T: type, ptr: anytype) T {
+      return @ptrCast(@alignCast(ptr));
+  }
+  ```
 
 ## Examples
 

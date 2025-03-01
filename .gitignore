@@ -1,9 +1,10 @@
 # Zig build files and cache
+.zig-cache/
+.zig-out/
+build-*/
+build/
 zig-cache/
 zig-out/
-build/
-build-*/
-.zig-cache
 
 # Compiled binary files
 *.o

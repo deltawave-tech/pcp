@@ -34,3 +34,6 @@ deps/
 
 # Custom ignore
 notes.md
+
+# Nix artifacts
+result

@@ -15,203 +15,211 @@ While a UOp graph approach (like tinygrad's) offers benefits for backend simplif
 
 Instead of representing operations as a runtime graph of UOps, we'll use Zig's comptime features to generate optimized execution plans at compile time:
 
-1. Define a small set of primitive operations as comptime-callable functions
-2. Compose high-level operations using these primitives at compile time
-3. Generate optimized, backend-specific execution plans
-4. Execute these plans at runtime with minimal overhead
+1. Define a small set of primitive operations that backends must implement
+2. Generate plans for high-level operations at compile time based on tensor shapes and types
+3. Move validation and compatibility checks to compile time where possible
+4. Minimize runtime overhead by executing pre-compiled plans
 
 ## Implementation Plan
 
-### Phase 1: Core Architecture Changes
+### Phase 1: Refactor ops.zig
 
 1. **Primitive Operations**
-   - Define a minimal set of primitive operations in `src/primitives.zig`
-   - Each primitive will have a comptime interface for plan generation
-   - Categories: movement, elementwise, and reduction operations
+   - Define a `Primitives` struct with core operations backends must implement
+   - Include basic operations like add, multiply, matmul, relu
+   - Provide default CPU implementations for each primitive
 
 2. **Plan Structure**
-   - Create a `Plan` type in `src/plan.zig` to represent execution plans
-   - Plans will contain backend-specific instructions for tensor operations
-   - Include mechanisms for static fusion of operations
+   - Create a generic `Plan` type parameterized by Backend, Input, and Output
+   - Each plan contains compile-time knowledge of shapes and types
+   - Plans include init and run methods with minimal runtime checks
 
-3. **Backend Interface Updates**
-   - Update `src/backends/backend.zig` to define the interface for backend implementations
-   - Each backend must implement the primitive operations
-   - Add capabilities for backends to provide optimization hints during plan generation
+3. **Operation Plans**
+   - Replace each high-level operation with a comptime Plan generator
+   - Move validation to compile time where possible
+   - Keep minimal runtime validation for dynamic aspects
 
-### Phase 2: High-Level Operation Reimplementation
+4. **Backend Interface**
+   - Define a standard backend interface that includes primitive operations
+   - Create a CpuBackend implementation that adopts the Primitives
 
-1. **Plan Generators**
-   - Create comptime functions for each high-level operation (e.g., matmul, softmax)
-   - These functions will generate optimized plans based on tensor shapes and backend
+### Phase 2: Update Tensor Implementation
 
-2. **Tensor Interface Updates**
-   - Update `src/tensor.zig` to work with compiled plans
-   - Add methods for executing plans on tensors
+1. **Tensor Updates**
+   - Update tensor.zig to support comptime shape initialization
+   - Ensure tensor operations work with the new Plan-based approach
+   - Add support for statically-known shapes at compile time
 
-3. **Update Examples**
-   - Adapt existing examples to use the new plan-based approach
+2. **Memory Management**
+   - Optimize memory management for plan-based operations
+   - Ensure proper cleanup of intermediate tensors
+   - Maintain reference counting for tensors across plan execution
 
-### Phase 3: Autodiff Integration
+### Phase 3: Extend Backend Support
+
+1. **Metal Backend**
+   - Update metal.zig to implement the primitive operations
+   - Optimize Metal-specific implementations
+   - Ensure plan compatibility across backends
+
+2. **Backend Optimizations**
+   - Add backend-specific optimization capabilities
+   - Implement operation fusion where beneficial
+   - Use comptime to generate optimized kernels
+
+### Phase 4: Autodiff Integration
 
 1. **Gradient Plans**
-   - Extend the Plan type to include gradient computation
-   - Generate backward plans at compile time using the chain rule
+   - Generate backward plans at compile time based on forward plans
+   - Ensure proper gradient flow through the computation
+   - Maintain memory safety during backward pass
 
 2. **Autodiff Module Updates**
-   - Rewrite `src/autodiff.zig` to use comptime plan generation for gradients
-   - Ensure proper memory management throughout the backward pass
+   - Update autodiff.zig to use the plan-based approach
+   - Ensure compatibility with existing models
+   - Optimize memory usage during backward pass
 
-### Phase 4: Optimization and Distribution
+### Phase 5: Examples and Tests
 
-1. **Static Optimizations**
-   - Implement comptime optimization passes for plans
-   - Add fusion logic for combining operations where beneficial
+1. **Update Examples**
+   - Adapt example code to use the new plan-based approach
+   - Demonstrate benefits in terms of performance and safety
+   - Provide clear usage patterns for new developers
 
-2. **Distribution Strategy**
-   - Add primitives for distributed tensor operations
-   - Implement comptime sharding strategies for distributed execution
+2. **Testing**
+   - Add comprehensive tests for all plan types
+   - Ensure compatibility across backends
+   - Validate memory safety and correct operation
 
 ## Implementation Details
 
 ### Primitive Operations
 
-We'll define the following primitive operations:
+The core primitive operations will include:
 
 ```zig
-// Movement operations
-fn reshape(comptime Backend: type, tensor: Tensor, comptime new_shape: []const usize) Plan(Backend) {...}
-fn transpose(comptime Backend: type, tensor: Tensor, comptime axes: []const usize) Plan(Backend) {...}
-fn slice(comptime Backend: type, tensor: Tensor, comptime start: []const usize, comptime end: []const usize) Plan(Backend) {...}
-
-// Elementwise operations
-fn elementwiseUnary(comptime Backend: type, tensor: Tensor, comptime op: ElementwiseOp) Plan(Backend) {...}
-fn elementwiseBinary(comptime Backend: type, a: Tensor, b: Tensor, comptime op: ElementwiseOp) Plan(Backend) {...}
-
-// Reduction operations
-fn reduce(comptime Backend: type, tensor: Tensor, comptime op: ReduceOp, comptime axes: []const usize) Plan(Backend) {...}
+pub const Primitives = struct {
+    fn add(comptime T: type, a: Tensor(T), b: Tensor(T), result: Tensor(T)) void { ... }
+    fn multiply(comptime T: type, a: Tensor(T), b: Tensor(T), result: Tensor(T)) void { ... }
+    fn matmul(comptime T: type, a: Tensor(T), b: Tensor(T), result: Tensor(T)) void { ... }
+    fn relu(comptime T: type, a: Tensor(T), result: Tensor(T)) void { ... }
+    // Additional primitives: subtract, divide, transpose, exp, log, reduce, etc.
+};
 ```
 
 ### Plan Structure
 
-A Plan will be a struct containing:
-- Input tensor specifications
-- Output tensor specification
-- A sequence of operations with backend-specific optimizations
-- Memory management instructions
+The generic Plan type:
 
 ```zig
-pub fn Plan(comptime Backend: type) type {
+fn Plan(comptime Backend: type, comptime Input: type, comptime Output: type) type {
     return struct {
         const Self = @This();
-        
-        inputs: []const TensorSpec,
-        output: TensorSpec,
-        operations: []const Operation(Backend),
-        
-        pub fn run(self: Self, inputs: []const Tensor) Tensor {
-            // Execute the plan with the given input tensors
-            // ...
+        allocator: Allocator,
+
+        pub fn init(allocator: Allocator) Self {
+            return .{ .allocator = allocator };
+        }
+
+        pub fn run(self: Self, input: Input) !Tensor(Output) {
+            // To be overridden by specific plans
+            _ = self; _ = input;
+            return OpError.NotImplemented;
         }
     };
 }
 ```
 
-### High-Level Operation Example: Matrix Multiplication
+### Operation Plan Example
+
+A matrix multiplication plan:
 
 ```zig
-pub fn matmulPlan(comptime Backend: type, comptime a_shape: []const usize, comptime b_shape: []const usize) Plan(Backend) {
-    if (a_shape[1] != b_shape[0]) {
-        @compileError("Matrix dimensions don't match for multiplication");
+pub fn MatmulPlan(comptime Backend: type, comptime T: type, comptime M: usize, comptime N: usize, comptime P: usize) type {
+    comptime {
+        if (!Backend.hasPrimitive("matmul")) @compileError("Backend must implement matmul primitive");
+        if (T != f32) @compileError("Only f32 supported for now");
     }
-    
-    // Create a plan for: C[i,k] = sum_j A[i,j] * B[j,k]
-    const reshapeA = reshape(Backend, "A", [a_shape[0], a_shape[1], 1]);
-    const reshapeB = reshape(Backend, "B", [1, b_shape[0], b_shape[1]]);
-    const broadcast = [_]usize{a_shape[0], a_shape[1], b_shape[1]};
-    const mul = elementwiseBinary(Backend, reshapeA, reshapeB, .multiply, broadcast);
-    const result = reduce(Backend, mul, .sum, [_]usize{1});
-    
-    // Allow the backend to optimize this plan
-    return Backend.optimize(result);
+
+    return struct {
+        const Base = Plan(Backend, struct { a: Tensor(T), b: Tensor(T) }, T);
+        base: Base,
+
+        pub fn init(allocator: Allocator) @This() {
+            return .{ .base = Base.init(allocator) };
+        }
+
+        pub fn run(self: @This(), input: struct { a: Tensor(T), b: Tensor(T) }) !Tensor(T) {
+            // Runtime validation
+            if (input.a.shape.rank() != 2 or input.b.shape.rank() != 2 or
+                input.a.shape.dims[0] != M or input.a.shape.dims[1] != N or
+                input.b.shape.dims[0] != N or input.b.shape.dims[1] != P) {
+                return OpError.ShapeMismatch;
+            }
+            if (input.a.dtype != T or input.b.dtype != T) {
+                return OpError.UnsupportedDataType;
+            }
+
+            // Allocate result
+            const result_dims = [_]usize{ M, P };
+            var result = try Tensor(T).zeros(self.base.allocator, &result_dims, T, input.a.backend);
+            errdefer result.deinit();
+
+            // Execute primitive
+            Backend.matmul(T, input.a, input.b, result);
+            return result;
+        }
+    };
 }
 ```
 
-### Backend Implementation Example: CPU
+### Backend Implementation
+
+A simple CPU backend:
 
 ```zig
-pub const CPUBackend = struct {
-    // Primitive implementations
-    pub fn reshape(tensor: Tensor, new_shape: []const usize) PlanOp {
-        return PlanOp{
-            .op = .reshape,
-            .inputs = [_]TensorRef{tensor.ref()},
-            .shapes = [_][]const usize{new_shape},
-        };
+pub const CpuBackend = struct {
+    pub fn hasPrimitive(comptime name: []const u8) bool {
+        return std.mem.eql(u8, name, "add") or
+               std.mem.eql(u8, name, "multiply") or
+               std.mem.eql(u8, name, "matmul") or
+               std.mem.eql(u8, name, "relu");
     }
-    
-    // Other primitives...
-    
-    // Plan optimization
-    pub fn optimize(plan: Plan(CPUBackend)) Plan(CPUBackend) {
-        // Apply CPU-specific optimizations
-        // e.g., loop fusion, SIMD intrinsics, etc.
-        return optimized_plan;
-    }
+
+    pub usingnamespace Primitives; // Include default implementations
 };
 ```
 
 ## Memory Management
 
-One of the key benefits of this approach is improved memory management:
+Memory management will be simplified with the Plan-based approach:
 
-1. Tensor lifetimes are clearer since operations are composed at compile time
-2. Memory allocations and deallocations can be planned in advance
-3. The runtime execution has minimal overhead without complex graph traversal
-
-We'll continue to use reference counting, but with more static guarantees:
-
-```zig
-// In plan.run()
-fn run(self: Self, inputs: []const Tensor) Tensor {
-    var intermediates = std.ArrayList(Tensor).init(allocator);
-    defer {
-        // Clean up all intermediate tensors
-        for (intermediates.items) |t| {
-            t.deinit();
-        }
-        intermediates.deinit();
-    }
-    
-    // Execute operations...
-    
-    // Return the final result tensor
-    return result;
-}
-```
+1. Plans are responsible for allocating result tensors
+2. Error handling is streamlined with `errdefer` for cleanup
+3. Memory is allocated only when necessary and properly cleaned up
 
 ## Migration Strategy
 
-To transition from our current implementation to the comptime plan approach:
+1. Begin by refactoring ops.zig to implement the core Plan structure
+2. Update tensor.zig to support comptime shape information
+3. Implement primitive operations in CPU and Metal backends
+4. Update autodiff.zig to use the new Plan-based approach
+5. Convert example code to use Plans
+6. Add comprehensive tests for all operations
 
-1. First, implement the core primitives and plan structure
-2. Create plan generators for basic operations (add, multiply, etc.)
-3. Implement the CPU backend for these primitives
-4. Update one example (e.g., autodiff_test.zig) to use the new approach
-5. Gradually migrate other operations and examples
-6. Update the Metal backend to use the new architecture
-7. Finally, integrate the updated autodiff system
+## Future Optimizations
 
-## Timeline
-
-- **Week 1**: Core architecture - primitives, plan structure, CPU backend
-- **Week 2**: Basic operations and first example migration
-- **Week 3**: Autodiff integration and more operations
-- **Week 4**: Metal backend and optimization passes
-- **Week 5**: Distributed primitives and testing
+1. **Kernel Fusion**: Backends can implement sophisticated plan optimization
+2. **Type Specialization**: Generated code can be optimized for specific types
+3. **SIMD Utilization**: Backends can use SIMD instructions for primitives
+4. **Distribution**: Plans can include sharding strategies for distributed execution
 
 ## Conclusion
 
-This comptime-based approach offers a more elegant and Zig-specific solution than a direct UOp graph port from tinygrad. It leverages Zig's strengths while maintaining the benefits of operation decomposition and backend simplification.
+The comptime Plan-based approach offers significant advantages over a runtime UOp graph:
 
-The implementation will require significant changes to our architecture, but the resulting system will be more performant, safer, and better aligned with our vision for planetary-scale tensor computation.
+1. Better performance due to compile-time optimization
+2. Enhanced safety through static validation
+3. Simplified runtime logic with minimal overhead
+4. Elegant architecture leveraging Zig's unique strengths
+5. Maintainable codebase with clear separation of concerns

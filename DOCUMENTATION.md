@@ -17,6 +17,7 @@ A comprehensive guide to the PCP tensor computation framework with automatic dif
    - [Error Handling](#error-handling)
    - [Embedding Implementation](#embedding-implementation)
    - [Neural Network Training](#neural-network-training)
+   - [Compile-Time Planning](#compile-time-planning)
 6. [Zig Version](#zig-version)
 7. [Examples](#examples)
 
@@ -28,6 +29,7 @@ Key features:
 - Pure Zig implementation with no external dependencies
 - Reference-counted tensor management
 - Automatic differentiation with computational graphs
+- Compile-time operation planning and validation
 - Support for CPU computations (with Metal/GPU support in development)
 - Memory-safe tensor operations with proper cleanup
 
@@ -36,8 +38,8 @@ Key features:
 PCP follows a layered architecture design:
 
 1. **Core Tensor Layer**: Low-level tensor operations, memory management
-2. **Operations Layer**: Mathematical functions on tensors
-3. **Autodiff Layer**: Gradient computation through a computational graph
+2. **Operations Layer**: Mathematical functions on tensors with compile-time plans
+3. **Autodiff Layer**: Gradient computation through a computational graph or via compile-time plans
 4. **Model Layer**: Neural network model implementations (like GPT-2)
 5. **Training Layer**: Example training loops and optimization algorithms
 
@@ -113,69 +115,86 @@ Key components:
 
 ### Operations Module
 
-The operations module (`ops.zig`) provides mathematical operations on tensors.
+The operations module (`ops.zig`) provides mathematical operations on tensors with both a traditional interface and a modern compile-time plan-based approach.
 
-Key operations:
-- add/subtract (element-wise)
-- multiply (element-wise)
-- matmul (matrix multiplication)
-- relu/softmax (activation functions)
-- transpose
-
-Example implementation:
+#### Primitive Operations
+Basic operations implemented by all backends:
 
 ```zig
-pub fn matmul(allocator: Allocator, a: Tensor, b: Tensor) !Tensor {
-    // Check dimensions for matrix multiplication: (m, n) x (n, p) -> (m, p)
-    if (a.shape.rank() != 2 or b.shape.rank() != 2) {
-        return OpError.DimensionMismatch;
+pub const Primitives = struct {
+    /// Add two tensors element-wise
+    pub fn add(comptime T: type, a: Tensor, b: Tensor, result: *Tensor) void {
+        // Implementation...
     }
     
-    if (a.shape.dims[1] != b.shape.dims[0]) {
-        return OpError.ShapeMismatch;
+    /// Matrix multiplication for 2D tensors
+    pub fn matmul(comptime T: type, a: Tensor, b: Tensor, result: *Tensor) void {
+        // Implementation...
     }
     
-    // Result dimensions: [a.dims[0], b.dims[1]]
-    const result_dims = [_]usize{ a.shape.dims[0], b.shape.dims[1] };
-    var result = try Tensor.zeros(allocator, &result_dims, a.dtype, a.backend);
-    
-    switch (a.dtype) {
-        .f32 => {
-            const a_buf = @ptrCast([*]f32, a.buffer.data.ptr);
-            const b_buf = @ptrCast([*]f32, b.buffer.data.ptr);
-            const result_buf = @ptrCast([*]f32, result.buffer.data.ptr);
-            
-            const m = a.shape.dims[0];
-            const n = a.shape.dims[1]; // also b.shape.dims[0]
-            const p = b.shape.dims[1];
-            
-            // Simple 3-loop matrix multiplication
-            for (0..m) |i| {
-                for (0..p) |j| {
-                    var sum: f32 = 0.0;
-                    for (0..n) |k| {
-                        sum += a_buf[i * n + k] * b_buf[k * p + j];
-                    }
-                    result_buf[i * p + j] = sum;
-                }
-            }
-        },
-        else => {
-            // Clean up the result tensor on error
-            result.deinit();
-            return OpError.UnsupportedDataType;
+    // Other primitives: subtract, multiply, divide, relu, softmax, transpose, embedding_lookup
+};
+```
+
+#### Operation Plans
+Modern operation interface using compile-time validation:
+
+```zig
+/// Generic type for comptime-generated operation plans
+pub fn PlanType(comptime Backend: type, comptime InputType: type, comptime OutputType: type) type {
+    return struct {
+        pub allocator: Allocator,
+        
+        pub fn init(allocator: Allocator) Self {
+            return .{ .allocator = allocator };
         }
+        
+        pub fn run(self: Self, input: InputType) !OutputType {
+            // To be overridden by specific plans
+        }
+        
+        // Default gradient type for operations without gradients
+        pub const GradType = void;
+    };
+}
+
+/// Example plan implementation for matrix multiplication
+pub fn MatmulPlan(comptime Backend: type, comptime T: type, 
+                 comptime M: ?usize, comptime N: ?usize, comptime P: ?usize) type {
+    // Comptime validation
+    comptime {
+        if (!Backend.hasPrimitive("matmul")) @compileError("Backend must implement matmul primitive");
+        if (T != f32) @compileError("Only f32 supported for now");
     }
     
-    return result;
+    return struct {
+        pub const InputType = struct { a: Tensor, b: Tensor };
+        pub const op_type = OpType.matmul;
+        pub const GradType = struct { da: Tensor, db: Tensor };
+        
+        const Base = PlanType(Backend, InputType, Tensor);
+        base: Base,
+        
+        // Implementation...
+    };
+}
+```
+
+#### Legacy Interface
+Backward compatibility with direct operation functions:
+
+```zig
+/// Matrix multiplication (legacy interface)
+pub fn matmul(allocator: Allocator, a: Tensor, b: Tensor) !Tensor {
+    // Runtime validation and implementation...
 }
 ```
 
 ### Autodiff Engine
 
-The autodiff module (`autodiff.zig`) provides automatic differentiation capabilities through a computational graph.
+The autodiff module (`autodiff.zig`) provides automatic differentiation capabilities through two approaches:
 
-Key components:
+#### 1. Computational Graph Approach (Legacy)
 
 - **Node**: A node in the computational graph
   ```zig
@@ -202,29 +221,10 @@ Key components:
   };
   ```
 
-- **Operation Nodes**: Functions that create operation nodes in the graph
-  ```zig
-  pub fn matmul(allocator: Allocator, a: *Node, b: *Node) !*Node {
-      // Perform the operation
-      var result_tensor = try ops.matmul(allocator, a.tensor, b.tensor);
-      result_tensor.requires_grad = a.requires_grad or b.requires_grad;
-      
-      // Create the result node
-      var result = try Node.init(allocator, result_tensor, result_tensor.requires_grad);
-      result.op_type = .matmul;
-      
-      // Save input nodes for backward pass
-      try result.inputs.append(a);
-      try result.inputs.append(b);
-      
-      return result;
-  }
-  ```
-
 - **Backward Pass**: Gradient computation through the graph
   ```zig
   pub fn backward(allocator: Allocator, node: *Node) !void {
-      // Initialize gradient of the output node to ones
+      // Initialize gradient
       try node.initGradOnes();
       
       // Build a topological sort of the graph
@@ -258,6 +258,64 @@ Key components:
               }
           }
       }
+  }
+  ```
+
+#### 2. Compile-Time Plan Approach (Modern)
+
+- **GradRules**: Generic gradient computation rules
+  ```zig
+  pub const GradRules = struct {
+      /// Gradient for add: da = grad_out, db = grad_out
+      pub fn add(allocator: Allocator, grad_out: Tensor, a: Tensor, b: Tensor) !struct { da: Tensor, db: Tensor } {
+          // Implementation...
+      }
+      
+      /// Gradient for matmul: da = grad_out @ b^T, db = a^T @ grad_out
+      pub fn matmul(allocator: Allocator, grad_out: Tensor, a: Tensor, b: Tensor) !struct { da: Tensor, db: Tensor } {
+          // Implementation...
+      }
+      
+      // Other gradient rules...
+  };
+  ```
+
+- **AutoDiffPlan**: Wrapper for operation plans that adds gradient functionality
+  ```zig
+  pub fn AutoDiffPlan(comptime ForwardPlanType: type) type {
+      // Comptime validation
+      comptime {
+          if (!@hasField(ForwardPlanType, "GradType")) {
+              @compileError("Forward plan must define GradType for autodiff");
+          }
+          if (!@hasField(ForwardPlanType, "op_type")) {
+              @compileError("Forward plan must define op_type for autodiff");
+          }
+      }
+      
+      return struct {
+          // The forward plan
+          forward_plan: ForwardPlanType,
+          
+          // Keep track of input and output for backward pass
+          last_input: ?ForwardPlanType.InputType = null,
+          last_output: ?Tensor = null,
+          
+          allocator: Allocator,
+          
+          // Methods for forward and backward...
+          
+          /// Comptime function to select and apply the appropriate gradient rule
+          fn computeGradient(self: *Self, grad_out: Tensor) !ForwardPlanType.GradType {
+              // Use comptime type information to select the right gradient function
+              switch (ForwardPlanType.op_type) {
+                  .add => {
+                      return try GradRules.add(self.allocator, grad_out, input.a, input.b);
+                  },
+                  // Other operation types...
+              }
+          }
+      };
   }
   ```
 
@@ -338,11 +396,12 @@ Throughout the PCP codebase, several best practices are employed:
    }
    ```
 
-4. **Builder Pattern**: Operations chain together to build the computation graph
+4. **Compile-time Validation**: Use Zig's comptime to verify interfaces at compile time
    ```zig
-   var h_pre = try autodiff.matmul(allocator, x, w1); // Linear layer
-   var h = try autodiff.relu(allocator, h_pre); // Activation
-   var y_pred = try autodiff.matmul(allocator, h, w2); // Second linear layer
+   comptime {
+       if (!Backend.hasPrimitive("matmul")) @compileError("Backend must implement matmul primitive");
+       if (T != f32) @compileError("Only f32 supported for now");
+   }
    ```
 
 5. **Factory Methods**: Static creation methods for objects
@@ -440,61 +499,36 @@ This approach ensures:
 
 ### Embedding Implementation
 
-Embedding layers require special handling for gradient flow and memory management. PCP implements this with careful reference counting:
+Embedding layers require special handling for gradient flow and memory management. PCP implements this with careful reference counting and specialized gradient accumulation:
 
 ```zig
-pub fn embedding_lookup(allocator: Allocator, params: *Node, indices: Tensor) !*Node {
-    // Create output tensor with shape [batch_size, seq_len, embed_dim]
-    var result_dims = [_]usize{ batch_size, seq_len, embed_dim };
-    var result_tensor = try Tensor.zeros(allocator, &result_dims, params.tensor.dtype, params.tensor.backend);
+/// Gradient for embedding lookup: accumulate gradients at token positions
+pub fn embedding_lookup(allocator: Allocator, grad_out: Tensor, 
+                       params: Tensor, indices: Tensor) !Tensor {
+    // Gradient for params is sparse: only positions referenced by indices get gradients
+    var d_params = try Tensor.zeros(allocator, params.shape.dims, params.dtype, params.backend);
+    errdefer d_params.deinit();
     
-    // Perform lookup - simplified for readability
-    for (0..batch_size) |b| {
-        for (0..seq_len) |s| {
-            const token_id = // Get token ID from indices
-            
-            // Copy embedding for this token
-            for (0..embed_dim) |d| {
-                const src_idx = token_id * embed_dim + d;
-                const dst_idx = (b * seq_len + s) * embed_dim + d;
-                result_buf[dst_idx] = params_buf[src_idx];
-            }
-        }
-    }
+    // Extract dimensions
+    const vocab_size = params.shape.dims[0];
+    const embed_dim = params.shape.dims[1];
     
-    // Create result node
-    var result = try Node.init(allocator, result_tensor, params.requires_grad);
-    result.op_type = .embedding_lookup;
-    
-    // Save input nodes for backward pass
-    try result.inputs.append(params);
-    
-    // Create a copy of the indices tensor that we'll own
-    const indices_for_copy = indices.retain();
-    const indices_node = try Node.init(allocator, indices_for_copy, false);
-    try result.inputs.append(indices_node);
-    
-    return result;
-}
-```
-
-The backward pass for embeddings is complex due to the sparse nature of gradients:
-
-```zig
-fn backwardEmbeddingLookup(allocator: Allocator, node: *Node) !void {
     // For each token in the batch, accumulate gradients back to the embedding table
     for (0..batch_size) |b| {
         for (0..seq_len) |s| {
-            const token_id = // Get token ID from indices
+            // Get token ID, clamping to vocab size
+            const token_id = /* ... */;
             
             // Accumulate gradients for this embedding
             for (0..embed_dim) |d| {
                 const grad_pos = (b * seq_len + s) * embed_dim + d;
                 const param_pos = token_id * embed_dim + d;
-                params_grad_buf[param_pos] += grad_buf[grad_pos];
+                d_params_buf[param_pos] += grad_buf[grad_pos];
             }
         }
     }
+    
+    return d_params;
 }
 ```
 
@@ -540,44 +574,49 @@ for (0..num_epochs) |epoch| {
 }
 ```
 
-The optimizer implementation (Adam) shows how gradients are applied to parameters:
+### Compile-Time Planning
+
+One of the key innovations in PCP is the use of Zig's comptime features to generate operation plans that validate and optimize operations at compile time.
+
+#### Plan Generation
 
 ```zig
-pub fn step(self: *Adam, parameter: *Tensor, gradient: Tensor) !void {
-    // Increment time step
-    self.t += 1;
-    
-    // Get moment vectors
-    var m = self.m_map.get(parameter).?;
-    var v = self.v_map.get(parameter).?;
-    
-    // Get pointers to the data
-    const param_buf = ptrCastHelper([*]f32, parameter.buffer.data.ptr)[0..parameter.shape.elemCount()];
-    const grad_buf = ptrCastHelper([*]f32, gradient.buffer.data.ptr)[0..gradient.shape.elemCount()];
-    const m_buf = ptrCastHelper([*]f32, m.buffer.data.ptr)[0..m.shape.elemCount()];
-    const v_buf = ptrCastHelper([*]f32, v.buffer.data.ptr)[0..v.shape.elemCount()];
-    
-    // Update parameters using Adam update rule
-    const lr = self.learning_rate;
-    const beta1 = self.beta1;
-    const beta2 = self.beta2;
-    const epsilon = self.epsilon;
-    
-    // Apply Adam update to each parameter
-    for (param_buf, 0..) |*param, i| {
-        const g = grad_buf[i];
-        
-        // Update biased first moment estimate
-        m_buf[i] = beta1 * m_buf[i] + (1.0 - beta1) * g;
-        
-        // Update biased second raw moment estimate
-        v_buf[i] = beta2 * v_buf[i] + (1.0 - beta2) * g * g;
-        
-        // Apply update
-        param.* -= lr_t * m_buf[i] / (@sqrt(v_buf[i]) + epsilon);
+// Creating a plan with static dimensions
+const MatmulOp = MatmulPlan(CpuBackend, f32, 128, 256, 64);
+var matmul_op = MatmulOp.init(allocator);
+
+// Wrapping with autodiff
+const MatmulWithGrad = AutoDiffPlan(MatmulOp);
+var autodiff_op = MatmulWithGrad.init(allocator);
+```
+
+#### Compile-Time Type Selection for Gradients
+
+The core of the autodiff system uses comptime to select the appropriate gradient computation:
+
+```zig
+fn computeGradient(self: *Self, grad_out: Tensor) !ForwardPlanType.GradType {
+    // Use comptime type information to select the right gradient function
+    switch (ForwardPlanType.op_type) {
+        .add => {
+            return try GradRules.add(self.allocator, grad_out, input.a, input.b);
+        },
+        .subtract => {
+            return try GradRules.subtract(self.allocator, grad_out, input.a, input.b);
+        },
+        .matmul => {
+            return try GradRules.matmul(self.allocator, grad_out, input.a, input.b);
+        },
+        // Other operations...
     }
 }
 ```
+
+This approach ensures:
+1. Operations are validated at compile time
+2. The correct gradient function is selected at compile time
+3. Runtime overhead is minimized
+4. Type safety is maintained throughout the system
 
 ## Zig Version
 

@@ -334,6 +334,20 @@ pub fn AddPlan(comptime Backend: type, comptime T: type, comptime shape: ?[]cons
         pub fn init(allocator: Allocator) @This() {
             return .{ .base = Base.init(allocator) };
         }
+        
+        /// Compute gradients for add operation: da = grad_out, db = grad_out
+        pub fn gradient(self: @This(), grad_out: Tensor, input: InputType) !GradType {
+            _ = self; // Not used
+            
+            // Both inputs receive the same gradient
+            var da = try grad_out.clone();
+            errdefer da.deinit();
+            
+            var db = try grad_out.clone();
+            errdefer db.deinit();
+            
+            return .{ .da = da, .db = db };
+        }
 
         pub fn run(self: @This(), input: InputType) !Tensor {
             // Runtime shape check for inputs
@@ -394,6 +408,27 @@ pub fn SubtractPlan(comptime Backend: type, comptime T: type, comptime shape: ?[
         pub fn init(allocator: Allocator) @This() {
             return .{ .base = Base.init(allocator) };
         }
+        
+        /// Compute gradients for subtract operation: da = grad_out, db = -grad_out
+        pub fn gradient(self: @This(), grad_out: Tensor, input: InputType) !GradType {
+            const allocator = self.base.allocator;
+            
+            // First input gets the gradient directly
+            var da = try grad_out.clone();
+            errdefer da.deinit();
+            
+            // Create negative gradient for second input
+            const negative_one = try Tensor.filled(allocator, grad_out.shape.dims, grad_out.dtype, -1.0, grad_out.backend);
+            errdefer negative_one.deinit();
+            
+            var db = try multiply(allocator, grad_out, negative_one);
+            errdefer db.deinit();
+            
+            // Clean up temporary tensor
+            negative_one.deinit();
+            
+            return .{ .da = da, .db = db };
+        }
 
         pub fn run(self: @This(), input: InputType) !Tensor {
             // Runtime shape check
@@ -453,6 +488,21 @@ pub fn MultiplyPlan(comptime Backend: type, comptime T: type, comptime shape: ?[
 
         pub fn init(allocator: Allocator) @This() {
             return .{ .base = Base.init(allocator) };
+        }
+        
+        /// Compute gradients for multiply operation: da = grad_out * b, db = grad_out * a
+        pub fn gradient(self: @This(), grad_out: Tensor, input: InputType) !GradType {
+            const allocator = self.base.allocator;
+            
+            // Input a gradient is element-wise product of grad_out and b
+            var da = try multiply(allocator, grad_out, input.b);
+            errdefer da.deinit();
+            
+            // Input b gradient is element-wise product of grad_out and a
+            var db = try multiply(allocator, grad_out, input.a);
+            errdefer db.deinit();
+            
+            return .{ .da = da, .db = db };
         }
 
         pub fn run(self: @This(), input: InputType) !Tensor {
@@ -574,6 +624,33 @@ pub fn MatmulPlan(comptime Backend: type, comptime T: type, comptime M: ?usize, 
         pub fn init(allocator: Allocator) @This() {
             return .{ .base = Base.init(allocator) };
         }
+        
+        /// Compute gradients for matmul: da = grad_out @ b^T, db = a^T @ grad_out
+        pub fn gradient(self: @This(), grad_out: Tensor, input: InputType) !GradType {
+            const allocator = self.base.allocator;
+            
+            // Compute b transpose
+            const b_transpose = try transpose(allocator, input.b);
+            errdefer b_transpose.deinit();
+            
+            // Gradient for a is grad_out @ b^T
+            var da = try matmul(allocator, grad_out, b_transpose);
+            errdefer da.deinit();
+            
+            // Compute a transpose
+            const a_transpose = try transpose(allocator, input.a);
+            errdefer a_transpose.deinit();
+            
+            // Gradient for b is a^T @ grad_out
+            var db = try matmul(allocator, a_transpose, grad_out);
+            errdefer db.deinit();
+            
+            // Clean up temporaries
+            b_transpose.deinit();
+            a_transpose.deinit();
+            
+            return .{ .da = da, .db = db };
+        }
 
         pub fn run(self: @This(), input: InputType) !Tensor {
             // Runtime validation for 2D shapes
@@ -630,6 +707,31 @@ pub fn ReluPlan(comptime Backend: type, comptime T: type, comptime shape: ?[]con
 
         pub fn init(allocator: Allocator) @This() {
             return .{ .base = Base.init(allocator) };
+        }
+        
+        /// Compute gradient for relu: da = grad_out * (input > 0)
+        pub fn gradient(self: @This(), grad_out: Tensor, input: Tensor) !GradType {
+            const allocator = self.base.allocator;
+            
+            // Create mask with 1s where input > 0, 0s elsewhere
+            var mask = try Tensor.zeros(allocator, input.shape.dims, input.dtype, input.backend);
+            errdefer mask.deinit();
+            
+            const input_buf = ptrCastHelper([*]f32, input.buffer.data.ptr)[0..input.shape.elemCount()];
+            const mask_buf = ptrCastHelper([*]f32, mask.buffer.data.ptr)[0..mask.shape.elemCount()];
+            
+            for (input_buf, 0..) |val, i| {
+                mask_buf[i] = if (val > 0) 1.0 else 0.0;
+            }
+            
+            // Gradient is element-wise product of upstream gradient and mask
+            var result = try multiply(allocator, grad_out, mask);
+            errdefer result.deinit();
+            
+            // Clean up temporary
+            mask.deinit();
+            
+            return result;
         }
 
         pub fn run(self: @This(), input: Tensor) !Tensor {

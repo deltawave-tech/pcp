@@ -213,6 +213,109 @@ Memory management will be simplified with the Plan-based approach:
 5. Convert example code to use Plans
 6. Add comprehensive tests for all operations
 
+## Architectural Improvements
+
+Based on our experience with the implementation so far, we're planning the following architectural improvements:
+
+### 1. Centralizing Plan Definitions
+
+We'll move all `*WithGrad` plan type declarations from `autodiff.zig` to `ops.zig` to create a more consistent structure:
+
+```zig
+// In ops.zig
+pub fn AddPlan(comptime Backend: type, comptime T: type, comptime shape: ?[]const usize) type {
+    // ... existing implementation ...
+    return struct {
+        pub const InputType = struct { a: Tensor, b: Tensor };
+        pub const op_type = OpType.add;
+        pub const GradType = struct { da: Tensor, db: Tensor };
+        
+        // ... implementation ...
+        
+        // Gradient computation built in
+        pub fn gradient(self: @This(), grad_out: Tensor, a: Tensor, b: Tensor) !GradType {
+            // ... gradient implementation ...
+        }
+    };
+}
+```
+
+This approach ensures:
+- All plan-related functionality is in one place
+- GradType and op_type are always defined consistently
+- Easier maintenance and extension
+
+### 2. Comptime Fusion for Complex Gradients
+
+For operations with complex gradient rules (like matmul and softmax), we'll implement comptime fusion to optimize the computation:
+
+```zig
+pub fn matmul_gradient(allocator: Allocator, grad_out: Tensor, a: Tensor, b: Tensor) !struct { da: Tensor, db: Tensor } {
+    // Current implementation: Multiple operations
+    const b_t = try ops.transpose(allocator, b);
+    errdefer b_t.deinit();
+    const da = try ops.matmul(allocator, grad_out, b_t);
+    b_t.deinit();
+
+    const a_t = try ops.transpose(allocator, a);
+    errdefer a_t.deinit();
+    const db = try ops.matmul(allocator, a_t, grad_out);
+    a_t.deinit();
+
+    return .{ .da = da, .db = db };
+}
+
+// Fused implementation
+pub fn matmul_gradient_fused(comptime Backend: type, comptime T: type) type {
+    return struct {
+        pub fn compute(allocator: Allocator, grad_out: Tensor, a: Tensor, b: Tensor) !struct { da: Tensor, db: Tensor } {
+            // One-shot optimized implementation
+            var result = try compute_fused_matmul_grad(allocator, grad_out, a, b);
+            return result;
+        }
+    };
+}
+```
+
+Benefits:
+- Reduced temporary tensor allocations
+- Fewer individual operations
+- Potential for backend-specific optimizations
+
+### 3. Enhanced Shape Validation
+
+We'll improve shape validation by combining comptime checks with robust runtime validation:
+
+```zig
+pub fn MatmulPlan(comptime Backend: type, comptime T: type, comptime M: ?usize, comptime N: ?usize, comptime P: ?usize) type {
+    // ... implementation ...
+    
+    pub fn run(self: Self, input: InputType) !Tensor {
+        // Comptime shape validation when dimensions are known
+        if (M != null and N != null and P != null) {
+            // Static validation
+            comptime {
+                if (/* validation logic */) {
+                    @compileError("Invalid static dimensions");
+                }
+            }
+        } else {
+            // Runtime validation for dynamic dimensions
+            if (/* validation logic */) {
+                return error.ShapeMismatch;
+            }
+        }
+        
+        // ... implementation ...
+    }
+}
+```
+
+This approach provides:
+- Compile-time safety when shapes are known
+- Runtime safety for dynamic shapes
+- Consistent error handling
+
 ## Future Optimizations
 
 1. **Kernel Fusion**: Backends can implement sophisticated plan optimization

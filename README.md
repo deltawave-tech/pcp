@@ -56,6 +56,26 @@ PCP uses Zig's compile-time features to optimize tensor operations:
 - Error handling is streamlined with errdefer for cleanup
 - Plans can be composed to build complex operations
 
+### Architectural Improvements
+
+We're continuously enhancing the architecture with these key principles:
+
+1. **Consistency**: All plan types follow a uniform structure with:
+   - Required declarations (`GradType`, `op_type`)
+   - Standard interfaces (`init`, `run`)
+   - Common error handling patterns
+
+2. **Comptime Optimizations**:
+   - Shape validation at compile time when possible
+   - Plan fusion for combining operations
+   - Specialized implementations based on input types
+   - Gradient rule generation from forward operations
+
+3. **Runtime Safety**:
+   - Fallback validation for dynamic shapes
+   - Bounds checking for tensor operations
+   - Consistent memory management patterns
+
 > **Note**: We're migrating from a legacy Node-based computation graph approach to the new comptime Plan-based system. The legacy system is marked as deprecated and will be removed in the future.
 
 ## Getting Started
@@ -121,6 +141,9 @@ The framework is designed with performance in mind:
 - [x] Robust bounds checking and safety mechanisms
 - [x] Comptime Plan-based operation design
 - [x] Automatic gradient rule generation with comptime
+- [ ] Centralize all plan definitions in ops.zig with consistent structure
+- [ ] Implement comptime operation fusion for complex gradient rules
+- [ ] Enhance shape validation with optional parameters and runtime checks
 - [ ] Complete migration from legacy Node-based system to Plan-based approach
 - [ ] Update all examples to use the Plan-based API
 - [ ] Complete Metal backend implementation

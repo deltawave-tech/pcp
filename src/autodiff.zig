@@ -363,68 +363,10 @@ pub fn AutoDiffPlan(comptime ForwardPlanType: type) type {
         /// Comptime function to select and apply the appropriate gradient rule
         fn computeGradient(self: *Self, grad_out: Tensor) !ForwardPlanType.GradType {
             const input = self.last_input.?;
-            const output = self.last_output.?;
             
-            // Inline helper to create a gradient result
-            const makeGradResult = struct {
-                fn binaryOp(da: Tensor, db: Tensor) ForwardPlanType.GradType {
-                    return .{ .da = da, .db = db };
-                }
-                
-                fn unaryOp(da: Tensor) ForwardPlanType.GradType {
-                    return da;
-                }
-            };
-            
-            // Use comptime type information to select the right gradient function
-            switch (ForwardPlanType.op_type) {
-                // Binary operations that need both inputs
-                .add => {
-                    const result = try GradRules.add(self.allocator, grad_out, input.a, input.b);
-                    return makeGradResult.binaryOp(result.da, result.db);
-                },
-                .subtract => {
-                    const result = try GradRules.subtract(self.allocator, grad_out, input.a, input.b);
-                    return makeGradResult.binaryOp(result.da, result.db);
-                },
-                .multiply => {
-                    const result = try GradRules.multiply(self.allocator, grad_out, input.a, input.b);
-                    return makeGradResult.binaryOp(result.da, result.db);
-                },
-                .divide => {
-                    const result = try GradRules.divide(self.allocator, grad_out, input.a, input.b);
-                    return makeGradResult.binaryOp(result.da, result.db);
-                },
-                .matmul => {
-                    const result = try GradRules.matmul(self.allocator, grad_out, input.a, input.b);
-                    return makeGradResult.binaryOp(result.da, result.db);
-                },
-                
-                // Unary operations with single input tensor
-                .relu => {
-                    const result = try GradRules.relu(self.allocator, grad_out, input);
-                    return makeGradResult.unaryOp(result);
-                },
-                .softmax => {
-                    const result = try GradRules.softmax(self.allocator, grad_out, output, input);
-                    return makeGradResult.unaryOp(result);
-                },
-                .transpose => {
-                    const result = try GradRules.transpose(self.allocator, grad_out, input);
-                    return makeGradResult.unaryOp(result);
-                },
-                
-                // Special case for embedding lookup which has structured input
-                .embedding_lookup => {
-                    const result = try GradRules.embedding_lookup(self.allocator, grad_out, input.params, input.indices);
-                    return makeGradResult.unaryOp(result);
-                },
-                
-                // Default error case
-                else => {
-                    @compileError("Unsupported operation type for gradient: " ++ @tagName(ForwardPlanType.op_type));
-                },
-            }
+            // Use the plan's gradient method directly - much simpler!
+            // This takes advantage of the gradient methods we added to the plan types directly.
+            return try self.forward_plan.gradient(grad_out, input);
         }
     };
 }
@@ -441,8 +383,8 @@ pub fn AddPlanWithGrad(comptime Backend: type, comptime T: type, comptime shape:
         const InputType = BasePlan.InputType;
         const op_type = .add;
         
-        // Define the gradient type for add operation
-        const GradType = struct { da: Tensor, db: Tensor };
+        // Define the gradient type for add operation by referencing base plan's GradType
+        const GradType = BasePlan.GradType;
         
         // Embed the base plan
         base: BasePlan,
@@ -453,6 +395,11 @@ pub fn AddPlanWithGrad(comptime Backend: type, comptime T: type, comptime shape:
         
         pub fn run(self: Self, input: InputType) !Tensor {
             return self.base.run(input);
+        }
+        
+        /// Pass through to the base plan's gradient function
+        pub fn gradient(self: Self, grad_out: Tensor, input: InputType) !GradType {
+            return self.base.gradient(grad_out, input);
         }
     };
 }
@@ -466,8 +413,8 @@ pub fn SubtractPlanWithGrad(comptime Backend: type, comptime T: type, comptime s
         const InputType = BasePlan.InputType;
         const op_type = .subtract;
         
-        // Define the gradient type for subtract operation
-        const GradType = struct { da: Tensor, db: Tensor };
+        // Define the gradient type for subtract operation by referencing base plan's GradType
+        const GradType = BasePlan.GradType;
         
         // Embed the base plan
         base: BasePlan,
@@ -478,6 +425,11 @@ pub fn SubtractPlanWithGrad(comptime Backend: type, comptime T: type, comptime s
         
         pub fn run(self: Self, input: InputType) !Tensor {
             return self.base.run(input);
+        }
+        
+        /// Pass through to the base plan's gradient function
+        pub fn gradient(self: Self, grad_out: Tensor, input: InputType) !GradType {
+            return self.base.gradient(grad_out, input);
         }
     };
 }
@@ -491,8 +443,8 @@ pub fn MultiplyPlanWithGrad(comptime Backend: type, comptime T: type, comptime s
         const InputType = BasePlan.InputType;
         const op_type = .multiply;
         
-        // Define the gradient type for multiply operation
-        const GradType = struct { da: Tensor, db: Tensor };
+        // Define the gradient type for multiply operation by referencing base plan's GradType
+        const GradType = BasePlan.GradType;
         
         // Embed the base plan
         base: BasePlan,
@@ -503,6 +455,11 @@ pub fn MultiplyPlanWithGrad(comptime Backend: type, comptime T: type, comptime s
         
         pub fn run(self: Self, input: InputType) !Tensor {
             return self.base.run(input);
+        }
+        
+        /// Pass through to the base plan's gradient function
+        pub fn gradient(self: Self, grad_out: Tensor, input: InputType) !GradType {
+            return self.base.gradient(grad_out, input);
         }
     };
 }
@@ -516,8 +473,8 @@ pub fn MatmulPlanWithGrad(comptime Backend: type, comptime T: type, comptime M: 
         const InputType = BasePlan.InputType;
         const op_type = .matmul;
         
-        // Define the gradient type for matmul operation
-        const GradType = struct { da: Tensor, db: Tensor };
+        // Define the gradient type for matmul operation by referencing base plan's GradType
+        const GradType = BasePlan.GradType;
         
         // Embed the base plan
         base: BasePlan,
@@ -528,6 +485,11 @@ pub fn MatmulPlanWithGrad(comptime Backend: type, comptime T: type, comptime M: 
         
         pub fn run(self: Self, input: InputType) !Tensor {
             return self.base.run(input);
+        }
+        
+        /// Pass through to the base plan's gradient function
+        pub fn gradient(self: Self, grad_out: Tensor, input: InputType) !GradType {
+            return self.base.gradient(grad_out, input);
         }
     };
 }
@@ -543,7 +505,7 @@ pub fn ReluPlanWithGrad(comptime Backend: type, comptime T: type, comptime shape
         
         // Define the gradient type for relu operation (single input)
         // For unary operations, GradType is just a Tensor, not a struct with da/db fields
-        const GradType = Tensor;
+        const GradType = BasePlan.GradType;
         
         // Embed the base plan
         base: BasePlan,
@@ -554,6 +516,11 @@ pub fn ReluPlanWithGrad(comptime Backend: type, comptime T: type, comptime shape
         
         pub fn run(self: Self, input: InputType) !Tensor {
             return self.base.run(input);
+        }
+        
+        /// Pass through to the base plan's gradient function
+        pub fn gradient(self: Self, grad_out: Tensor, input: InputType) !GradType {
+            return self.base.gradient(grad_out, input);
         }
     };
 }
@@ -568,7 +535,7 @@ pub fn SoftmaxPlanWithGrad(comptime Backend: type, comptime T: type, comptime ba
         const op_type = .softmax;
         
         // Define the gradient type for softmax operation (single input)
-        const GradType = Tensor;
+        const GradType = BasePlan.GradType;
         
         // Embed the base plan
         base: BasePlan,
@@ -579,6 +546,11 @@ pub fn SoftmaxPlanWithGrad(comptime Backend: type, comptime T: type, comptime ba
         
         pub fn run(self: Self, input: InputType) !Tensor {
             return self.base.run(input);
+        }
+        
+        /// Pass through to the base plan's gradient function
+        pub fn gradient(self: Self, grad_out: Tensor, input: InputType) !GradType {
+            return self.base.gradient(grad_out, input);
         }
     };
 }
@@ -593,7 +565,7 @@ pub fn TransposePlanWithGrad(comptime Backend: type, comptime T: type, comptime 
         const op_type = .transpose;
         
         // Define the gradient type for transpose operation (single input)
-        const GradType = Tensor;
+        const GradType = BasePlan.GradType;
         
         // Embed the base plan
         base: BasePlan,
@@ -604,6 +576,11 @@ pub fn TransposePlanWithGrad(comptime Backend: type, comptime T: type, comptime 
         
         pub fn run(self: Self, input: InputType) !Tensor {
             return self.base.run(input);
+        }
+        
+        /// Pass through to the base plan's gradient function
+        pub fn gradient(self: Self, grad_out: Tensor, input: InputType) !GradType {
+            return self.base.gradient(grad_out, input);
         }
     };
 }
@@ -618,7 +595,7 @@ pub fn DividePlanWithGrad(comptime Backend: type, comptime T: type, comptime sha
         const op_type = .divide;
         
         // Define the gradient type for divide operation
-        const GradType = struct { da: Tensor, db: Tensor };
+        const GradType = BasePlan.GradType;
         
         // Embed the base plan
         base: BasePlan,
@@ -629,6 +606,11 @@ pub fn DividePlanWithGrad(comptime Backend: type, comptime T: type, comptime sha
         
         pub fn run(self: Self, input: InputType) !Tensor {
             return self.base.run(input);
+        }
+        
+        /// Pass through to the base plan's gradient function
+        pub fn gradient(self: Self, grad_out: Tensor, input: InputType) !GradType {
+            return self.base.gradient(grad_out, input);
         }
     };
 }
@@ -649,6 +631,12 @@ pub fn EmbeddingLookupPlanWithGrad(comptime Backend: type, comptime T: type, com
         
         pub fn init(allocator: Allocator) Self {
             return .{ .allocator = allocator };
+        }
+        
+        /// Compute gradients for embedding lookup
+        pub fn gradient(self: Self, grad_out: Tensor, input: InputType) !GradType {
+            // Delegate to the GradRules implementation for embedding lookup
+            return try GradRules.embedding_lookup(self.allocator, grad_out, input.params, input.indices);
         }
         
         pub fn run(self: Self, input: InputType) !Tensor {

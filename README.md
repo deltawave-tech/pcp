@@ -141,7 +141,8 @@ The framework is designed with performance in mind:
 - [x] Robust bounds checking and safety mechanisms
 - [x] Comptime Plan-based operation design
 - [x] Automatic gradient rule generation with comptime
-- [ ] Centralize all plan definitions in ops.zig with consistent structure
+- [x] Centralize all plan definitions in ops.zig with consistent structure
+- [x] Tie gradient computation directly to operation plans
 - [ ] Implement comptime operation fusion for complex gradient rules
 - [ ] Enhance shape validation with optional parameters and runtime checks
 - [ ] Complete migration from legacy Node-based system to Plan-based approach

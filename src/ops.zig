@@ -336,7 +336,7 @@ pub fn AddPlan(comptime Backend: type, comptime T: type, comptime shape: ?[]cons
         }
         
         /// Compute gradients for add operation: da = grad_out, db = grad_out
-        pub fn gradient(self: @This(), grad_out: Tensor, input: InputType) !GradType {
+        pub fn gradient(self: @This(), grad_out: Tensor, _: InputType) !GradType {
             _ = self; // Not used
             
             // Both inputs receive the same gradient
@@ -410,7 +410,7 @@ pub fn SubtractPlan(comptime Backend: type, comptime T: type, comptime shape: ?[
         }
         
         /// Compute gradients for subtract operation: da = grad_out, db = -grad_out
-        pub fn gradient(self: @This(), grad_out: Tensor, input: InputType) !GradType {
+        pub fn gradient(self: @This(), grad_out: Tensor, _: InputType) !GradType {
             const allocator = self.base.allocator;
             
             // First input gets the gradient directly

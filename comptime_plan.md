@@ -217,14 +217,14 @@ Memory management will be simplified with the Plan-based approach:
 
 Based on our experience with the implementation so far, we're planning the following architectural improvements:
 
-### 1. Centralizing Plan Definitions
+### 1. Centralizing Plan Definitions ✅
 
-We'll move all `*WithGrad` plan type declarations from `autodiff.zig` to `ops.zig` to create a more consistent structure:
+We've moved gradient computation directly into operation plans in `ops.zig` to create a more consistent structure:
 
 ```zig
 // In ops.zig
 pub fn AddPlan(comptime Backend: type, comptime T: type, comptime shape: ?[]const usize) type {
-    // ... existing implementation ...
+    // ... comptime validation ...
     return struct {
         pub const InputType = struct { a: Tensor, b: Tensor };
         pub const op_type = OpType.add;
@@ -232,9 +232,16 @@ pub fn AddPlan(comptime Backend: type, comptime T: type, comptime shape: ?[]cons
         
         // ... implementation ...
         
-        // Gradient computation built in
-        pub fn gradient(self: @This(), grad_out: Tensor, a: Tensor, b: Tensor) !GradType {
-            // ... gradient implementation ...
+        // Gradient computation built into the plan
+        pub fn gradient(self: @This(), grad_out: Tensor, _: InputType) !GradType {
+            // Both inputs receive the same gradient
+            var da = try grad_out.clone();
+            errdefer da.deinit();
+            
+            var db = try grad_out.clone();
+            errdefer db.deinit();
+            
+            return .{ .da = da, .db = db };
         }
     };
 }
@@ -243,7 +250,11 @@ pub fn AddPlan(comptime Backend: type, comptime T: type, comptime shape: ?[]cons
 This approach ensures:
 - All plan-related functionality is in one place
 - GradType and op_type are always defined consistently
-- Easier maintenance and extension
+- Gradient computation is directly tied to the operation that produces it
+- AutoDiffPlan directly calls the plan's gradient method
+- WithGrad plan wrappers simply pass through to the base plan's gradient method
+
+The code is more maintainable because adding a new operation only requires implementing one plan type with its gradient method, not modifying the autodiff engine.
 
 ### 2. Comptime Fusion for Complex Gradients
 

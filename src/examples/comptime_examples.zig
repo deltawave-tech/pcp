@@ -143,7 +143,28 @@ fn demoAutoDiff(allocator: Allocator) !void {
     
     // Create an AddPlan with gradient support
     const shape_opt: ?[]const usize = &dims;
-    const PlanType = autodiff.AddPlanWithGrad(ops.CpuBackend, f32, shape_opt);
+    
+    // For direct ops.AddPlan
+    const BasePlanType = ops.AddPlan(ops.CpuBackend, f32, shape_opt);
+    
+    // Instead of adding with autodiff.AddPlanWithGrad, define the plan type inline for debugging
+    const PlanType = struct {
+        const Self = @This();
+        const InputType = BasePlanType.InputType;
+        const op_type = BasePlanType.op_type;
+        const GradType = struct { da: Tensor, db: Tensor };
+        
+        base: BasePlanType,
+        
+        pub fn init(alloc: Allocator) Self {
+            return .{ .base = BasePlanType.init(alloc) };
+        }
+        
+        pub fn run(self: Self, input: InputType) !Tensor {
+            return self.base.run(input);
+        }
+    };
+    
     var auto_diff = autodiff.AutoDiffPlan(PlanType).init(allocator);
     defer auto_diff.deinit();
     
@@ -179,7 +200,28 @@ fn demoAutoDiff(allocator: Allocator) !void {
     const M: ?usize = 2;
     const N: ?usize = 2;
     const P: ?usize = 2;
-    const MatMulPlanType = autodiff.MatmulPlanWithGrad(ops.CpuBackend, f32, M, N, P);
+    
+    // For direct ops.MatmulPlan
+    const BaseMatmulPlanType = ops.MatmulPlan(ops.CpuBackend, f32, M, N, P);
+    
+    // Create the MatMul plan type inline for debugging
+    const MatMulPlanType = struct {
+        const Self = @This();
+        const InputType = BaseMatmulPlanType.InputType;
+        const op_type = BaseMatmulPlanType.op_type;
+        const GradType = struct { da: Tensor, db: Tensor };
+        
+        base: BaseMatmulPlanType,
+        
+        pub fn init(alloc: Allocator) Self {
+            return .{ .base = BaseMatmulPlanType.init(alloc) };
+        }
+        
+        pub fn run(self: Self, input: InputType) !Tensor {
+            return self.base.run(input);
+        }
+    };
+    
     var matmul_autodiff = autodiff.AutoDiffPlan(MatMulPlanType).init(allocator);
     defer matmul_autodiff.deinit();
     
@@ -249,19 +291,76 @@ fn demoSimpleNetwork(allocator: Allocator) !void {
     const N1: ?usize = 2;
     const P1: ?usize = 2;
     
-    // Create plans for each operation
-    const matmul1_plan = autodiff.MatmulPlanWithGrad(ops.CpuBackend, f32, M1, N1, P1).init(allocator);
-    const relu_plan = autodiff.ReluPlanWithGrad(ops.CpuBackend, f32, &input_dims).init(allocator);
-    const matmul2_plan = autodiff.MatmulPlanWithGrad(ops.CpuBackend, f32, M1, N1, P1).init(allocator);
+    // Create direct plan types
+    const BaseMatmul1PlanType = ops.MatmulPlan(ops.CpuBackend, f32, M1, N1, P1);
+    const BaseReluPlanType = ops.ReluPlan(ops.CpuBackend, f32, &input_dims);
+    const BaseMatmul2PlanType = ops.MatmulPlan(ops.CpuBackend, f32, M1, N1, P1);
+    
+    // Define wrapper types with GradType
+    const Matmul1PlanType = struct {
+        const Self = @This();
+        const InputType = BaseMatmul1PlanType.InputType;
+        const op_type = BaseMatmul1PlanType.op_type;
+        const GradType = struct { da: Tensor, db: Tensor };
+        
+        base: BaseMatmul1PlanType,
+        
+        pub fn init(alloc: Allocator) Self {
+            return .{ .base = BaseMatmul1PlanType.init(alloc) };
+        }
+        
+        pub fn run(self: Self, input: InputType) !Tensor {
+            return self.base.run(input);
+        }
+    };
+    
+    const ReluPlanType = struct {
+        const Self = @This();
+        const InputType = Tensor;
+        const op_type = BaseReluPlanType.op_type;
+        const GradType = Tensor;
+        
+        base: BaseReluPlanType,
+        
+        pub fn init(alloc: Allocator) Self {
+            return .{ .base = BaseReluPlanType.init(alloc) };
+        }
+        
+        pub fn run(self: Self, input: InputType) !Tensor {
+            return self.base.run(input);
+        }
+    };
+    
+    const Matmul2PlanType = struct {
+        const Self = @This();
+        const InputType = BaseMatmul2PlanType.InputType;
+        const op_type = BaseMatmul2PlanType.op_type;
+        const GradType = struct { da: Tensor, db: Tensor };
+        
+        base: BaseMatmul2PlanType,
+        
+        pub fn init(alloc: Allocator) Self {
+            return .{ .base = BaseMatmul2PlanType.init(alloc) };
+        }
+        
+        pub fn run(self: Self, input: InputType) !Tensor {
+            return self.base.run(input);
+        }
+    };
+    
+    // Create plan instances
+    const matmul1_plan = Matmul1PlanType.init(allocator);
+    const relu_plan = ReluPlanType.init(allocator);
+    const matmul2_plan = Matmul2PlanType.init(allocator);
     
     // Create AutoDiff wrappers
-    var matmul1_autodiff = autodiff.AutoDiffPlan(@TypeOf(matmul1_plan)).init(allocator);
+    var matmul1_autodiff = autodiff.AutoDiffPlan(Matmul1PlanType).init(allocator);
     defer matmul1_autodiff.deinit();
     
-    var relu_autodiff = autodiff.AutoDiffPlan(@TypeOf(relu_plan)).init(allocator);
+    var relu_autodiff = autodiff.AutoDiffPlan(ReluPlanType).init(allocator);
     defer relu_autodiff.deinit();
     
-    var matmul2_autodiff = autodiff.AutoDiffPlan(@TypeOf(matmul2_plan)).init(allocator);
+    var matmul2_autodiff = autodiff.AutoDiffPlan(Matmul2PlanType).init(allocator);
     defer matmul2_autodiff.deinit();
     
     // Forward pass through the network
@@ -296,14 +395,54 @@ fn demoSimpleNetwork(allocator: Allocator) !void {
     printTensor(target);
     
     // Compute a simple loss: MSE = (output - target)^2
-    // Create subtraction plan
-    const subtract_plan = autodiff.SubtractPlanWithGrad(ops.CpuBackend, f32, &input_dims).init(allocator);
-    var subtract_autodiff = autodiff.AutoDiffPlan(@TypeOf(subtract_plan)).init(allocator);
+    // Create direct plan types
+    const BaseSubtractPlanType = ops.SubtractPlan(ops.CpuBackend, f32, &input_dims);
+    const BaseMultiplyPlanType = ops.MultiplyPlan(ops.CpuBackend, f32, &input_dims);
+    
+    // Define wrapper types with GradType
+    const SubtractPlanType = struct {
+        const Self = @This();
+        const InputType = BaseSubtractPlanType.InputType;
+        const op_type = BaseSubtractPlanType.op_type;
+        const GradType = struct { da: Tensor, db: Tensor };
+        
+        base: BaseSubtractPlanType,
+        
+        pub fn init(alloc: Allocator) Self {
+            return .{ .base = BaseSubtractPlanType.init(alloc) };
+        }
+        
+        pub fn run(self: Self, input: InputType) !Tensor {
+            return self.base.run(input);
+        }
+    };
+    
+    const MultiplyPlanType = struct {
+        const Self = @This();
+        const InputType = BaseMultiplyPlanType.InputType;
+        const op_type = BaseMultiplyPlanType.op_type;
+        const GradType = struct { da: Tensor, db: Tensor };
+        
+        base: BaseMultiplyPlanType,
+        
+        pub fn init(alloc: Allocator) Self {
+            return .{ .base = BaseMultiplyPlanType.init(alloc) };
+        }
+        
+        pub fn run(self: Self, input: InputType) !Tensor {
+            return self.base.run(input);
+        }
+    };
+    
+    // Create plan instances
+    const subtract_plan = SubtractPlanType.init(allocator);
+    const multiply_plan = MultiplyPlanType.init(allocator);
+    
+    // Create AutoDiff wrappers
+    var subtract_autodiff = autodiff.AutoDiffPlan(SubtractPlanType).init(allocator);
     defer subtract_autodiff.deinit();
     
-    // Create multiplication plan (for squaring)
-    const multiply_plan = autodiff.MultiplyPlanWithGrad(ops.CpuBackend, f32, &input_dims).init(allocator);
-    var multiply_autodiff = autodiff.AutoDiffPlan(@TypeOf(multiply_plan)).init(allocator);
+    var multiply_autodiff = autodiff.AutoDiffPlan(MultiplyPlanType).init(allocator);
     defer multiply_autodiff.deinit();
     
     // Calculate difference

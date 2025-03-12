@@ -250,9 +250,9 @@ fn demoSimpleNetwork(allocator: Allocator) !void {
     const P1: ?usize = 2;
     
     // Create plans for each operation
-    var matmul1_plan = autodiff.MatmulPlanWithGrad(ops.CpuBackend, f32, M1, N1, P1).init(allocator);
-    var relu_plan = autodiff.ReluPlanWithGrad(ops.CpuBackend, f32, &input_dims).init(allocator);
-    var matmul2_plan = autodiff.MatmulPlanWithGrad(ops.CpuBackend, f32, M1, N1, P1).init(allocator);
+    const matmul1_plan = autodiff.MatmulPlanWithGrad(ops.CpuBackend, f32, M1, N1, P1).init(allocator);
+    const relu_plan = autodiff.ReluPlanWithGrad(ops.CpuBackend, f32, &input_dims).init(allocator);
+    const matmul2_plan = autodiff.MatmulPlanWithGrad(ops.CpuBackend, f32, M1, N1, P1).init(allocator);
     
     // Create AutoDiff wrappers
     var matmul1_autodiff = autodiff.AutoDiffPlan(@TypeOf(matmul1_plan)).init(allocator);
@@ -297,12 +297,12 @@ fn demoSimpleNetwork(allocator: Allocator) !void {
     
     // Compute a simple loss: MSE = (output - target)^2
     // Create subtraction plan
-    var subtract_plan = autodiff.SubtractPlanWithGrad(ops.CpuBackend, f32, &input_dims).init(allocator);
+    const subtract_plan = autodiff.SubtractPlanWithGrad(ops.CpuBackend, f32, &input_dims).init(allocator);
     var subtract_autodiff = autodiff.AutoDiffPlan(@TypeOf(subtract_plan)).init(allocator);
     defer subtract_autodiff.deinit();
     
     // Create multiplication plan (for squaring)
-    var multiply_plan = autodiff.MultiplyPlanWithGrad(ops.CpuBackend, f32, &input_dims).init(allocator);
+    const multiply_plan = autodiff.MultiplyPlanWithGrad(ops.CpuBackend, f32, &input_dims).init(allocator);
     var multiply_autodiff = autodiff.AutoDiffPlan(@TypeOf(multiply_plan)).init(allocator);
     defer multiply_autodiff.deinit();
     

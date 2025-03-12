@@ -846,14 +846,12 @@ pub const Node = struct {
 
 /// Create a computational graph node from a tensor
 /// DEPRECATED: Use the Plan-based approach instead
-@deprecated("Use the comptime Plan-based approach instead")
 pub fn variable(allocator: Allocator, t: Tensor, requires_grad: bool) !*Node {
     return Node.init(allocator, t, requires_grad);
 }
 
 /// Add two nodes element-wise
 /// DEPRECATED: Use the Plan-based approach with AutoDiffPlan instead
-@deprecated("Use the comptime Plan-based approach with AutoDiffPlan instead")
 pub fn add(allocator: Allocator, a: *Node, b: *Node) !*Node {
     // Perform the operation using the legacy interface
     var result_tensor = try ops.add(allocator, a.tensor, b.tensor);
@@ -1092,7 +1090,6 @@ pub fn embedding_lookup(allocator: Allocator, params: *Node, indices: Tensor) !*
 
 /// Compute gradients through the computational graph
 /// DEPRECATED: Use the Plan-based approach with AutoDiffPlan instead
-@deprecated("Use the comptime Plan-based approach with AutoDiffPlan instead")
 pub fn backward(allocator: Allocator, node: *Node) !void {
     // Initialize gradient of the output node to ones
     try node.initGradOnes();

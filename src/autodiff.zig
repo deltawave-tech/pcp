@@ -292,12 +292,15 @@ pub const GradRules = struct {
 
 /// AutoDiffPlan wraps a forward plan and provides backward functionality
 pub fn AutoDiffPlan(comptime ForwardPlanType: type) type {
+    // Use @hasDecl for checking constants instead of @hasField
+    // This fixes the detection of GradType and op_type in plan types
+    
     // Comptime validation
     comptime {
-        if (!@hasField(ForwardPlanType, "GradType")) {
+        if (!@hasDecl(ForwardPlanType, "GradType")) {
             @compileError("Forward plan must define GradType for autodiff");
         }
-        if (!@hasField(ForwardPlanType, "op_type")) {
+        if (!@hasDecl(ForwardPlanType, "op_type")) {
             @compileError("Forward plan must define op_type for autodiff");
         }
     }
@@ -362,39 +365,59 @@ pub fn AutoDiffPlan(comptime ForwardPlanType: type) type {
             const input = self.last_input.?;
             const output = self.last_output.?;
             
+            // Inline helper to create a gradient result
+            const makeGradResult = struct {
+                fn binaryOp(da: Tensor, db: Tensor) ForwardPlanType.GradType {
+                    return .{ .da = da, .db = db };
+                }
+                
+                fn unaryOp(da: Tensor) ForwardPlanType.GradType {
+                    return da;
+                }
+            };
+            
             // Use comptime type information to select the right gradient function
             switch (ForwardPlanType.op_type) {
                 // Binary operations that need both inputs
                 .add => {
-                    return try GradRules.add(self.allocator, grad_out, input.a, input.b);
+                    const result = try GradRules.add(self.allocator, grad_out, input.a, input.b);
+                    return makeGradResult.binaryOp(result.da, result.db);
                 },
                 .subtract => {
-                    return try GradRules.subtract(self.allocator, grad_out, input.a, input.b);
+                    const result = try GradRules.subtract(self.allocator, grad_out, input.a, input.b);
+                    return makeGradResult.binaryOp(result.da, result.db);
                 },
                 .multiply => {
-                    return try GradRules.multiply(self.allocator, grad_out, input.a, input.b);
+                    const result = try GradRules.multiply(self.allocator, grad_out, input.a, input.b);
+                    return makeGradResult.binaryOp(result.da, result.db);
                 },
                 .divide => {
-                    return try GradRules.divide(self.allocator, grad_out, input.a, input.b);
+                    const result = try GradRules.divide(self.allocator, grad_out, input.a, input.b);
+                    return makeGradResult.binaryOp(result.da, result.db);
                 },
                 .matmul => {
-                    return try GradRules.matmul(self.allocator, grad_out, input.a, input.b);
+                    const result = try GradRules.matmul(self.allocator, grad_out, input.a, input.b);
+                    return makeGradResult.binaryOp(result.da, result.db);
                 },
                 
                 // Unary operations with single input tensor
                 .relu => {
-                    return try GradRules.relu(self.allocator, grad_out, input);
+                    const result = try GradRules.relu(self.allocator, grad_out, input);
+                    return makeGradResult.unaryOp(result);
                 },
                 .softmax => {
-                    return try GradRules.softmax(self.allocator, grad_out, output, input);
+                    const result = try GradRules.softmax(self.allocator, grad_out, output, input);
+                    return makeGradResult.unaryOp(result);
                 },
                 .transpose => {
-                    return try GradRules.transpose(self.allocator, grad_out, input);
+                    const result = try GradRules.transpose(self.allocator, grad_out, input);
+                    return makeGradResult.unaryOp(result);
                 },
                 
                 // Special case for embedding lookup which has structured input
                 .embedding_lookup => {
-                    return try GradRules.embedding_lookup(self.allocator, grad_out, input.params, input.indices);
+                    const result = try GradRules.embedding_lookup(self.allocator, grad_out, input.params, input.indices);
+                    return makeGradResult.unaryOp(result);
                 },
                 
                 // Default error case
@@ -519,6 +542,7 @@ pub fn ReluPlanWithGrad(comptime Backend: type, comptime T: type, comptime shape
         const op_type = .relu;
         
         // Define the gradient type for relu operation (single input)
+        // For unary operations, GradType is just a Tensor, not a struct with da/db fields
         const GradType = Tensor;
         
         // Embed the base plan

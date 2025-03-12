@@ -90,4 +90,25 @@ pub fn build(b: *std.Build) void {
     
     const run_autodiff_test_step = b.step("run-autodiff-test", "Run the autodiff memory leak test");
     run_autodiff_test_step.dependOn(&run_autodiff_test_cmd.step);
+    
+    // Comptime Plan examples executable
+    const comptime_examples = b.addExecutable(.{
+        .name = "comptime_examples",
+        .root_source_file = b.path("src/examples/comptime_examples.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    
+    // Add module dependencies for comptime examples
+    comptime_examples.root_module.addImport("pcp", pcp_module);
+    
+    // Install the executable
+    b.installArtifact(comptime_examples);
+    
+    // Run step for comptime examples
+    const run_comptime_examples_cmd = b.addRunArtifact(comptime_examples);
+    run_comptime_examples_cmd.step.dependOn(b.getInstallStep());
+    
+    const run_comptime_examples_step = b.step("run-comptime-examples", "Run the comptime plan examples");
+    run_comptime_examples_step.dependOn(&run_comptime_examples_cmd.step);
 }

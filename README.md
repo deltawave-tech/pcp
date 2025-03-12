@@ -56,6 +56,8 @@ PCP uses Zig's compile-time features to optimize tensor operations:
 - Error handling is streamlined with errdefer for cleanup
 - Plans can be composed to build complex operations
 
+> **Note**: We're migrating from a legacy Node-based computation graph approach to the new comptime Plan-based system. The legacy system is marked as deprecated and will be removed in the future.
+
 ## Getting Started
 
 ### Prerequisites
@@ -93,6 +95,9 @@ zig build run-shakespeare
 
 # Run the GPT-2 training example
 zig build run-gpt2
+
+# Run the comptime plan examples (recommended)
+zig build run-comptime-examples
 ```
 
 ## Performance
@@ -108,16 +113,16 @@ The framework is designed with performance in mind:
 
 - [x] Core tensor implementation
 - [x] Basic operations (add, matmul, etc.)
-- [x] Autodiff engine with proper memory management
+- [x] Autodiff engine with memory management
 - [x] Basic model definition (GPT-2)
 - [x] Memory leak fixes in backward operations
 - [x] Training examples with text generation
 - [x] Embedding layers with proper gradient flow
-- [x] Enhanced reference counting for tensor management
 - [x] Robust bounds checking and safety mechanisms
 - [x] Comptime Plan-based operation design
 - [x] Automatic gradient rule generation with comptime
-- [ ] Complete reference counting system fixes
+- [ ] Complete migration from legacy Node-based system to Plan-based approach
+- [ ] Update all examples to use the Plan-based API
 - [ ] Complete Metal backend implementation
 - [ ] Actor-based distributed training
 - [ ] Decentralized optimization algorithms

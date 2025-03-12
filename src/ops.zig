@@ -256,7 +256,10 @@ pub const Primitives = struct {
                     const dst_idx = (b * seq_len + s) * embed_dim + d;
                     
                     // Bounds checking
-                    if (src_idx >= params_buf.len || dst_idx >= result_buf.len) {
+                    if (src_idx >= params_buf.len) {
+                        continue;
+                    }
+                    if (dst_idx >= result_buf.len) {
                         continue;
                     }
                     
@@ -270,9 +273,10 @@ pub const Primitives = struct {
 /// --- Plan Definition ---
 /// Generic type for comptime-generated operation plans
 pub fn PlanType(comptime Backend: type, comptime InputType: type, comptime OutputType: type) type {
+    _ = Backend; // Used to match interface, actual backend implementation comes from specific plan
     return struct {
         const Self = @This();
-        pub allocator: Allocator,  // Make allocator public
+        allocator: Allocator,  // Make allocator public
 
         pub fn init(allocator: Allocator) Self {
             return .{ .allocator = allocator };

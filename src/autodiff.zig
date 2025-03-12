@@ -21,6 +21,7 @@ const BackendType = tensor.BackendType;
 pub const GradRules = struct {
     /// Gradient for add: da = grad_out, db = grad_out
     pub fn add(allocator: Allocator, grad_out: Tensor, a: Tensor, b: Tensor) !struct { da: Tensor, db: Tensor } {
+        _ = allocator; // Unused - we use grad_out.clone() instead
         _ = a; // Unused parameter
         _ = b; // Unused parameter
         
@@ -409,7 +410,7 @@ pub fn AutoDiffPlan(comptime ForwardPlanType: type) type {
 // For each operation plan in ops.zig, we extend it with gradient computation info
 
 /// Extend ops.AddPlan with gradient type information
-pub fn AddPlanWithGrad(comptime Backend: type, comptime T: type, comptime shape: []const usize) type {
+pub fn AddPlanWithGrad(comptime Backend: type, comptime T: type, comptime shape: ?[]const usize) type {
     const BasePlan = ops.AddPlan(Backend, T, shape);
     
     return struct {
@@ -434,7 +435,7 @@ pub fn AddPlanWithGrad(comptime Backend: type, comptime T: type, comptime shape:
 }
 
 /// Extend ops.SubtractPlan with gradient type information
-pub fn SubtractPlanWithGrad(comptime Backend: type, comptime T: type, comptime shape: []const usize) type {
+pub fn SubtractPlanWithGrad(comptime Backend: type, comptime T: type, comptime shape: ?[]const usize) type {
     const BasePlan = ops.SubtractPlan(Backend, T, shape);
     
     return struct {
@@ -459,7 +460,7 @@ pub fn SubtractPlanWithGrad(comptime Backend: type, comptime T: type, comptime s
 }
 
 /// Extend ops.MultiplyPlan with gradient type information
-pub fn MultiplyPlanWithGrad(comptime Backend: type, comptime T: type, comptime shape: []const usize) type {
+pub fn MultiplyPlanWithGrad(comptime Backend: type, comptime T: type, comptime shape: ?[]const usize) type {
     const BasePlan = ops.MultiplyPlan(Backend, T, shape);
     
     return struct {
@@ -484,7 +485,7 @@ pub fn MultiplyPlanWithGrad(comptime Backend: type, comptime T: type, comptime s
 }
 
 /// Extend ops.MatmulPlan with gradient type information
-pub fn MatmulPlanWithGrad(comptime Backend: type, comptime T: type, comptime M: usize, comptime N: usize, comptime P: usize) type {
+pub fn MatmulPlanWithGrad(comptime Backend: type, comptime T: type, comptime M: ?usize, comptime N: ?usize, comptime P: ?usize) type {
     const BasePlan = ops.MatmulPlan(Backend, T, M, N, P);
     
     return struct {
@@ -509,7 +510,7 @@ pub fn MatmulPlanWithGrad(comptime Backend: type, comptime T: type, comptime M: 
 }
 
 /// Extend ops.ReluPlan with gradient type information
-pub fn ReluPlanWithGrad(comptime Backend: type, comptime T: type, comptime shape: []const usize) type {
+pub fn ReluPlanWithGrad(comptime Backend: type, comptime T: type, comptime shape: ?[]const usize) type {
     const BasePlan = ops.ReluPlan(Backend, T, shape);
     
     return struct {
@@ -534,7 +535,7 @@ pub fn ReluPlanWithGrad(comptime Backend: type, comptime T: type, comptime shape
 }
 
 /// Extend ops.SoftmaxPlan with gradient type information
-pub fn SoftmaxPlanWithGrad(comptime Backend: type, comptime T: type, comptime batch_size: usize, comptime feature_size: usize) type {
+pub fn SoftmaxPlanWithGrad(comptime Backend: type, comptime T: type, comptime batch_size: ?usize, comptime feature_size: ?usize) type {
     const BasePlan = ops.SoftmaxPlan(Backend, T, batch_size, feature_size);
     
     return struct {
@@ -559,7 +560,7 @@ pub fn SoftmaxPlanWithGrad(comptime Backend: type, comptime T: type, comptime ba
 }
 
 /// Extend ops.TransposePlan with gradient type information
-pub fn TransposePlanWithGrad(comptime Backend: type, comptime T: type, comptime rows: usize, comptime cols: usize) type {
+pub fn TransposePlanWithGrad(comptime Backend: type, comptime T: type, comptime rows: ?usize, comptime cols: ?usize) type {
     const BasePlan = ops.TransposePlan(Backend, T, rows, cols);
     
     return struct {
@@ -584,7 +585,7 @@ pub fn TransposePlanWithGrad(comptime Backend: type, comptime T: type, comptime 
 }
 
 /// Extend ops.DividePlan with gradient type information
-pub fn DividePlanWithGrad(comptime Backend: type, comptime T: type, comptime shape: []const usize) type {
+pub fn DividePlanWithGrad(comptime Backend: type, comptime T: type, comptime shape: ?[]const usize) type {
     const BasePlan = ops.DividePlan(Backend, T, shape);
     
     return struct {
@@ -609,7 +610,9 @@ pub fn DividePlanWithGrad(comptime Backend: type, comptime T: type, comptime sha
 }
 
 /// Define a plan for embedding lookup operation
-pub fn EmbeddingLookupPlanWithGrad(comptime Backend: type, comptime T: type, comptime vocab_size: usize, comptime embed_dim: usize) type {
+pub fn EmbeddingLookupPlanWithGrad(comptime Backend: type, comptime T: type, comptime vocab_size: ?usize, comptime embed_dim: ?usize) type {
+    _ = Backend; // Used at compile time for consistency with other Plan functions
+    _ = T; // Used at compile time for consistency with other Plan functions
     return struct {
         const Self = @This();
         const InputType = struct { params: Tensor, indices: Tensor };
@@ -1383,7 +1386,7 @@ fn backwardSoftmax(allocator: Allocator, node: *Node) !void {
             try a.initGrad();
             if (a.grad) |*a_grad| {
                 // Use the modern GradRule implementation
-                const da = try GradRules.softmax(f32, allocator, grad, node.tensor, a.tensor);
+                const da = try GradRules.softmax(allocator, grad, node.tensor, a.tensor);
                 
                 // Accumulate the result
                 const temp = try ops.add(allocator, a_grad.*, da);
@@ -1424,6 +1427,7 @@ fn backwardTranspose(allocator: Allocator, node: *Node) !void {
 
 /// Backward pass for embedding lookup
 fn backwardEmbeddingLookup(allocator: Allocator, node: *Node) !void {
+    _ = allocator; // Allocator is used indirectly in lower-level functions
     // This function is kept from the original implementation 
     // because embedding_lookup has complex gradient logic
     
@@ -1547,8 +1551,8 @@ test "autodiff add plan" {
     try b.setScalar(&[_]usize{1, 0}, 7.0);
     try b.setScalar(&[_]usize{1, 1}, 8.0);
     
-    // Create an AddPlan with gradient support using direct ops.AddPlan
-    const PlanType = ops.AddPlan(ops.CpuBackend, f32, &dims);
+    // Create an AddPlan with gradient support using AddPlanWithGrad
+    const PlanType = AddPlanWithGrad(ops.CpuBackend, f32, &dims);
     const AutoDiffType = AutoDiffPlan(PlanType);
     
     var auto_diff = AutoDiffType.init(allocator);
@@ -1615,8 +1619,8 @@ test "autodiff matmul plan" {
     try b.setScalar(&[_]usize{2, 0}, 11.0);
     try b.setScalar(&[_]usize{2, 1}, 12.0);
     
-    // Create a MatmulPlan directly from ops.zig
-    const PlanType = ops.MatmulPlan(ops.CpuBackend, f32, M, N, P);
+    // Create a MatmulPlan with gradient support
+    const PlanType = MatmulPlanWithGrad(ops.CpuBackend, f32, M, N, P);
     const AutoDiffType = AutoDiffPlan(PlanType);
     
     var auto_diff = AutoDiffType.init(allocator);
@@ -1677,8 +1681,8 @@ test "autodiff relu plan" {
     try a.setScalar(&[_]usize{1, 0}, 0.0);
     try a.setScalar(&[_]usize{1, 1}, 3.0);
     
-    // Create a ReluPlan using ops.ReluPlan directly
-    const PlanType = ops.ReluPlan(ops.CpuBackend, f32, &dims);
+    // Create a ReluPlan with gradient support
+    const PlanType = ReluPlanWithGrad(ops.CpuBackend, f32, &dims);
     const AutoDiffType = AutoDiffPlan(PlanType);
     
     var auto_diff = AutoDiffType.init(allocator);
@@ -1729,8 +1733,8 @@ test "autodiff divide plan" {
     try b.setScalar(&[_]usize{1, 0}, 5.0);
     try b.setScalar(&[_]usize{1, 1}, 8.0);
     
-    // Create a DividePlan directly from ops.zig
-    const PlanType = ops.DividePlan(ops.CpuBackend, f32, &dims);
+    // Create a DividePlan with gradient support
+    const PlanType = DividePlanWithGrad(ops.CpuBackend, f32, &dims);
     const AutoDiffType = AutoDiffPlan(PlanType);
     
     var auto_diff = AutoDiffType.init(allocator);
@@ -1813,8 +1817,8 @@ test "autodiff embedding lookup plan" {
     try indices.setScalar(&[_]usize{1, 0}, 3.0);  // batch 1, pos 0: word ID 3
     try indices.setScalar(&[_]usize{1, 1}, 0.0);  // batch 1, pos 1: word ID 0
     
-    // Create an EmbeddingLookupPlan directly from ops.zig
-    const PlanType = ops.EmbeddingLookupPlan(ops.CpuBackend, f32, vocab_size, embed_dim);
+    // Create an EmbeddingLookupPlan with gradient support
+    const PlanType = EmbeddingLookupPlanWithGrad(ops.CpuBackend, f32, vocab_size, embed_dim);
     const AutoDiffType = AutoDiffPlan(PlanType);
     
     var auto_diff = AutoDiffType.init(allocator);

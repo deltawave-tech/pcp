@@ -591,9 +591,9 @@ pub fn MatmulPlan(comptime Backend: type, comptime T: type, comptime M: ?usize, 
             const n = input.a.shape.dims[1];
             const p = input.b.shape.dims[1];
             
-            if (comptime M != null and m != M.?) return OpError.ShapeMismatch;
-            if (comptime N != null and n != N.?) return OpError.ShapeMismatch;
-            if (comptime P != null and p != P.?) return OpError.ShapeMismatch;
+            if (M != null and m != M.?) return OpError.ShapeMismatch;
+            if (N != null and n != N.?) return OpError.ShapeMismatch;
+            if (P != null and p != P.?) return OpError.ShapeMismatch;
 
             // Check dtypes
             if (input.a.dtype != DType.f32 or input.b.dtype != DType.f32) {

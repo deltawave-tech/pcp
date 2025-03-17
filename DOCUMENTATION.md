@@ -26,11 +26,11 @@ A comprehensive guide to the PCP tensor computation framework with automatic dif
 Planetary Compute Protocol (PCP) is a distributed tensor computation framework written in Zig. It provides a foundation for building and training neural networks with proper memory management and automatic differentiation. PCP is designed for performance and memory safety, making it suitable for both research and production environments.
 
 Key features:
-- Pure Zig implementation with no external dependencies
+- Pure Zig implementation with minimal external dependencies
 - Reference-counted tensor management
-- Automatic differentiation with computational graphs
+- Automatic differentiation with compile-time plans
 - Compile-time operation planning and validation
-- Support for CPU computations (with Metal/GPU support in development)
+- Support for CPU and Metal backend computations
 - Memory-safe tensor operations with proper cleanup
 
 ## Architecture Overview
@@ -115,7 +115,7 @@ Key components:
 
 ### Operations Module
 
-The operations module (`ops.zig`) provides mathematical operations on tensors with both a traditional interface and a modern compile-time plan-based approach.
+The operations module (`ops.zig`) provides mathematical operations on tensors using a compile-time plan-based approach.
 
 #### Primitive Operations
 Basic operations implemented by all backends:
@@ -177,16 +177,6 @@ pub fn MatmulPlan(comptime Backend: type, comptime T: type,
         
         // Implementation...
     };
-}
-```
-
-#### Legacy Interface
-Backward compatibility with direct operation functions:
-
-```zig
-/// Matrix multiplication (legacy interface)
-pub fn matmul(allocator: Allocator, a: Tensor, b: Tensor) !Tensor {
-    // Runtime validation and implementation...
 }
 ```
 
@@ -261,18 +251,18 @@ The autodiff module (`autodiff.zig`) provides automatic differentiation capabili
   }
   ```
 
-The key improvements in this design:
+The key features of this design:
 1. Gradient computation is tied directly to the operation that produces it
 2. Each plan type includes its own gradient method
 3. The AutoDiffPlan directly calls the plan's gradient method
 4. Memory management is handled consistently with errdefer for cleanup
 5. The code is more maintainable as adding a new operation only requires implementing one plan type
 
-The project has completely migrated from using a Node-based autodiff approach to this modern Plan-based approach, which offers:
-1. Better compile-time guarantees and type safety
-2. Simplified memory management (no graph to clean up)
-3. Closer integration between operations and their gradient implementations
-4. More natural fit with Zig's compile-time metaprogramming capabilities
+The Plan-based approach offers:
+1. Strong compile-time guarantees and type safety
+2. Simplified memory management with clear ownership
+3. Close integration between operations and their gradient implementations
+4. Natural fit with Zig's compile-time metaprogramming capabilities
 5. Better performance through operation specialization
 
 ### Model Implementation
@@ -348,19 +338,17 @@ Throughout the PCP codebase, several best practices are employed:
 
 1. **Explicit Memory Management**: All resources are tracked and freed appropriately
    ```zig
-   pub fn deinit(self: *Node) void {
-       // Clean up inputs array
-       self.inputs.deinit();
-       
-       // Clean up gradient if it exists
-       if (self.grad) |*g| {
-           g.deinit();
+   pub fn deinit(self: *Plan) void {
+       // Clean up resources
+       if (self.input) |input| {
+           input.deinit();
        }
        
-       // Release the tensor
-       self.tensor.deinit();
+       if (self.output) |*output| {
+           output.deinit();
+       }
        
-       // Free the Node itself
+       // Free the Plan itself if needed
        self.allocator.destroy(self);
    }
    ```
@@ -851,6 +839,8 @@ The project includes several example applications:
 3. **shakespeare_training.zig**: Training a language model on Shakespeare text using the Plan-based approach
 4. **autodiff_test.zig**: Automatic differentiation tests using the Plan-based approach
 5. **comptime_examples.zig**: Examples demonstrating the compile-time planning features
+6. **metal_test.zig**: Test of Metal backend integration with the plan-based architecture
+7. **metal_benchmark.zig**: Performance benchmarks for the Metal backend
 
 These examples demonstrate how to use the framework for real-world tasks and provide templates for building more complex applications.
 

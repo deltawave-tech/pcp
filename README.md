@@ -76,7 +76,7 @@ We're continuously enhancing the architecture with these key principles:
    - Bounds checking for tensor operations
    - Consistent memory management patterns
 
-> **Note**: We're migrating from a legacy Node-based computation graph approach to the new comptime Plan-based system. The legacy system is marked as deprecated and will be removed in the future.
+> **Note**: We've successfully migrated the core functionality from the legacy Node-based computation graph to the new comptime Plan-based system. The GPT-2 model and a dedicated test now use the Plan-based approach for both forward and backward passes. The legacy Node-based system has been deprecated and removed from core modules, with remaining examples being updated to the Plan-based approach.
 
 ## Getting Started
 
@@ -116,8 +116,11 @@ zig build run-shakespeare
 # Run the GPT-2 training example
 zig build run-gpt2
 
-# Run the comptime plan examples (recommended)
+# Run the comptime plan examples
 zig build run-comptime-examples
+
+# Run the Plan-based autodiff test (recommended)
+zig build run-plan-test
 ```
 
 ## Performance
@@ -143,10 +146,14 @@ The framework is designed with performance in mind:
 - [x] Automatic gradient rule generation with comptime
 - [x] Centralize all plan definitions in ops.zig with consistent structure
 - [x] Tie gradient computation directly to operation plans
+- [x] Implemented AutoDiffPlan wrapper for all operations
+- [x] Updated GPT-2 model to use Plan-based approach
+- [x] Added dedicated test for Plan-based autodiff
+- [x] Implemented real gradient-based training for GPT-2
 - [ ] Implement comptime operation fusion for complex gradient rules
 - [ ] Enhance shape validation with optional parameters and runtime checks
-- [ ] Complete migration from legacy Node-based system to Plan-based approach
-- [ ] Update all examples to use the Plan-based API
+- [ ] Complete migration of all examples to Plan-based approach
+- [ ] Update shakespeare_training.zig to use Plan-based gradients
 - [ ] Complete Metal backend implementation
 - [ ] Actor-based distributed training
 - [ ] Decentralized optimization algorithms

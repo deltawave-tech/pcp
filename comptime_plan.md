@@ -45,27 +45,28 @@ Instead of representing operations and gradients as a runtime graph, we'll use Z
    - Defined a standard backend interface that includes primitive operations
    - Created a CpuBackend implementation that adopts the Primitives
 
-### 🔄 Phase 2: Implement Comptime Gradient Generator
+### ✅ Phase 2: Implement Comptime Gradient Generator (Completed)
 
 1. **Gradient Rules**
-   - Define gradient computation rules for each primitive operation
-   - Build a table mapping forward operations to their gradient rules
-   - Implement rules for key operations: add, matmul, relu, etc.
+   - Defined gradient computation rules for each primitive operation
+   - Built direct gradient methods into each operation plan
+   - Implemented rules for key operations: add, subtract, multiply, divide, matmul, relu, softmax, transpose, embedding_lookup
 
 2. **AutoDiffPlan Generator**
-   - Create a comptime function that generates backward passes from forward plans
-   - Analyze Plan types to determine the appropriate gradient rules
-   - Compose gradient operations into a complete backward pass
+   - Created the `AutoDiffPlan` function that wraps forward plans with backward capabilities
+   - Ensured AutoDiffPlan tracks the inputs/outputs needed for gradient computation
+   - Built a consistent interface for all operations through WithGrad wrappers
 
 3. **Integration with ops.zig**
-   - Ensure backward passes reuse the same primitive operations
-   - Maintain consistent interfaces between forward and backward passes
+   - Made backward passes reuse the same primitive operations
+   - Established consistent interfaces between forward and backward passes
    - Support both runtime and comptime shape information
+   - Created WithGrad wrappers for all operation plans
 
 4. **Memory Management**
-   - Ensure proper cleanup of intermediate tensors during gradient computation
-   - Maintain reference counting for tensors through forward and backward passes
-   - Use errdefer for clean error handling in gradient computation
+   - Implemented proper cleanup of intermediate tensors during gradient computation
+   - Added reference tracking for tensors through forward and backward passes
+   - Used errdefer for clean error handling in gradient computation
 
 ### 🔜 Phase 3: Update Tensor and Backend Support
 
@@ -84,18 +85,21 @@ Instead of representing operations and gradients as a runtime graph, we'll use Z
    - Implement operation fusion where beneficial
    - Use comptime to generate optimized kernels
 
-### 🔜 Phase 4: Examples and Testing
+### 🔄 Phase 4: Examples and Testing (In Progress)
 
 1. **Update Examples**
-   - Adapt example code to use the new plan-based approach with autodiff
-   - Demonstrate benefits in terms of performance and safety
-   - Provide clear usage patterns for new developers
+   - ✅ Created dedicated Plan-based test showing full forward/backward functionality
+   - ✅ Updated GPT-2 model implementation to use Plan-based approach
+   - ✅ Added real gradient-based training to GPT-2 training example
+   - 🔄 Continue adapting remaining examples to the Plan-based approach
+   - 🔄 Update shakespeare_training.zig to use Plan-based gradients
 
 2. **Testing**
-   - Add comprehensive tests for all plan types and their gradients
-   - Test gradient computations against numerical gradients
-   - Ensure compatibility across backends
-   - Validate memory safety during forward and backward passes
+   - ✅ Added tests for core plan types and their gradients
+   - ✅ Implemented proper test for Plan-based autodiff with various operations
+   - ✅ Verified memory safety during forward and backward passes
+   - 🔄 Expand testing coverage to all operations
+   - 🔄 Add cross-backend compatibility testing
 
 ## Implementation Details
 
@@ -334,6 +338,88 @@ This approach provides:
 3. **SIMD Utilization**: Backends can use SIMD instructions for primitives
 4. **Distribution**: Plans can include sharding strategies for distributed execution
 
+## New AutoDiffPlan Implementation
+
+One of the key new concepts introduced in our implementation is the AutoDiffPlan wrapper:
+
+```zig
+/// AutoDiffPlan wraps a forward plan and provides backward functionality
+pub fn AutoDiffPlan(comptime ForwardPlanType: type) type {
+    // Comptime validation
+    comptime {
+        if (!@hasDecl(ForwardPlanType, "GradType")) {
+            @compileError("Forward plan must define GradType for autodiff");
+        }
+        if (!@hasDecl(ForwardPlanType, "op_type")) {
+            @compileError("Forward plan must define op_type for autodiff");
+        }
+    }
+    
+    return struct {
+        const Self = @This();
+        
+        // The forward plan
+        forward_plan: ForwardPlanType,
+        
+        // Keep track of input and output for backward pass
+        last_input: ?ForwardPlanType.InputType = null,
+        last_output: ?Tensor = null,
+        
+        allocator: Allocator,
+        
+        pub fn init(allocator: Allocator) Self {
+            return .{
+                .forward_plan = ForwardPlanType.init(allocator),
+                .allocator = allocator,
+            };
+        }
+        
+        pub fn deinit(self: *Self) void {
+            if (self.last_output != null) {
+                self.last_output.?.deinit();
+                self.last_output = null;
+            }
+        }
+        
+        /// Forward pass: run the forward plan and cache inputs/outputs for backward
+        pub fn forward(self: *Self, input: ForwardPlanType.InputType) !Tensor {
+            // Run the forward plan
+            const output = try self.forward_plan.run(input);
+            
+            // Clean up previous output if it exists
+            if (self.last_output != null) {
+                self.last_output.?.deinit();
+            }
+            
+            // Store input and output
+            self.last_input = input;
+            self.last_output = try output.clone();
+            
+            return output;
+        }
+        
+        /// Backward pass: compute gradients with respect to inputs
+        pub fn backward(self: *Self, grad_out: Tensor) !ForwardPlanType.GradType {
+            // Ensure we have inputs and outputs from a previous forward pass
+            if (self.last_input == null or self.last_output == null) {
+                return error.NoPreviousForward;
+            }
+            
+            // Call the plan's gradient method directly
+            return try self.forward_plan.gradient(grad_out, self.last_input.?);
+        }
+    };
+}
+```
+
+This wrapper provides several key advantages:
+
+1. **Automatic input/output tracking** - Stores the inputs and outputs needed for gradient computation
+2. **Memory safety** - Properly handles tensor lifetimes and cleanup
+3. **Simplified interface** - Provides a consistent backward() method for all operation types
+4. **Compile-time validation** - Ensures all plans have the necessary gradient information
+5. **Clear separation of concerns** - Plans provide gradient rules, wrapper handles tracking
+
 ## Conclusion
 
 The comptime Plan-based approach offers significant advantages over a runtime UOp graph:
@@ -343,3 +429,5 @@ The comptime Plan-based approach offers significant advantages over a runtime UO
 3. Simplified runtime logic with minimal overhead
 4. Elegant architecture leveraging Zig's unique strengths
 5. Maintainable codebase with clear separation of concerns
+6. Consistent interface for gradient computation
+7. Proper memory management with explicit tensor lifetimes

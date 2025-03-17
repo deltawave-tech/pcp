@@ -518,6 +518,7 @@ pub fn main() !void {
                 // First make a copy of the input tensor to avoid ownership issues
                 var input_dims = [_]usize{ batch.inputs.shape.dims[0], batch.inputs.shape.dims[1] };
                 var input_copy = try Tensor.zeros(allocator, &input_dims, batch.inputs.dtype, batch.inputs.backend);
+                errdefer input_copy.deinit(); // Ensure cleanup on error
                 
                 // Copy data from batch.inputs to input_copy
                 const input_copy_buf = ptrCastHelper([*]f32, input_copy.buffer.data.ptr)[0..input_copy.shape.elemCount()];
@@ -528,10 +529,12 @@ pub fn main() !void {
                 
                 // Wrap forward pass in a simpler try statement, with a fallback on catch
                 logits = blk: {
-                    // First try the real model
-                    const result = model.forward(input_copy) catch {
-                        // On error, free input_copy to prevent memory leak
-                        input_copy.deinit();
+                    // First try the real model - create a clone to avoid ownership issues
+                    var input_clone = try input_copy.clone();
+                    defer input_copy.deinit(); // Always free the original copy
+                    
+                    const result = model.forward(input_clone) catch {
+                        input_clone.deinit(); // Free the clone on error
                         
                         // Fall back to a dummy tensor
                         std.debug.print("Error in model forward pass, falling back to dummy tensor\n", .{});
@@ -544,8 +547,8 @@ pub fn main() !void {
                         break :blk fallback_tensor;
                     };
                     
-                    // If we get here, model.forward() succeeded, but input_copy is now owned by the model
-                    // and should not be freed here (the model handles cleanup).
+                    // If we get here, model.forward() succeeded. The model now owns input_clone,
+                    // but we've already freed input_copy.
                     break :blk result;
                 };
             }

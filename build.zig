@@ -49,7 +49,7 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run unit tests");
     for (test_targets) |t_target| {
         // Add unit tests
-        inline for (.{ "src/tensor.zig", "src/autodiff.zig", "src/ops.zig" }) |module| {
+        inline for (.{ "src/tensor.zig", "src/autodiff.zig", "src/ops.zig", "src/prop_tests.zig" }) |module| {
             const unit_tests = b.addTest(.{
                 .root_source_file = b.path(module),
                 .target = b.resolveTargetQuery(t_target),
@@ -419,4 +419,16 @@ pub fn build(b: *std.Build) void {
 
     const run_plan_test_step = b.step("run-plan-test", "Run the Plan-based autodiff test");
     run_plan_test_step.dependOn(&run_plan_test_cmd.step);
+
+    // Property-based testing step
+    const prop_tests = b.addTest(.{
+        .root_source_file = b.path("src/prop_tests.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    
+    const run_prop_tests = b.addRunArtifact(prop_tests);
+    
+    const run_prop_tests_step = b.step("run-prop-tests", "Run property-based tests for tensor operations");
+    run_prop_tests_step.dependOn(&run_prop_tests.step);
 }

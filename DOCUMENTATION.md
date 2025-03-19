@@ -200,7 +200,7 @@ The autodiff module (`autodiff.zig`) provides automatic differentiation capabili
           
           /// Compute gradients for add operation: da = grad_out, db = grad_out
           pub fn gradient(self: @This(), grad_out: Tensor, _: InputType) !GradType {
-              _ = self; // Not used
+              const allocator = self.base.allocator;
               
               // Both inputs receive the same gradient
               var da = try grad_out.clone();
@@ -208,6 +208,60 @@ The autodiff module (`autodiff.zig`) provides automatic differentiation capabili
               
               var db = try grad_out.clone();
               errdefer db.deinit();
+              
+              return .{ .da = da, .db = db };
+          }
+      };
+  }
+  ```
+
+- **More Complex Gradient Example**: For operations like division, gradients follow proper calculus rules:
+  ```zig
+  pub fn DividePlan(comptime Backend: type, comptime T: type, comptime shape: ?[]const usize) type {
+      // Comptime validation...
+      return struct {
+          pub const InputType = struct { a: Tensor, b: Tensor };
+          pub const op_type = OpType.divide;
+          pub const GradType = struct { da: Tensor, db: Tensor };
+          
+          const Base = PlanType(Backend, InputType, Tensor);
+          base: Base,
+          
+          // Implementation...
+          
+          /// Compute gradients for divide: da = grad_out / b, db = -grad_out * a / (b * b)
+          pub fn gradient(self: @This(), grad_out: Tensor, input: InputType) !GradType {
+              const allocator = self.base.allocator;
+              
+              // Input a gradient is element-wise division of grad_out by b
+              var da = try divide(allocator, grad_out, input.b);
+              errdefer da.deinit();
+              
+              // Input b gradient is more complex: -grad_out * a / (b * b)
+              // First calculate b^2
+              var b_squared = try multiply(allocator, input.b, input.b);
+              errdefer b_squared.deinit();
+              
+              // Calculate a / b^2
+              var a_div_b_squared = try divide(allocator, input.a, b_squared);
+              errdefer a_div_b_squared.deinit();
+              
+              // Multiply by grad_out
+              var temp = try multiply(allocator, grad_out, a_div_b_squared);
+              errdefer temp.deinit();
+              
+              // Negate the result
+              const negative_one = try Tensor.filled(allocator, temp.shape.dims, temp.dtype, -1.0, temp.backend);
+              errdefer negative_one.deinit();
+              
+              var db = try multiply(allocator, temp, negative_one);
+              errdefer db.deinit();
+              
+              // Clean up temporaries
+              b_squared.deinit();
+              a_div_b_squared.deinit();
+              temp.deinit();
+              negative_one.deinit();
               
               return .{ .da = da, .db = db };
           }
@@ -240,12 +294,15 @@ The autodiff module (`autodiff.zig`) provides automatic differentiation capabili
           
           // Methods for forward and backward passes...
           
-          /// Comptime function to compute gradients
-          fn computeGradient(self: *Self, grad_out: Tensor) !ForwardPlanType.GradType {
-              const input = self.last_input.?;
+          /// Backward pass: compute gradients with respect to inputs
+          pub fn backward(self: *Self, grad_out: Tensor) !ForwardPlanType.GradType {
+              // Ensure we have inputs and outputs from a previous forward pass
+              if (self.last_input == null or self.last_output == null) {
+                  return error.NoPreviousForward;
+              }
               
-              // Use the plan's gradient method directly
-              return try self.forward_plan.gradient(grad_out, input);
+              // Call the plan's gradient method directly
+              return try self.forward_plan.gradient(grad_out, self.last_input.?);
           }
       };
   }
@@ -253,7 +310,7 @@ The autodiff module (`autodiff.zig`) provides automatic differentiation capabili
 
 The key features of this design:
 1. Gradient computation is tied directly to the operation that produces it
-2. Each plan type includes its own gradient method
+2. Each plan type includes its own gradient method following correct calculus rules
 3. The AutoDiffPlan directly calls the plan's gradient method
 4. Memory management is handled consistently with errdefer for cleanup
 5. The code is more maintainable as adding a new operation only requires implementing one plan type
@@ -264,6 +321,7 @@ The Plan-based approach offers:
 3. Close integration between operations and their gradient implementations
 4. Natural fit with Zig's compile-time metaprogramming capabilities
 5. Better performance through operation specialization
+6. Proper implementation of mathematical gradient rules for each operation
 
 ### Model Implementation
 
@@ -582,7 +640,9 @@ var autodiff_op = MatmulWithGrad.init(allocator);
 
 #### Direct Gradient Methods in Plans
 
-The improved design directly includes gradient computation in each plan:
+All operation plans include their own gradient computation methods. Here are two examples showing how different mathematical operations implement their gradient calculations:
+
+##### Matrix Multiplication Gradients
 
 ```zig
 pub fn MatmulPlan(comptime Backend: type, comptime T: type, 
@@ -598,27 +658,29 @@ pub fn MatmulPlan(comptime Backend: type, comptime T: type,
         pub const op_type = OpType.matmul;
         pub const GradType = struct { da: Tensor, db: Tensor };
         
+        const Base = PlanType(Backend, InputType, Tensor);
+        base: Base,
+        
         // ... implementation of run() method ...
         
         /// Compute gradients for matmul: da = grad_out @ b^T, db = a^T @ grad_out
         pub fn gradient(self: @This(), grad_out: Tensor, input: InputType) !GradType {
-            const a = input.a;
-            const b = input.b;
+            const allocator = self.base.allocator;
             
             // Compute b transpose
-            const b_transpose = try ops.transpose(self.allocator, b);
+            const b_transpose = try transpose(allocator, input.b);
             errdefer b_transpose.deinit();
             
             // Gradient for a is grad_out @ b^T
-            var da = try ops.matmul(self.allocator, grad_out, b_transpose);
+            var da = try matmul(allocator, grad_out, b_transpose);
             errdefer da.deinit();
             
             // Compute a transpose
-            const a_transpose = try ops.transpose(self.allocator, a);
+            const a_transpose = try transpose(allocator, input.a);
             errdefer a_transpose.deinit();
             
             // Gradient for b is a^T @ grad_out
-            var db = try ops.matmul(self.allocator, a_transpose, grad_out);
+            var db = try matmul(allocator, a_transpose, grad_out);
             errdefer db.deinit();
             
             // Clean up temporaries
@@ -631,9 +693,69 @@ pub fn MatmulPlan(comptime Backend: type, comptime T: type,
 }
 ```
 
+##### Division Gradients
+
+```zig
+pub fn DividePlan(comptime Backend: type, comptime T: type, comptime shape: ?[]const usize) type {
+    // Comptime validation
+    comptime {
+        if (!Backend.hasPrimitive("divide")) @compileError("Backend must implement divide primitive");
+        if (T != f32) @compileError("Only f32 supported for now");
+    }
+    
+    return struct {
+        pub const InputType = struct { a: Tensor, b: Tensor };
+        pub const op_type = OpType.divide;
+        pub const GradType = struct { da: Tensor, db: Tensor };
+        
+        const Base = PlanType(Backend, InputType, Tensor);
+        base: Base,
+        
+        // ... implementation of run() method ...
+        
+        /// Compute gradients for divide: da = grad_out / b, db = -grad_out * a / (b * b)
+        pub fn gradient(self: @This(), grad_out: Tensor, input: InputType) !GradType {
+            const allocator = self.base.allocator;
+            
+            // Input a gradient is element-wise division of grad_out by b
+            var da = try divide(allocator, grad_out, input.b);
+            errdefer da.deinit();
+            
+            // Input b gradient is more complex: -grad_out * a / (b * b)
+            // First calculate b^2
+            var b_squared = try multiply(allocator, input.b, input.b);
+            errdefer b_squared.deinit();
+            
+            // Calculate a / b^2
+            var a_div_b_squared = try divide(allocator, input.a, b_squared);
+            errdefer a_div_b_squared.deinit();
+            
+            // Multiply by grad_out
+            var temp = try multiply(allocator, grad_out, a_div_b_squared);
+            errdefer temp.deinit();
+            
+            // Negate the result
+            const negative_one = try Tensor.filled(allocator, temp.shape.dims, temp.dtype, -1.0, temp.backend);
+            errdefer negative_one.deinit();
+            
+            var db = try multiply(allocator, temp, negative_one);
+            errdefer db.deinit();
+            
+            // Clean up temporaries
+            b_squared.deinit();
+            a_div_b_squared.deinit();
+            temp.deinit();
+            negative_one.deinit();
+            
+            return .{ .da = da, .db = db };
+        }
+    };
+}
+```
+
 #### Simplified Autodiff Backward
 
-The AutoDiffPlan's backward method now directly calls the plan's gradient method:
+The AutoDiffPlan's backward method directly calls the plan's gradient method, providing a consistent interface:
 
 ```zig
 /// Backward pass: compute gradients with respect to inputs
@@ -654,6 +776,8 @@ This approach ensures:
 3. The gradient implementation is directly tied to the operation itself
 4. Type safety is maintained throughout the system
 5. New operations can be added consistently by implementing a single plan type
+6. Mathematical gradient rules are correctly implemented for each operation type
+7. Memory management is handled consistently across all operations
 
 ## Zig Version
 
@@ -832,17 +956,29 @@ This approach provides:
 
 ### Project Examples
 
-The project includes several example applications:
+The project includes several example applications that demonstrate how to use the framework:
 
-1. **plan_based_test.zig**: Dedicated test of the Plan-based autodiff approach
-2. **gpt2_training.zig**: GPT-2 implementation with Plan-based training
-3. **shakespeare_training.zig**: Training a language model on Shakespeare text using the Plan-based approach
-4. **autodiff_test.zig**: Automatic differentiation tests using the Plan-based approach
-5. **comptime_examples.zig**: Examples demonstrating the compile-time planning features
-6. **metal_test.zig**: Test of Metal backend integration with the plan-based architecture
-7. **metal_benchmark.zig**: Performance benchmarks for the Metal backend
+1. **plan_based_test.zig**: Dedicated test of the Plan-based autodiff approach - this example shows a simple neural network using plans for all operations and demonstrates both forward and backward passes.
 
-These examples demonstrate how to use the framework for real-world tasks and provide templates for building more complex applications.
+2. **gpt2_training.zig**: Complete GPT-2 implementation with Plan-based training - shows how to implement a state-of-the-art transformer model using the framework, including gradient-based training.
+
+3. **shakespeare_training.zig**: Training a language model on Shakespeare text using the Plan-based approach - demonstrates how to load data, train a model, and generate text.
+
+4. **autodiff_test.zig**: Comprehensive automatic differentiation tests using the Plan-based approach - includes tests for various operations like addition, multiplication, division, matmul, ReLU, and embedding lookups.
+
+5. **comptime_examples.zig**: Examples demonstrating the compile-time planning features - shows basic operations with compile-time shapes and how to use autodiff with these operations.
+
+6. **metal_test.zig**: Test of Metal backend integration with the plan-based architecture - demonstrates how the framework can be extended to new hardware backends.
+
+7. **metal_benchmark.zig**: Performance benchmarks for the Metal backend - shows how to benchmark operations across different backends.
+
+Each example builds upon the Plan-based approach to automatic differentiation and demonstrates proper memory management, error handling, and gradient computation. Together, they showcase how the framework can be used for everything from simple neural networks to complex language models with proper gradient-based training.
+
+For new users, the recommended learning path is:
+1. Start with `comptime_examples.zig` to understand the basic operations
+2. Move to `plan_based_test.zig` to see how autodiff works
+3. Explore `autodiff_test.zig` to understand more complex operations and their gradients
+4. Finally examine the practical applications in `shakespeare_training.zig` and `gpt2_training.zig`
 
 ---
 

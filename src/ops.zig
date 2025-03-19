@@ -565,6 +565,43 @@ pub fn DividePlan(comptime Backend: type, comptime T: type, comptime shape: ?[]c
             return .{ .base = Base.init(allocator) };
         }
 
+        /// Compute gradients for divide: da = grad_out / b, db = -grad_out * a / (b * b)
+        pub fn gradient(self: @This(), grad_out: Tensor, input: InputType) !GradType {
+            const allocator = self.base.allocator;
+            
+            // Input a gradient is element-wise division of grad_out by b
+            var da = try divide(allocator, grad_out, input.b);
+            errdefer da.deinit();
+            
+            // Input b gradient is more complex: -grad_out * a / (b * b)
+            // First calculate b^2
+            var b_squared = try multiply(allocator, input.b, input.b);
+            errdefer b_squared.deinit();
+            
+            // Calculate a / b^2
+            var a_div_b_squared = try divide(allocator, input.a, b_squared);
+            errdefer a_div_b_squared.deinit();
+            
+            // Multiply by grad_out
+            var temp = try multiply(allocator, grad_out, a_div_b_squared);
+            errdefer temp.deinit();
+            
+            // Negate the result
+            const negative_one = try Tensor.filled(allocator, temp.shape.dims, temp.dtype, -1.0, temp.backend);
+            errdefer negative_one.deinit();
+            
+            var db = try multiply(allocator, temp, negative_one);
+            errdefer db.deinit();
+            
+            // Clean up temporaries
+            b_squared.deinit();
+            a_div_b_squared.deinit();
+            temp.deinit();
+            negative_one.deinit();
+            
+            return .{ .da = da, .db = db };
+        }
+
         pub fn run(self: @This(), input: InputType) !Tensor {
             // Runtime shape check
             if (!input.a.shape.eql(input.b.shape)) {

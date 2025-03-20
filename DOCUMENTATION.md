@@ -788,47 +788,55 @@ PCP includes a state-of-the-art property-based testing framework to verify the c
 
 The property-based testing framework in `prop_tests.zig` follows these sophisticated principles:
 
-1. **Enhanced Random Tensor Generation**: Generate tensors with random values, dimensions, and data types to test operations across a wide range of inputs.
+1. **Enhanced Random Tensor Generation**: Generate tensors with random values, dimensions, and data types (including f16, f32, f64, i32, i64, and bool) to test operations across a wide range of inputs.
 2. **Mathematical Property Verification**: Test invariant properties that should hold for all valid inputs (e.g., commutativity, distributivity).
-3. **Rigorous Gradient Verification**: Verify gradients both analytically and numerically using finite differences.
-4. **Input Shrinking**: When tests fail, attempt to find minimal failing inputs.
-5. **Comprehensive Error Reporting**: Detailed error information to help diagnose test failures.
+3. **Rigorous Gradient Verification**: Verify gradients both analytically and numerically using finite differences with adaptive epsilon scaling.
+4. **Advanced Input Shrinking**: When tests fail, attempt to find minimal failing inputs using multiple strategies:
+   - Dimension reduction to find the smallest tensor shape that fails
+   - Value simplification to identify problematic values (zeros, small values, etc.)
+   - Single value targeting to isolate individual elements causing failures
+5. **Comprehensive Error Reporting**: Detailed error information including maximum absolute/relative differences, data types, and value comparisons to help diagnose test failures.
 6. **Multiple Test Iterations**: Run each test multiple times with different random inputs to improve coverage.
-7. **Configurable Testing Parameters**: Easily adjust iterations, seed values, and verbosity.
+7. **Fully Configurable Testing**: Control all aspects including epsilon values, edge case probability, iteration count, and more.
+8. **Performance Measurement**: Optional timing of tests to identify performance regressions.
 
 #### Enhanced Random Tensor Generators
 
-The framework includes sophisticated tensor generators that support variable dimensions, multiple data types, and edge cases:
+The framework includes sophisticated tensor generators that support variable dimensions, multiple data types (f16, f32, f64, i32, i64, and bool), and edge cases. All generator functions use a consistent configuration-based approach:
 
 ```zig
-/// Generates a random tensor with the specified shape constraints
-/// max_dim limits the maximum size of each dimension
-/// max_rank specifies the maximum number of dimensions (default is 2)
-/// include_edge_cases determines whether to include special cases
-/// dtype specifies the data type (default is f32)
+/// Generates a random tensor with the specified shape constraints and configuration
 pub fn randomTensor(
     allocator: Allocator, 
     rnd: *std.Random, 
-    max_dim: usize, 
-    max_rank: ?usize,
-    include_edge_cases: ?bool,
+    config: PropertyTestConfig,
     dtype: ?DType
 ) !Tensor {
-    const rank = if (max_rank) |mr| rnd.intRangeAtMost(usize, 1, mr) else 2;
-    const edge_cases = include_edge_cases orelse false;
-    const data_type = dtype orelse .f32;
+    const rank = rnd.intRangeAtMost(usize, 1, config.max_rank);
+    const data_type = dtype orelse blk: {
+        // Choose a random data type from available options
+        const types = [_]DType{ .f32, .f16, .f64, .i32, .i64, .bool };
+        const type_idx = rnd.intRangeAtMost(usize, 0, types.len - 1);
+        break :blk types[type_idx];
+    };
     
     // Prepare a buffer for dimensions
     var shape_buffer: [4]usize = undefined;
     
-    // Generate random dimensions for each axis including edge cases
+    // Generate random dimensions for each axis
+    var has_zero_dim = false;
     for (0..rank) |i| {
-        if (edge_cases and rnd.float(f32) < 0.1) {
-            // 10% chance of single-element dimension (1)
+        // Empty dimensions support (0xN tensors)
+        if (config.enable_empty_tensors and rnd.float(f32) < 0.05) {
+            // 5% chance of empty dimension (0) if enabled
+            shape_buffer[i] = 0;
+            has_zero_dim = true;
+        } else if (rnd.float(f32) < config.edge_case_probability) {
+            // Single-element dimension (1) with configurable probability
             shape_buffer[i] = 1;
         } else {
             // Otherwise, random dimension between 1 and max_dim
-            shape_buffer[i] = rnd.intRangeAtMost(usize, 1, max_dim);
+            shape_buffer[i] = rnd.intRangeAtMost(usize, 1, config.max_dim);
         }
     }
     
@@ -836,33 +844,115 @@ pub fn randomTensor(
     var tensor_obj = try Tensor.zeros(allocator, shape_buffer[0..rank], data_type, .cpu);
     errdefer tensor_obj.deinit();
     
-    // Fill with type-specific random values
-    switch (data_type) {
-        .f32 => {
-            const buf = ptrCastHelper([*]f32, tensor_obj.buffer.data.ptr)[0..tensor_obj.shape.elemCount()];
-            for (buf) |*x| {
-                x.* = rnd.float(f32) * 2.0 - 1.0; // Random value between -1.0 and 1.0
-            }
-        },
-        .i32 => {
-            const buf = ptrCastHelper([*]i32, tensor_obj.buffer.data.ptr)[0..tensor_obj.shape.elemCount()];
-            for (buf) |*x| {
-                x.* = rnd.intRangeLessThan(i32, -100, 100); // Random integers
-            }
-        },
-        // Other data types supported similarly
-        else => {},
+    // Fill with random values of appropriate type
+    if (!has_zero_dim) {
+        switch (data_type) {
+            .f32 => {
+                const buf = ptrCastHelper([*]f32, tensor_obj.buffer.data.ptr)[0..tensor_obj.shape.elemCount()];
+                for (buf) |*x| {
+                    x.* = rnd.float(f32) * 2.0 - 1.0; // Random value between -1.0 and 1.0
+                }
+            },
+            .f16 => {
+                const buf = ptrCastHelper([*]u16, tensor_obj.buffer.data.ptr)[0..tensor_obj.shape.elemCount()];
+                for (buf) |*x| {
+                    x.* = f32ToF16Bits(rnd.float(f32) * 2.0 - 1.0); // Convert from f32 to f16 bits
+                }
+            },
+            .f64 => {
+                const buf = ptrCastHelper([*]f64, tensor_obj.buffer.data.ptr)[0..tensor_obj.shape.elemCount()];
+                for (buf) |*x| {
+                    x.* = rnd.float(f64) * 2.0 - 1.0; // Random value between -1.0 and 1.0
+                }
+            },
+            .i32 => {
+                const buf = ptrCastHelper([*]i32, tensor_obj.buffer.data.ptr)[0..tensor_obj.shape.elemCount()];
+                for (buf) |*x| {
+                    x.* = rnd.intRangeLessThan(i32, -100, 100); // Random integers
+                }
+            },
+            .i64 => {
+                const buf = ptrCastHelper([*]i64, tensor_obj.buffer.data.ptr)[0..tensor_obj.shape.elemCount()];
+                for (buf) |*x| {
+                    x.* = rnd.intRangeLessThan(i64, -100, 100); // Random integers
+                }
+            },
+            .bool => {
+                const buf = ptrCastHelper([*]u8, tensor_obj.buffer.data.ptr)[0..tensor_obj.shape.elemCount()];
+                for (buf) |*x| {
+                    x.* = if (rnd.float(f32) < 0.5) 0 else 1; // Random boolean
+                }
+            },
+        }
+    }
+    
+    // Apply shrinking if active
+    if (shrinking_state.is_shrinking) {
+        applyShrinking(&tensor_obj);
     }
     
     return tensor_obj;
 }
 ```
 
-Similar generators are available for tensor pairs and trios with compatible shapes for operations like addition and matrix multiplication.
+The framework includes similar generators for tensor pairs and trios with compatible shapes:
+
+```zig
+/// Generates a pair of tensors with identical shapes
+pub fn randomTensorPair(allocator: Allocator, rnd: *std.Random, config: PropertyTestConfig, dtype: ?DType) !struct { a: Tensor, b: Tensor };
+
+/// Generates a trio of tensors with compatible shapes for matrix multiplication
+pub fn randomMatmulTrio(allocator: Allocator, rnd: *std.Random, config: PropertyTestConfig, dtype: ?DType) !struct { a: Tensor, b: Tensor, c: Tensor };
+```
+
+The MatmulTrio generator creates tensors with shapes suitable for matrix multiplication chains (m×n, n×p, p×q), addressing both basic cases and edge cases that could expose numerical errors.
+
+#### Extensive Configuration Options
+
+The testing framework is highly configurable through the `PropertyTestConfig` struct:
+
+```zig
+pub const PropertyTestConfig = struct {
+    /// Number of test iterations to run
+    iterations: usize = 50,
+    
+    /// Seed for random number generation (null for time-based seed)
+    seed: ?u64 = null,
+    
+    /// Enable verbose output
+    verbose: bool = false,
+    
+    /// Default epsilon (absolute error tolerance) for floating point comparisons
+    epsilon: f32 = 1e-5,
+    
+    /// Epsilon for matrix multiplication tests (needs to be larger due to accumulated error)
+    matmul_epsilon: f32 = 1e-4,
+    
+    /// Epsilon for finite difference tests (needs to be larger due to numerical approximation)
+    finite_diff_epsilon: f32 = 1e-2,
+    
+    /// Enable performance testing
+    measure_performance: bool = false,
+    
+    /// Enable empty tensor testing (may cause alignment issues in some operations)
+    enable_empty_tensors: bool = false,
+    
+    /// Maximum tensor rank to test (number of dimensions)
+    max_rank: usize = 4,
+    
+    /// Maximum size for tensor dimensions
+    max_dim: usize = 5,
+    
+    /// Control the percentage of edge cases in generated tensors
+    edge_case_probability: f32 = 0.1,
+};
+```
+
+Different configurations are used for standard tests, gradient verification tests, and performance tests, ensuring that each test type uses appropriate parameters for its requirements.
 
 #### Advanced Property Tests
 
-The framework verifies a comprehensive set of mathematical properties for tensor operations:
+The framework verifies a comprehensive set of mathematical properties for tensor operations, now with enhanced configurability and data type support:
 
 ```zig
 /// Check property: A + B = B + A (commutativity of addition)
@@ -981,192 +1071,344 @@ pub fn printTensorErrorReport(error_info: TensorComparisonError) void {
 }
 ```
 
-#### Finite Difference Gradient Verification
+#### Advanced Finite Difference Gradient Verification
 
-One of the most advanced features is numerical gradient verification using finite differences:
+The framework includes a sophisticated gradient verification system with support for different data types, adaptive epsilon scaling, and multi-operation tests:
 
 ```zig
-/// Helper function to calculate a numerical approximation of gradients using finite differences
+/// Advanced finite difference implementation with support for multiple data types
 pub fn finiteDifference(
     allocator: Allocator, 
     op: anytype, 
     input: Tensor, 
-    epsilon: f32
+    epsilon: f32,
+    reduction_method: enum { sum, mean, none } 
 ) !Tensor {
     // Compute the forward result of the operation
     const forward = try op.forward(input);
     defer forward.deinit();
     
-    // Create a result tensor to store the gradients
-    var grad = try Tensor.zeros(allocator, input.shape.dims, .f32, .cpu);
+    // Create a result tensor with same shape and dtype as the input
+    var grad = try Tensor.zeros(allocator, input.shape.dims, input.dtype, .cpu);
     errdefer grad.deinit();
     
-    // For each element in the input tensor
-    for (0..input.shape.elemCount()) |i| {
-        // Save the original value
-        const orig_val = input_buf[i];
-        
-        // Perturb the input by epsilon
-        input_buf[i] = orig_val + epsilon;
-        
-        // Compute the perturbed output
-        const perturbed_forward = try op.forward(input);
-        defer perturbed_forward.deinit();
-        
-        // Compute the numerical gradient (df/dx ≈ [f(x+ε) - f(x)]/ε)
-        var diff_sum: f32 = 0.0;
-        for (forward_buf, perturbed_buf) |orig, pert| {
-            diff_sum += pert - orig;
-        }
-        
-        grad_buf[i] = diff_sum / epsilon;
-        
-        // Restore the original value
-        input_buf[i] = orig_val;
+    // Handle different data types
+    switch (input.dtype) {
+        .f32 => try finiteDifferenceSpecific(f32, allocator, op, input, forward, epsilon, reduction_method, &grad),
+        .f16 => {
+            // For f16, we compute in f32 precision for stability
+            var f32_input = try convertTensorToF32(allocator, input);
+            defer f32_input.deinit();
+            
+            var f32_grad = try Tensor.zeros(allocator, input.shape.dims, .f32, .cpu);
+            defer f32_grad.deinit();
+            
+            var f32_op_adapter = F32OperationAdapter{ .op = op };
+            try finiteDifferenceSpecific(f32, allocator, &f32_op_adapter, f32_input, forward, epsilon, reduction_method, &f32_grad);
+            
+            // Convert back to f16
+            try convertF32ToTensor(f32_grad, &grad);
+        },
+        .f64 => try finiteDifferenceSpecific(f64, allocator, op, input, forward, epsilon, reduction_method, &grad),
+        // Additional data types supported similarly
+        else => return error.UnsupportedDataTypeForFiniteDifference,
     }
     
     return grad;
 }
 
-/// Check gradient correctness using finite differences
-pub fn checkGradientWithFiniteDifferences(allocator: Allocator, rnd: *std.Random) !void {
-    // Create a test tensor
-    var test_tensor = try randomTensor(allocator, rnd, 4, 2, false, .f32);
+/// Test gradient verification for multiple operations and data types
+fn checkGradientWithFiniteDifferences(allocator: Allocator, rnd: *std.Random) !void {
+    // Use configuration from shrinking state or default
+    var config = if (shrinking_state.is_shrinking) shrinking_state.config else default_config;
+    
+    // Create tensor with various data types for testing
+    const test_dtype = blk: {
+        const dtypes = [_]DType{ .f32, .f16, .f64 };
+        const idx = rnd.uintLessThan(usize, dtypes.len);
+        break :blk dtypes[idx];
+    };
+    
+    var test_tensor = try randomTensor(
+        allocator, 
+        rnd,
+        config,
+        test_dtype
+    );
     defer test_tensor.deinit();
     
-    // Set up a test operation (ReLU)
-    const ReluPlanType = autodiff.ReluPlanWithGrad(ops.CpuBackend, f32, null);
-    var relu_plan = autodiff.AutoDiffPlan(ReluPlanType).init(allocator);
-    defer relu_plan.deinit();
+    // Skip test for empty tensors
+    if (test_tensor.shape.elemCount() == 0) return;
     
-    // Get gradient from autodiff
-    const autodiff_grad = /* ... */;
+    // Apply shrinking if active
+    if (shrinking_state.is_shrinking) {
+        applyShrinking(&test_tensor);
+    }
     
-    // Get gradient from finite differences
-    var test_copy = try test_tensor.clone();
-    defer test_copy.deinit();
-    var numerical_grad = try finiteDifference(allocator, &relu_plan, test_copy, 1e-4);
-    defer numerical_grad.deinit();
+    // Test various operations
+    try testOperationGradient(
+        allocator,
+        "ReLU",        // Test ReLU (simple element-wise operation)
+        test_tensor,
+        rnd,
+        config.finite_diff_epsilon
+    );
     
-    // Compare the two gradients
-    const comparison = try tensorsApproxEqual(autodiff_grad, numerical_grad, 1e-2, true);
-    
-    if (comparison == .err) {
-        // Special handling for ReLU discontinuity at x=0
-        const input_val = input_buf[comparison.err.failure_index];
-        if (@abs(input_val) < 1e-3) {
-            std.debug.print("Ignoring error near ReLU activation boundary (x ≈ 0)\n", .{});
-            return;
-        }
+    // Test matrix multiplication if shape allows
+    if (test_tensor.shape.rank() == 2 && test_tensor.shape.elemCount() > 0) {
+        // Create compatible tensor for matmul
+        const n = test_tensor.shape.dims[1];
+        const p = rnd.intRangeAtMost(usize, 1, config.max_dim);
         
-        // Error reporting for other cases
+        var second_tensor = try Tensor.zeros(allocator, &[_]usize{ n, p }, test_tensor.dtype, .cpu);
+        defer second_tensor.deinit();
+        
+        // Fill with random values
         // ...
+        
+        // Test matrix multiplication gradients
+        try testBinaryOperationGradient(
+            allocator,
+            "MatMul",
+            test_tensor,
+            second_tensor,
+            rnd,
+            config.matmul_epsilon  // Use larger epsilon for matmul
+        );
     }
 }
 ```
 
-#### Advanced Test Runner with Shrinking
+#### Advanced Test Runner with Multi-Strategy Shrinking
 
-The framework includes a sophisticated test runner that supports shrinking (trying to find minimal failing cases):
+The framework includes a sophisticated test runner that supports multiple shrinking strategies and detailed reporting:
 
 ```zig
-/// Run a property test function multiple times with different random inputs
-/// Performs basic shrinking on failure by reducing dimensions when a test fails
+/// Thread-local state for the shrinking process
+pub const ShrinkingState = struct {
+    /// Current configuration for shrinking process
+    config: PropertyTestConfig,
+    
+    /// The random seed for reproducibility
+    seed: u64,
+    
+    /// The current shrinking strategy being attempted
+    strategy: enum {
+        none,
+        reduce_dimensions,
+        simplify_values,
+        simplify_single_value,
+    } = .none,
+    
+    /// Whether shrinking is in progress
+    is_shrinking: bool = false,
+    
+    /// Function to update a tensor according to shrinking strategy
+    pub fn shrinkTensor(self: *ShrinkingState, tensor: *Tensor) bool {
+        // Implementation details for various shrinking strategies
+    }
+};
+
+/// Run a property test function with enhanced configuration and shrinking
 pub fn runPropertyTest(
     allocator: Allocator,
     comptime testFn: fn (Allocator, *std.Random) anyerror!void,
-    iterations: usize,
-    seed: ?u64,
-    verbose: ?bool
+    config: PropertyTestConfig
 ) !void {
-    const verbose_output = verbose orelse false;
-    
-    // Create PRNG with specified or random seed
-    var prng = blk: {
-        const s = seed orelse @as(u64, @intCast(@abs(std.time.milliTimestamp())));
-        if (verbose_output) {
-            std.debug.print("Using seed: {}\n", .{s});
-        }
-        break :blk std.Random.DefaultPrng.init(s);
+    // Reset shrinking state
+    shrinking_state = ShrinkingState{
+        .config = config,
+        .seed = config.seed orelse @as(u64, @intCast(@abs(std.time.milliTimestamp()))),
     };
+    
+    // Log seed if verbose
+    if (config.verbose) {
+        std.debug.print("Using seed: {}\n", .{shrinking_state.seed});
+    }
+    
+    // Create PRNG with specified seed
+    var prng = std.Random.DefaultPrng.init(shrinking_state.seed);
     var rand = prng.random();
-    const rnd = &rand;
+    
+    // Measure performance if enabled
+    const start_time = if (config.measure_performance) std.time.nanoTimestamp() else 0;
     
     // Run the test multiple times with different random inputs
-    for (0..iterations) |i| {
-        if (verbose_output and i % 10 == 0) {
-            std.debug.print("Running iteration {}/{}\n", .{i + 1, iterations});
+    for (0..config.iterations) |i| {
+        if (config.verbose and i % 10 == 0) {
+            std.debug.print("Running iteration {}/{}\n", .{i + 1, config.iterations});
         }
         
+        // Measure individual test runtime if performance testing is enabled
+        const test_start_time = if (config.measure_performance) std.time.nanoTimestamp() else 0;
+        
         // Try to run the test
-        testFn(allocator, rnd) catch |err| {
-            // If the test fails, try to shrink inputs by reducing dimensions
+        testFn(allocator, &rand) catch |err| {
+            // If the test fails, try multiple shrinking strategies
             std.debug.print("Test failed on iteration {} with error: {!}\n", .{i + 1, err});
+            std.debug.print("Failure reproduces with seed: {}\n", .{shrinking_state.seed});
             
-            // Try to find a minimal failing case by shrinking the input
-            std.debug.print("Attempting to find minimal failing case...\n", .{});
-            
-            // Try with increasingly smaller dimensions
-            const shrink_steps = [_]usize{ 4, 3, 2, 1 };
-            var found_min = false;
-            
-            for (shrink_steps) |dim| {
-                std.debug.print("Trying with max_dim={}\n", .{dim});
-                
-                // Try to run with reduced dimensions
-                testFn(allocator, rnd) catch {
-                    found_min = true;
-                    std.debug.print("Test still fails with max_dim={}\n", .{dim});
-                    break;
-                };
-            }
-            
-            if (!found_min) {
-                std.debug.print("Could not find minimal case; test passed with smaller dimensions\n", .{});
-            }
+            // Try to find a minimal failing case
+            try shrinkFailingTest(allocator, testFn);
             
             return err;
         };
+        
+        // Log performance information if enabled
+        if (config.measure_performance) {
+            const elapsed = @as(u64, @intCast(std.time.nanoTimestamp() - test_start_time));
+            std.debug.print("Test iteration {} took: {d:.3} ms\n", 
+                .{i + 1, @as(f64, @floatFromInt(elapsed)) / 1000_000.0});
+        }
     }
+    
+    // Log total test time if performance testing is enabled
+    if (config.measure_performance) {
+        const total_elapsed = @as(u64, @intCast(std.time.nanoTimestamp() - start_time));
+        std.debug.print("Total test time: {d:.3} ms\n", 
+            .{@as(f64, @floatFromInt(total_elapsed)) / 1000_000.0});
+    }
+}
+
+/// Try to find a minimal failing test case using multiple shrinking strategies
+fn shrinkFailingTest(allocator: Allocator, testFn: anytype) !void {
+    std.debug.print("Attempting to find minimal failing case...\n", .{});
+    
+    // Enable shrinking mode
+    shrinking_state.is_shrinking = true;
+    
+    // Strategy 1: Reduce dimensions
+    shrinking_state.strategy = .reduce_dimensions;
+    const dim_steps = [_]usize{ 4, 3, 2, 1 };
+    
+    for (dim_steps) |dim| {
+        var config = shrinking_state.config;
+        config.max_dim = dim;
+        shrinking_state.config = config;
+        
+        std.debug.print("Strategy 1: Trying with max_dim={}\n", .{dim});
+        // Try with reduced dimensions...
+    }
+    
+    // Strategy 2: Simplify values
+    shrinking_state.strategy = .simplify_values;
+    
+    // Strategy 3: Target individual problematic values
+    shrinking_state.strategy = .simplify_single_value;
+    
+    // Reset shrinking state
+    shrinking_state.is_shrinking = false;
+    shrinking_state.strategy = .none;
 }
 ```
 
-#### Test Registration
+#### Consistent Configuration Approach
 
-Tests are registered using a uniform pattern that leverages the advanced test runner:
+All tests use a unified configuration-based approach. The framework provides specialized configurations for different testing needs:
 
 ```zig
+/// Configuration for standard tests
+fn standardTestConfig() PropertyTestConfig {
+    return PropertyTestConfig{
+        .iterations = 50,
+        .seed = 42,
+        .verbose = false,
+        .epsilon = 1e-5,
+        .matmul_epsilon = 1e-4,
+        .finite_diff_epsilon = 1e-2,
+        .measure_performance = false,
+        .enable_empty_tensors = true,  // Enable empty tensors for standard tests
+        .max_rank = 4,
+        .max_dim = 5,
+        .edge_case_probability = 0.1,
+    };
+}
+
+/// Configuration for performance testing
+fn perfTestConfig() PropertyTestConfig {
+    return PropertyTestConfig{
+        .iterations = 3,
+        .seed = 42,
+        .verbose = true,
+        .measure_performance = true,
+        .enable_empty_tensors = false, // Disable for performance testing
+        .max_rank = 3,
+        .max_dim = 16,  // Larger tensors to measure performance
+        .edge_case_probability = 0.0,  // No edge cases for performance tests
+    };
+}
+
+/// Configuration for gradient tests
+fn gradientTestConfig() PropertyTestConfig {
+    return PropertyTestConfig{
+        .iterations = 10, // Fewer iterations since gradient tests are more expensive
+        .seed = 42,
+        .verbose = false,
+        .epsilon = 1e-5,
+        .matmul_epsilon = 1e-4,
+        .finite_diff_epsilon = 1e-2,
+        .measure_performance = false,
+        .enable_empty_tensors = false, // Disable for gradient tests
+        .max_rank = 3,
+        .max_dim = 4, // Smaller tensors for gradient tests
+        .edge_case_probability = 0.1,
+    };
+}
+```
+
+The test functions use these configurations consistently:
+
+```zig
+/// Basic property test with standard configuration
 test "property-based addition commutativity" {
     const allocator = std.testing.allocator;
     try runPropertyTest(
         allocator,
         checkAdditionCommutativity,
-        50,          // iterations
-        42,          // seed for reproducibility
-        false        // verbose output
+        standardTestConfig()
     );
 }
 
-test "property-based matmul distributivity" {
-    const allocator = std.testing.allocator;
-    try runPropertyTest(
-        allocator,
-        checkMatmulDistributivity,
-        50,          // iterations
-        42,          // seed for reproducibility
-        false        // verbose output
-    );
-}
-
+/// Gradient test with specialized configuration
 test "property-based finite difference gradient verification" {
     const allocator = std.testing.allocator;
     try runPropertyTest(
         allocator,
         checkGradientWithFiniteDifferences,
-        10,          // fewer iterations (more computationally expensive)
-        42,          // seed for reproducibility
-        false        // verbose output
+        gradientTestConfig()
     );
+}
+
+/// Performance test with specialized configuration
+test "performance-test-matmul" {
+    if (@hasDecl(@import("root"), "perf_test") and @import("root").perf_test) {
+        const allocator = std.testing.allocator;
+        try runPropertyTest(
+            allocator,
+            checkMatmulAssociativity,
+            perfTestConfig()
+        );
+    }
+}
+```
+
+All test functions are also updated to use the configuration:
+
+```zig
+/// Check property: A + B = B + A (commutativity of addition)
+pub fn checkAdditionCommutativity(allocator: Allocator, rnd: *std.Random) !void {
+    // Get config from shrinking state or use default
+    var config = if (shrinking_state.is_shrinking) shrinking_state.config else default_config;
+    
+    // Generate random tensors with configurable options
+    var pair = try randomTensorPair(
+        allocator, 
+        rnd, 
+        config,
+        .f32          // dtype
+    );
+    
+    // Test implementation...
 }
 ```
 
@@ -1174,16 +1416,17 @@ test "property-based finite difference gradient verification" {
 
 This sophisticated approach provides several significant advantages:
 
-1. **Comprehensive Input Coverage**: Tests across diverse tensor shapes, dimensions, and data types
-2. **Mathematical Invariants**: Verifies fundamental properties like commutativity, associativity, and distributivity
-3. **Multi-Method Gradient Verification**: Uses both analytical derivation and numerical approximation
-4. **Instructive Failure Reporting**: Provides detailed error context to quickly resolve failures
-5. **Shrinking to Minimal Examples**: Helps find the smallest failing inputs for easier debugging
-6. **Edge Case Detection**: Actively tests boundary conditions and numerically challenging scenarios
-7. **Reproducible Testing**: Seed-based generation allows exact test reproduction
-8. **Flexible Test Configuration**: Adjustable test parameters for different testing environments
+1. **Full Type Coverage**: Tests across diverse tensor shapes, dimensions, and data types (f16, f32, f64, i32, i64, bool) to ensure consistent behavior
+2. **Mathematical Invariants**: Verifies fundamental properties like commutativity, associativity, and distributivity for all operations
+3. **Advanced Gradient Verification**: Uses both analytical derivation and numerical approximation with adaptive epsilon scaling to handle various numerical precision requirements
+4. **Comprehensive Error Reporting**: Provides detailed error information including values, types, and both absolute and relative differences
+5. **Multi-Strategy Shrinking**: Combines dimension reduction, value simplification, and individual value targeting to find minimal failing cases more effectively
+6. **Edge Case Detection**: Actively tests boundary conditions like empty tensors, single-element dimensions, and numerically challenging scenarios
+7. **Reproducible Testing**: Seed-based generation with detailed failure logs ensures exact test reproduction
+8. **Flexible Test Configuration**: Fully configurable parameters including epsilon values, iteration counts, and data type support
+9. **Performance Monitoring**: Optional performance testing to identify regressions and optimization opportunities
 
-The property-based testing framework ensures the mathematical correctness and robustness of PCP's tensor operations and gradients, providing high confidence in the library's behavior across a wide range of usage scenarios.
+The enhanced property-based testing framework ensures the mathematical correctness, robustness, and performance of PCP's tensor operations and gradients, providing high confidence in the library's behavior across a wide range of usage scenarios including edge cases.
 
 ## Zig Version
 

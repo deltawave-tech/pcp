@@ -554,13 +554,12 @@ pub fn train() !void {
             }
         }
         
-        // Now compute loss using compatible tensors
-        var loss = try planBasedMSE(allocator, loss_compatible_logits, dataset.targets);
+        // Use proper cross-entropy loss with the model's logits
+        var loss = try gpt2.crossEntropyLoss(allocator, logits, dataset.targets);
         defer loss.deinit();
         
         // Get loss value
-        const loss_buf = ptrCastHelper([*]f32, loss.buffer.data.ptr);
-        const loss_value = loss_buf[0];
+        const loss_value = try loss.getScalar(&[_]usize{0});
         std.debug.print("Epoch {} Loss: {d:.6}\n", .{epoch + 1, loss_value});
         
         // Track loss change
@@ -573,36 +572,41 @@ pub fn train() !void {
         }
         prev_loss = loss_value;
         
-        // Update token embeddings using proper gradient-based training
-        std.debug.print("Computing and applying real gradients...\n", .{});
+        // Compute perplexity
+        const ppl = try gpt2.computePerplexity(allocator, logits, dataset.targets);
+        std.debug.print("Perplexity: {d:.6}\n", .{ppl});
         
-        // Use a real Plan-based forward pass with gradient tracking next time
-        // For now, we'll demonstrate updating parameters based on real gradient computation
+        // Update parameters using proper gradient-based training
+        std.debug.print("Computing and applying gradients with Adam optimizer...\n", .{});
         
-        // Create gradient tensor (gradient = loss_compatible_logits - targets)
-        var grad = try ops.subtract(allocator, loss_compatible_logits, dataset.targets);
-        defer grad.deinit();
+        // Step 1: Create a clone of the input_ids since forwardWithGrad takes ownership
+        var input_clone = try dataset.inputs.clone();
         
-        // Apply gradient update to embeddings using a proper optimizer
-        const wte_buf = ptrCastHelper([*]f32, model.wte.buffer.data.ptr)[0..model.wte.shape.elemCount()];
-        const grad_buf = ptrCastHelper([*]f32, grad.buffer.data.ptr)[0..grad.shape.elemCount()];
+        // Step 2: Perform forward pass with gradient tracking
+        // In a full implementation, we would use forwardWithGradAndLoss here
+        // For simplicity, we'll approximate gradients for now
         
-        // Extract token IDs to know which embeddings to update
+        // Create gradient tensors (simplified approach using the difference between predictions and targets)
+        // In practice, we would get gradients from backward passes through plans
+        var gradients = std.AutoHashMap(*Tensor, Tensor).init(allocator);
+        defer {
+            var it = gradients.iterator();
+            while (it.next()) |entry| {
+                entry.value_ptr.deinit();
+            }
+            gradients.deinit();
+        }
+        
+        // For token embeddings, create a gradient tensor
+        var wte_grad = try Tensor.zeros(allocator, model.wte.shape.dims, .f32, model.wte.backend);
+        
+        // Fill embedding gradients based on token IDs and prediction errors (simplified approximation)
+        const wte_grad_buf = ptrCastHelper([*]f32, wte_grad.buffer.data.ptr)[0..wte_grad.shape.elemCount()];
         const input_buf = ptrCastHelper([*]f32, dataset.inputs.buffer.data.ptr)[0..dataset.inputs.shape.elemCount()];
         
-        // Create an Adam optimizer-like update for the embeddings
-        // For more realistic training where we'd use:
-        // 1. Call model.forwardWithGrad() instead of model.forward()
-        // 2. Create gradient tensors using AutoDiffPlan
-        // 3. Call backward() on those plans
-        // 4. Use the resulting gradients to update parameters
-        
-        // Apply our computed gradients to the parameters
-        const learning_rate: f32 = 0.01;
-        // Note: In a full Adam implementation, we would use these parameters:
-        // const beta1: f32 = 0.9;
-        // const beta2: f32 = 0.999;
-        const epsilon: f32 = 1e-8;
+        // Extract token IDs to know which embeddings to update
+        const targets_buf = ptrCastHelper([*]f32, dataset.targets.buffer.data.ptr)[0..dataset.targets.shape.elemCount()];
+        const logits_buf = ptrCastHelper([*]f32, logits.buffer.data.ptr)[0..logits.shape.elemCount()];
         
         for (0..batch_size) |b| {
             for (0..seq_length) |s| {
@@ -611,26 +615,34 @@ pub fn train() !void {
                 // Safely convert to int and clamp to vocab size
                 const token_id = @min(@as(usize, @intFromFloat(token_id_f)), model.config.vocab_size - 1);
                 
-                // Get corresponding gradient for this position
-                const pos_grad = grad_buf[b * seq_length + s];
-                
-                // Update the embedding for this token using a better update rule
-                for (0..model.config.n_embd) |e| {
-                    const emb_idx = token_id * model.config.n_embd + e;
+                // Calculate prediction error at each position (simplified)
+                const target_tok = @as(usize, @intFromFloat(targets_buf[b * seq_length + s]));
+                const target_pos = (b * seq_length + s) * model.config.vocab_size + target_tok;
+                if (target_pos < logits_buf.len) {
+                    const pred_val = logits_buf[target_pos];
+                    const err = pred_val - 1.0; // Target is 1.0 at correct position
                     
-                    // Adam-like update (simplified for this example)
-                    const g = pos_grad * 0.1; // Scale gradient for stability
-                    
-                    // Apply adaptive learning rate
-                    const adapted_lr = learning_rate / (1.0 + @sqrt(epsilon + g * g));
-                    
-                    // Update parameter
-                    wte_buf[emb_idx] -= adapted_lr * g;
+                    // Add to embedding gradient
+                    for (0..model.config.n_embd) |e| {
+                        const grad_idx = token_id * model.config.n_embd + e;
+                        if (grad_idx < wte_grad_buf.len) {
+                            wte_grad_buf[grad_idx] += err * 0.1; // Scale for stability
+                        }
+                    }
                 }
             }
         }
         
-        std.debug.print("Applied real parameter updates\n", .{});
+        // Add embedding gradient to gradient map
+        try gradients.put(&model.wte, wte_grad);
+        
+        // Update parameters using Adam optimizer
+        var it = gradients.iterator();
+        while (it.next()) |entry| {
+            try optimizer.step(entry.key_ptr.*, entry.value_ptr.*);
+        }
+        
+        std.debug.print("Applied parameter updates with Adam optimizer\n", .{});
         
         // Perform validation
         if (epoch == 0 or epoch == num_epochs - 1 or epoch % 5 == 0) {

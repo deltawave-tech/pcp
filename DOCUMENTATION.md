@@ -38,11 +38,11 @@ Key features:
 
 PCP follows a layered architecture design:
 
-1. **Core Tensor Layer**: Low-level tensor operations, memory management
+1. **Core Tensor Layer**: Low-level tensor operations, memory management with reference counting
 2. **Operations Layer**: Mathematical functions on tensors with compile-time plans
-3. **Autodiff Layer**: Gradient computation through a computational graph or via compile-time plans
+3. **Autodiff Layer**: Gradient computation via compile-time plans with embedded gradient methods
 4. **Model Layer**: Neural network model implementations (like GPT-2)
-5. **Training Layer**: Example training loops and optimization algorithms
+5. **Training Layer**: Plan-based training loops and optimization algorithms
 
 This layered approach allows for clean separation of concerns and modular development.
 
@@ -183,7 +183,7 @@ pub fn MatmulPlan(comptime Backend: type, comptime T: type,
 
 ### Autodiff Engine
 
-The autodiff module (`autodiff.zig`) provides automatic differentiation capabilities using the Compile-Time Plan Approach:
+The autodiff module (`autodiff.zig`) provides automatic differentiation capabilities using the Compile-Time Plan Approach, which offers excellent performance and type safety:
 
 - **Plan Types with Gradient Methods**: Each operation plan includes its own gradient computation method:
   ```zig
@@ -326,7 +326,7 @@ The Plan-based approach offers:
 
 ### Model Implementation
 
-The project includes implementations of neural network models, with GPT-2 as a primary example.
+The project includes implementations of neural network models, with GPT-2 as a primary example. All components use the Plan-based approach for operations.
 
 Key components:
 
@@ -343,50 +343,108 @@ Key components:
   };
   ```
 
-- **GPT2**: Main model implementation with Plan-based forward and gradient methods:
+- **GPT2**: Main model implementation with Plan-based operations:
   ```zig
   pub const GPT2 = struct {
       wte: Tensor, // Token embeddings
       wpe: Tensor, // Position embeddings
       blocks: []Block, // Transformer blocks
       ln_f: LayerNorm, // Final layer norm
+      lm_head: Tensor, // Language model head
       
-      // AutoDiff plans for different operations
-      matmul_plan: ?*autodiff.AutoDiffPlan(autodiff.MatmulPlanWithGrad(...)) = null,
-      embed_lookup_plan: ?*autodiff.AutoDiffPlan(autodiff.EmbeddingLookupPlanWithGrad(...)) = null,
-      add_plan: ?*autodiff.AutoDiffPlan(autodiff.AddPlanWithGrad(...)) = null,
+      // AutoDiff plans for operations
+      matmul_plan: ?*autodiff.AutoDiffPlan(autodiff.MatmulPlanWithGrad(...)),
+      embed_lookup_plan: ?*autodiff.AutoDiffPlan(autodiff.EmbeddingLookupPlanWithGrad(...)),
+      add_plan: ?*autodiff.AutoDiffPlan(autodiff.AddPlanWithGrad(...)),
       
-      // Regular forward pass
-      pub fn forward(self: *GPT2, input_ids: Tensor) !Tensor {
-          // Implementation using regular tensor operations
+      pub fn init(allocator: Allocator, config: GPT2Config, backend: BackendType) !GPT2 {
+          // Initialize tensors and plans
+          var wte = try Tensor.random(allocator, &wte_dims, .f32, backend);
+          wte.requiresGrad(true);
+          
+          // Initialize plans
+          const MatmulPlanType = autodiff.MatmulPlanWithGrad(ops.CpuBackend, f32, null, null, null);
+          const matmul_plan = try allocator.create(autodiff.AutoDiffPlan(MatmulPlanType));
+          matmul_plan.* = autodiff.AutoDiffPlan(MatmulPlanType).init(allocator);
+          
+          // Return model
+          return GPT2{
+              .wte = wte,
+              .matmul_plan = matmul_plan,
+              // ...
+          };
       }
       
-      // Forward pass with gradient tracking
+      // Forward pass using plans for all operations
       pub fn forwardWithGrad(self: *GPT2, input_ids: Tensor) !Tensor {
-          // Implementation using Plan operations instead of regular ones
+          // Token embeddings
+          var token_embeddings = try self.embed_lookup_plan.?.forward(.{ 
+              .params = self.wte, 
+              .indices = input_ids 
+          });
+          defer token_embeddings.deinit();
+          
+          // Position embeddings
+          var pos_embeddings = try self.embed_lookup_plan.?.forward(.{ 
+              .params = self.wpe, 
+              .indices = pos_ids 
+          });
+          defer pos_embeddings.deinit();
+          
+          // Add token and position embeddings
+          var embeddings = try self.add_plan.?.forward(.{ 
+              .a = token_embeddings, 
+              .b = pos_embeddings 
+          });
+          defer embeddings.deinit();
+          
+          // Process through transformer blocks
+          for (self.blocks) |*block| {
+              const new_output = try block.forwardWithGrad(current);
+              current.deinit();
+              current = new_output;
+          }
+          
+          // Apply final linear projection
+          return self.matmul_plan.?.forward(.{ .a = final_output, .b = self.lm_head });
       }
   };
   ```
 
-- **Attention and MLP Components**: Also implemented with the Plan-based approach:
+- **Block Component**: Transformer block with Plan-based operations:
   ```zig
-  pub const Attention = struct {
-      // Parameters
-      c_attn_weight: Tensor,
-      c_attn_bias: Tensor,
-      // ...
+  pub const Block = struct {
+      ln_1: LayerNorm,
+      attn: Attention,
+      ln_2: LayerNorm,
+      mlp: MLP,
       
-      // Plans for autodiff
-      matmul_plan: ?*autodiff.AutoDiffPlan(...) = null,
-      // ...
+      // Plan for residual connections
+      add_plan: ?*autodiff.AutoDiffPlan(autodiff.AddPlanWithGrad(...)),
       
-      // Forward methods
-      pub fn forward(self: *Attention, x: Tensor) !Tensor {
-          // Implementation with regular tensor operations
-      }
-      
-      pub fn forwardWithGrad(self: *Attention, x: Tensor) !Tensor {
-          // Implementation with Plan-based operations for gradient tracking
+      pub fn forwardWithGrad(self: *Block, x: Tensor) !Tensor {
+          // Layer norm
+          var norm1 = try self.ln_1.forwardWithGrad(x);
+          defer norm1.deinit();
+          
+          // Self-attention
+          var attn_output = try self.attn.forwardWithGrad(norm1);
+          defer attn_output.deinit();
+          
+          // Residual connection
+          var res1 = try self.add_plan.?.forward(.{ .a = x, .b = attn_output });
+          defer res1.deinit();
+          
+          // Layer norm
+          var norm2 = try self.ln_2.forwardWithGrad(res1);
+          defer norm2.deinit();
+          
+          // Feed-forward network
+          var mlp_output = try self.mlp.forwardWithGrad(norm2);
+          defer mlp_output.deinit();
+          
+          // Residual connection
+          return self.add_plan.?.forward(.{ .a = res1, .b = mlp_output });
       }
   };
   ```
@@ -586,6 +644,15 @@ pub fn embedding_lookup(allocator: Allocator, grad_out: Tensor,
 The PCP framework provides examples of neural network training loops:
 
 ```zig
+// Create plans for operations
+const MatmulPlanType = autodiff.MatmulPlanWithGrad(ops.CpuBackend, f32, null, null, null);
+var matmul_plan = autodiff.AutoDiffPlan(MatmulPlanType).init(allocator);
+defer matmul_plan.deinit();
+
+const ReluPlanType = autodiff.ReluPlanWithGrad(ops.CpuBackend, f32, null);
+var relu_plan = autodiff.AutoDiffPlan(ReluPlanType).init(allocator);
+defer relu_plan.deinit();
+
 // Training loop
 for (0..num_epochs) |epoch| {
     std.debug.print("Epoch {}/{}:\n", .{epoch + 1, num_epochs});
@@ -600,22 +667,39 @@ for (0..num_epochs) |epoch| {
         };
         defer batch.deinit();
         
-        // Forward pass
-        var logits = try model.forward(input_copy);
+        // Forward pass with plan-based operations
+        const hidden = try matmul_plan.forward(.{ .a = batch.inputs, .b = model.weights1 });
+        defer hidden.deinit();
         
-        // Compute the loss
-        var loss = try computeCrossEntropy(allocator, logits, batch.targets);
+        const activated = try relu_plan.forward(hidden);
+        defer activated.deinit();
+        
+        const logits = try matmul_plan.forward(.{ .a = activated, .b = model.weights2 });
+        defer logits.deinit();
+        
+        // Compute loss
+        var loss = try crossEntropyLoss(allocator, logits, batch.targets);
         defer loss.deinit();
         
-        // Backward pass
-        try autodiff.backward(allocator, loss);
+        // Backward pass with plans
+        var loss_grad = try Tensor.ones(allocator, loss.shape.dims, loss.dtype, loss.backend);
+        defer loss_grad.deinit();
         
-        // Update parameters
-        if (model.wte_node) |wte_node| {
-            if (wte_node.grad != null) {
-                try optimizer.step(&model.wte, wte_node.grad.?);
-            }
-        }
+        // Compute gradients
+        const logits_grad = try matmul_plan.backward(loss_grad);
+        defer logits_grad.da.deinit();
+        defer logits_grad.db.deinit();
+        
+        const activated_grad = try relu_plan.backward(logits_grad.da);
+        defer activated_grad.deinit();
+        
+        const hidden_grad = try matmul_plan.backward(activated_grad);
+        defer hidden_grad.da.deinit();
+        defer hidden_grad.db.deinit();
+        
+        // Update parameters using Adam optimizer
+        try optimizer.step(&model.weights1, hidden_grad.db);
+        try optimizer.step(&model.weights2, logits_grad.db);
         
         // Move to next batch
         batch_offset += batch_size;
@@ -626,6 +710,50 @@ for (0..num_epochs) |epoch| {
 ### Compile-Time Planning
 
 One of the key innovations in PCP is the use of Zig's comptime features to generate operation plans that validate and optimize operations at compile time.
+
+#### Compile-Time Gradient Pre-Computation
+
+A crucial feature of the Plan-based approach is the ability to pre-compute gradient rules at compile time:
+
+```zig
+// Each operation plan contains its own gradient method
+pub fn AddPlan(comptime Backend: type, comptime T: type, comptime shape: ?[]const usize) type {
+    // Comptime validation of backend and shape
+    comptime {
+        if (!Backend.hasPrimitive("add")) @compileError("Backend must implement add primitive");
+    }
+    
+    return struct {
+        pub const InputType = struct { a: Tensor, b: Tensor };
+        pub const GradType = struct { da: Tensor, db: Tensor };
+        
+        // Forward pass
+        pub fn run(self: Self, input: InputType) !Tensor {
+            // Implementation...
+        }
+        
+        // Gradient computation built directly into the plan
+        pub fn gradient(self: Self, grad_out: Tensor, _: InputType) !GradType {
+            const allocator = self.base.allocator;
+            
+            // Both inputs receive the same gradient
+            var da = try grad_out.clone();
+            errdefer da.deinit();
+            
+            var db = try grad_out.clone();
+            errdefer db.deinit();
+            
+            return .{ .da = da, .db = db };
+        }
+    };
+}
+```
+
+This approach offers several advantages:
+1. Gradient functions are defined in the same place as forward operations
+2. Type checking at compile time ensures gradient shapes match operation types
+3. Memory management is consistent across forward and backward passes
+4. No runtime lookup or dispatch is needed to find gradient functions
 
 #### Plan Generation
 
@@ -1442,9 +1570,9 @@ This project requires Zig 0.14.x or later.
 
 ## Examples
 
-### Recommended Plan-Based Approach
+### Plan-Based Neural Network Implementation
 
-Here's a complete example demonstrating the recommended Plan-based approach for a simple neural network:
+Here's a complete example demonstrating how to build a neural network using the Plan-based approach, which is the standard way to use the framework:
 
 ```zig
 const std = @import("std");

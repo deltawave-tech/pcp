@@ -12,12 +12,11 @@ A distributed tensor computation framework written in Zig, designed for training
 - Embedding layers with correct gradient flow
 - Reference-counted tensor management
 - Cross-platform backend support
-  - CPU computing with SIMD optimizations
+  - CPU
   - Apple Silicon via Metal (WIP)
-  - NVIDIA via CUDA (planned)
-  - AMD via ROCm (planned)
+  - NVIDIA (todo)
+  - AMD (todo))
 - Distributed training using actor model (planned)
-- Fault-tolerant decentralized optimization (planned)
 
 ## Project Structure
 
@@ -28,15 +27,13 @@ A distributed tensor computation framework written in Zig, designed for training
 - `src/backends/` - Hardware-specific backends
   - `metal.zig` - Metal backend for Apple Silicon
 - `src/models/` - Neural network model implementations
-  - `gpt2.zig` - GPT-2 transformer model
+  - `gpt2.zig` - GPT-2 transformer model (wip)
 - `src/examples/` - Example applications
-  - `gpt2_training.zig` - Training a mini GPT-2 model
-  - `shakespeare_training.zig` - Training on Shakespeare text
+  - `gpt2_training.zig` - Training a mini GPT-2 model (wip)
+  - `shakespeare_training.zig` - Training on Shakespeare text (wip)
   - `autodiff_test.zig` - Memory leak tests and benchmarks
 
 ## Memory Management
-
-One of PCP's core strengths is its careful memory management:
 
 - All tensors and computational graph nodes track their own memory
 - Reference counting for efficient tensor reuse and proper cleanup
@@ -58,8 +55,6 @@ PCP uses Zig's compile-time features to optimize tensor operations:
 
 ### Architectural Improvements
 
-We're continuously enhancing the architecture with these key principles:
-
 1. **Consistency**: All plan types follow a uniform structure with:
    - Required declarations (`GradType`, `op_type`)
    - Standard interfaces (`init`, `run`)
@@ -76,14 +71,13 @@ We're continuously enhancing the architecture with these key principles:
    - Bounds checking for tensor operations
    - Consistent memory management patterns
 
-> **Note**: We've successfully migrated the core functionality from the legacy Node-based computation graph to the new comptime Plan-based system. The GPT-2 model and a dedicated test now use the Plan-based approach for both forward and backward passes. The legacy Node-based system has been deprecated and removed from core modules, with remaining examples being updated to the Plan-based approach.
 
 ## Getting Started
 
 ### Prerequisites
 
 - Zig compiler (0.14.x)
-- For Metal backend: macOS with an Apple Silicon or compatible GPU
+- For Metal backend: macOS with Apple Silicon
 
 ### Zig Version Compatibility
 
@@ -123,41 +117,24 @@ zig build run-comptime-examples
 zig build run-plan-test
 ```
 
-## Performance
-
-The framework is designed with performance in mind:
-
-- Fast tensor operations on the CPU
-- Efficient memory usage with proper cleanup of temporary tensors
-- Benchmarks show tensor operations complete in milliseconds
-- Metal GPU backend (WIP) will further accelerate computations
-
 ## Roadmap
 
 - [x] Core tensor implementation
 - [x] Basic operations (add, matmul, etc.)
 - [x] Autodiff engine with memory management
-- [x] Basic model definition (GPT-2)
-- [x] Memory leak fixes in backward operations
 - [x] Training examples with text generation
 - [x] Embedding layers with proper gradient flow
-- [x] Robust bounds checking and safety mechanisms
 - [x] Comptime Plan-based operation design
 - [x] Automatic gradient rule generation with comptime
 - [x] Centralize all plan definitions in ops.zig with consistent structure
 - [x] Tie gradient computation directly to operation plans
 - [x] Implemented AutoDiffPlan wrapper for all operations
-- [x] Updated GPT-2 model to use Plan-based approach
 - [x] Added dedicated test for Plan-based autodiff
-- [x] Implemented real gradient-based training for GPT-2
-- [ ] Implement comptime operation fusion for complex gradient rules
-- [ ] Enhance shape validation with optional parameters and runtime checks
-- [ ] Complete migration of all examples to Plan-based approach
-- [ ] Update shakespeare_training.zig to use Plan-based gradients
+- [ ] Comptime operation fusion for complex gradients
+- [ ] Enhance shape validation for dynamic dimensions
 - [ ] Complete Metal backend implementation
 - [ ] Actor-based distributed training
 - [ ] Decentralized optimization algorithms
-- [ ] CUDA and ROCm backends
 
 ## License
 

@@ -928,7 +928,7 @@ pub const Block = struct {
         defer mlp_output.deinit();
         
         // Step 6: Add MLP output to residual (second residual connection) with plan
-        var res2 = try self.add_plan.?.forward(.{ .a = res1, .b = mlp_output });
+        const res2 = try self.add_plan.?.forward(.{ .a = res1, .b = mlp_output });
         
         std.debug.print("Block.forwardWithGrad: Completed full block\n", .{});
         return res2;
@@ -938,11 +938,16 @@ pub const Block = struct {
 // Main GPT-2 model
 // Cross-entropy loss function for language modeling
 pub fn crossEntropyLoss(allocator: Allocator, logits: Tensor, targets: Tensor) !Tensor {
+    // Check for valid dimensions
+    if (logits.shape.rank() < 3) {
+        return error.InvalidLogitsShape;
+    }
+    
     const batch_size = targets.shape.dims[0];
     const seq_len = targets.shape.dims[1];
     const vocab_size = logits.shape.dims[2];
     
-    var loss = try Tensor.zeros(allocator, &[_]usize{1}, .f32, logits.backend);
+    const loss = try Tensor.zeros(allocator, &[_]usize{1}, .f32, logits.backend);
     const loss_buf = ptrCastHelper([*]f32, loss.buffer.data.ptr);
     const logits_buf = ptrCastHelper([*]f32, logits.buffer.data.ptr)[0..logits.shape.elemCount()];
     const targets_buf = ptrCastHelper([*]f32, targets.buffer.data.ptr)[0..targets.shape.elemCount()];
@@ -971,7 +976,7 @@ pub fn crossEntropyLoss(allocator: Allocator, logits: Tensor, targets: Tensor) !
             }
             
             // Compute negative log-likelihood
-            if (target_idx < vocab_size && logit_offset + target_idx < logits_buf.len) {
+            if (target_idx < vocab_size and logit_offset + target_idx < logits_buf.len) {
                 total_loss -= (logits_buf[logit_offset + target_idx] - max_logit - @log(sum_exp));
             }
         }
@@ -1205,11 +1210,16 @@ pub const GPT2 = struct {
         var final_output = try self.ln_f.forward(current);
         current.deinit();
         
-        // Step 6: Project hidden states to vocabulary logits using lm_head
-        const logits = try ops.matmul(self.allocator, final_output, self.lm_head);
+        // Step 6: Project hidden states to vocabulary logits
+        var flat_logits = try ops.matmul(self.allocator, final_output, self.lm_head);
         final_output.deinit();
         
-        // Return the logits
+        // Reshape logits to [batch_size, seq_len, vocab_size]
+        const vocab_size = self.config.vocab_size;
+        const new_shape = [_]usize{ batch_size, seq_len, vocab_size };
+        const logits = try flat_logits.reshape(self.allocator, &new_shape);
+        flat_logits.deinit();
+        
         return logits;
     }
     
@@ -1281,7 +1291,7 @@ pub const GPT2 = struct {
                 for (0..self.config.n_embd) |e| {
                     const src_idx = (b * seq_len + s) * self.config.n_embd + e;
                     const dst_idx = (b * seq_len + s) * self.config.n_embd + e;
-                    if (src_idx < embeddings_buf.len && dst_idx < reshaped_buf.len) {
+                    if (src_idx < embeddings_buf.len and dst_idx < reshaped_buf.len) {
                         reshaped_buf[dst_idx] = embeddings_buf[src_idx];
                     }
                 }
@@ -1308,10 +1318,16 @@ pub const GPT2 = struct {
         std.debug.print("GPT2.forwardWithGrad: Applied final layer norm\n", .{});
         
         // Step 8: Project hidden states to vocabulary logits using lm_head with plan
-        const logits = try self.matmul_plan.?.forward(.{ .a = final_output, .b = self.lm_head });
+        var flat_logits = try self.matmul_plan.?.forward(.{ .a = final_output, .b = self.lm_head });
         final_output.deinit();
         
-        std.debug.print("GPT2.forwardWithGrad: Computed final logits\n", .{});
+        // Reshape logits to [batch_size, seq_len, vocab_size]
+        const vocab_size = self.config.vocab_size;
+        const new_shape = [_]usize{ batch_size, seq_len, vocab_size };
+        const logits = try flat_logits.reshape(self.allocator, &new_shape);
+        flat_logits.deinit();
+        
+        std.debug.print("GPT2.forwardWithGrad: Computed and reshaped final logits\n", .{});
         
         return logits;
     }
@@ -1332,17 +1348,17 @@ pub const GPT2 = struct {
             grads.deinit();
         }
         
-        // Clone input_ids since forwardWithGrad will take ownership
-        var input_clone = try input_ids.clone();
-        
         // Forward pass with gradient tracking
-        var logits = try self.forwardWithGrad(input_clone);
+        // Note: forwardWithGrad takes ownership of input_ids, so we need a copy
+        const input_copy = try input_ids.clone();
+        const logits = try self.forwardWithGrad(input_copy);
+        // No need to deinit input_copy as forwardWithGrad takes ownership
         
         // Compute loss
-        var loss = try crossEntropyLoss(self.allocator, logits, targets);
+        const loss = try crossEntropyLoss(self.allocator, logits, targets);
         
-        // Create a gradient tensor (all ones, since loss is scalar)
-        var loss_grad = try Tensor.ones(self.allocator, loss.shape.dims, .f32, loss.backend);
+        // For a complete implementation, we would create a gradient tensor
+        // and perform backward passes through the operations
         
         // TODO: In a more complete implementation, we would:
         // 1. Perform backward pass on the plans

@@ -175,6 +175,26 @@ pub const Tensor = struct {
         return new_tensor;
     }
     
+    /// Reshape a tensor to a new shape, preserving data
+    pub fn reshape(self: Tensor, allocator: Allocator, new_dims: []const usize) !Tensor {
+        var elem_count: usize = 1;
+        for (new_dims) |dim| {
+            elem_count *= dim;
+        }
+        
+        if (elem_count != self.shape.elemCount()) {
+            return error.ShapeMismatch;
+        }
+        
+        var new_tensor = try Tensor.init(allocator, new_dims, self.dtype, self.backend);
+        errdefer new_tensor.deinit();
+        
+        @memcpy(new_tensor.buffer.data, self.buffer.data[0..self.buffer.data.len]);
+        new_tensor.requires_grad = self.requires_grad;
+        
+        return new_tensor;
+    }
+    
     /// Initialize a tensor with a specific value
     pub fn filled(allocator: Allocator, dims: []const usize, dtype: DType, value: anytype, backend: BackendType) !Tensor {
         var tensor = try init(allocator, dims, dtype, backend);

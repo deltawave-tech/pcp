@@ -579,8 +579,8 @@ pub fn train() !void {
         // Update parameters using proper gradient-based training
         std.debug.print("Computing and applying gradients with Adam optimizer...\n", .{});
         
-        // Step 1: Create a clone of the input_ids since forwardWithGrad takes ownership
-        var input_clone = try dataset.inputs.clone();
+        // Note: A full implementation would use forwardWithGradAndLoss
+        // For now, we're using a simplified approximation
         
         // Step 2: Perform forward pass with gradient tracking
         // In a full implementation, we would use forwardWithGradAndLoss here
@@ -606,7 +606,6 @@ pub fn train() !void {
         
         // Extract token IDs to know which embeddings to update
         const targets_buf = ptrCastHelper([*]f32, dataset.targets.buffer.data.ptr)[0..dataset.targets.shape.elemCount()];
-        const logits_buf = ptrCastHelper([*]f32, logits.buffer.data.ptr)[0..logits.shape.elemCount()];
         
         for (0..batch_size) |b| {
             for (0..seq_length) |s| {
@@ -683,9 +682,12 @@ pub fn train() !void {
                     var max_prob: f32 = 0.0;
                     var max_token: usize = 0;
                     
+                    // With 3D logits [batch, seq_len, vocab_size], the index calculation changes
+                    const batch_idx = 0; // We always use batch 0 for validation
                     for (0..config.vocab_size) |j| {
-                        if (i * config.vocab_size + j >= val_output_buf.len) break;
-                        const prob = val_output_buf[i * config.vocab_size + j];
+                        const idx = (batch_idx * tokens.len + i) * config.vocab_size + j;
+                        if (idx >= val_output_buf.len) break;
+                        const prob = val_output_buf[idx];
                         if (prob > max_prob) {
                             max_prob = prob;
                             max_token = j;

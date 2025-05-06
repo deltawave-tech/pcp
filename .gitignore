@@ -21,6 +21,7 @@ deps/
 
 # Editor and system files
 .DS_Store
+.dir-locals.el
 .vscode/
 .idea/
 *.swp

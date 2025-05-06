@@ -13,7 +13,7 @@ fn ptrCastHelper(comptime T: type, ptr: anytype) T {
 const Allocator = std.mem.Allocator;
 const Tensor = tensorModule.Tensor;
 const DType = tensorModule.DType;
-const Node = autodiff.Node;
+// Using Plan-based approach instead of Node-based autodiff
 
 // Helper function to print tensor contents
 fn printTensor(t: Tensor) void {
@@ -46,157 +46,149 @@ fn printTensor(t: Tensor) void {
     }
 }
 
-// Test a simple model with backward pass
+// Test a simple model with Plan-based approach
 fn testSimpleModel(allocator: Allocator) !void {
-    std.debug.print("\n=== Testing Simple Model ===\n", .{});
+    std.debug.print("\n=== Testing Simple Model with Plan-Based Approach ===\n", .{});
     
     // Create simple tensors
     var dims = [_]usize{ 2, 2 };
     
     // Create tensors for parameters
-    var w1_tensor = try Tensor.zeros(allocator, &dims, .f32, .cpu);
-    try w1_tensor.setScalar(&[_]usize{0, 0}, 0.1);
-    try w1_tensor.setScalar(&[_]usize{0, 1}, 0.2);
-    try w1_tensor.setScalar(&[_]usize{1, 0}, 0.3);
-    try w1_tensor.setScalar(&[_]usize{1, 1}, 0.4);
+    var w1 = try Tensor.zeros(allocator, &dims, .f32, .cpu);
+    defer w1.deinit();
+    try w1.setScalar(&[_]usize{0, 0}, 0.1);
+    try w1.setScalar(&[_]usize{0, 1}, 0.2);
+    try w1.setScalar(&[_]usize{1, 0}, 0.3);
+    try w1.setScalar(&[_]usize{1, 1}, 0.4);
     
-    var w2_tensor = try Tensor.zeros(allocator, &dims, .f32, .cpu);
-    try w2_tensor.setScalar(&[_]usize{0, 0}, 0.5);
-    try w2_tensor.setScalar(&[_]usize{0, 1}, 0.6);
-    try w2_tensor.setScalar(&[_]usize{1, 0}, 0.7);
-    try w2_tensor.setScalar(&[_]usize{1, 1}, 0.8);
+    var w2 = try Tensor.zeros(allocator, &dims, .f32, .cpu);
+    defer w2.deinit();
+    try w2.setScalar(&[_]usize{0, 0}, 0.5);
+    try w2.setScalar(&[_]usize{0, 1}, 0.6);
+    try w2.setScalar(&[_]usize{1, 0}, 0.7);
+    try w2.setScalar(&[_]usize{1, 1}, 0.8);
     
     // Create input
-    var x_tensor = try Tensor.zeros(allocator, &dims, .f32, .cpu);
-    try x_tensor.setScalar(&[_]usize{0, 0}, 1.0);
-    try x_tensor.setScalar(&[_]usize{0, 1}, 2.0);
-    try x_tensor.setScalar(&[_]usize{1, 0}, 3.0);
-    try x_tensor.setScalar(&[_]usize{1, 1}, 4.0);
+    var x = try Tensor.zeros(allocator, &dims, .f32, .cpu);
+    defer x.deinit();
+    try x.setScalar(&[_]usize{0, 0}, 1.0);
+    try x.setScalar(&[_]usize{0, 1}, 2.0);
+    try x.setScalar(&[_]usize{1, 0}, 3.0);
+    try x.setScalar(&[_]usize{1, 1}, 4.0);
     
     // Target values
-    var y_tensor = try Tensor.zeros(allocator, &dims, .f32, .cpu);
-    try y_tensor.setScalar(&[_]usize{0, 0}, 0.5);
-    try y_tensor.setScalar(&[_]usize{0, 1}, 0.5);
-    try y_tensor.setScalar(&[_]usize{1, 0}, 0.5);
-    try y_tensor.setScalar(&[_]usize{1, 1}, 0.5);
+    var y_target = try Tensor.zeros(allocator, &dims, .f32, .cpu);
+    defer y_target.deinit();
+    try y_target.setScalar(&[_]usize{0, 0}, 0.5);
+    try y_target.setScalar(&[_]usize{0, 1}, 0.5);
+    try y_target.setScalar(&[_]usize{1, 0}, 0.5);
+    try y_target.setScalar(&[_]usize{1, 1}, 0.5);
     
-    // Convert to nodes (requires_grad = true for parameters)
-    std.debug.print("Creating parameter nodes\n", .{});
+    // Create the autodiff plans
+    std.debug.print("Creating Plan-based operations\n", .{});
     
-    // For parameters, make copies to keep the originals
-    const w1_copy = try Tensor.init(allocator, w1_tensor.shape.dims, w1_tensor.dtype, w1_tensor.backend);
-    @memcpy(w1_copy.buffer.data, w1_tensor.buffer.data[0..w1_tensor.buffer.data.len]);
+    // Create MatMul plans
+    const MatmulPlanType = autodiff.MatmulPlanWithGrad(ops.CpuBackend, f32, null, null, null);
+    var matmul_plan1 = autodiff.AutoDiffPlan(MatmulPlanType).init(allocator);
+    defer matmul_plan1.deinit();
     
-    const w2_copy = try Tensor.init(allocator, w2_tensor.shape.dims, w2_tensor.dtype, w2_tensor.backend);
-    @memcpy(w2_copy.buffer.data, w2_tensor.buffer.data[0..w2_tensor.buffer.data.len]);
+    var matmul_plan2 = autodiff.AutoDiffPlan(MatmulPlanType).init(allocator);
+    defer matmul_plan2.deinit();
     
-    var w1 = try autodiff.variable(allocator, w1_copy, true);
-    var w2 = try autodiff.variable(allocator, w2_copy, true);
+    // Create ReLU plan
+    const ReluPlanType = autodiff.ReluPlanWithGrad(ops.CpuBackend, f32, null);
+    var relu_plan = autodiff.AutoDiffPlan(ReluPlanType).init(allocator);
+    defer relu_plan.deinit();
     
-    // For input, make a copy
-    const x_copy = try Tensor.init(allocator, x_tensor.shape.dims, x_tensor.dtype, x_tensor.backend);
-    @memcpy(x_copy.buffer.data, x_tensor.buffer.data[0..x_tensor.buffer.data.len]);
+    // Create Subtract plan
+    const SubtractPlanType = autodiff.SubtractPlanWithGrad(ops.CpuBackend, f32, null);
+    var subtract_plan = autodiff.AutoDiffPlan(SubtractPlanType).init(allocator);
+    defer subtract_plan.deinit();
     
-    var x = try autodiff.variable(allocator, x_copy, false); // Doesn't need gradients
+    // Create Multiply plan
+    const MultiplyPlanType = autodiff.MultiplyPlanWithGrad(ops.CpuBackend, f32, null);
+    var multiply_plan = autodiff.AutoDiffPlan(MultiplyPlanType).init(allocator);
+    defer multiply_plan.deinit();
     
-    // Forward pass: h = relu(x @ w1), y_pred = h @ w2
-    std.debug.print("Building computational graph\n", .{});
-    var h_pre = try autodiff.matmul(allocator, x, w1); // Linear layer
-    var h = try autodiff.relu(allocator, h_pre); // Activation
-    var y_pred = try autodiff.matmul(allocator, h, w2); // Second linear layer
+    // Forward pass using plans
+    std.debug.print("Running forward pass with plans...\n", .{});
+    
+    // h_pre = x @ w1
+    const h_pre = try matmul_plan1.forward(.{ .a = x, .b = w1 });
+    defer h_pre.deinit();
+    
+    // h = relu(h_pre)
+    const h = try relu_plan.forward(h_pre);
+    defer h.deinit();
+    
+    // y_pred = h @ w2
+    const y_pred = try matmul_plan2.forward(.{ .a = h, .b = w2 });
+    defer y_pred.deinit();
     
     // Print prediction
-    std.debug.print("\nPrediction:\n", .{});
-    printTensor(y_pred.tensor);
+    std.debug.print("\nPrediction (Plan-based):\n", .{});
+    printTensor(y_pred);
     
-    // Compute loss: MSE = mean((y_pred - y_target)^2)
-    // Convert y_target to node
-    const y_copy = try Tensor.init(allocator, y_tensor.shape.dims, y_tensor.dtype, y_tensor.backend);
-    @memcpy(y_copy.buffer.data, y_tensor.buffer.data[0..y_tensor.buffer.data.len]);
+    // Compute MSE loss components
+    // diff = y_pred - y_target
+    const diff = try subtract_plan.forward(.{ .a = y_pred, .b = y_target });
+    defer diff.deinit();
     
-    var y_target = try autodiff.variable(allocator, y_copy, false);
+    // diff_squared = diff * diff
+    const diff_squared = try multiply_plan.forward(.{ .a = diff, .b = diff });
+    defer diff_squared.deinit();
     
-    // Compute difference
-    var diff = try autodiff.subtract(allocator, y_pred, y_target);
+    // Calculate mean manually
+    const diff_squared_buf = ptrCastHelper([*]f32, diff_squared.buffer.data.ptr)[0..diff_squared.shape.elemCount()];
+    var sum: f32 = 0.0;
+    for (diff_squared_buf) |val| {
+        sum += val;
+    }
+    const loss_value = sum / @as(f32, @floatFromInt(diff_squared.shape.elemCount()));
     
-    // Square the difference
-    var diff_squared = try autodiff.multiply(allocator, diff, diff);
+    std.debug.print("\nMSE Loss: {d:.6}\n", .{loss_value});
     
-    // Create a tensor of ones to use for reducing
-    const ones = try Tensor.filled(allocator, diff_squared.tensor.shape.dims, diff_squared.tensor.dtype, 1.0, diff_squared.tensor.backend);
-    var ones_node = try autodiff.variable(allocator, ones, false);
+    // Backward pass
+    std.debug.print("\nRunning backward pass with plans...\n", .{});
     
-    // Create a small constant factor node for mean calculation
-    const ones_for_reduction = try Tensor.filled(allocator, &[_]usize{diff_squared.tensor.shape.dims[1], 1}, diff_squared.tensor.dtype, 1.0, diff_squared.tensor.backend);
-    var ones_for_reduction_node = try autodiff.variable(allocator, ones_for_reduction, false);
+    // Create gradient with ones
+    var grad_ones = try Tensor.filled(allocator, y_pred.shape.dims, y_pred.dtype, 1.0, y_pred.backend);
+    defer grad_ones.deinit();
     
-    // Sum through matrix multiplication with ones tensor
-    // sum(diff_squared) = diff_squared @ ones
-    var sum_squared_diff = try autodiff.matmul(allocator, diff_squared, ones_for_reduction_node);
+    // Backprop through second matmul
+    const grads2 = try matmul_plan2.backward(grad_ones);
+    defer grads2.da.deinit();
+    defer grads2.db.deinit();
     
-    // Create scale factor - matching the shape of sum_squared_diff
-    const scale_factor = try Tensor.filled(allocator, sum_squared_diff.tensor.shape.dims, sum_squared_diff.tensor.dtype, 0.25, sum_squared_diff.tensor.backend);
-    var scale_node = try autodiff.variable(allocator, scale_factor, false);
+    // Backprop through relu
+    const relu_grad = try relu_plan.backward(grads2.da);
+    defer relu_grad.deinit();
     
-    // Multiply by 0.25 to get mean (element-wise multiplication)
-    var loss = try autodiff.multiply(allocator, sum_squared_diff, scale_node);
-    
-    // Print loss
-    std.debug.print("\nLoss:\n", .{});
-    printTensor(loss.tensor);
-    
-    // Run backward pass
-    std.debug.print("\nRunning backward pass...\n", .{});
-    try autodiff.backward(allocator, loss);
+    // Backprop through first matmul
+    const grads1 = try matmul_plan1.backward(relu_grad);
+    defer grads1.da.deinit();
+    defer grads1.db.deinit();
     
     // Print gradients
-    std.debug.print("\nGradients for w1:\n", .{});
-    if (w1.grad) |grad| {
-        printTensor(grad);
-    } else {
-        std.debug.print("No gradient\n", .{});
-    }
+    std.debug.print("\nGradients for w1 (Plan-based):\n", .{});
+    printTensor(grads1.db);
     
-    std.debug.print("\nGradients for w2:\n", .{});
-    if (w2.grad) |grad| {
-        printTensor(grad);
-    } else {
-        std.debug.print("No gradient\n", .{});
-    }
+    std.debug.print("\nGradients for w2 (Plan-based):\n", .{});
+    printTensor(grads2.db);
     
-    // Clean up intermediate nodes
-    std.debug.print("\nCleaning up nodes\n", .{});
-    loss.deinit();
-    sum_squared_diff.deinit();
-    scale_node.deinit();
-    ones_for_reduction_node.deinit();
-    ones_node.deinit();
-    diff_squared.deinit();
-    diff.deinit();
-    y_target.deinit();
-    y_pred.deinit();
-    h.deinit();
-    h_pre.deinit();
-    x.deinit();
-    w2.deinit();
-    w1.deinit();
-    
-    // Clean up original tensors
-    w1_tensor.deinit();
-    w2_tensor.deinit();
-    x_tensor.deinit();
-    y_tensor.deinit();
-    
-    std.debug.print("\nModel test completed successfully\n", .{});
+    std.debug.print("\nPlan-based model test completed successfully\n", .{});
 }
 
-// Test embedding functionality
+// Test embedding functionality with Plan-based approach
 fn testEmbeddings(allocator: Allocator) !void {
-    std.debug.print("\n=== Testing Embedding Lookup ===\n", .{});
+    std.debug.print("\n=== Testing Embedding Lookup with Plan-Based Approach ===\n", .{});
     
     // Create a small embedding table
-    var embed_dims = [_]usize{ 5, 3 }; // 5 words, 3-dimensional embeddings
+    const vocab_size: usize = 5;
+    const embed_dim: usize = 3;
+    var embed_dims = [_]usize{ vocab_size, embed_dim }; // 5 words, 3-dimensional embeddings
     var embeddings = try Tensor.zeros(allocator, &embed_dims, .f32, .cpu);
+    defer embeddings.deinit();
     
     // Fill with test values
     var embed_buf = ptrCastHelper([*]f32, embeddings.buffer.data.ptr)[0..embeddings.shape.elemCount()];
@@ -223,12 +215,10 @@ fn testEmbeddings(allocator: Allocator) !void {
     
     std.debug.print("Created embedding table with shape [{}, {}]\n", .{embed_dims[0], embed_dims[1]});
     
-    // Create embedding parameters node
-    var embed_node = try autodiff.variable(allocator, embeddings, true);
-    
     // Create indices tensor for lookup
     var indices_dims = [_]usize{ 2, 2 }; // Batch size 2, sequence length 2
     var indices = try Tensor.zeros(allocator, &indices_dims, .f32, .cpu);
+    defer indices.deinit();
     
     // Set indices: [[1, 2], [3, 0]]
     try indices.setScalar(&[_]usize{0, 0}, 1.0); // first word of first sequence: word ID 1
@@ -238,125 +228,95 @@ fn testEmbeddings(allocator: Allocator) !void {
     
     std.debug.print("Created indices tensor with shape [{}, {}]\n", .{indices_dims[0], indices_dims[1]});
     
-    // Store the reference count before lookup
-    const embed_ref_before = embeddings.getRefCount();
-    const indices_ref_before = indices.getRefCount();
-    std.debug.print("Before lookup: embed_ref_count={}, indices_ref_count={}\n", 
-        .{embed_ref_before, indices_ref_before});
+    // Create embedding lookup plan
+    const EmbedPlanType = autodiff.EmbeddingLookupPlanWithGrad(ops.CpuBackend, f32, vocab_size, embed_dim);
+    var embed_plan = autodiff.AutoDiffPlan(EmbedPlanType).init(allocator);
+    defer embed_plan.deinit();
     
-    // Perform embedding lookup
-    std.debug.print("Performing embedding lookup\n", .{});
-    var lookup_result = try autodiff.embedding_lookup(allocator, embed_node, indices);
+    // Create subtract plan for loss computation
+    const SubtractPlanType = autodiff.SubtractPlanWithGrad(ops.CpuBackend, f32, null);
+    var subtract_plan = autodiff.AutoDiffPlan(SubtractPlanType).init(allocator);
+    defer subtract_plan.deinit();
     
-    // Check reference counts after lookup
-    const embed_ref_after = embeddings.getRefCount();
-    const indices_ref_after = indices.getRefCount();
-    std.debug.print("After lookup: embed_ref_count={}, indices_ref_count={}\n", 
-        .{embed_ref_after, indices_ref_after});
+    // Create multiply plan for squaring the difference
+    const MultiplyPlanType = autodiff.MultiplyPlanWithGrad(ops.CpuBackend, f32, null);
+    var multiply_plan = autodiff.AutoDiffPlan(MultiplyPlanType).init(allocator);
+    defer multiply_plan.deinit();
+    
+    // Perform embedding lookup using plan
+    std.debug.print("Performing embedding lookup with plan...\n", .{});
+    const lookup_result = try embed_plan.forward(.{ .params = embeddings, .indices = indices });
+    defer lookup_result.deinit();
     
     // Print results
-    std.debug.print("\nEmbedding lookup result:\n", .{});
-    printTensor(lookup_result.tensor);
+    std.debug.print("\nEmbedding lookup result (Plan-based):\n", .{});
+    printTensor(lookup_result);
     
-    // Create a simpler loss function
-    // Just use mean squared error directly on the embedding output
-    // Create target tensor with the same shape as lookup_result.tensor
-    const target = try Tensor.filled(allocator, lookup_result.tensor.shape.dims, 
-                                 lookup_result.tensor.dtype, 0.5, lookup_result.tensor.backend);
+    // Create target tensor with the same shape as lookup_result
+    const target = try Tensor.filled(allocator, lookup_result.shape.dims, lookup_result.dtype, 0.5, lookup_result.backend);
+    defer target.deinit();
     
     std.debug.print("\nTarget tensor:\n", .{});
     printTensor(target);
     
-    var target_node = try autodiff.variable(allocator, target, false);
+    // Compute difference: diff = lookup_result - target
+    std.debug.print("\nComputing loss with plans...\n", .{});
+    const diff = try subtract_plan.forward(.{ .a = lookup_result, .b = target });
+    defer diff.deinit();
     
-    // Compute difference
-    std.debug.print("\nComputing loss directly on 3D tensors\n", .{});
-    var diff = try autodiff.subtract(allocator, lookup_result, target_node);
+    // Square the difference: diff_squared = diff * diff
+    const diff_squared = try multiply_plan.forward(.{ .a = diff, .b = diff });
+    defer diff_squared.deinit();
     
-    // Square the difference
-    var diff_squared = try autodiff.multiply(allocator, diff, diff);
-    
-    // We need to sum up the gradients
-    // Create a vector of ones with shape matching diff_squared's last two dimensions [seq_len, embed_dim]
-    const ones_dims = [_]usize{lookup_result.tensor.shape.dims[1] * lookup_result.tensor.shape.dims[2], 1};
-    const ones = try Tensor.filled(allocator, &ones_dims, .f32, 1.0, .cpu);
-    var ones_node = try autodiff.variable(allocator, ones, false);
-    
-    // Sum over last dimension first
-    var batch_sums = std.ArrayList(*autodiff.Node).init(allocator);
-    defer batch_sums.deinit();
-    
-    // Loop through each batch element
-    for (0..lookup_result.tensor.shape.dims[0]) |b| {
-        // Extract this batch element (shape [seq_len, embed_dim])
-        var batch_slice_dims = [_]usize{1, lookup_result.tensor.shape.dims[1], lookup_result.tensor.shape.dims[2]};
-        var batch_slice = try Tensor.zeros(allocator, &batch_slice_dims, .f32, .cpu);
-        
-        const diff_squared_buf = ptrCastHelper([*]f32, diff_squared.tensor.buffer.data.ptr)[0..diff_squared.tensor.shape.elemCount()];
-        const batch_slice_buf = ptrCastHelper([*]f32, batch_slice.buffer.data.ptr)[0..batch_slice.shape.elemCount()];
-        
-        // Copy data for this batch
-        const start_idx = b * lookup_result.tensor.shape.dims[1] * lookup_result.tensor.shape.dims[2];
-        const copy_len = lookup_result.tensor.shape.dims[1] * lookup_result.tensor.shape.dims[2];
-        @memcpy(batch_slice_buf, diff_squared_buf[start_idx..start_idx+copy_len]);
-        
-        const batch_node = try autodiff.variable(allocator, batch_slice, true);
-        try batch_sums.append(batch_node);
+    // Calculate mean manually
+    const diff_squared_buf = ptrCastHelper([*]f32, diff_squared.buffer.data.ptr)[0..diff_squared.shape.elemCount()];
+    var sum: f32 = 0.0;
+    for (diff_squared_buf) |val| {
+        sum += val;
     }
+    const mse = sum / @as(f32, @floatFromInt(diff_squared.shape.elemCount()));
     
-    // Create a loss node for the mean
-    // For simplicity, just use the first batch element's sum as the loss
-    var loss = batch_sums.items[0];
+    std.debug.print("\nMSE Loss: {d:.6}\n", .{mse});
     
-    // Print loss
-    std.debug.print("\nLoss:\n", .{});
-    printTensor(loss.tensor);
+    // Create gradient with ones
+    var grad_ones = try Tensor.filled(allocator, diff_squared.shape.dims, diff_squared.dtype, 1.0, diff_squared.backend);
+    defer grad_ones.deinit();
     
-    // Run backward pass
-    std.debug.print("\nRunning backward pass...\n", .{});
-    try autodiff.backward(allocator, loss);
+    // Backward pass
+    std.debug.print("\nRunning backward pass with plans...\n", .{});
     
-    // Check embedding gradients
-    std.debug.print("\nEmbedding gradients:\n", .{});
-    if (embed_node.grad) |grad| {
-        printTensor(grad);
-    } else {
-        std.debug.print("No gradient\n", .{});
-    }
+    // Backprop through multiply
+    const diff_grads = try multiply_plan.backward(grad_ones);
+    defer diff_grads.da.deinit();
+    defer diff_grads.db.deinit();
     
-    // Cleanup 
-    std.debug.print("\nCleaning up\n", .{});
+    // Backprop through subtract
+    const lookup_target_grads = try subtract_plan.backward(diff_grads.da);
+    defer lookup_target_grads.da.deinit();
+    defer lookup_target_grads.db.deinit();
     
-    // Clean up batch nodes except loss which we'll clean up separately
-    for (batch_sums.items) |batch_node| {
-        if (batch_node != loss) {
-            batch_node.deinit();
-        }
-    }
+    // Backprop through embedding lookup
+    const embed_grads = try embed_plan.backward(lookup_target_grads.da);
+    defer embed_grads.deinit();
     
-    loss.deinit();
-    ones_node.deinit();
-    diff_squared.deinit();
-    diff.deinit();
-    target_node.deinit();
-    lookup_result.deinit();
-    embed_node.deinit();
+    // Print embedding gradients
+    std.debug.print("\nEmbedding gradients (Plan-based):\n", .{});
+    printTensor(embed_grads);
     
-    // Since the indices were retained by the embedding_lookup, but lookup_result's deinit 
-    // will now clean up any indices nodes, we do NOT need to release our original reference
-    std.debug.print("Final indices ref_count before exiting: {}\n", .{indices.getRefCount()});
-    // DO NOT CALL indices.deinit() here - that would cause a double-free
-    
-    std.debug.print("\nEmbedding test completed successfully\n", .{});
+    std.debug.print("\nPlan-based embedding test completed successfully\n", .{});
 }
 
-// Test a more complex model with connected nodes
+// Test a more complex model with Plan-based approach
 fn testComplexModel(allocator: Allocator) !void {
-    std.debug.print("\n=== Testing Complex Model with Embedding Lookups ===\n", .{});
+    std.debug.print("\n=== Testing Complex Model with Plan-Based Approach ===\n", .{});
     
     // Create emulation of GPT-2 tokens with a small vocab (10) and small embedding dim (4)
-    var wte_dims = [_]usize{ 10, 4 }; // Vocab size 10, embedding dim 4
+    const vocab_size: usize = 10;
+    const embed_dim: usize = 4;
+    
+    var wte_dims = [_]usize{ vocab_size, embed_dim };
     var wte = try Tensor.random(allocator, &wte_dims, .f32, .cpu);
+    defer wte.deinit();
     
     // Scale down random values
     const wte_ptr = ptrCastHelper([*]f32, wte.buffer.data.ptr)[0..wte.shape.elemCount()];
@@ -365,8 +325,10 @@ fn testComplexModel(allocator: Allocator) !void {
     }
     
     // Position embeddings: 5 positions, embedding dim 4
-    var wpe_dims = [_]usize{ 5, 4 };
+    const num_positions: usize = 5;
+    var wpe_dims = [_]usize{ num_positions, embed_dim };
     var wpe = try Tensor.random(allocator, &wpe_dims, .f32, .cpu);
+    defer wpe.deinit();
     
     // Scale down random values
     const wpe_ptr = ptrCastHelper([*]f32, wpe.buffer.data.ptr)[0..wpe.shape.elemCount()];
@@ -375,8 +337,11 @@ fn testComplexModel(allocator: Allocator) !void {
     }
     
     // Create input: batch size 2, sequence length 3, with token IDs
-    var input_dims = [_]usize{ 2, 3 };
+    const batch_size: usize = 2;
+    const seq_len: usize = 3;
+    var input_dims = [_]usize{ batch_size, seq_len };
     var input_ids = try Tensor.zeros(allocator, &input_dims, .f32, .cpu);
+    defer input_ids.deinit();
     
     // Set token IDs: [[1, 2, 3], [4, 5, 6]]
     try input_ids.setScalar(&[_]usize{0, 0}, 1.0);
@@ -386,73 +351,21 @@ fn testComplexModel(allocator: Allocator) !void {
     try input_ids.setScalar(&[_]usize{1, 1}, 5.0);
     try input_ids.setScalar(&[_]usize{1, 2}, 6.0);
     
-    // Create parameter nodes
-    var wte_node = try autodiff.variable(allocator, wte, true);
-    var wpe_node = try autodiff.variable(allocator, wpe, true);
-    
-    // Store parameter nodes for gradient inspection
-    var model_params = std.ArrayList(*Node).init(allocator);
-    try model_params.append(wte_node);
-    try model_params.append(wpe_node);
-    
-    std.debug.print("Building forward pass with autodiff.embedding_lookup\n", .{});
-    
-    // Use embedding lookup for token embeddings
-    var token_embeds = try autodiff.embedding_lookup(allocator, wte_node, input_ids);
-    
     // Create position indices
-    var pos_indices_dims = [_]usize{ 2, 3 };
-    var pos_indices = try Tensor.zeros(allocator, &pos_indices_dims, .f32, .cpu);
+    var pos_indices = try Tensor.zeros(allocator, &input_dims, .f32, .cpu);
+    defer pos_indices.deinit();
     
     // Fill with position IDs
-    for (0..2) |b| {
-        for (0..3) |s| {
+    for (0..batch_size) |b| {
+        for (0..seq_len) |s| {
             try pos_indices.setScalar(&[_]usize{b, s}, @as(f32, @floatFromInt(s)));
         }
     }
     
-    // Use embedding lookup for position embeddings
-    var pos_embeds = try autodiff.embedding_lookup(allocator, wpe_node, pos_indices);
-    
-    // Reshape embeddings to [batch_size*seq_len, embed_dim]
-    const batch_size = input_ids.shape.dims[0];
-    const seq_len = input_ids.shape.dims[1];
-    const embed_dim = wte_node.tensor.shape.dims[1];
-    
-    var flat_dims = [_]usize{ batch_size * seq_len, embed_dim };
-    
-    // Create flattened tensors
-    var token_embeds_flat = try Tensor.zeros(allocator, &flat_dims, .f32, .cpu);
-    var pos_embeds_flat = try Tensor.zeros(allocator, &flat_dims, .f32, .cpu);
-    
-    // Copy data
-    const token_embeds_buf = ptrCastHelper([*]f32, token_embeds.tensor.buffer.data.ptr)[0..token_embeds.tensor.shape.elemCount()];
-    const pos_embeds_buf = ptrCastHelper([*]f32, pos_embeds.tensor.buffer.data.ptr)[0..pos_embeds.tensor.shape.elemCount()];
-    
-    const token_flat_buf = ptrCastHelper([*]f32, token_embeds_flat.buffer.data.ptr)[0..token_embeds_flat.shape.elemCount()];
-    const pos_flat_buf = ptrCastHelper([*]f32, pos_embeds_flat.buffer.data.ptr)[0..pos_embeds_flat.shape.elemCount()];
-    
-    for (0..batch_size) |b| {
-        for (0..seq_len) |s| {
-            for (0..embed_dim) |e| {
-                const src_idx = (b * seq_len + s) * embed_dim + e;
-                const dst_idx = (b * seq_len + s) * embed_dim + e;
-                token_flat_buf[dst_idx] = token_embeds_buf[src_idx];
-                pos_flat_buf[dst_idx] = pos_embeds_buf[src_idx];
-            }
-        }
-    }
-    
-    // Create nodes for flattened tensors
-    var token_embeds_flat_node = try autodiff.variable(allocator, token_embeds_flat, true);
-    var pos_embeds_flat_node = try autodiff.variable(allocator, pos_embeds_flat, true);
-    
-    // Add token and position embeddings
-    var combined = try autodiff.add(allocator, token_embeds_flat_node, pos_embeds_flat_node);
-    
-    // Create a small projection layer
-    var proj_dims = [_]usize{ 4, 10 }; // Project back to vocab size
+    // Create projection layer weights
+    var proj_dims = [_]usize{ embed_dim, vocab_size }; // Project back to vocab size
     var proj = try Tensor.random(allocator, &proj_dims, .f32, .cpu);
+    defer proj.deinit();
     
     // Scale down
     const proj_ptr = ptrCastHelper([*]f32, proj.buffer.data.ptr)[0..proj.shape.elemCount()];
@@ -460,105 +373,292 @@ fn testComplexModel(allocator: Allocator) !void {
         val.* *= 0.1;
     }
     
-    var proj_node = try autodiff.variable(allocator, proj, true);
+    // Create plans for all operations
+    std.debug.print("Creating Plan-based operations\n", .{});
     
-    // Store with other parameters
-    try model_params.append(proj_node);
+    // Token embedding lookup plan
+    const TokenEmbedPlanType = autodiff.EmbeddingLookupPlanWithGrad(ops.CpuBackend, f32, vocab_size, embed_dim);
+    var token_embed_plan = autodiff.AutoDiffPlan(TokenEmbedPlanType).init(allocator);
+    defer token_embed_plan.deinit();
+    
+    // Position embedding lookup plan
+    const PosEmbedPlanType = autodiff.EmbeddingLookupPlanWithGrad(ops.CpuBackend, f32, num_positions, embed_dim);
+    var pos_embed_plan = autodiff.AutoDiffPlan(PosEmbedPlanType).init(allocator);
+    defer pos_embed_plan.deinit();
+    
+    // Add plan
+    const AddPlanType = autodiff.AddPlanWithGrad(ops.CpuBackend, f32, null);
+    var add_plan = autodiff.AutoDiffPlan(AddPlanType).init(allocator);
+    defer add_plan.deinit();
+    
+    // MatMul plan
+    const MatmulPlanType = autodiff.MatmulPlanWithGrad(ops.CpuBackend, f32, null, null, null);
+    var matmul_plan = autodiff.AutoDiffPlan(MatmulPlanType).init(allocator);
+    defer matmul_plan.deinit();
+    
+    // Softmax plan
+    const SoftmaxPlanType = autodiff.SoftmaxPlanWithGrad(ops.CpuBackend, f32, null, null);
+    var softmax_plan = autodiff.AutoDiffPlan(SoftmaxPlanType).init(allocator);
+    defer softmax_plan.deinit();
+    
+    // Subtract plan
+    const SubtractPlanType = autodiff.SubtractPlanWithGrad(ops.CpuBackend, f32, null);
+    var subtract_plan = autodiff.AutoDiffPlan(SubtractPlanType).init(allocator);
+    defer subtract_plan.deinit();
+    
+    // Multiply plan
+    const MultiplyPlanType = autodiff.MultiplyPlanWithGrad(ops.CpuBackend, f32, null);
+    var multiply_plan = autodiff.AutoDiffPlan(MultiplyPlanType).init(allocator);
+    defer multiply_plan.deinit();
+    
+    // Forward pass using plans
+    std.debug.print("Running forward pass with plans...\n", .{});
+    
+    // Token embeddings
+    const token_embeds = try token_embed_plan.forward(.{ .params = wte, .indices = input_ids });
+    defer token_embeds.deinit();
+    
+    // Position embeddings
+    const pos_embeds = try pos_embed_plan.forward(.{ .params = wpe, .indices = pos_indices });
+    defer pos_embeds.deinit();
+    
+    // Reshape embeddings to match dimensions for adding
+    const flat_size = batch_size * seq_len * embed_dim;
+    var token_embeds_flat = try Tensor.zeros(allocator, &[_]usize{flat_size}, .f32, token_embeds.backend);
+    defer token_embeds_flat.deinit();
+    
+    var pos_embeds_flat = try Tensor.zeros(allocator, &[_]usize{flat_size}, .f32, pos_embeds.backend);
+    defer pos_embeds_flat.deinit();
+    
+    // Copy data - make sure we're using the correct sizes
+    const token_data_size = @min(token_embeds_flat.buffer.data.len, token_embeds.buffer.data.len);
+    const pos_data_size = @min(pos_embeds_flat.buffer.data.len, pos_embeds.buffer.data.len);
+    
+    @memcpy(token_embeds_flat.buffer.data[0..token_data_size], token_embeds.buffer.data[0..token_data_size]);
+    @memcpy(pos_embeds_flat.buffer.data[0..pos_data_size], pos_embeds.buffer.data[0..pos_data_size]);
+    
+    // Reshape to 2D for next operations
+    var token_embeds_reshaped = try Tensor.zeros(allocator, &[_]usize{batch_size * seq_len, embed_dim}, .f32, token_embeds.backend);
+    defer token_embeds_reshaped.deinit();
+    
+    var pos_embeds_reshaped = try Tensor.zeros(allocator, &[_]usize{batch_size * seq_len, embed_dim}, .f32, pos_embeds.backend);
+    defer pos_embeds_reshaped.deinit();
+    
+    // Copy data to reshaped tensors - make sure we're using the correct sizes
+    const token_reshape_size = @min(token_embeds_reshaped.buffer.data.len, token_embeds_flat.buffer.data.len);
+    const pos_reshape_size = @min(pos_embeds_reshaped.buffer.data.len, pos_embeds_flat.buffer.data.len);
+    
+    @memcpy(token_embeds_reshaped.buffer.data[0..token_reshape_size], token_embeds_flat.buffer.data[0..token_reshape_size]);
+    @memcpy(pos_embeds_reshaped.buffer.data[0..pos_reshape_size], pos_embeds_flat.buffer.data[0..pos_reshape_size]);
+    
+    // Add token and position embeddings
+    const combined = try add_plan.forward(.{ .a = token_embeds_reshaped, .b = pos_embeds_reshaped });
+    defer combined.deinit();
     
     // Apply projection: logits = combined @ proj
-    var logits = try autodiff.matmul(allocator, combined, proj_node);
+    const logits = try matmul_plan.forward(.{ .a = combined, .b = proj });
+    defer logits.deinit();
     
     // Apply softmax to get probabilities
-    var probs = try autodiff.softmax(allocator, logits);
+    const probs = try softmax_plan.forward(logits);
+    defer probs.deinit();
     
     // Create target tensor: one-hot
-    var targets_dims = [_]usize{ batch_size * seq_len, 10 };
-    var targets = try Tensor.zeros(allocator, &targets_dims, .f32, .cpu);
+    var targets = try Tensor.zeros(allocator, &[_]usize{batch_size * seq_len, vocab_size}, .f32, .cpu);
+    defer targets.deinit();
     
     // Set target values (just set position 0 to 1.0 for each example)
     const targets_buf = ptrCastHelper([*]f32, targets.buffer.data.ptr)[0..targets.shape.elemCount()];
     for (0..batch_size * seq_len) |i| {
-        targets_buf[i * 10] = 1.0;
+        targets_buf[i * vocab_size] = 1.0;
     }
     
-    var targets_node = try autodiff.variable(allocator, targets, false);
+    // Compute loss: diff = probs - targets
+    const diff = try subtract_plan.forward(.{ .a = probs, .b = targets });
+    defer diff.deinit();
     
-    // Compute cross-entropy loss (simplified)
-    // Just subtract targets from probs, square and sum
-    var diff = try autodiff.subtract(allocator, probs, targets_node);
-    var diff_squared = try autodiff.multiply(allocator, diff, diff);
+    // Square the difference: diff_squared = diff * diff
+    const diff_squared = try multiply_plan.forward(.{ .a = diff, .b = diff });
+    defer diff_squared.deinit();
     
-    // Create a tensor of ones to use for reducing
-    const ones_dims = [_]usize{ 10, 1 };
-    const ones = try Tensor.filled(allocator, &ones_dims, .f32, 1.0, .cpu);
-    var ones_node = try autodiff.variable(allocator, ones, false);
-    
-    // Sum through matrix multiplication with ones tensor
-    var loss_per_example = try autodiff.matmul(allocator, diff_squared, ones_node);
-    
-    // Mean across examples - create with same shape as loss_per_example
-    const mean_factor = try Tensor.filled(allocator, loss_per_example.tensor.shape.dims, .f32, 1.0 / @as(f32, @floatFromInt(batch_size * seq_len)), .cpu);
-    var mean_node = try autodiff.variable(allocator, mean_factor, false);
-    
-    // Get scalar loss by element-wise multiplication
-    var loss = try autodiff.multiply(allocator, loss_per_example, mean_node);
-    
-    // Print loss
-    std.debug.print("\nLoss:\n", .{});
-    printTensor(loss.tensor);
-    
-    // Run backward pass
-    std.debug.print("\nRunning backward pass...\n", .{});
-    try autodiff.backward(allocator, loss);
-    
-    // Check all parameter gradients
-    for (model_params.items, 0..) |param, i| {
-        std.debug.print("\nGradients for parameter {d}:\n", .{i});
-        if (param.grad) |grad| {
-            printTensor(grad);
-        } else {
-            std.debug.print("No gradient\n", .{});
-        }
+    // Calculate sum and mean manually
+    const diff_squared_buf = ptrCastHelper([*]f32, diff_squared.buffer.data.ptr)[0..diff_squared.shape.elemCount()];
+    var sum: f32 = 0.0;
+    for (diff_squared_buf) |val| {
+        sum += val;
     }
+    const mse = sum / @as(f32, @floatFromInt(diff_squared.shape.elemCount()));
     
-    // Clean up
-    std.debug.print("\nCleaning up\n", .{});
+    std.debug.print("\nMSE Loss: {d:.6}\n", .{mse});
     
-    // Check reference counts before cleanup
-    std.debug.print("Before cleanup: input_ids ref_count={}, pos_indices ref_count={}\n", 
-        .{input_ids.getRefCount(), pos_indices.getRefCount()});
+    // Create gradient with ones
+    var grad_ones = try Tensor.filled(allocator, diff_squared.shape.dims, diff_squared.dtype, 1.0, diff_squared.backend);
+    defer grad_ones.deinit();
     
-    // Clean up parameters list
-    model_params.deinit();
+    // Backward pass
+    std.debug.print("\nRunning backward pass with plans...\n", .{});
     
-    // Clean up nodes (in reverse creation order)
-    loss.deinit();
-    mean_node.deinit();
-    loss_per_example.deinit();
-    ones_node.deinit();
-    diff_squared.deinit();
-    diff.deinit();
-    targets_node.deinit();
-    probs.deinit();
-    logits.deinit();
-    proj_node.deinit();
-    combined.deinit();
-    pos_embeds_flat_node.deinit();
-    token_embeds_flat_node.deinit();
-    pos_embeds.deinit(); 
-    token_embeds.deinit();
-    wpe_node.deinit();
-    wte_node.deinit();
+    // Backprop through square
+    const diff_grads = try multiply_plan.backward(grad_ones);
+    defer diff_grads.da.deinit();
+    defer diff_grads.db.deinit();
     
-    // We should NOT explicitly free input_ids and pos_indices here
-    // They're released through the embedding_lookup node's deinit
-    // Just print the reference counts to verify they're still valid
-    std.debug.print("Final ref counts: input_ids={}, pos_indices={}\n", 
-        .{input_ids.getRefCount(), pos_indices.getRefCount()});
+    // Backprop through subtract
+    const prob_target_grads = try subtract_plan.backward(diff_grads.da);
+    defer prob_target_grads.da.deinit();
+    defer prob_target_grads.db.deinit();
     
-    std.debug.print("Tensors cleaned up successfully\n", .{});
+    // Backprop through softmax
+    const logits_grad = try softmax_plan.backward(prob_target_grads.da);
+    defer logits_grad.deinit();
     
-    std.debug.print("\nComplex model test completed successfully\n", .{});
+    // Backprop through projection
+    // Note: We need to provide the same format as in the forward pass
+    const proj_grads = try matmul_plan.backward(logits_grad);
+    defer proj_grads.da.deinit();
+    defer proj_grads.db.deinit();
+    
+    // Backprop through add
+    const embed_grads = try add_plan.backward(proj_grads.da);
+    defer embed_grads.da.deinit();
+    defer embed_grads.db.deinit();
+    
+    // Print gradients
+    std.debug.print("\nGradients for token embeddings (Plan-based):\n", .{});
+    const token_grads = try token_embed_plan.backward(embed_grads.da);
+    defer token_grads.deinit();
+    printTensor(token_grads);
+    
+    std.debug.print("\nGradients for position embeddings (Plan-based):\n", .{});
+    const pos_grads = try pos_embed_plan.backward(embed_grads.db);
+    defer pos_grads.deinit();
+    printTensor(pos_grads);
+    
+    std.debug.print("\nGradients for projection matrix (Plan-based):\n", .{});
+    printTensor(proj_grads.db);
+    
+    std.debug.print("\nPlan-based complex model test completed successfully\n", .{});
+}
+
+// Test a simple model with Plan-based approach
+fn testPlanBasedModel(allocator: Allocator) !void {
+    std.debug.print("\n=== Testing Plan-Based Model ===\n", .{});
+    
+    // Create simple tensors
+    var dims = [_]usize{ 2, 2 };
+    
+    // Create tensors for parameters
+    var w1_tensor = try Tensor.zeros(allocator, &dims, .f32, .cpu);
+    defer w1_tensor.deinit();
+    
+    try w1_tensor.setScalar(&[_]usize{0, 0}, 0.1);
+    try w1_tensor.setScalar(&[_]usize{0, 1}, 0.2);
+    try w1_tensor.setScalar(&[_]usize{1, 0}, 0.3);
+    try w1_tensor.setScalar(&[_]usize{1, 1}, 0.4);
+    
+    var w2_tensor = try Tensor.zeros(allocator, &dims, .f32, .cpu);
+    defer w2_tensor.deinit();
+    
+    try w2_tensor.setScalar(&[_]usize{0, 0}, 0.5);
+    try w2_tensor.setScalar(&[_]usize{0, 1}, 0.6);
+    try w2_tensor.setScalar(&[_]usize{1, 0}, 0.7);
+    try w2_tensor.setScalar(&[_]usize{1, 1}, 0.8);
+    
+    // Create input
+    var x_tensor = try Tensor.zeros(allocator, &dims, .f32, .cpu);
+    defer x_tensor.deinit();
+    
+    try x_tensor.setScalar(&[_]usize{0, 0}, 1.0);
+    try x_tensor.setScalar(&[_]usize{0, 1}, 2.0);
+    try x_tensor.setScalar(&[_]usize{1, 0}, 3.0);
+    try x_tensor.setScalar(&[_]usize{1, 1}, 4.0);
+    
+    // Target values
+    var y_tensor = try Tensor.zeros(allocator, &dims, .f32, .cpu);
+    defer y_tensor.deinit();
+    
+    try y_tensor.setScalar(&[_]usize{0, 0}, 0.5);
+    try y_tensor.setScalar(&[_]usize{0, 1}, 0.5);
+    try y_tensor.setScalar(&[_]usize{1, 0}, 0.5);
+    try y_tensor.setScalar(&[_]usize{1, 1}, 0.5);
+    
+    // Create the autodiff plans
+    const MatmulPlanType = autodiff.MatmulPlanWithGrad(ops.CpuBackend, f32, null, null, null);
+    var matmul_plan1 = autodiff.AutoDiffPlan(MatmulPlanType).init(allocator);
+    defer matmul_plan1.deinit();
+    
+    var matmul_plan2 = autodiff.AutoDiffPlan(MatmulPlanType).init(allocator);
+    defer matmul_plan2.deinit();
+    
+    const ReluPlanType = autodiff.ReluPlanWithGrad(ops.CpuBackend, f32, null);
+    var relu_plan = autodiff.AutoDiffPlan(ReluPlanType).init(allocator);
+    defer relu_plan.deinit();
+    
+    // Forward pass using plans
+    std.debug.print("Running forward pass with plans...\n", .{});
+    
+    // h_pre = x @ w1
+    const h_pre = try matmul_plan1.forward(.{ .a = x_tensor, .b = w1_tensor });
+    defer h_pre.deinit();
+    
+    // h = relu(h_pre)
+    const h = try relu_plan.forward(h_pre);
+    defer h.deinit();
+    
+    // y_pred = h @ w2
+    const y_pred = try matmul_plan2.forward(.{ .a = h, .b = w2_tensor });
+    defer y_pred.deinit();
+    
+    // Print prediction
+    std.debug.print("\nPrediction (Plan-based):\n", .{});
+    printTensor(y_pred);
+    
+    // Compute MSE loss manually
+    var diff = try ops.subtract(allocator, y_pred, y_tensor);
+    defer diff.deinit();
+    
+    var diff_squared = try ops.multiply(allocator, diff, diff);
+    defer diff_squared.deinit();
+    
+    // Calculate mean manually
+    const diff_squared_buf = ptrCastHelper([*]f32, diff_squared.buffer.data.ptr)[0..diff_squared.shape.elemCount()];
+    var sum: f32 = 0.0;
+    for (diff_squared_buf) |val| {
+        sum += val;
+    }
+    const mse = sum / @as(f32, @floatFromInt(diff_squared.shape.elemCount()));
+    
+    std.debug.print("\nMSE Loss: {d:.6}\n", .{mse});
+    
+    // Create gradient with ones
+    var grad_ones = try Tensor.filled(allocator, y_pred.shape.dims, y_pred.dtype, 1.0, y_pred.backend);
+    defer grad_ones.deinit();
+    
+    // Backward pass
+    std.debug.print("\nRunning backward pass with plans...\n", .{});
+    
+    // Backprop through second matmul
+    const grads2 = try matmul_plan2.backward(grad_ones);
+    defer grads2.da.deinit();
+    defer grads2.db.deinit();
+    
+    // Backprop through relu
+    const relu_grad = try relu_plan.backward(grads2.da);
+    defer relu_grad.deinit();
+    
+    // Backprop through first matmul
+    const grads1 = try matmul_plan1.backward(relu_grad);
+    defer grads1.da.deinit();
+    defer grads1.db.deinit();
+    
+    // Print gradients
+    std.debug.print("\nGradients for w1 (Plan-based):\n", .{});
+    printTensor(grads1.db);
+    
+    std.debug.print("\nGradients for w2 (Plan-based):\n", .{});
+    printTensor(grads2.db);
+    
+    std.debug.print("\nPlan-based model test completed successfully\n", .{});
 }
 
 pub fn main() !void {
@@ -566,16 +666,13 @@ pub fn main() !void {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
     
-    std.debug.print("Starting autodiff debug tests\n", .{});
+    std.debug.print("Starting autodiff with Plan-based approach...\n", .{});
     
-    // Test simple operations
+    // Run all Plan-based tests
     try testSimpleModel(allocator);
-    
-    // Test embedding functionality
     try testEmbeddings(allocator);
-    
-    // Test complex model with embedding lookups
     try testComplexModel(allocator);
+    try testPlanBasedModel(allocator);
     
-    std.debug.print("\nAll tests completed successfully!\n", .{});
+    std.debug.print("\nAll Plan-based tests completed successfully!\n", .{});
 }

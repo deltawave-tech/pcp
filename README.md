@@ -30,7 +30,6 @@ A distributed tensor computation framework written in Zig, designed for training
   - `gpt2.zig` - GPT-2 transformer model (wip)
 - `src/examples/` - Example applications
   - `gpt2_training.zig` - Training a mini GPT-2 model (wip)
-  - `shakespeare_training.zig` - Training on Shakespeare text (wip)
   - `autodiff_test.zig` - Memory leak tests and benchmarks
 
 ## Memory Management
@@ -103,9 +102,6 @@ zig build test
 
 # Run benchmark and memory tests
 zig build run-autodiff-test
-
-# Run the Shakespeare training example
-zig build run-shakespeare
 
 # Run the GPT-2 training example
 zig build run-gpt2

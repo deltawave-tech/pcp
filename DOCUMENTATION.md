@@ -133,6 +133,31 @@ pub const Primitives = struct {
         // Implementation...
     }
     
+    /// Batched matrix multiplication for 3D tensors
+    pub fn batched_matmul(comptime T: type, a: Tensor, b: Tensor, result: *Tensor) void {
+        // Implementation...
+    }
+    
+    /// Element-wise power operation
+    pub fn pow(comptime T: type, base: Tensor, exponent: Tensor, result: *Tensor) void {
+        // Implementation...
+    }
+    
+    /// Sum elements of a tensor along specified axes
+    pub fn sum_reduce(comptime T: type, a: Tensor, axes: []const usize, keep_dims: bool, result: *Tensor) void {
+        // Implementation...
+    }
+    
+    /// Expand a tensor to a target shape (broadcasting)
+    pub fn expand(comptime T: type, a: Tensor, target_shape: []const usize, result: *Tensor) void {
+        // Implementation...
+    }
+    
+    /// Reshape a tensor to a new shape
+    pub fn reshape(comptime T: type, a: Tensor, result: *Tensor) void {
+        // Implementation...
+    }
+    
     // Other primitives: subtract, multiply, divide, relu, softmax, transpose, embedding_lookup
 };
 ```
@@ -177,6 +202,51 @@ pub fn MatmulPlan(comptime Backend: type, comptime T: type,
         base: Base,
         
         // Implementation...
+    };
+}
+
+/// Example plan implementation for batched matrix multiplication
+pub fn BatchedMatmulPlan(comptime Backend: type, comptime T: type, 
+                    comptime BatchSize: ?usize, comptime M: ?usize, comptime K: ?usize, comptime N: ?usize) type {
+    // Comptime validation
+    comptime {
+        if (!Backend.hasPrimitive("batched_matmul")) @compileError("Backend must implement batched_matmul primitive");
+        if (T != f32) @compileError("Only f32 supported for now");
+    }
+
+    return struct {
+        pub const InputType = struct { a: Tensor, b: Tensor };
+        pub const op_type = OpType.batched_matmul;
+        pub const GradType = struct { da: Tensor, db: Tensor };
+        
+        const Base = PlanType(Backend, InputType, Tensor);
+        base: Base,
+        
+        // Implementation...
+    };
+}
+
+/// Example plan implementation for layer normalization
+pub fn LayerNormPlan(comptime Backend: type, comptime T: type, comptime shape: ?[]const usize, comptime epsilon: f32) type {
+    // Comptime validation
+    comptime {
+        if (T != f32) @compileError("Only f32 supported for now");
+    }
+
+    return struct {
+        pub const InputType = struct { 
+            input: Tensor, 
+            gamma: Tensor, // scale parameter
+            beta: Tensor,  // shift parameter
+        };
+        
+        pub const op_type = OpType.layer_norm;
+        pub const GradType = struct { dinput: Tensor, dgamma: Tensor, dbeta: Tensor };
+        
+        const Base = PlanType(Backend, InputType, Tensor);
+        base: Base,
+        
+        // Implementation composed of more primitive operations...
     };
 }
 ```
@@ -1739,15 +1809,13 @@ The project includes several example applications that demonstrate how to use th
 
 2. **gpt2_training.zig**: Complete GPT-2 implementation with Plan-based training - shows how to implement a state-of-the-art transformer model using the framework, including gradient-based training.
 
-3. **shakespeare_training.zig**: Training a language model on Shakespeare text using the Plan-based approach - demonstrates how to load data, train a model, and generate text.
+3. **autodiff_test.zig**: Comprehensive automatic differentiation tests using the Plan-based approach - includes tests for various operations like addition, multiplication, division, matmul, ReLU, and embedding lookups.
 
-4. **autodiff_test.zig**: Comprehensive automatic differentiation tests using the Plan-based approach - includes tests for various operations like addition, multiplication, division, matmul, ReLU, and embedding lookups.
+4. **comptime_examples.zig**: Examples demonstrating the compile-time planning features - shows basic operations with compile-time shapes and how to use autodiff with these operations.
 
-5. **comptime_examples.zig**: Examples demonstrating the compile-time planning features - shows basic operations with compile-time shapes and how to use autodiff with these operations.
+5. **metal_test.zig**: Test of Metal backend integration with the plan-based architecture - demonstrates how the framework can be extended to new hardware backends.
 
-6. **metal_test.zig**: Test of Metal backend integration with the plan-based architecture - demonstrates how the framework can be extended to new hardware backends.
-
-7. **metal_benchmark.zig**: Performance benchmarks for the Metal backend - shows how to benchmark operations across different backends.
+6. **metal_benchmark.zig**: Performance benchmarks for the Metal backend - shows how to benchmark operations across different backends.
 
 Each example builds upon the Plan-based approach to automatic differentiation and demonstrates proper memory management, error handling, and gradient computation. Together, they showcase how the framework can be used for everything from simple neural networks to complex language models with proper gradient-based training.
 
@@ -1755,7 +1823,7 @@ For new users, the recommended learning path is:
 1. Start with `comptime_examples.zig` to understand the basic operations
 2. Move to `plan_based_test.zig` to see how autodiff works
 3. Explore `autodiff_test.zig` to understand more complex operations and their gradients
-4. Finally examine the practical applications in `shakespeare_training.zig` and `gpt2_training.zig`
+4. Finally examine the practical applications in `gpt2_training.zig`
 
 ---
 

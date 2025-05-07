@@ -1115,3 +1115,233 @@ test "autodiff embedding lookup plan" {
     try std.testing.expectEqual(@as(f32, 1.0), try grad.getScalar(&[_]usize{3, 2}));
 }
 
+/// Extend ops.SumReducePlan with gradient type information
+pub fn SumReducePlanWithGrad(comptime Backend: type, comptime T: type, comptime axes: ?[]const usize, comptime keep_dims: bool) type {
+    const BasePlan = ops.SumReducePlan(Backend, T, axes, keep_dims);
+    
+    return struct {
+        const Self = @This();
+        const InputType = Tensor;
+        const op_type = .sum_reduce;
+        
+        // Define the gradient type for sum_reduce operation (single input)
+        const GradType = BasePlan.GradType;
+        
+        // Embed the base plan
+        base: BasePlan,
+        
+        pub fn init(allocator: Allocator) Self {
+            return .{ .base = BasePlan.init(allocator) };
+        }
+        
+        pub fn deinit(self: *Self) void {
+            self.base.deinit();
+        }
+        
+        pub fn run(self: Self, input: InputType) !Tensor {
+            return self.base.run(input);
+        }
+        
+        /// Pass through to the base plan's gradient function
+        pub fn gradient(self: Self, grad_out: Tensor, input: InputType) !GradType {
+            return self.base.gradient(grad_out, input);
+        }
+    };
+}
+
+/// Extend ops.PowPlan with gradient type information
+pub fn PowPlanWithGrad(comptime Backend: type, comptime T: type, comptime shape: ?[]const usize) type {
+    const BasePlan = ops.PowPlan(Backend, T, shape);
+    
+    return struct {
+        const Self = @This();
+        const InputType = BasePlan.InputType;
+        const op_type = .pow;
+        
+        // Define the gradient type for power operation
+        const GradType = BasePlan.GradType;
+        
+        // Embed the base plan
+        base: BasePlan,
+        
+        pub fn init(allocator: Allocator) Self {
+            return .{ .base = BasePlan.init(allocator) };
+        }
+        
+        pub fn run(self: Self, input: InputType) !Tensor {
+            return self.base.run(input);
+        }
+        
+        /// Pass through to the base plan's gradient function
+        pub fn gradient(self: Self, grad_out: Tensor, input: InputType) !GradType {
+            return self.base.gradient(grad_out, input);
+        }
+    };
+}
+
+/// Extend ops.ExpandPlan with gradient type information
+pub fn ExpandPlanWithGrad(comptime Backend: type, comptime T: type, comptime target_shape: ?[]const usize) type {
+    const BasePlan = ops.ExpandPlan(Backend, T, target_shape);
+    
+    return struct {
+        const Self = @This();
+        const InputType = BasePlan.InputType;
+        const op_type = .expand;
+        
+        // Define the gradient type for expand operation (single input)
+        const GradType = BasePlan.GradType;
+        
+        // Embed the base plan
+        base: BasePlan,
+        
+        pub fn init(allocator: Allocator) Self {
+            return .{ .base = BasePlan.init(allocator) };
+        }
+        
+        pub fn deinit(self: *Self) void {
+            self.base.deinit();
+        }
+        
+        pub fn run(self: *Self, input: InputType) !Tensor {
+            return try self.base.run(input);
+        }
+        
+        /// Pass through to the base plan's gradient function
+        pub fn gradient(self: Self, grad_out: Tensor, input: InputType) !GradType {
+            return self.base.gradient(grad_out, input);
+        }
+    };
+}
+
+/// Extend ops.ReshapePlan with gradient type information
+pub fn ReshapePlanWithGrad(comptime Backend: type, comptime T: type, comptime shape: ?[]const usize) type {
+    const BasePlan = ops.ReshapePlan(Backend, T, shape);
+    
+    return struct {
+        const Self = @This();
+        const InputType = BasePlan.InputType;
+        const op_type = .reshape;
+        
+        // Define the gradient type for reshape operation (single input)
+        const GradType = BasePlan.GradType;
+        
+        // Embed the base plan
+        base: BasePlan,
+        
+        pub fn init(allocator: Allocator) Self {
+            return .{ .base = BasePlan.init(allocator) };
+        }
+        
+        pub fn deinit(self: *Self) void {
+            self.base.deinit();
+        }
+        
+        pub fn run(self: *Self, input: InputType) !Tensor {
+            return try self.base.run(input);
+        }
+        
+        /// Pass through to the base plan's gradient function
+        pub fn gradient(self: Self, grad_out: Tensor, input: InputType) !GradType {
+            return self.base.gradient(grad_out, input);
+        }
+    };
+}
+
+/// Extend ops.LayerNormPlan with gradient type information
+pub fn LayerNormPlanWithGrad(comptime Backend: type, comptime T: type, comptime shape: ?[]const usize, comptime epsilon: f32) type {
+    const BasePlan = ops.LayerNormPlan(Backend, T, shape, epsilon);
+    
+    return struct {
+        const Self = @This();
+        const InputType = BasePlan.InputType;
+        const op_type = .layer_norm;
+        
+        // Define the gradient type for layer norm operation (multiple inputs)
+        const GradType = BasePlan.GradType;
+        
+        // Embed the base plan
+        base: BasePlan,
+        
+        pub fn init(allocator: Allocator) Self {
+            return .{ .base = BasePlan.init(allocator) };
+        }
+        
+        pub fn deinit(self: *Self) void {
+            self.base.deinit();
+        }
+        
+        pub fn run(self: *Self, input: InputType) !Tensor {
+            return try self.base.run(input);
+        }
+        
+        /// Pass through to the base plan's gradient function
+        pub fn gradient(self: *Self, grad_out: Tensor, input: InputType) !GradType {
+            return try self.base.gradient(grad_out, input);
+        }
+    };
+}
+
+/// Extend ops.CrossEntropyLossPlan with gradient type information
+pub fn CrossEntropyLossPlanWithGrad(comptime Backend: type, comptime T: type, comptime shape_logits: ?[]const usize, comptime shape_targets: ?[]const usize) type {
+    const BasePlan = ops.CrossEntropyLossPlan(Backend, T, shape_logits, shape_targets);
+    
+    return struct {
+        const Self = @This();
+        const InputType = BasePlan.InputType;
+        const op_type = .cross_entropy;
+        
+        // Define the gradient type for cross entropy loss operation
+        const GradType = BasePlan.GradType;
+        
+        // Embed the base plan
+        base: BasePlan,
+        
+        pub fn init(allocator: Allocator) Self {
+            return .{ .base = BasePlan.init(allocator) };
+        }
+        
+        pub fn deinit(self: *Self) void {
+            self.base.deinit();
+        }
+        
+        pub fn run(self: *Self, input: InputType) !Tensor {
+            return try self.base.run(input);
+        }
+        
+        /// Pass through to the base plan's gradient function
+        pub fn gradient(self: *Self, grad_out: Tensor, input: InputType) !GradType {
+            return try self.base.gradient(grad_out, input);
+        }
+    };
+}
+
+/// Extend ops.BatchedMatmulPlan with gradient type information
+pub fn BatchedMatmulPlanWithGrad(comptime Backend: type, comptime T: type, comptime BatchSize: ?usize, comptime M: ?usize, comptime K: ?usize, comptime N: ?usize) type {
+    const BasePlan = ops.BatchedMatmulPlan(Backend, T, BatchSize, M, K, N);
+    
+    return struct {
+        const Self = @This();
+        const InputType = BasePlan.InputType;
+        const op_type = .batched_matmul;
+        
+        // Define the gradient type for batched matmul operation
+        const GradType = BasePlan.GradType;
+        
+        // Embed the base plan
+        base: BasePlan,
+        
+        pub fn init(allocator: Allocator) Self {
+            return .{ .base = BasePlan.init(allocator) };
+        }
+        
+        pub fn run(self: Self, input: InputType) !Tensor {
+            return try self.base.run(input);
+        }
+        
+        /// Pass through to the base plan's gradient function
+        pub fn gradient(self: Self, grad_out: Tensor, input: InputType) !GradType {
+            return try self.base.gradient(grad_out, input);
+        }
+    };
+}
+

@@ -1,15 +1,7 @@
 const std = @import("std");
 const tensor = @import("tensor.zig");
 
-/// Helper function for pointer casting
-fn ptrCastHelper(comptime T: type, ptr: anytype) T {
-    // We still need to use alignCast for pointers that require higher alignment
-    return @ptrCast(@alignCast(ptr));
-}
-
 const Allocator = std.mem.Allocator;
-const Tensor = tensor.Tensor;
-const DType = tensor.DType;
 const Shape = tensor.Shape;
 const BackendType = tensor.BackendType;
 
@@ -40,235 +32,239 @@ pub const OpType = enum {
 
 /// --- Primitive Operations ---
 /// These are the building blocks for comptime plans, implemented by backends
-pub const Primitives = struct {
-    /// Add two tensors element-wise
-    pub fn add(comptime T: type, a: Tensor, b: Tensor, result: *Tensor) void {
-        // Move type checking to comptime
-        comptime {
-            if (T != f32) @compileError("Only f32 supported for now");
+pub fn Primitives(comptime T: type) type {
+    const Tensor = tensor.Tensor(T);
+
+    return struct {
+        /// Add two tensors element-wise
+        pub fn add(a: Tensor, b: Tensor, result: *Tensor) void {
+            // Move type checking to comptime
+            comptime {
+                if (T != f32) @compileError("Only f32 supported for now");
+            }
+
+            const a_buf = a.buffer.data;
+            const b_buf = b.buffer.data;
+            const result_buf = result.buffer.data;
+
+            for (a_buf, b_buf, 0..) |a_val, b_val, i| {
+                result_buf[i] = a_val + b_val;
+            }
         }
 
-        const a_buf = ptrCastHelper([*]f32, a.buffer.data.ptr)[0..a.shape.elemCount()];
-        const b_buf = ptrCastHelper([*]f32, b.buffer.data.ptr)[0..b.shape.elemCount()];
-        const result_buf = ptrCastHelper([*]f32, result.buffer.data.ptr)[0..result.shape.elemCount()];
+        /// Subtract two tensors element-wise
+        pub fn subtract(a: Tensor, b: Tensor, result: *Tensor) void {
+            // Move type checking to comptime
+            comptime {
+                if (T != f32) @compileError("Only f32 supported for now");
+            }
 
-        for (a_buf, b_buf, 0..) |a_val, b_val, i| {
-            result_buf[i] = a_val + b_val;
-        }
-    }
+            const a_buf = a.buffer.data;
+            const b_buf = b.buffer.data;
+            const result_buf = result.buffer.data;
 
-    /// Subtract two tensors element-wise
-    pub fn subtract(comptime T: type, a: Tensor, b: Tensor, result: *Tensor) void {
-        // Move type checking to comptime
-        comptime {
-            if (T != f32) @compileError("Only f32 supported for now");
-        }
-
-        const a_buf = ptrCastHelper([*]f32, a.buffer.data.ptr)[0..a.shape.elemCount()];
-        const b_buf = ptrCastHelper([*]f32, b.buffer.data.ptr)[0..b.shape.elemCount()];
-        const result_buf = ptrCastHelper([*]f32, result.buffer.data.ptr)[0..result.shape.elemCount()];
-
-        for (a_buf, b_buf, 0..) |a_val, b_val, i| {
-            result_buf[i] = a_val - b_val;
-        }
-    }
-
-    /// Multiply two tensors element-wise
-    pub fn multiply(comptime T: type, a: Tensor, b: Tensor, result: *Tensor) void {
-        // Move type checking to comptime
-        comptime {
-            if (T != f32) @compileError("Only f32 supported for now");
+            for (a_buf, b_buf, 0..) |a_val, b_val, i| {
+                result_buf[i] = a_val - b_val;
+            }
         }
 
-        const a_buf = ptrCastHelper([*]f32, a.buffer.data.ptr)[0..a.shape.elemCount()];
-        const b_buf = ptrCastHelper([*]f32, b.buffer.data.ptr)[0..b.shape.elemCount()];
-        const result_buf = ptrCastHelper([*]f32, result.buffer.data.ptr)[0..result.shape.elemCount()];
+        /// Multiply two tensors element-wise
+        pub fn multiply(a: Tensor, b: Tensor, result: *Tensor) void {
+            // Move type checking to comptime
+            comptime {
+                if (T != f32) @compileError("Only f32 supported for now");
+            }
 
-        for (a_buf, b_buf, 0..) |a_val, b_val, i| {
-            result_buf[i] = a_val * b_val;
-        }
-    }
+            const a_buf = a.buffer.data;
+            const b_buf = b.buffer.data;
+            const result_buf = result.buffer.data;
 
-    /// Divide two tensors element-wise
-    pub fn divide(comptime T: type, a: Tensor, b: Tensor, result: *Tensor) void {
-        // Move type checking to comptime
-        comptime {
-            if (T != f32) @compileError("Only f32 supported for now");
-        }
-
-        const a_buf = ptrCastHelper([*]f32, a.buffer.data.ptr)[0..a.shape.elemCount()];
-        const b_buf = ptrCastHelper([*]f32, b.buffer.data.ptr)[0..b.shape.elemCount()];
-        const result_buf = ptrCastHelper([*]f32, result.buffer.data.ptr)[0..result.shape.elemCount()];
-
-        for (a_buf, b_buf, 0..) |a_val, b_val, i| {
-            result_buf[i] = a_val / b_val;
-        }
-    }
-
-    /// Matrix multiplication for 2D tensors
-    pub fn matmul(comptime T: type, a: Tensor, b: Tensor, result: *Tensor) void {
-        // Move type checking to comptime
-        comptime {
-            if (T != f32) @compileError("Only f32 supported for now");
+            for (a_buf, b_buf, 0..) |a_val, b_val, i| {
+                result_buf[i] = a_val * b_val;
+            }
         }
 
-        const a_buf = ptrCastHelper([*]f32, a.buffer.data.ptr);
-        const b_buf = ptrCastHelper([*]f32, b.buffer.data.ptr);
-        const result_buf = ptrCastHelper([*]f32, result.buffer.data.ptr);
+        /// Divide two tensors element-wise
+        pub fn divide(a: Tensor, b: Tensor, result: *Tensor) void {
+            // Move type checking to comptime
+            comptime {
+                if (T != f32) @compileError("Only f32 supported for now");
+            }
 
-        const m = a.shape.dims[0];
-        const n = a.shape.dims[1]; // also b.shape.dims[0]
-        const p = b.shape.dims[1];
+            const a_buf = a.buffer.data;
+            const b_buf = b.buffer.data;
+            const result_buf = result.buffer.data;
 
-        // Simple 3-loop matrix multiplication
-        for (0..m) |i| {
-            for (0..p) |j| {
+            for (a_buf, b_buf, 0..) |a_val, b_val, i| {
+                result_buf[i] = a_val / b_val;
+            }
+        }
+
+        /// Matrix multiplication for 2D tensors
+        pub fn matmul(a: Tensor, b: Tensor, result: *Tensor) void {
+            // Move type checking to comptime
+            comptime {
+                if (T != f32) @compileError("Only f32 supported for now");
+            }
+
+            const a_buf = a.buffer.data;
+            const b_buf = b.buffer.data;
+            const result_buf = result.buffer.data;
+
+            const m = a.shape.dims[0];
+            const n = a.shape.dims[1]; // also b.shape.dims[0]
+            const p = b.shape.dims[1];
+
+            // Simple 3-loop matrix multiplication
+            for (0..m) |i| {
+                for (0..p) |j| {
+                    var sum: f32 = 0.0;
+                    for (0..n) |k| {
+                        sum += a_buf[i * n + k] * b_buf[k * p + j];
+                    }
+                    result_buf[i * p + j] = sum;
+                }
+            }
+        }
+
+        /// Apply ReLU activation function element-wise
+        pub fn relu(a: Tensor, result: *Tensor) void {
+            // Move type checking to comptime
+            comptime {
+                if (T != f32) @compileError("Only f32 supported for now");
+            }
+
+            const a_buf = a.buffer.data;
+            const result_buf = result.buffer.data;
+
+            for (a_buf, 0..) |a_val, i| {
+                result_buf[i] = if (a_val > 0) a_val else 0;
+            }
+        }
+
+        /// Apply softmax to 2D tensor (on last dimension)
+        pub fn softmax(a: Tensor, result: *Tensor) void {
+            // Move type checking to comptime
+            comptime {
+                if (T != f32) @compileError("Only f32 supported for now");
+            }
+
+            const a_buf = a.buffer.data;
+            const result_buf = result.buffer.data;
+
+            const batch_size = a.shape.dims[0];
+            const feature_size = a.shape.dims[1];
+
+            // Apply softmax for each row
+            for (0..batch_size) |i| {
+                // Find max value for numerical stability
+                var max_val: f32 = std.math.floatMin(f32);
+                for (0..feature_size) |j| {
+                    const val = a_buf[i * feature_size + j];
+                    max_val = if (val > max_val) val else max_val;
+                }
+
+                // Compute exp(x - max) and sum
                 var sum: f32 = 0.0;
-                for (0..n) |k| {
-                    sum += a_buf[i * n + k] * b_buf[k * p + j];
-                }
-                result_buf[i * p + j] = sum;
-            }
-        }
-    }
-
-    /// Apply ReLU activation function element-wise
-    pub fn relu(comptime T: type, a: Tensor, result: *Tensor) void {
-        // Move type checking to comptime
-        comptime {
-            if (T != f32) @compileError("Only f32 supported for now");
-        }
-
-        const a_buf = ptrCastHelper([*]f32, a.buffer.data.ptr)[0..a.shape.elemCount()];
-        const result_buf = ptrCastHelper([*]f32, result.buffer.data.ptr)[0..result.shape.elemCount()];
-
-        for (a_buf, 0..) |a_val, i| {
-            result_buf[i] = if (a_val > 0) a_val else 0;
-        }
-    }
-
-    /// Apply softmax to 2D tensor (on last dimension)
-    pub fn softmax(comptime T: type, a: Tensor, result: *Tensor) void {
-        // Move type checking to comptime
-        comptime {
-            if (T != f32) @compileError("Only f32 supported for now");
-        }
-
-        const a_buf = ptrCastHelper([*]f32, a.buffer.data.ptr);
-        const result_buf = ptrCastHelper([*]f32, result.buffer.data.ptr);
-
-        const batch_size = a.shape.dims[0];
-        const feature_size = a.shape.dims[1];
-
-        // Apply softmax for each row
-        for (0..batch_size) |i| {
-            // Find max value for numerical stability
-            var max_val: f32 = std.math.floatMin(f32);
-            for (0..feature_size) |j| {
-                const val = a_buf[i * feature_size + j];
-                max_val = if (val > max_val) val else max_val;
-            }
-
-            // Compute exp(x - max) and sum
-            var sum: f32 = 0.0;
-            for (0..feature_size) |j| {
-                const val = std.math.exp(a_buf[i * feature_size + j] - max_val);
-                result_buf[i * feature_size + j] = val;
-                sum += val;
-            }
-
-            // Normalize
-            for (0..feature_size) |j| {
-                result_buf[i * feature_size + j] /= sum;
-            }
-        }
-    }
-
-    /// Transpose a 2D tensor
-    pub fn transpose(comptime T: type, a: Tensor, result: *Tensor) void {
-        // Move type checking to comptime
-        comptime {
-            if (T != f32) @compileError("Only f32 supported for now");
-        }
-
-        const a_buf = ptrCastHelper([*]f32, a.buffer.data.ptr);
-        const result_buf = ptrCastHelper([*]f32, result.buffer.data.ptr);
-
-        const rows = a.shape.dims[0];
-        const cols = a.shape.dims[1];
-
-        for (0..rows) |i| {
-            for (0..cols) |j| {
-                result_buf[j * rows + i] = a_buf[i * cols + j];
-            }
-        }
-    }
-
-    /// Embedding lookup - fetch embeddings based on indices
-    pub fn embedding_lookup(comptime T: type, params: Tensor, indices: Tensor, result: *Tensor) void {
-        // Move type checking to comptime
-        comptime {
-            if (T != f32) @compileError("Only f32 supported for now");
-        }
-
-        const vocab_size = params.shape.dims[0];
-        const embed_dim = params.shape.dims[1];
-
-        // Extract batch size and sequence length from indices shape
-        var batch_size: usize = 1;
-        var seq_len: usize = 1;
-
-        if (indices.shape.rank() == 1) {
-            seq_len = indices.shape.dims[0];
-        } else if (indices.shape.rank() == 2) {
-            batch_size = indices.shape.dims[0];
-            seq_len = indices.shape.dims[1];
-        }
-
-        const params_buf = ptrCastHelper([*]f32, params.buffer.data.ptr)[0..params.shape.elemCount()];
-        const indices_buf = ptrCastHelper([*]f32, indices.buffer.data.ptr)[0..indices.shape.elemCount()];
-        const result_buf = ptrCastHelper([*]f32, result.buffer.data.ptr)[0..result.shape.elemCount()];
-
-        // Perform lookup
-        for (0..batch_size) |b| {
-            for (0..seq_len) |s| {
-                // Get the token id from indices
-                var index_pos: usize = 0;
-                if (indices.shape.rank() == 1) {
-                    index_pos = s;
-                } else {
-                    index_pos = b * seq_len + s;
+                for (0..feature_size) |j| {
+                    const val = std.math.exp(a_buf[i * feature_size + j] - max_val);
+                    result_buf[i * feature_size + j] = val;
+                    sum += val;
                 }
 
-                // Bounds check
-                if (index_pos >= indices_buf.len) {
-                    continue;
+                // Normalize
+                for (0..feature_size) |j| {
+                    result_buf[i * feature_size + j] /= sum;
                 }
+            }
+        }
 
-                const token_id_f = indices_buf[index_pos];
-                // Safely convert to int and bound to vocab size
-                const token_id_i = @as(i32, @intFromFloat(token_id_f));
-                const token_id = @as(usize, @intCast(@max(0, @min(token_id_i, @as(i32, @intCast(vocab_size - 1))))));
+        /// Transpose a 2D tensor
+        pub fn transpose(a: Tensor, result: *Tensor) void {
+            // Move type checking to comptime
+            comptime {
+                if (T != f32) @compileError("Only f32 supported for now");
+            }
 
-                // Copy embedding for this token
-                for (0..embed_dim) |d| {
-                    const src_idx = token_id * embed_dim + d;
-                    const dst_idx = (b * seq_len + s) * embed_dim + d;
+            const a_buf = a.buffer.data;
+            const result_buf = result.buffer.data;
 
-                    // Bounds checking
-                    if (src_idx >= params_buf.len) {
-                        continue;
+            const rows = a.shape.dims[0];
+            const cols = a.shape.dims[1];
+
+            for (0..rows) |i| {
+                for (0..cols) |j| {
+                    result_buf[j * rows + i] = a_buf[i * cols + j];
+                }
+            }
+        }
+
+        /// Embedding lookup - fetch embeddings based on indices
+        pub fn embedding_lookup(params: Tensor, indices: Tensor, result: *Tensor) void {
+            // Move type checking to comptime
+            comptime {
+                if (T != f32) @compileError("Only f32 supported for now");
+            }
+
+            const vocab_size = params.shape.dims[0];
+            const embed_dim = params.shape.dims[1];
+
+            // Extract batch size and sequence length from indices shape
+            var batch_size: usize = 1;
+            var seq_len: usize = 1;
+
+            if (indices.shape.rank() == 1) {
+                seq_len = indices.shape.dims[0];
+            } else if (indices.shape.rank() == 2) {
+                batch_size = indices.shape.dims[0];
+                seq_len = indices.shape.dims[1];
+            }
+
+            const params_buf = params.buffer.data;
+            const indices_buf = indices.buffer.data;
+            const result_buf = result.buffer.data;
+
+            // Perform lookup
+            for (0..batch_size) |b| {
+                for (0..seq_len) |s| {
+                    // Get the token id from indices
+                    var index_pos: usize = 0;
+                    if (indices.shape.rank() == 1) {
+                        index_pos = s;
+                    } else {
+                        index_pos = b * seq_len + s;
                     }
-                    if (dst_idx >= result_buf.len) {
+
+                    // Bounds check
+                    if (index_pos >= indices_buf.len) {
                         continue;
                     }
 
-                    result_buf[dst_idx] = params_buf[src_idx];
+                    const token_id_f = indices_buf[index_pos];
+                    // Safely convert to int and bound to vocab size
+                    const token_id_i = @as(i32, @intFromFloat(token_id_f));
+                    const token_id = @as(usize, @intCast(@max(0, @min(token_id_i, @as(i32, @intCast(vocab_size - 1))))));
+
+                    // Copy embedding for this token
+                    for (0..embed_dim) |d| {
+                        const src_idx = token_id * embed_dim + d;
+                        const dst_idx = (b * seq_len + s) * embed_dim + d;
+
+                        // Bounds checking
+                        if (src_idx >= params_buf.len) {
+                            continue;
+                        }
+                        if (dst_idx >= result_buf.len) {
+                            continue;
+                        }
+
+                        result_buf[dst_idx] = params_buf[src_idx];
+                    }
                 }
             }
         }
-    }
-};
+    };
+}
 
 /// --- Plan Definition ---
 /// Generic type for comptime-generated operation plans
@@ -296,22 +292,24 @@ pub fn PlanType(comptime Backend: type, comptime InputType: type, comptime Outpu
 
 /// --- Backend Definition ---
 /// CPU Backend with default primitive implementations
-pub const CpuBackend = struct {
-    pub fn hasPrimitive(comptime name: []const u8) bool {
-        return std.mem.eql(u8, name, "add") or
-            std.mem.eql(u8, name, "subtract") or
-            std.mem.eql(u8, name, "multiply") or
-            std.mem.eql(u8, name, "divide") or
-            std.mem.eql(u8, name, "matmul") or
-            std.mem.eql(u8, name, "relu") or
-            std.mem.eql(u8, name, "softmax") or
-            std.mem.eql(u8, name, "transpose") or
-            std.mem.eql(u8, name, "embedding_lookup");
-    }
+pub fn CpuBackend(comptime T: type) type {
+    return struct {
+        pub fn hasPrimitive(comptime name: []const u8) bool {
+            return std.mem.eql(u8, name, "add") or
+                std.mem.eql(u8, name, "subtract") or
+                std.mem.eql(u8, name, "multiply") or
+                std.mem.eql(u8, name, "divide") or
+                std.mem.eql(u8, name, "matmul") or
+                std.mem.eql(u8, name, "relu") or
+                std.mem.eql(u8, name, "softmax") or
+                std.mem.eql(u8, name, "transpose") or
+                std.mem.eql(u8, name, "embedding_lookup");
+        }
 
-    // Include default primitive implementations
-    pub usingnamespace Primitives;
-};
+        // Include default primitive implementations
+        pub usingnamespace Primitives(T);
+    };
+}
 
 /// --- Operation Plans ---
 /// Add two tensors element-wise
@@ -321,6 +319,8 @@ pub fn AddPlan(comptime Backend: type, comptime T: type, comptime shape: ?[]cons
         if (!Backend.hasPrimitive("add")) @compileError("Backend must implement add primitive");
         if (T != f32) @compileError("Only f32 supported for now");
     }
+
+    const Tensor = tensor.Tensor(T);
 
     return struct {
         pub const InputType = struct { a: Tensor, b: Tensor }; // Make InputType public
@@ -372,17 +372,12 @@ pub fn AddPlan(comptime Backend: type, comptime T: type, comptime shape: ?[]cons
                 }
             }
 
-            // Check dtypes
-            if (input.a.dtype != DType.f32 or input.b.dtype != DType.f32) {
-                return OpError.UnsupportedDataType;
-            }
-
             // Allocate result tensor
-            var result = try Tensor.zeros(self.base.allocator, input.a.shape.dims, DType.f32, input.a.backend);
+            var result = try Tensor.zeros(self.base.allocator, input.a.shape.dims, input.a.backend);
             errdefer result.deinit();
 
             // Execute primitive
-            Backend.add(T, input.a, input.b, &result);
+            Backend.add(input.a, input.b, &result);
             return result;
         }
     };
@@ -395,6 +390,9 @@ pub fn SubtractPlan(comptime Backend: type, comptime T: type, comptime shape: ?[
         if (!Backend.hasPrimitive("subtract")) @compileError("Backend must implement subtract primitive");
         if (T != f32) @compileError("Only f32 supported for now");
     }
+
+    const Tensor = tensor.Tensor(T);
+    const legacy_api = LegacyApi(T);
 
     return struct {
         pub const InputType = struct { a: Tensor, b: Tensor };
@@ -417,10 +415,10 @@ pub fn SubtractPlan(comptime Backend: type, comptime T: type, comptime shape: ?[
             errdefer da.deinit();
 
             // Create negative gradient for second input
-            const negative_one = try Tensor.filled(allocator, grad_out.shape.dims, grad_out.dtype, -1.0, grad_out.backend);
+            const negative_one = try Tensor.filled(allocator, grad_out.shape.dims, -1.0, grad_out.backend);
             errdefer negative_one.deinit();
 
-            var db = try multiply(allocator, grad_out, negative_one);
+            var db = try legacy_api.multiply(allocator, grad_out, negative_one);
             errdefer db.deinit();
 
             // Clean up temporary tensor
@@ -453,17 +451,12 @@ pub fn SubtractPlan(comptime Backend: type, comptime T: type, comptime shape: ?[
                 }
             }
 
-            // Check dtypes
-            if (input.a.dtype != DType.f32 or input.b.dtype != DType.f32) {
-                return OpError.UnsupportedDataType;
-            }
-
             // Allocate result tensor
-            var result = try Tensor.zeros(self.base.allocator, input.a.shape.dims, DType.f32, input.a.backend);
+            var result = try Tensor.zeros(self.base.allocator, input.a.shape.dims, input.a.backend);
             errdefer result.deinit();
 
             // Execute primitive
-            Backend.subtract(T, input.a, input.b, &result);
+            Backend.subtract(input.a, input.b, &result);
             return result;
         }
     };
@@ -476,6 +469,9 @@ pub fn MultiplyPlan(comptime Backend: type, comptime T: type, comptime shape: ?[
         if (!Backend.hasPrimitive("multiply")) @compileError("Backend must implement multiply primitive");
         if (T != f32) @compileError("Only f32 supported for now");
     }
+
+    const Tensor = tensor.Tensor(T);
+    const legacy_api = LegacyApi(T);
 
     return struct {
         pub const InputType = struct { a: Tensor, b: Tensor };
@@ -494,11 +490,11 @@ pub fn MultiplyPlan(comptime Backend: type, comptime T: type, comptime shape: ?[
             const allocator = self.base.allocator;
 
             // Input a gradient is element-wise product of grad_out and b
-            var da = try multiply(allocator, grad_out, input.b);
+            var da = try legacy_api.multiply(allocator, grad_out, input.b);
             errdefer da.deinit();
 
             // Input b gradient is element-wise product of grad_out and a
-            var db = try multiply(allocator, grad_out, input.a);
+            var db = try legacy_api.multiply(allocator, grad_out, input.a);
             errdefer db.deinit();
 
             return .{ .da = da, .db = db };
@@ -528,17 +524,12 @@ pub fn MultiplyPlan(comptime Backend: type, comptime T: type, comptime shape: ?[
                 }
             }
 
-            // Check dtypes
-            if (input.a.dtype != DType.f32 or input.b.dtype != DType.f32) {
-                return OpError.UnsupportedDataType;
-            }
-
             // Allocate result tensor
-            var result = try Tensor.zeros(self.base.allocator, input.a.shape.dims, DType.f32, input.a.backend);
+            var result = try Tensor.zeros(self.base.allocator, input.a.shape.dims, input.a.backend);
             errdefer result.deinit();
 
             // Execute primitive
-            Backend.multiply(T, input.a, input.b, &result);
+            Backend.multiply(input.a, input.b, &result);
             return result;
         }
     };
@@ -551,6 +542,9 @@ pub fn DividePlan(comptime Backend: type, comptime T: type, comptime shape: ?[]c
         if (!Backend.hasPrimitive("divide")) @compileError("Backend must implement divide primitive");
         if (T != f32) @compileError("Only f32 supported for now");
     }
+
+    const Tensor = tensor.Tensor(T);
+    const legacy_api = LegacyApi(T);
 
     return struct {
         pub const InputType = struct { a: Tensor, b: Tensor };
@@ -569,27 +563,27 @@ pub fn DividePlan(comptime Backend: type, comptime T: type, comptime shape: ?[]c
             const allocator = self.base.allocator;
 
             // Input a gradient is element-wise division of grad_out by b
-            var da = try divide(allocator, grad_out, input.b);
+            var da = try legacy_api.divide(allocator, grad_out, input.b);
             errdefer da.deinit();
 
             // Input b gradient is more complex: -grad_out * a / (b * b)
             // First calculate b^2
-            var b_squared = try multiply(allocator, input.b, input.b);
+            var b_squared = try legacy_api.multiply(allocator, input.b, input.b);
             errdefer b_squared.deinit();
 
             // Calculate a / b^2
-            var a_div_b_squared = try divide(allocator, input.a, b_squared);
+            var a_div_b_squared = try legacy_api.divide(allocator, input.a, b_squared);
             errdefer a_div_b_squared.deinit();
 
             // Multiply by grad_out
-            var temp = try multiply(allocator, grad_out, a_div_b_squared);
+            var temp = try legacy_api.multiply(allocator, grad_out, a_div_b_squared);
             errdefer temp.deinit();
 
             // Negate the result
-            const negative_one = try Tensor.filled(allocator, temp.shape.dims, temp.dtype, -1.0, temp.backend);
+            const negative_one = try Tensor.filled(allocator, temp.shape.dims, -1.0, temp.backend);
             errdefer negative_one.deinit();
 
-            var db = try multiply(allocator, temp, negative_one);
+            var db = try legacy_api.multiply(allocator, temp, negative_one);
             errdefer db.deinit();
 
             // Clean up temporaries
@@ -625,17 +619,12 @@ pub fn DividePlan(comptime Backend: type, comptime T: type, comptime shape: ?[]c
                 }
             }
 
-            // Check dtypes
-            if (input.a.dtype != DType.f32 or input.b.dtype != DType.f32) {
-                return OpError.UnsupportedDataType;
-            }
-
             // Allocate result tensor
-            var result = try Tensor.zeros(self.base.allocator, input.a.shape.dims, DType.f32, input.a.backend);
+            var result = try Tensor.zeros(self.base.allocator, input.a.shape.dims, input.a.backend);
             errdefer result.deinit();
 
             // Execute primitive
-            Backend.divide(T, input.a, input.b, &result);
+            Backend.divide(input.a, input.b, &result);
             return result;
         }
     };
@@ -648,6 +637,9 @@ pub fn MatmulPlan(comptime Backend: type, comptime T: type, comptime M: ?usize, 
         if (!Backend.hasPrimitive("matmul")) @compileError("Backend must implement matmul primitive");
         if (T != f32) @compileError("Only f32 supported for now");
     }
+
+    const Tensor = tensor.Tensor(T);
+    const legacy_api = LegacyApi(T);
 
     return struct {
         pub const InputType = struct { a: Tensor, b: Tensor };
@@ -666,19 +658,19 @@ pub fn MatmulPlan(comptime Backend: type, comptime T: type, comptime M: ?usize, 
             const allocator = self.base.allocator;
 
             // Compute b transpose
-            const b_transpose = try transpose(allocator, input.b);
+            const b_transpose = try legacy_api.transpose(allocator, input.b);
             errdefer b_transpose.deinit();
 
             // Gradient for a is grad_out @ b^T
-            var da = try matmul(allocator, grad_out, b_transpose);
+            var da = try legacy_api.matmul(allocator, grad_out, b_transpose);
             errdefer da.deinit();
 
             // Compute a transpose
-            const a_transpose = try transpose(allocator, input.a);
+            const a_transpose = try legacy_api.transpose(allocator, input.a);
             errdefer a_transpose.deinit();
 
             // Gradient for b is a^T @ grad_out
-            var db = try matmul(allocator, a_transpose, grad_out);
+            var db = try legacy_api.matmul(allocator, a_transpose, grad_out);
             errdefer db.deinit();
 
             // Clean up temporaries
@@ -708,18 +700,13 @@ pub fn MatmulPlan(comptime Backend: type, comptime T: type, comptime M: ?usize, 
             if (N != null and n != N.?) return OpError.ShapeMismatch;
             if (P != null and p != P.?) return OpError.ShapeMismatch;
 
-            // Check dtypes
-            if (input.a.dtype != DType.f32 or input.b.dtype != DType.f32) {
-                return OpError.UnsupportedDataType;
-            }
-
             // Allocate result
             const result_dims = [_]usize{ m, p };
-            var result = try Tensor.zeros(self.base.allocator, &result_dims, DType.f32, input.a.backend);
+            var result = try Tensor.zeros(self.base.allocator, &result_dims, input.a.backend);
             errdefer result.deinit();
 
             // Execute primitive
-            Backend.matmul(T, input.a, input.b, &result);
+            Backend.matmul(input.a, input.b, &result);
             return result;
         }
     };
@@ -732,6 +719,9 @@ pub fn ReluPlan(comptime Backend: type, comptime T: type, comptime shape: ?[]con
         if (!Backend.hasPrimitive("relu")) @compileError("Backend must implement relu primitive");
         if (T != f32) @compileError("Only f32 supported for now");
     }
+
+    const Tensor = tensor.Tensor(T);
+    const legacy_api = LegacyApi(T);
 
     return struct {
         pub const InputType = Tensor;
@@ -753,15 +743,15 @@ pub fn ReluPlan(comptime Backend: type, comptime T: type, comptime shape: ?[]con
             var mask = try Tensor.zeros(allocator, input.shape.dims, input.dtype, input.backend);
             errdefer mask.deinit();
 
-            const input_buf = ptrCastHelper([*]f32, input.buffer.data.ptr)[0..input.shape.elemCount()];
-            const mask_buf = ptrCastHelper([*]f32, mask.buffer.data.ptr)[0..mask.shape.elemCount()];
+            const input_buf = input.buffer.data;
+            const mask_buf = mask.buffer.data;
 
             for (input_buf, 0..) |val, i| {
                 mask_buf[i] = if (val > 0) 1.0 else 0.0;
             }
 
             // Gradient is element-wise product of upstream gradient and mask
-            var result = try multiply(allocator, grad_out, mask);
+            var result = try legacy_api.multiply(allocator, grad_out, mask);
             errdefer result.deinit();
 
             // Clean up temporary
@@ -789,14 +779,10 @@ pub fn ReluPlan(comptime Backend: type, comptime T: type, comptime shape: ?[]con
                 }
             }
 
-            if (input.dtype != DType.f32) {
-                return OpError.UnsupportedDataType;
-            }
-
-            var result = try Tensor.zeros(self.base.allocator, input.shape.dims, DType.f32, input.backend);
+            var result = try Tensor.zeros(self.base.allocator, input.shape.dims, input.backend);
             errdefer result.deinit();
 
-            Backend.relu(T, input, &result);
+            Backend.relu(input, &result);
             return result;
         }
     };
@@ -809,6 +795,8 @@ pub fn SoftmaxPlan(comptime Backend: type, comptime T: type, comptime batch_size
         if (!Backend.hasPrimitive("softmax")) @compileError("Backend must implement softmax primitive");
         if (T != f32) @compileError("Only f32 supported for now");
     }
+
+    const Tensor = tensor.Tensor(T);
 
     return struct {
         pub const InputType = Tensor;
@@ -837,14 +825,10 @@ pub fn SoftmaxPlan(comptime Backend: type, comptime T: type, comptime batch_size
                 return OpError.ShapeMismatch;
             }
 
-            if (input.dtype != DType.f32) {
-                return OpError.UnsupportedDataType;
-            }
-
-            var result = try Tensor.zeros(self.base.allocator, input.shape.dims, DType.f32, input.backend);
+            var result = try Tensor.zeros(self.base.allocator, input.shape.dims, input.backend);
             errdefer result.deinit();
 
-            Backend.softmax(T, input, &result);
+            Backend.softmax(input, &result);
             return result;
         }
     };
@@ -857,6 +841,8 @@ pub fn TransposePlan(comptime Backend: type, comptime T: type, comptime rows: ?u
         if (!Backend.hasPrimitive("transpose")) @compileError("Backend must implement transpose primitive");
         if (T != f32) @compileError("Only f32 supported for now");
     }
+
+    const Tensor = tensor.Tensor(T);
 
     return struct {
         pub const InputType = Tensor;
@@ -885,13 +871,9 @@ pub fn TransposePlan(comptime Backend: type, comptime T: type, comptime rows: ?u
                 return OpError.ShapeMismatch;
             }
 
-            if (input.dtype != DType.f32) {
-                return OpError.UnsupportedDataType;
-            }
-
             // Result dimensions are swapped
             const result_dims = [_]usize{ input.shape.dims[1], input.shape.dims[0] };
-            var result = try Tensor.zeros(self.base.allocator, &result_dims, DType.f32, input.backend);
+            var result = try Tensor.zeros(self.base.allocator, &result_dims, input.backend);
             errdefer result.deinit();
 
             Backend.transpose(T, input, &result);
@@ -907,6 +889,8 @@ pub fn EmbeddingLookupPlan(comptime Backend: type, comptime T: type, comptime vo
         if (!Backend.hasPrimitive("embedding_lookup")) @compileError("Backend must implement embedding_lookup primitive");
         if (T != f32) @compileError("Only f32 supported for now");
     }
+
+    const Tensor = tensor.Tensor(T);
 
     return struct {
         pub const InputType = struct { params: Tensor, indices: Tensor };
@@ -948,14 +932,9 @@ pub fn EmbeddingLookupPlan(comptime Backend: type, comptime T: type, comptime vo
                 return OpError.InvalidIndicesShape;
             }
 
-            // Check dtypes
-            if (input.params.dtype != DType.f32 or input.indices.dtype != DType.f32) {
-                return OpError.UnsupportedDataType;
-            }
-
             // Create output tensor
             const result_dims = [_]usize{ batch_size, seq_len, input.params.shape.dims[1] };
-            var result = try Tensor.zeros(self.base.allocator, &result_dims, DType.f32, input.params.backend);
+            var result = try Tensor.zeros(self.base.allocator, &result_dims, input.params.backend);
             errdefer result.deinit();
 
             // Execute primitive
@@ -965,228 +944,173 @@ pub fn EmbeddingLookupPlan(comptime Backend: type, comptime T: type, comptime vo
     };
 }
 
-/// --- Legacy Interface for Backward Compatibility ---
-/// These functions provide backward compatibility with the existing API
-/// Add two tensors element-wise (legacy interface)
-pub fn add(allocator: Allocator, a: Tensor, b: Tensor) !Tensor {
-    // For the legacy interface, we need to perform the checks at runtime
-    // since we can't use runtime values for comptime parameters
+pub fn LegacyApi(comptime T: type) type {
+    const Tensor = tensor.Tensor(T);
 
-    // Check if shapes match
-    if (!a.shape.eql(b.shape)) {
-        return OpError.ShapeMismatch;
-    }
+    return struct {
+        /// --- Legacy Interface for Backward Compatibility ---
+        /// These functions provide backward compatibility with the existing API
+        /// Add two tensors element-wise (legacy interface)
+        pub fn add(allocator: Allocator, a: Tensor, b: Tensor) !Tensor {
+            // For the legacy interface, we need to perform the checks at runtime
+            // since we can't use runtime values for comptime parameters
 
-    // Check if dtypes match
-    if (a.dtype != b.dtype) {
-        return OpError.UnsupportedDataType;
-    }
+            // Check if shapes match
+            if (!a.shape.eql(b.shape)) {
+                return OpError.ShapeMismatch;
+            }
 
-    // Create result tensor
-    var result = try Tensor.zeros(allocator, a.shape.dims, a.dtype, a.backend);
-    errdefer result.deinit();
+            // Create result tensor
+            var result = try Tensor.zeros(allocator, a.shape.dims, a.backend);
+            errdefer result.deinit();
 
-    // Perform the operation using the primitive function
-    if (a.dtype == .f32) {
-        CpuBackend.add(f32, a, b, &result);
-    } else {
-        return OpError.UnsupportedDataType;
-    }
+            // Perform the operation using the primitive function
+            CpuBackend(T).add(a, b, &result);
 
-    return result;
-}
+            return result;
+        }
 
-/// Subtract two tensors element-wise (legacy interface)
-pub fn subtract(allocator: Allocator, a: Tensor, b: Tensor) !Tensor {
-    // For the legacy interface, we need to perform the checks at runtime
+        /// Subtract two tensors element-wise (legacy interface)
+        pub fn subtract(allocator: Allocator, a: Tensor, b: Tensor) !Tensor {
+            // For the legacy interface, we need to perform the checks at runtime
 
-    // Check if shapes match
-    if (!a.shape.eql(b.shape)) {
-        return OpError.ShapeMismatch;
-    }
+            // Check if shapes match
+            if (!a.shape.eql(b.shape)) {
+                return OpError.ShapeMismatch;
+            }
 
-    // Check if dtypes match
-    if (a.dtype != b.dtype) {
-        return OpError.UnsupportedDataType;
-    }
+            // Create result tensor
+            var result = try Tensor.zeros(allocator, a.shape.dims, a.backend);
+            errdefer result.deinit();
 
-    // Create result tensor
-    var result = try Tensor.zeros(allocator, a.shape.dims, a.dtype, a.backend);
-    errdefer result.deinit();
+            CpuBackend(T).subtract(a, b, &result);
+            return result;
+        }
 
-    // Perform the operation using the primitive function
-    if (a.dtype == .f32) {
-        CpuBackend.subtract(f32, a, b, &result);
-    } else {
-        return OpError.UnsupportedDataType;
-    }
+        /// Multiply two tensors element-wise (legacy interface)
+        pub fn multiply(allocator: Allocator, a: Tensor, b: Tensor) !Tensor {
+            // For the legacy interface, we need to perform the checks at runtime
 
-    return result;
-}
+            // Check if shapes match
+            if (!a.shape.eql(b.shape)) {
+                return OpError.ShapeMismatch;
+            }
 
-/// Multiply two tensors element-wise (legacy interface)
-pub fn multiply(allocator: Allocator, a: Tensor, b: Tensor) !Tensor {
-    // For the legacy interface, we need to perform the checks at runtime
+            // Create result tensor
+            var result = try Tensor.zeros(allocator, a.shape.dims, a.backend);
+            errdefer result.deinit();
 
-    // Check if shapes match
-    if (!a.shape.eql(b.shape)) {
-        return OpError.ShapeMismatch;
-    }
+            // Perform the operation using the primitive function
+            CpuBackend(T).multiply(a, b, &result);
+            return result;
+        }
 
-    // Check if dtypes match
-    if (a.dtype != b.dtype) {
-        return OpError.UnsupportedDataType;
-    }
+        /// Divide two tensors element-wise (legacy interface)
+        pub fn divide(allocator: Allocator, a: Tensor, b: Tensor) !Tensor {
+            // For the legacy interface, we need to perform the checks at runtime
 
-    // Create result tensor
-    var result = try Tensor.zeros(allocator, a.shape.dims, a.dtype, a.backend);
-    errdefer result.deinit();
+            // Check if shapes match
+            if (!a.shape.eql(b.shape)) {
+                return OpError.ShapeMismatch;
+            }
 
-    // Perform the operation using the primitive function
-    if (a.dtype == .f32) {
-        CpuBackend.multiply(f32, a, b, &result);
-    } else {
-        return OpError.UnsupportedDataType;
-    }
+            // Create result tensor
+            var result = try Tensor.zeros(allocator, a.shape.dims, a.backend);
+            errdefer result.deinit();
 
-    return result;
-}
+            CpuBackend(T).divide(a, b, &result);
 
-/// Divide two tensors element-wise (legacy interface)
-pub fn divide(allocator: Allocator, a: Tensor, b: Tensor) !Tensor {
-    // For the legacy interface, we need to perform the checks at runtime
+            return result;
+        }
 
-    // Check if shapes match
-    if (!a.shape.eql(b.shape)) {
-        return OpError.ShapeMismatch;
-    }
+        /// Matrix multiplication (legacy interface)
+        pub fn matmul(allocator: Allocator, a: Tensor, b: Tensor) !Tensor {
+            // For the legacy interface, we need to perform the checks at runtime
 
-    // Check if dtypes match
-    if (a.dtype != b.dtype) {
-        return OpError.UnsupportedDataType;
-    }
+            // Check dimensions for matrix multiplication
+            if (a.shape.rank() != 2 or b.shape.rank() != 2) {
+                return OpError.DimensionMismatch;
+            }
 
-    // Create result tensor
-    var result = try Tensor.zeros(allocator, a.shape.dims, a.dtype, a.backend);
-    errdefer result.deinit();
+            if (a.shape.dims[1] != b.shape.dims[0]) {
+                return OpError.ShapeMismatch;
+            }
 
-    // Perform the operation using the primitive function
-    if (a.dtype == .f32) {
-        CpuBackend.divide(f32, a, b, &result);
-    } else {
-        return OpError.UnsupportedDataType;
-    }
+            // Result dimensions: [a.dims[0], b.dims[1]]
+            const result_dims = [_]usize{ a.shape.dims[0], b.shape.dims[1] };
+            var result = try Tensor.zeros(allocator, &result_dims, a.backend);
+            errdefer result.deinit();
 
-    return result;
-}
+            CpuBackend(T).matmul(a, b, &result);
 
-/// Matrix multiplication (legacy interface)
-pub fn matmul(allocator: Allocator, a: Tensor, b: Tensor) !Tensor {
-    // For the legacy interface, we need to perform the checks at runtime
+            return result;
+        }
 
-    // Check dimensions for matrix multiplication
-    if (a.shape.rank() != 2 or b.shape.rank() != 2) {
-        return OpError.DimensionMismatch;
-    }
+        /// Apply ReLU activation function element-wise (legacy interface)
+        pub fn relu(allocator: Allocator, a: Tensor) !Tensor {
+            // For the legacy interface, we need to perform the checks at runtime
 
-    if (a.shape.dims[1] != b.shape.dims[0]) {
-        return OpError.ShapeMismatch;
-    }
+            // Create result tensor
+            var result = try Tensor.zeros(allocator, a.shape.dims, a.backend);
+            errdefer result.deinit();
 
-    // Check if dtypes match
-    if (a.dtype != b.dtype) {
-        return OpError.UnsupportedDataType;
-    }
+            // Perform the operation using the primitive function
+            CpuBackend(T).relu(a, &result);
+            return result;
+        }
 
-    // Result dimensions: [a.dims[0], b.dims[1]]
-    const result_dims = [_]usize{ a.shape.dims[0], b.shape.dims[1] };
-    var result = try Tensor.zeros(allocator, &result_dims, a.dtype, a.backend);
-    errdefer result.deinit();
+        /// Softmax activation (legacy interface)
+        pub fn softmax(allocator: Allocator, a: Tensor) !Tensor {
+            // For the legacy interface, we need to perform the checks at runtime
 
-    // Perform the operation using the primitive function
-    if (a.dtype == .f32) {
-        CpuBackend.matmul(f32, a, b, &result);
-    } else {
-        return OpError.UnsupportedDataType;
-    }
+            if (a.shape.rank() != 2) {
+                return OpError.DimensionMismatch;
+            }
 
-    return result;
-}
+            // Create result tensor
+            var result = try Tensor.zeros(allocator, a.shape.dims, a.backend);
+            errdefer result.deinit();
 
-/// Apply ReLU activation function element-wise (legacy interface)
-pub fn relu(allocator: Allocator, a: Tensor) !Tensor {
-    // For the legacy interface, we need to perform the checks at runtime
+            // Perform the operation using the primitive function
+            CpuBackend(T).softmax(a, &result);
+            return result;
+        }
 
-    // Create result tensor
-    var result = try Tensor.zeros(allocator, a.shape.dims, a.dtype, a.backend);
-    errdefer result.deinit();
+        /// Transpose a 2D tensor (legacy interface)
+        pub fn transpose(allocator: Allocator, a: Tensor) !Tensor {
+            // For the legacy interface, we need to perform the checks at runtime
 
-    // Perform the operation using the primitive function
-    if (a.dtype == .f32) {
-        CpuBackend.relu(f32, a, &result);
-    } else {
-        return OpError.UnsupportedDataType;
-    }
+            if (a.shape.rank() != 2) {
+                return OpError.DimensionMismatch;
+            }
 
-    return result;
-}
+            // Result dimensions are swapped
+            const result_dims = [_]usize{ a.shape.dims[1], a.shape.dims[0] };
+            var result = try Tensor.zeros(allocator, &result_dims, a.backend);
+            errdefer result.deinit();
 
-/// Softmax activation (legacy interface)
-pub fn softmax(allocator: Allocator, a: Tensor) !Tensor {
-    // For the legacy interface, we need to perform the checks at runtime
-
-    if (a.shape.rank() != 2) {
-        return OpError.DimensionMismatch;
-    }
-
-    // Create result tensor
-    var result = try Tensor.zeros(allocator, a.shape.dims, a.dtype, a.backend);
-    errdefer result.deinit();
-
-    // Perform the operation using the primitive function
-    if (a.dtype == .f32) {
-        CpuBackend.softmax(f32, a, &result);
-    } else {
-        return OpError.UnsupportedDataType;
-    }
-
-    return result;
-}
-
-/// Transpose a 2D tensor (legacy interface)
-pub fn transpose(allocator: Allocator, a: Tensor) !Tensor {
-    // For the legacy interface, we need to perform the checks at runtime
-
-    if (a.shape.rank() != 2) {
-        return OpError.DimensionMismatch;
-    }
-
-    // Result dimensions are swapped
-    const result_dims = [_]usize{ a.shape.dims[1], a.shape.dims[0] };
-    var result = try Tensor.zeros(allocator, &result_dims, a.dtype, a.backend);
-    errdefer result.deinit();
-
-    // Perform the operation using the primitive function
-    if (a.dtype == .f32) {
-        CpuBackend.transpose(f32, a, &result);
-    } else {
-        return OpError.UnsupportedDataType;
-    }
-
-    return result;
+            // Perform the operation using the primitive function
+            CpuBackend(T).transpose(a, &result);
+            return result;
+        }
+    };
 }
 
 // --- Tests ---
 
 test "element-wise operations" {
+    const T = f32;
+    const Tensor = tensor.Tensor(T);
+    const legacy_api = LegacyApi(T);
+
     const allocator = std.testing.allocator;
     var dims = [_]usize{ 2, 2 };
 
     // Create two 2x2 tensors
-    var a = try Tensor.zeros(allocator, &dims, .f32, .cpu);
+    var a = try Tensor.zeros(allocator, &dims, .cpu);
     defer a.deinit();
 
-    var b = try Tensor.zeros(allocator, &dims, .f32, .cpu);
+    var b = try Tensor.zeros(allocator, &dims, .cpu);
     defer b.deinit();
 
     // Set values in tensor a: [[1, 2], [3, 4]]
@@ -1203,7 +1127,7 @@ test "element-wise operations" {
 
     // Test addition using the legacy interface
     {
-        var result = try add(allocator, a, b);
+        var result = try legacy_api.add(allocator, a, b);
         defer result.deinit();
 
         try std.testing.expectEqual(@as(f32, 6.0), try result.getScalar(&[_]usize{ 0, 0 }));
@@ -1214,7 +1138,7 @@ test "element-wise operations" {
 
     // Test addition using legacy interface
     {
-        var result = try add(allocator, a, b);
+        var result = try legacy_api.add(allocator, a, b);
         defer result.deinit();
 
         try std.testing.expectEqual(@as(f32, 6.0), try result.getScalar(&[_]usize{ 0, 0 }));
@@ -1225,7 +1149,7 @@ test "element-wise operations" {
 
     // Test subtraction
     {
-        var result = try subtract(allocator, a, b);
+        var result = try legacy_api.subtract(allocator, a, b);
         defer result.deinit();
 
         try std.testing.expectEqual(@as(f32, -4.0), try result.getScalar(&[_]usize{ 0, 0 }));
@@ -1236,7 +1160,7 @@ test "element-wise operations" {
 
     // Test element-wise multiplication
     {
-        var result = try multiply(allocator, a, b);
+        var result = try legacy_api.multiply(allocator, a, b);
         defer result.deinit();
 
         try std.testing.expectEqual(@as(f32, 5.0), try result.getScalar(&[_]usize{ 0, 0 }));
@@ -1247,12 +1171,16 @@ test "element-wise operations" {
 }
 
 test "matrix multiplication" {
+    const T = f32;
+    const Tensor = tensor.Tensor(T);
+    const legacy_api = LegacyApi(T);
+
     const allocator = std.testing.allocator;
     var a_dims = [_]usize{ 2, 3 };
     var b_dims = [_]usize{ 3, 2 };
 
     // Create a 2x3 matrix: [[1, 2, 3], [4, 5, 6]]
-    var a = try Tensor.zeros(allocator, &a_dims, .f32, .cpu);
+    var a = try Tensor.zeros(allocator, &a_dims, .cpu);
     defer a.deinit();
 
     try a.setScalar(&[_]usize{ 0, 0 }, 1.0);
@@ -1263,7 +1191,7 @@ test "matrix multiplication" {
     try a.setScalar(&[_]usize{ 1, 2 }, 6.0);
 
     // Create a 3x2 matrix: [[7, 8], [9, 10], [11, 12]]
-    var b = try Tensor.zeros(allocator, &b_dims, .f32, .cpu);
+    var b = try Tensor.zeros(allocator, &b_dims, .cpu);
     defer b.deinit();
 
     try b.setScalar(&[_]usize{ 0, 0 }, 7.0);
@@ -1275,7 +1203,7 @@ test "matrix multiplication" {
 
     // Test matrix multiplication using the legacy interface
     {
-        var result = try matmul(allocator, a, b);
+        var result = try legacy_api.matmul(allocator, a, b);
         defer result.deinit();
 
         try std.testing.expectEqual(@as(f32, 58.0), try result.getScalar(&[_]usize{ 0, 0 }));
@@ -1286,7 +1214,7 @@ test "matrix multiplication" {
 
     // Test using legacy interface
     {
-        var result = try matmul(allocator, a, b);
+        var result = try legacy_api.matmul(allocator, a, b);
         defer result.deinit();
 
         try std.testing.expectEqual(@as(f32, 58.0), try result.getScalar(&[_]usize{ 0, 0 }));
@@ -1297,11 +1225,15 @@ test "matrix multiplication" {
 }
 
 test "activation functions" {
+    const T = f32;
+    const Tensor = tensor.Tensor(T);
+    const legacy_api = LegacyApi(T);
+
     const allocator = std.testing.allocator;
     var dims = [_]usize{ 2, 2 };
 
     // Create a 2x2 tensor: [[-1, 2], [0, 3]]
-    var a = try Tensor.zeros(allocator, &dims, .f32, .cpu);
+    var a = try Tensor.zeros(allocator, &dims, .cpu);
     defer a.deinit();
 
     try a.setScalar(&[_]usize{ 0, 0 }, -1.0);
@@ -1311,7 +1243,7 @@ test "activation functions" {
 
     // Test ReLU using the legacy interface
     {
-        var result = try relu(allocator, a);
+        var result = try legacy_api.relu(allocator, a);
         defer result.deinit();
 
         try std.testing.expectEqual(@as(f32, 0.0), try result.getScalar(&[_]usize{ 0, 0 }));
@@ -1322,7 +1254,7 @@ test "activation functions" {
 
     // Test ReLU using legacy interface
     {
-        var result = try relu(allocator, a);
+        var result = try legacy_api.relu(allocator, a);
         defer result.deinit();
 
         try std.testing.expectEqual(@as(f32, 0.0), try result.getScalar(&[_]usize{ 0, 0 }));
@@ -1332,7 +1264,7 @@ test "activation functions" {
     }
 
     // Create a 2x2 tensor: [[1, 2], [3, 4]]
-    var b = try Tensor.zeros(allocator, &dims, .f32, .cpu);
+    var b = try Tensor.zeros(allocator, &dims, .cpu);
     defer b.deinit();
 
     try b.setScalar(&[_]usize{ 0, 0 }, 1.0);
@@ -1342,7 +1274,7 @@ test "activation functions" {
 
     // Test Softmax using legacy interface
     {
-        var result = try softmax(allocator, b);
+        var result = try legacy_api.softmax(allocator, b);
         defer result.deinit();
 
         // Check that softmax outputs sum to 1 for each row
@@ -1361,11 +1293,15 @@ test "activation functions" {
 }
 
 test "transpose" {
+    const T = f32;
+    const Tensor = tensor.Tensor(T);
+    const legacy_api = LegacyApi(T);
+
     const allocator = std.testing.allocator;
     var dims = [_]usize{ 2, 3 };
 
     // Create a 2x3 matrix: [[1, 2, 3], [4, 5, 6]]
-    var a = try Tensor.zeros(allocator, &dims, .f32, .cpu);
+    var a = try Tensor.zeros(allocator, &dims, .cpu);
     defer a.deinit();
 
     try a.setScalar(&[_]usize{ 0, 0 }, 1.0);
@@ -1377,7 +1313,7 @@ test "transpose" {
 
     // Test Transpose using the legacy interface
     {
-        var result = try transpose(allocator, a);
+        var result = try legacy_api.transpose(allocator, a);
         defer result.deinit();
 
         try std.testing.expectEqual(@as(f32, 1.0), try result.getScalar(&[_]usize{ 0, 0 }));
@@ -1390,7 +1326,7 @@ test "transpose" {
 
     // Test using legacy interface
     {
-        var result = try transpose(allocator, a);
+        var result = try legacy_api.transpose(allocator, a);
         defer result.deinit();
 
         try std.testing.expectEqual(@as(f32, 1.0), try result.getScalar(&[_]usize{ 0, 0 }));

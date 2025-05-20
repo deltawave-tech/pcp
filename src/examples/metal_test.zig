@@ -4,19 +4,15 @@ const tensor = pcp.tensor;
 const ops = pcp.ops;
 const metal = @import("../backends/metal.zig");
 
-/// Helper function for pointer casting
-fn ptrCastHelper(comptime T: type, ptr: anytype) T {
-    // We still need to use alignCast for pointers that require higher alignment
-    return @ptrCast(@alignCast(ptr));
-}
-
+const DataType = f32;
 const Allocator = std.mem.Allocator;
-const Tensor = tensor.Tensor;
-const DType = tensor.DType;
+const Tensor = tensor.Tensor(DataType);
+
+const legacy_api = ops.LegacyApi(DataType);
 
 // Helper function to print tensor contents
 fn printTensor(t: Tensor) void {
-    const buf = ptrCastHelper([*]f32, t.buffer.data.ptr)[0..t.shape.elemCount()];
+    const buf = t.buffer.data;
 
     std.debug.print("Shape: [", .{});
     for (t.shape.dims) |dim| {
@@ -61,7 +57,7 @@ pub fn main() !void {
     var dims = [_]usize{ 2, 3 };
 
     // Create a tensor with CPU backend first
-    var a_cpu = try Tensor.zeros(allocator, &dims, .f32, .cpu);
+    var a_cpu = try Tensor.zeros(allocator, &dims, .cpu);
     defer a_cpu.deinit();
 
     // Set some values
@@ -73,7 +69,7 @@ pub fn main() !void {
     try a_cpu.setScalar(&[_]usize{ 1, 2 }, 6.0);
 
     // Create another tensor
-    var b_cpu = try Tensor.zeros(allocator, &dims, .f32, .cpu);
+    var b_cpu = try Tensor.zeros(allocator, &dims, .cpu);
     defer b_cpu.deinit();
 
     try b_cpu.setScalar(&[_]usize{ 0, 0 }, 6.0);
@@ -84,22 +80,22 @@ pub fn main() !void {
     try b_cpu.setScalar(&[_]usize{ 1, 2 }, 1.0);
 
     // Create Metal tensors from CPU tensors
-    var a_metal = try Tensor.zeros(allocator, &dims, .f32, .metal);
+    var a_metal = try Tensor.zeros(allocator, &dims, .metal);
     defer a_metal.deinit();
 
     // Copy data from CPU tensor to Metal tensor
-    const a_cpu_buf = ptrCastHelper([*]f32, a_cpu.buffer.data.ptr)[0..a_cpu.shape.elemCount()];
-    const a_metal_buf = ptrCastHelper([*]f32, a_metal.buffer.data.ptr)[0..a_metal.shape.elemCount()];
+    const a_cpu_buf = a_cpu.buffer.data;
+    const a_metal_buf = a_metal.buffer.data;
     for (a_cpu_buf, 0..) |val, i| {
         a_metal_buf[i] = val;
     }
 
-    var b_metal = try Tensor.zeros(allocator, &dims, .f32, .metal);
+    var b_metal = try Tensor.zeros(allocator, &dims, .metal);
     defer b_metal.deinit();
 
     // Copy data from CPU tensor to Metal tensor
-    const b_cpu_buf = ptrCastHelper([*]f32, b_cpu.buffer.data.ptr)[0..b_cpu.shape.elemCount()];
-    const b_metal_buf = ptrCastHelper([*]f32, b_metal.buffer.data.ptr)[0..b_metal.shape.elemCount()];
+    const b_cpu_buf = b_cpu.buffer.data;
+    const b_metal_buf = b_metal.buffer.data;
     for (b_cpu_buf, 0..) |val, i| {
         b_metal_buf[i] = val;
     }
@@ -129,7 +125,7 @@ pub fn main() !void {
     printTensor(add_result);
 
     // Compare with CPU result
-    const add_cpu_result = try ops.add(allocator, a_cpu, b_cpu);
+    const add_cpu_result = try legacy_api.add(allocator, a_cpu, b_cpu);
     defer add_cpu_result.deinit();
 
     std.debug.print("\nA + B (CPU for comparison):\n", .{});
@@ -148,7 +144,7 @@ pub fn main() !void {
     printTensor(multiply_result);
 
     // Compare with CPU result
-    const multiply_cpu_result = try ops.multiply(allocator, a_cpu, b_cpu);
+    const multiply_cpu_result = try legacy_api.multiply(allocator, a_cpu, b_cpu);
     defer multiply_cpu_result.deinit();
 
     std.debug.print("\nA * B (CPU for comparison):\n", .{});
@@ -159,7 +155,7 @@ pub fn main() !void {
 
     // Create a tensor with negative values
     var c_dims = [_]usize{6};
-    var c_cpu = try Tensor.zeros(allocator, &c_dims, .f32, .cpu);
+    var c_cpu = try Tensor.zeros(allocator, &c_dims, .cpu);
     defer c_cpu.deinit();
 
     try c_cpu.setScalar(&[_]usize{0}, -2.0);
@@ -169,12 +165,12 @@ pub fn main() !void {
     try c_cpu.setScalar(&[_]usize{4}, 2.0);
     try c_cpu.setScalar(&[_]usize{5}, 3.0);
 
-    var c_metal = try Tensor.zeros(allocator, &c_dims, .f32, .metal);
+    var c_metal = try Tensor.zeros(allocator, &c_dims, .metal);
     defer c_metal.deinit();
 
     // Copy data from CPU tensor to Metal tensor
-    const c_cpu_buf = ptrCastHelper([*]f32, c_cpu.buffer.data.ptr)[0..c_cpu.shape.elemCount()];
-    const c_metal_buf = ptrCastHelper([*]f32, c_metal.buffer.data.ptr)[0..c_metal.shape.elemCount()];
+    const c_cpu_buf = c_cpu.buffer.data;
+    const c_metal_buf = c_metal.buffer.data;
     for (c_cpu_buf, 0..) |val, i| {
         c_metal_buf[i] = val;
     }
@@ -192,7 +188,7 @@ pub fn main() !void {
     printTensor(relu_result);
 
     // Compare with CPU result
-    const relu_cpu_result = try ops.relu(allocator, c_cpu);
+    const relu_cpu_result = try legacy_api.relu(allocator, c_cpu);
     defer relu_cpu_result.deinit();
 
     std.debug.print("\nReLU(C) (CPU for comparison):\n", .{});
@@ -203,7 +199,7 @@ pub fn main() !void {
 
     // Create matrices for matmul
     var mat_a_dims = [_]usize{ 2, 3 };
-    var mat_a_cpu = try Tensor.zeros(allocator, &mat_a_dims, .f32, .cpu);
+    var mat_a_cpu = try Tensor.zeros(allocator, &mat_a_dims, .cpu);
     defer mat_a_cpu.deinit();
 
     try mat_a_cpu.setScalar(&[_]usize{ 0, 0 }, 1.0);
@@ -214,7 +210,7 @@ pub fn main() !void {
     try mat_a_cpu.setScalar(&[_]usize{ 1, 2 }, 6.0);
 
     var mat_b_dims = [_]usize{ 3, 2 };
-    var mat_b_cpu = try Tensor.zeros(allocator, &mat_b_dims, .f32, .cpu);
+    var mat_b_cpu = try Tensor.zeros(allocator, &mat_b_dims, .cpu);
     defer mat_b_cpu.deinit();
 
     try mat_b_cpu.setScalar(&[_]usize{ 0, 0 }, 7.0);
@@ -224,22 +220,22 @@ pub fn main() !void {
     try mat_b_cpu.setScalar(&[_]usize{ 2, 0 }, 11.0);
     try mat_b_cpu.setScalar(&[_]usize{ 2, 1 }, 12.0);
 
-    var mat_a_metal = try Tensor.zeros(allocator, &mat_a_dims, .f32, .metal);
+    var mat_a_metal = try Tensor.zeros(allocator, &mat_a_dims, .metal);
     defer mat_a_metal.deinit();
 
     // Copy data from CPU tensor to Metal tensor
-    const mat_a_cpu_buf = ptrCastHelper([*]f32, mat_a_cpu.buffer.data.ptr)[0..mat_a_cpu.shape.elemCount()];
-    const mat_a_metal_buf = ptrCastHelper([*]f32, mat_a_metal.buffer.data.ptr)[0..mat_a_metal.shape.elemCount()];
+    const mat_a_cpu_buf = mat_a_cpu.buffer.data;
+    const mat_a_metal_buf = mat_a_metal.buffer.data;
     for (mat_a_cpu_buf, 0..) |val, i| {
         mat_a_metal_buf[i] = val;
     }
 
-    var mat_b_metal = try Tensor.zeros(allocator, &mat_b_dims, .f32, .metal);
+    var mat_b_metal = try Tensor.zeros(allocator, &mat_b_dims, .metal);
     defer mat_b_metal.deinit();
 
     // Copy data from CPU tensor to Metal tensor
-    const mat_b_cpu_buf = ptrCastHelper([*]f32, mat_b_cpu.buffer.data.ptr)[0..mat_b_cpu.shape.elemCount()];
-    const mat_b_metal_buf = ptrCastHelper([*]f32, mat_b_metal.buffer.data.ptr)[0..mat_b_metal.shape.elemCount()];
+    const mat_b_cpu_buf = mat_b_cpu.buffer.data;
+    const mat_b_metal_buf = mat_b_metal.buffer.data;
     for (mat_b_cpu_buf, 0..) |val, i| {
         mat_b_metal_buf[i] = val;
     }
@@ -260,7 +256,7 @@ pub fn main() !void {
     printTensor(matmul_result);
 
     // Compare with CPU result
-    const matmul_cpu_result = try ops.matmul(allocator, mat_a_cpu, mat_b_cpu);
+    const matmul_cpu_result = try legacy_api.matmul(allocator, mat_a_cpu, mat_b_cpu);
     defer matmul_cpu_result.deinit();
 
     std.debug.print("\nA @ B (CPU for comparison):\n", .{});

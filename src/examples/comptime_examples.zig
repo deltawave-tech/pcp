@@ -4,19 +4,13 @@ const tensor = pcp.tensor;
 const ops = pcp.ops;
 const autodiff = pcp.autodiff;
 
-/// Helper function for pointer casting
-fn ptrCastHelper(comptime T: type, ptr: anytype) T {
-    // We still need to use alignCast for pointers that require higher alignment
-    return @ptrCast(@alignCast(ptr));
-}
-
 const Allocator = std.mem.Allocator;
-const Tensor = tensor.Tensor;
-const DType = tensor.DType;
+const DataType = f32;
+const Tensor = tensor.Tensor(DataType);
 
 /// Helper function to print tensor values
 fn printTensor(t: Tensor) void {
-    const buf = ptrCastHelper([*]f32, t.buffer.data.ptr)[0..t.shape.elemCount()];
+    const buf = t.buffer.data.ptr;
 
     std.debug.print("Shape: [", .{});
     for (t.shape.dims) |dim| {
@@ -38,7 +32,7 @@ fn printTensor(t: Tensor) void {
     } else {
         // For other ranks, just print all values
         std.debug.print("[ ", .{});
-        for (buf) |val| {
+        for (t.buffer.data) |val| {
             std.debug.print("{d:.4} ", .{val});
         }
         std.debug.print("]\n", .{});
@@ -53,14 +47,14 @@ fn demoBasicPlans(allocator: Allocator) !void {
     const dims = [_]usize{ 2, 2 };
 
     // Create input tensors
-    var a = try Tensor.zeros(allocator, &dims, .f32, .cpu);
+    var a = try Tensor.zeros(allocator, &dims, .cpu);
     defer a.deinit();
     try a.setScalar(&[_]usize{ 0, 0 }, 1.0);
     try a.setScalar(&[_]usize{ 0, 1 }, 2.0);
     try a.setScalar(&[_]usize{ 1, 0 }, 3.0);
     try a.setScalar(&[_]usize{ 1, 1 }, 4.0);
 
-    var b = try Tensor.zeros(allocator, &dims, .f32, .cpu);
+    var b = try Tensor.zeros(allocator, &dims, .cpu);
     defer b.deinit();
     try b.setScalar(&[_]usize{ 0, 0 }, 5.0);
     try b.setScalar(&[_]usize{ 0, 1 }, 6.0);
@@ -75,7 +69,7 @@ fn demoBasicPlans(allocator: Allocator) !void {
 
     // Create an AddPlan with the CPU backend and fixed shape
     const shape_opt: ?[]const usize = &dims;
-    var plan = ops.AddPlan(ops.CpuBackend, f32, shape_opt).init(allocator);
+    var plan = ops.AddPlan(ops.CpuBackend(DataType), DataType, shape_opt).init(allocator);
 
     // Execute the plan
     const result = try plan.run(.{ .a = a, .b = b });
@@ -88,7 +82,7 @@ fn demoBasicPlans(allocator: Allocator) !void {
     const M: ?usize = 2;
     const N: ?usize = 2;
     const P: ?usize = 2;
-    var matmul_plan = ops.MatmulPlan(ops.CpuBackend, f32, M, N, P).init(allocator);
+    var matmul_plan = ops.MatmulPlan(ops.CpuBackend(DataType), DataType, M, N, P).init(allocator);
 
     // Execute the matmul plan
     const matmul_result = try matmul_plan.run(.{ .a = a, .b = b });
@@ -98,10 +92,10 @@ fn demoBasicPlans(allocator: Allocator) !void {
     printTensor(matmul_result);
 
     // Create a ReluPlan
-    var relu_plan = ops.ReluPlan(ops.CpuBackend, f32, shape_opt).init(allocator);
+    var relu_plan = ops.ReluPlan(ops.CpuBackend(DataType), DataType, shape_opt).init(allocator);
 
     // Create a tensor with negative values to test ReLU
-    var c = try Tensor.zeros(allocator, &dims, .f32, .cpu);
+    var c = try Tensor.zeros(allocator, &dims, .cpu);
     defer c.deinit();
     try c.setScalar(&[_]usize{ 0, 0 }, -1.0);
     try c.setScalar(&[_]usize{ 0, 1 }, 2.0);
@@ -127,14 +121,14 @@ fn demoAutoDiff(allocator: Allocator) !void {
     const dims = [_]usize{ 2, 2 };
 
     // Create input tensors
-    var a = try Tensor.zeros(allocator, &dims, .f32, .cpu);
+    var a = try Tensor.zeros(allocator, &dims, .cpu);
     defer a.deinit();
     try a.setScalar(&[_]usize{ 0, 0 }, 1.0);
     try a.setScalar(&[_]usize{ 0, 1 }, 2.0);
     try a.setScalar(&[_]usize{ 1, 0 }, 3.0);
     try a.setScalar(&[_]usize{ 1, 1 }, 4.0);
 
-    var b = try Tensor.zeros(allocator, &dims, .f32, .cpu);
+    var b = try Tensor.zeros(allocator, &dims, .cpu);
     defer b.deinit();
     try b.setScalar(&[_]usize{ 0, 0 }, 5.0);
     try b.setScalar(&[_]usize{ 0, 1 }, 6.0);
@@ -145,11 +139,11 @@ fn demoAutoDiff(allocator: Allocator) !void {
     const shape_opt: ?[]const usize = &dims;
 
     // Use the predefined WithGrad plan that adds proper GradType declarations
-    const PlanType = autodiff.AddPlanWithGrad(ops.CpuBackend, f32, shape_opt);
+    const PlanType = autodiff.AddPlanWithGrad(ops.CpuBackend(DataType), DataType, shape_opt);
 
     // Now we use the official WithGrad plan types that have proper GradType and op_type declarations
 
-    var auto_diff = autodiff.AutoDiffPlan(PlanType).init(allocator);
+    var auto_diff = autodiff.AutoDiffPlan(PlanType, DataType).init(allocator);
     defer auto_diff.deinit();
 
     // Forward pass
@@ -161,7 +155,7 @@ fn demoAutoDiff(allocator: Allocator) !void {
     printTensor(output);
 
     // Create gradient tensor (all ones for simplicity)
-    var grad_out = try Tensor.filled(allocator, &dims, .f32, 1.0, .cpu);
+    var grad_out = try Tensor.filled(allocator, &dims, 1.0, .cpu);
     defer grad_out.deinit();
 
     std.debug.print("\nUpstream gradient (all ones):\n", .{});
@@ -186,9 +180,9 @@ fn demoAutoDiff(allocator: Allocator) !void {
     const P: ?usize = 2;
 
     // Use WithGrad plan that has proper GradType declaration
-    const MatMulPlanType = autodiff.MatmulPlanWithGrad(ops.CpuBackend, f32, M, N, P);
+    const MatMulPlanType = autodiff.MatmulPlanWithGrad(ops.CpuBackend(DataType), DataType, M, N, P);
 
-    var matmul_autodiff = autodiff.AutoDiffPlan(MatMulPlanType).init(allocator);
+    var matmul_autodiff = autodiff.AutoDiffPlan(MatMulPlanType, DataType).init(allocator);
     defer matmul_autodiff.deinit();
 
     // Forward pass for matmul
@@ -200,7 +194,7 @@ fn demoAutoDiff(allocator: Allocator) !void {
     printTensor(matmul_output);
 
     // Create gradient tensor for matmul output
-    var matmul_grad = try Tensor.filled(allocator, matmul_output.shape.dims, .f32, 1.0, .cpu);
+    var matmul_grad = try Tensor.filled(allocator, matmul_output.shape.dims, 1.0, .cpu);
     defer matmul_grad.deinit();
 
     // Backward pass for matmul
@@ -225,7 +219,7 @@ fn demoSimpleNetwork(allocator: Allocator) !void {
 
     // Create input tensor (2x2)
     const input_dims = [_]usize{ 2, 2 };
-    var input = try Tensor.zeros(allocator, &input_dims, .f32, .cpu);
+    var input = try Tensor.zeros(allocator, &input_dims, .cpu);
     defer input.deinit();
     try input.setScalar(&[_]usize{ 0, 0 }, 0.5);
     try input.setScalar(&[_]usize{ 0, 1 }, -0.5);
@@ -237,7 +231,7 @@ fn demoSimpleNetwork(allocator: Allocator) !void {
 
     // Create weight tensors
     // Weight 1: 2x2
-    var w1 = try Tensor.zeros(allocator, &input_dims, .f32, .cpu);
+    var w1 = try Tensor.zeros(allocator, &input_dims, .cpu);
     defer w1.deinit();
     try w1.setScalar(&[_]usize{ 0, 0 }, 0.1);
     try w1.setScalar(&[_]usize{ 0, 1 }, 0.2);
@@ -245,7 +239,7 @@ fn demoSimpleNetwork(allocator: Allocator) !void {
     try w1.setScalar(&[_]usize{ 1, 1 }, 0.4);
 
     // Weight 2: 2x2
-    var w2 = try Tensor.zeros(allocator, &input_dims, .f32, .cpu);
+    var w2 = try Tensor.zeros(allocator, &input_dims, .cpu);
     defer w2.deinit();
     try w2.setScalar(&[_]usize{ 0, 0 }, 0.5);
     try w2.setScalar(&[_]usize{ 0, 1 }, 0.6);
@@ -258,20 +252,20 @@ fn demoSimpleNetwork(allocator: Allocator) !void {
     const P1: ?usize = 2;
 
     // Use WithGrad plans for proper autodiff support
-    const Matmul1PlanType = autodiff.MatmulPlanWithGrad(ops.CpuBackend, f32, M1, N1, P1);
-    const ReluPlanType = autodiff.ReluPlanWithGrad(ops.CpuBackend, f32, &input_dims);
-    const Matmul2PlanType = autodiff.MatmulPlanWithGrad(ops.CpuBackend, f32, M1, N1, P1);
+    const Matmul1PlanType = autodiff.MatmulPlanWithGrad(ops.CpuBackend(DataType), DataType, M1, N1, P1);
+    const ReluPlanType = autodiff.ReluPlanWithGrad(ops.CpuBackend(DataType), DataType, &input_dims);
+    const Matmul2PlanType = autodiff.MatmulPlanWithGrad(ops.CpuBackend(DataType), DataType, M1, N1, P1);
 
     // Create AutoDiff wrappers directly without storing unused plans
 
     // Create AutoDiff wrappers
-    var matmul1_autodiff = autodiff.AutoDiffPlan(Matmul1PlanType).init(allocator);
+    var matmul1_autodiff = autodiff.AutoDiffPlan(Matmul1PlanType, DataType).init(allocator);
     defer matmul1_autodiff.deinit();
 
-    var relu_autodiff = autodiff.AutoDiffPlan(ReluPlanType).init(allocator);
+    var relu_autodiff = autodiff.AutoDiffPlan(ReluPlanType, DataType).init(allocator);
     defer relu_autodiff.deinit();
 
-    var matmul2_autodiff = autodiff.AutoDiffPlan(Matmul2PlanType).init(allocator);
+    var matmul2_autodiff = autodiff.AutoDiffPlan(Matmul2PlanType, DataType).init(allocator);
     defer matmul2_autodiff.deinit();
 
     // Forward pass through the network
@@ -299,7 +293,7 @@ fn demoSimpleNetwork(allocator: Allocator) !void {
     printTensor(output);
 
     // Define a target output for simple MSE loss
-    var target = try Tensor.filled(allocator, output.shape.dims, .f32, 0.5, .cpu);
+    var target = try Tensor.filled(allocator, output.shape.dims, 0.5, .cpu);
     defer target.deinit();
 
     std.debug.print("\nTarget output:\n", .{});
@@ -307,16 +301,16 @@ fn demoSimpleNetwork(allocator: Allocator) !void {
 
     // Compute a simple loss: MSE = (output - target)^2
     // Use WithGrad plans for proper autodiff support
-    const SubtractPlanType = autodiff.SubtractPlanWithGrad(ops.CpuBackend, f32, &input_dims);
-    const MultiplyPlanType = autodiff.MultiplyPlanWithGrad(ops.CpuBackend, f32, &input_dims);
+    const SubtractPlanType = autodiff.SubtractPlanWithGrad(ops.CpuBackend(DataType), DataType, &input_dims);
+    const MultiplyPlanType = autodiff.MultiplyPlanWithGrad(ops.CpuBackend(DataType), DataType, &input_dims);
 
     // Create AutoDiff wrappers directly without storing unused plans
 
     // Create AutoDiff wrappers
-    var subtract_autodiff = autodiff.AutoDiffPlan(SubtractPlanType).init(allocator);
+    var subtract_autodiff = autodiff.AutoDiffPlan(SubtractPlanType, DataType).init(allocator);
     defer subtract_autodiff.deinit();
 
-    var multiply_autodiff = autodiff.AutoDiffPlan(MultiplyPlanType).init(allocator);
+    var multiply_autodiff = autodiff.AutoDiffPlan(MultiplyPlanType, DataType).init(allocator);
     defer multiply_autodiff.deinit();
 
     // Calculate difference
@@ -337,7 +331,7 @@ fn demoSimpleNetwork(allocator: Allocator) !void {
     std.debug.print("\nRunning backward pass to compute gradients...\n", .{});
 
     // Create gradient tensor (all ones for simplicity)
-    var loss_grad = try Tensor.filled(allocator, loss.shape.dims, .f32, 1.0, .cpu);
+    var loss_grad = try Tensor.filled(allocator, loss.shape.dims, 1.0, .cpu);
     defer loss_grad.deinit();
 
     // Backpropagation for each layer in reverse order

@@ -4,19 +4,14 @@ const tensor = pcp.tensor;
 const ops = pcp.ops;
 const autodiff = pcp.autodiff;
 
-/// Helper function for pointer casting
-fn ptrCastHelper(comptime T: type, ptr: anytype) T {
-    // We still need to use alignCast for pointers that require higher alignment
-    return @ptrCast(@alignCast(ptr));
-}
-
 const Allocator = std.mem.Allocator;
-const Tensor = tensor.Tensor;
-const DType = tensor.DType;
+const DataType = f32;
+const Tensor = tensor.Tensor(DataType);
+const legacy_api = ops.LegacyApi(DataType);
 
 // Helper function to print tensor contents
 fn printTensor(t: Tensor) void {
-    const buf = ptrCastHelper([*]f32, t.buffer.data.ptr)[0..t.shape.elemCount()];
+    const buf = t.buffer.data;
 
     std.debug.print("Shape: [", .{});
     for (t.shape.dims) |dim| {
@@ -53,7 +48,7 @@ fn testPlanBasedModel(allocator: Allocator) !void {
     var dims = [_]usize{ 2, 2 };
 
     // Create tensors for parameters
-    var w1_tensor = try Tensor.zeros(allocator, &dims, .f32, .cpu);
+    var w1_tensor = try Tensor.zeros(allocator, &dims, .cpu);
     defer w1_tensor.deinit();
 
     try w1_tensor.setScalar(&[_]usize{ 0, 0 }, 0.1);
@@ -61,7 +56,7 @@ fn testPlanBasedModel(allocator: Allocator) !void {
     try w1_tensor.setScalar(&[_]usize{ 1, 0 }, 0.3);
     try w1_tensor.setScalar(&[_]usize{ 1, 1 }, 0.4);
 
-    var w2_tensor = try Tensor.zeros(allocator, &dims, .f32, .cpu);
+    var w2_tensor = try Tensor.zeros(allocator, &dims, .cpu);
     defer w2_tensor.deinit();
 
     try w2_tensor.setScalar(&[_]usize{ 0, 0 }, 0.5);
@@ -70,7 +65,7 @@ fn testPlanBasedModel(allocator: Allocator) !void {
     try w2_tensor.setScalar(&[_]usize{ 1, 1 }, 0.8);
 
     // Create input
-    var x_tensor = try Tensor.zeros(allocator, &dims, .f32, .cpu);
+    var x_tensor = try Tensor.zeros(allocator, &dims, .cpu);
     defer x_tensor.deinit();
 
     try x_tensor.setScalar(&[_]usize{ 0, 0 }, 1.0);
@@ -79,7 +74,7 @@ fn testPlanBasedModel(allocator: Allocator) !void {
     try x_tensor.setScalar(&[_]usize{ 1, 1 }, 4.0);
 
     // Target values
-    var y_tensor = try Tensor.zeros(allocator, &dims, .f32, .cpu);
+    var y_tensor = try Tensor.zeros(allocator, &dims, .cpu);
     defer y_tensor.deinit();
 
     try y_tensor.setScalar(&[_]usize{ 0, 0 }, 0.5);
@@ -88,15 +83,15 @@ fn testPlanBasedModel(allocator: Allocator) !void {
     try y_tensor.setScalar(&[_]usize{ 1, 1 }, 0.5);
 
     // Create the autodiff plans
-    const MatmulPlanType = autodiff.MatmulPlanWithGrad(ops.CpuBackend, f32, null, null, null);
-    var matmul_plan1 = autodiff.AutoDiffPlan(MatmulPlanType).init(allocator);
+    const MatmulPlanType = autodiff.MatmulPlanWithGrad(ops.CpuBackend(DataType), DataType, null, null, null);
+    var matmul_plan1 = autodiff.AutoDiffPlan(MatmulPlanType, DataType).init(allocator);
     defer matmul_plan1.deinit();
 
-    var matmul_plan2 = autodiff.AutoDiffPlan(MatmulPlanType).init(allocator);
+    var matmul_plan2 = autodiff.AutoDiffPlan(MatmulPlanType, DataType).init(allocator);
     defer matmul_plan2.deinit();
 
-    const ReluPlanType = autodiff.ReluPlanWithGrad(ops.CpuBackend, f32, null);
-    var relu_plan = autodiff.AutoDiffPlan(ReluPlanType).init(allocator);
+    const ReluPlanType = autodiff.ReluPlanWithGrad(ops.CpuBackend(DataType), DataType, null);
+    var relu_plan = autodiff.AutoDiffPlan(ReluPlanType, DataType).init(allocator);
     defer relu_plan.deinit();
 
     // Forward pass using plans
@@ -119,14 +114,14 @@ fn testPlanBasedModel(allocator: Allocator) !void {
     printTensor(y_pred);
 
     // Compute MSE loss manually
-    var diff = try ops.subtract(allocator, y_pred, y_tensor);
+    var diff = try legacy_api.subtract(allocator, y_pred, y_tensor);
     defer diff.deinit();
 
-    var diff_squared = try ops.multiply(allocator, diff, diff);
+    var diff_squared = try legacy_api.multiply(allocator, diff, diff);
     defer diff_squared.deinit();
 
     // Calculate mean manually
-    const diff_squared_buf = ptrCastHelper([*]f32, diff_squared.buffer.data.ptr)[0..diff_squared.shape.elemCount()];
+    const diff_squared_buf = diff_squared.buffer.data;
     var sum: f32 = 0.0;
     for (diff_squared_buf) |val| {
         sum += val;
@@ -136,7 +131,7 @@ fn testPlanBasedModel(allocator: Allocator) !void {
     std.debug.print("\nMSE Loss: {d:.6}\n", .{mse});
 
     // Create gradient with ones
-    var grad_ones = try Tensor.filled(allocator, y_pred.shape.dims, y_pred.dtype, 1.0, y_pred.backend);
+    var grad_ones = try Tensor.filled(allocator, y_pred.shape.dims, 1.0, y_pred.backend);
     defer grad_ones.deinit();
 
     // Backward pass

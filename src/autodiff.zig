@@ -2,15 +2,8 @@ const std = @import("std");
 const tensor = @import("tensor.zig");
 const ops = @import("ops.zig");
 
-/// Helper function for pointer casting
-fn ptrCastHelper(comptime T: type, ptr: anytype) T {
-    // We still need to use alignCast for pointers that require higher alignment
-    return @ptrCast(@alignCast(ptr));
-}
-
 const Allocator = std.mem.Allocator;
-const Tensor = tensor.Tensor;
-const DType = tensor.DType;
+
 const Shape = tensor.Shape;
 const BackendType = tensor.BackendType;
 
@@ -18,278 +11,283 @@ const BackendType = tensor.BackendType;
 // These rules define how to compute gradients for each primitive operation
 
 /// Gradient rules that can be used by any backend
-pub const GradRules = struct {
-    /// Gradient for add: da = grad_out, db = grad_out
-    pub fn add(allocator: Allocator, grad_out: Tensor, a: Tensor, b: Tensor) !struct { da: Tensor, db: Tensor } {
-        _ = allocator; // Unused - we use grad_out.clone() instead
-        _ = a; // Unused parameter
-        _ = b; // Unused parameter
+pub fn GradRules(comptime T: type) type {
+    const Tensor = tensor.Tensor(T);
+    const legacy_api = ops.LegacyApi(T);
 
-        // Both inputs receive the same gradient
-        var da = try grad_out.clone();
-        errdefer da.deinit();
+    return struct {
+        /// Gradient for add: da = grad_out, db = grad_out
+        pub fn add(allocator: Allocator, grad_out: Tensor, a: Tensor, b: Tensor) !struct { da: Tensor, db: Tensor } {
+            _ = allocator; // Unused - we use grad_out.clone() instead
+            _ = a; // Unused parameter
+            _ = b; // Unused parameter
 
-        var db = try grad_out.clone();
-        errdefer db.deinit();
+            // Both inputs receive the same gradient
+            var da = try grad_out.clone();
+            errdefer da.deinit();
 
-        return .{ .da = da, .db = db };
-    }
+            var db = try grad_out.clone();
+            errdefer db.deinit();
 
-    /// Gradient for subtract: da = grad_out, db = -grad_out
-    pub fn subtract(allocator: Allocator, grad_out: Tensor, a: Tensor, b: Tensor) !struct { da: Tensor, db: Tensor } {
-        _ = a; // Unused parameter
-        _ = b; // Unused parameter
-
-        // First input gets the gradient directly
-        var da = try grad_out.clone();
-        errdefer da.deinit();
-
-        // Create negative gradient for second input
-        const negative_one = try Tensor.filled(allocator, grad_out.shape.dims, grad_out.dtype, -1.0, grad_out.backend);
-        errdefer negative_one.deinit();
-
-        var db = try ops.multiply(allocator, grad_out, negative_one);
-        errdefer db.deinit();
-
-        // Clean up temporary tensor
-        negative_one.deinit();
-
-        return .{ .da = da, .db = db };
-    }
-
-    /// Gradient for multiply (element-wise): da = grad_out * b, db = grad_out * a
-    pub fn multiply(allocator: Allocator, grad_out: Tensor, a: Tensor, b: Tensor) !struct { da: Tensor, db: Tensor } {
-        // Input a gradient is element-wise product of grad_out and b
-        var da = try ops.multiply(allocator, grad_out, b);
-        errdefer da.deinit();
-
-        // Input b gradient is element-wise product of grad_out and a
-        var db = try ops.multiply(allocator, grad_out, a);
-        errdefer db.deinit();
-
-        return .{ .da = da, .db = db };
-    }
-
-    /// Gradient for divide (element-wise): da = grad_out / b, db = -grad_out * a / (b * b)
-    pub fn divide(allocator: Allocator, grad_out: Tensor, a: Tensor, b: Tensor) !struct { da: Tensor, db: Tensor } {
-        // Input a gradient is element-wise division of grad_out by b
-        var da = try ops.divide(allocator, grad_out, b);
-        errdefer da.deinit();
-
-        // Input b gradient is more complex: -grad_out * a / (b * b)
-        // First calculate b^2
-        var b_squared = try ops.multiply(allocator, b, b);
-        errdefer b_squared.deinit();
-
-        // Calculate a / b^2
-        var a_div_b_squared = try ops.divide(allocator, a, b_squared);
-        errdefer a_div_b_squared.deinit();
-
-        // Multiply by grad_out
-        var temp = try ops.multiply(allocator, grad_out, a_div_b_squared);
-        errdefer temp.deinit();
-
-        // Negate the result
-        const negative_one = try Tensor.filled(allocator, temp.shape.dims, temp.dtype, -1.0, temp.backend);
-        errdefer negative_one.deinit();
-
-        var db = try ops.multiply(allocator, temp, negative_one);
-        errdefer db.deinit();
-
-        // Clean up temporaries
-        b_squared.deinit();
-        a_div_b_squared.deinit();
-        temp.deinit();
-        negative_one.deinit();
-
-        return .{ .da = da, .db = db };
-    }
-
-    /// Gradient for matmul: da = grad_out @ b^T, db = a^T @ grad_out
-    pub fn matmul(allocator: Allocator, grad_out: Tensor, a: Tensor, b: Tensor) !struct { da: Tensor, db: Tensor } {
-        // Compute b transpose
-        const b_transpose = try ops.transpose(allocator, b);
-        errdefer b_transpose.deinit();
-
-        // Gradient for a is grad_out @ b^T
-        var da = try ops.matmul(allocator, grad_out, b_transpose);
-        errdefer da.deinit();
-
-        // Compute a transpose
-        const a_transpose = try ops.transpose(allocator, a);
-        errdefer a_transpose.deinit();
-
-        // Gradient for b is a^T @ grad_out
-        var db = try ops.matmul(allocator, a_transpose, grad_out);
-        errdefer db.deinit();
-
-        // Clean up temporaries
-        b_transpose.deinit();
-        a_transpose.deinit();
-
-        return .{ .da = da, .db = db };
-    }
-
-    /// Gradient for relu: da = grad_out * (a > 0)
-    pub fn relu(allocator: Allocator, grad_out: Tensor, a: Tensor) !Tensor {
-        // Create mask with 1s where input > 0, 0s elsewhere
-        var mask = try Tensor.zeros(allocator, a.shape.dims, a.dtype, a.backend);
-        errdefer mask.deinit();
-
-        const a_buf = ptrCastHelper([*]f32, a.buffer.data.ptr)[0..a.shape.elemCount()];
-        const mask_buf = ptrCastHelper([*]f32, mask.buffer.data.ptr)[0..mask.shape.elemCount()];
-
-        for (a_buf, 0..) |val, i| {
-            mask_buf[i] = if (val > 0) 1.0 else 0.0;
+            return .{ .da = da, .db = db };
         }
 
-        // Gradient is element-wise product of upstream gradient and mask
-        var da = try ops.multiply(allocator, grad_out, mask);
-        errdefer da.deinit();
+        /// Gradient for subtract: da = grad_out, db = -grad_out
+        pub fn subtract(allocator: Allocator, grad_out: Tensor, a: Tensor, b: Tensor) !struct { da: Tensor, db: Tensor } {
+            _ = a; // Unused parameter
+            _ = b; // Unused parameter
 
-        // Clean up temporary
-        mask.deinit();
+            // First input gets the gradient directly
+            var da = try grad_out.clone();
+            errdefer da.deinit();
 
-        return da;
-    }
+            // Create negative gradient for second input
+            const negative_one = try Tensor.filled(allocator, grad_out.shape.dims, grad_out.dtype, -1.0, grad_out.backend);
+            errdefer negative_one.deinit();
 
-    /// Gradient for softmax: complex Jacobian-vector product
-    pub fn softmax(allocator: Allocator, grad_out: Tensor, output: Tensor, a: Tensor) !Tensor {
-        // Create tensor for result gradient
-        var da = try Tensor.zeros(allocator, a.shape.dims, a.dtype, a.backend);
-        errdefer da.deinit();
+            var db = try legacy_api.multiply(allocator, grad_out, negative_one);
+            errdefer db.deinit();
 
-        const softmax_out = ptrCastHelper([*]f32, output.buffer.data.ptr)[0..output.shape.elemCount()];
-        const upstream_grad = ptrCastHelper([*]f32, grad_out.buffer.data.ptr)[0..grad_out.shape.elemCount()];
-        const result_grad = ptrCastHelper([*]f32, da.buffer.data.ptr)[0..da.shape.elemCount()];
+            // Clean up temporary tensor
+            negative_one.deinit();
 
-        const batch_size = output.shape.dims[0];
-        const feature_size = output.shape.dims[1];
+            return .{ .da = da, .db = db };
+        }
 
-        // For each batch item
-        for (0..batch_size) |b_idx| {
-            // Calculate Jacobian-vector product
-            for (0..feature_size) |i| {
-                var sum: f32 = 0.0;
+        /// Gradient for multiply (element-wise): da = grad_out * b, db = grad_out * a
+        pub fn multiply(allocator: Allocator, grad_out: Tensor, a: Tensor, b: Tensor) !struct { da: Tensor, db: Tensor } {
+            // Input a gradient is element-wise product of grad_out and b
+            var da = try legacy_api.multiply(allocator, grad_out, b);
+            errdefer da.deinit();
 
-                for (0..feature_size) |j| {
-                    const s_i = softmax_out[b_idx * feature_size + i];
-                    const s_j = softmax_out[b_idx * feature_size + j];
-                    const g = upstream_grad[b_idx * feature_size + j];
+            // Input b gradient is element-wise product of grad_out and a
+            var db = try legacy_api.multiply(allocator, grad_out, a);
+            errdefer db.deinit();
 
-                    // dy_j/dx_i = y_j * (δ_ij - y_i)
-                    const delta_ij: f32 = if (i == j) 1.0 else 0.0;
-                    sum += g * s_j * (delta_ij - s_i);
-                }
+            return .{ .da = da, .db = db };
+        }
 
-                result_grad[b_idx * feature_size + i] = sum;
+        /// Gradient for divide (element-wise): da = grad_out / b, db = -grad_out * a / (b * b)
+        pub fn divide(allocator: Allocator, grad_out: Tensor, a: Tensor, b: Tensor) !struct { da: Tensor, db: Tensor } {
+            // Input a gradient is element-wise division of grad_out by b
+            var da = try legacy_api.divide(allocator, grad_out, b);
+            errdefer da.deinit();
+
+            // Input b gradient is more complex: -grad_out * a / (b * b)
+            // First calculate b^2
+            var b_squared = try legacy_api.multiply(allocator, b, b);
+            errdefer b_squared.deinit();
+
+            // Calculate a / b^2
+            var a_div_b_squared = try legacy_api.divide(allocator, a, b_squared);
+            errdefer a_div_b_squared.deinit();
+
+            // Multiply by grad_out
+            var temp = try legacy_api.multiply(allocator, grad_out, a_div_b_squared);
+            errdefer temp.deinit();
+
+            // Negate the result
+            const negative_one = try Tensor.filled(allocator, temp.shape.dims, temp.dtype, -1.0, temp.backend);
+            errdefer negative_one.deinit();
+
+            var db = try legacy_api.multiply(allocator, temp, negative_one);
+            errdefer db.deinit();
+
+            // Clean up temporaries
+            b_squared.deinit();
+            a_div_b_squared.deinit();
+            temp.deinit();
+            negative_one.deinit();
+
+            return .{ .da = da, .db = db };
+        }
+
+        /// Gradient for matmul: da = grad_out @ b^T, db = a^T @ grad_out
+        pub fn matmul(allocator: Allocator, grad_out: Tensor, a: Tensor, b: Tensor) !struct { da: Tensor, db: Tensor } {
+            // Compute b transpose
+            const b_transpose = try legacy_api.transpose(allocator, b);
+            errdefer b_transpose.deinit();
+
+            // Gradient for a is grad_out @ b^T
+            var da = try legacy_api.matmul(allocator, grad_out, b_transpose);
+            errdefer da.deinit();
+
+            // Compute a transpose
+            const a_transpose = try legacy_api.transpose(allocator, a);
+            errdefer a_transpose.deinit();
+
+            // Gradient for b is a^T @ grad_out
+            var db = try legacy_api.matmul(allocator, a_transpose, grad_out);
+            errdefer db.deinit();
+
+            // Clean up temporaries
+            b_transpose.deinit();
+            a_transpose.deinit();
+
+            return .{ .da = da, .db = db };
+        }
+
+        /// Gradient for relu: da = grad_out * (a > 0)
+        pub fn relu(allocator: Allocator, grad_out: Tensor, a: Tensor) !Tensor {
+            // Create mask with 1s where input > 0, 0s elsewhere
+            var mask = try Tensor.zeros(allocator, a.shape.dims, a.backend);
+            errdefer mask.deinit();
+
+            const a_buf = a.buffer.data;
+            const mask_buf = mask.buffer.data;
+
+            for (a_buf, 0..) |val, i| {
+                mask_buf[i] = if (val > 0) 1.0 else 0.0;
             }
+
+            // Gradient is element-wise product of upstream gradient and mask
+            var da = try legacy_api.multiply(allocator, grad_out, mask);
+            errdefer da.deinit();
+
+            // Clean up temporary
+            mask.deinit();
+
+            return da;
         }
 
-        return da;
-    }
+        /// Gradient for softmax: complex Jacobian-vector product
+        pub fn softmax(allocator: Allocator, grad_out: Tensor, output: Tensor, a: Tensor) !Tensor {
+            // Create tensor for result gradient
+            var da = try Tensor.zeros(allocator, a.shape.dims, a.backend);
+            errdefer da.deinit();
 
-    /// Gradient for transpose: da = grad_out^T
-    pub fn transpose(allocator: Allocator, grad_out: Tensor, a: Tensor) !Tensor {
-        _ = a; // Unused parameter
+            const softmax_out = output.buffer.data;
+            const upstream_grad = grad_out.buffer.data;
+            const result_grad = da.buffer.data;
 
-        // Gradient is just the transpose of the upstream gradient
-        var da = try ops.transpose(allocator, grad_out);
-        errdefer da.deinit();
+            const batch_size = output.shape.dims[0];
+            const feature_size = output.shape.dims[1];
 
-        return da;
-    }
+            // For each batch item
+            for (0..batch_size) |b_idx| {
+                // Calculate Jacobian-vector product
+                for (0..feature_size) |i| {
+                    var sum: f32 = 0.0;
 
-    /// Gradient for embedding lookup: accumulate gradients at token positions
-    pub fn embedding_lookup(allocator: Allocator, grad_out: Tensor, params: Tensor, indices: Tensor) !Tensor {
-        // Gradient for params is sparse: only positions referenced by indices get gradients
-        var d_params = try Tensor.zeros(allocator, params.shape.dims, params.dtype, params.backend);
-        errdefer d_params.deinit();
+                    for (0..feature_size) |j| {
+                        const s_i = softmax_out[b_idx * feature_size + i];
+                        const s_j = softmax_out[b_idx * feature_size + j];
+                        const g = upstream_grad[b_idx * feature_size + j];
 
-        // Extract dimensions
-        const vocab_size = params.shape.dims[0];
-        const embed_dim = params.shape.dims[1];
+                        // dy_j/dx_i = y_j * (δ_ij - y_i)
+                        const delta_ij: f32 = if (i == j) 1.0 else 0.0;
+                        sum += g * s_j * (delta_ij - s_i);
+                    }
 
-        // Parse indices dimensions
-        var batch_size: usize = 1;
-        var seq_len: usize = 1;
-
-        if (indices.shape.rank() == 1) {
-            seq_len = indices.shape.dims[0];
-        } else if (indices.shape.rank() == 2) {
-            batch_size = indices.shape.dims[0];
-            seq_len = indices.shape.dims[1];
-        } else {
-            return ops.OpError.InvalidIndicesShape;
-        }
-
-        // Get data buffers with bounds checking
-        if (indices.shape.elemCount() == 0) {
-            return ops.OpError.EmptyTensor;
-        }
-
-        if (grad_out.shape.elemCount() == 0) {
-            return ops.OpError.EmptyTensor;
-        }
-
-        const indices_buf = ptrCastHelper([*]f32, indices.buffer.data.ptr)[0..indices.shape.elemCount()];
-        const grad_buf = ptrCastHelper([*]f32, grad_out.buffer.data.ptr)[0..grad_out.shape.elemCount()];
-        const d_params_buf = ptrCastHelper([*]f32, d_params.buffer.data.ptr)[0..d_params.shape.elemCount()];
-
-        // For each token in the batch, accumulate gradients back to the embedding table
-        for (0..batch_size) |b| {
-            for (0..seq_len) |s| {
-                // Get index of current token
-                var index_pos: usize = 0;
-                if (indices.shape.rank() == 1) {
-                    index_pos = s;
-                } else {
-                    index_pos = b * seq_len + s;
+                    result_grad[b_idx * feature_size + i] = sum;
                 }
+            }
 
-                // Bounds check
-                if (index_pos >= indices_buf.len) {
-                    std.debug.print("Warning: Index out of bounds in embedding_lookup gradient: {}/{}\n", .{ index_pos, indices_buf.len });
-                    continue;
-                }
+            return da;
+        }
 
-                // Get token ID, clamping to vocab size
-                const token_id_f = indices_buf[index_pos];
-                const token_id_i = @as(i32, @intFromFloat(token_id_f));
-                // No need to handle optional here, vocab_size is not optional in this context
-                const token_id = @as(usize, @intCast(@max(0, @min(token_id_i, @as(i32, @intCast(vocab_size - 1))))));
+        /// Gradient for transpose: da = grad_out^T
+        pub fn transpose(allocator: Allocator, grad_out: Tensor, a: Tensor) !Tensor {
+            _ = a; // Unused parameter
 
-                // Accumulate gradients for this embedding
-                // No need to handle optional here, embed_dim is not optional in this context
-                for (0..embed_dim) |d| {
-                    const grad_pos = (b * seq_len + s) * embed_dim + d;
-                    const param_pos = token_id * embed_dim + d;
+            // Gradient is just the transpose of the upstream gradient
+            var da = try legacy_api.transpose(allocator, grad_out);
+            errdefer da.deinit();
 
-                    // Bounds checking
-                    if (grad_pos >= grad_buf.len) {
-                        std.debug.print("Warning: Grad pos out of bounds in embedding_lookup gradient: {}/{}\n", .{ grad_pos, grad_buf.len });
+            return da;
+        }
+
+        /// Gradient for embedding lookup: accumulate gradients at token positions
+        pub fn embedding_lookup(allocator: Allocator, grad_out: Tensor, params: Tensor, indices: Tensor) !Tensor {
+            // Gradient for params is sparse: only positions referenced by indices get gradients
+            var d_params = try Tensor.zeros(allocator, params.shape.dims, params.backend);
+            errdefer d_params.deinit();
+
+            // Extract dimensions
+            const vocab_size = params.shape.dims[0];
+            const embed_dim = params.shape.dims[1];
+
+            // Parse indices dimensions
+            var batch_size: usize = 1;
+            var seq_len: usize = 1;
+
+            if (indices.shape.rank() == 1) {
+                seq_len = indices.shape.dims[0];
+            } else if (indices.shape.rank() == 2) {
+                batch_size = indices.shape.dims[0];
+                seq_len = indices.shape.dims[1];
+            } else {
+                return ops.OpError.InvalidIndicesShape;
+            }
+
+            // Get data buffers with bounds checking
+            if (indices.shape.elemCount() == 0) {
+                return ops.OpError.EmptyTensor;
+            }
+
+            if (grad_out.shape.elemCount() == 0) {
+                return ops.OpError.EmptyTensor;
+            }
+
+            const indices_buf = indices.buffer.data;
+            const grad_buf = grad_out.buffer.data;
+            const d_params_buf = d_params.buffer.data;
+
+            // For each token in the batch, accumulate gradients back to the embedding table
+            for (0..batch_size) |b| {
+                for (0..seq_len) |s| {
+                    // Get index of current token
+                    var index_pos: usize = 0;
+                    if (indices.shape.rank() == 1) {
+                        index_pos = s;
+                    } else {
+                        index_pos = b * seq_len + s;
+                    }
+
+                    // Bounds check
+                    if (index_pos >= indices_buf.len) {
+                        std.debug.print("Warning: Index out of bounds in embedding_lookup gradient: {}/{}\n", .{ index_pos, indices_buf.len });
                         continue;
                     }
 
-                    if (param_pos >= d_params_buf.len) {
-                        std.debug.print("Warning: Param pos out of bounds in embedding_lookup gradient: {}/{}\n", .{ param_pos, d_params_buf.len });
-                        continue;
-                    }
+                    // Get token ID, clamping to vocab size
+                    const token_id_f = indices_buf[index_pos];
+                    const token_id_i = @as(i32, @intFromFloat(token_id_f));
+                    // No need to handle optional here, vocab_size is not optional in this context
+                    const token_id = @as(usize, @intCast(@max(0, @min(token_id_i, @as(i32, @intCast(vocab_size - 1))))));
 
-                    d_params_buf[param_pos] += grad_buf[grad_pos];
+                    // Accumulate gradients for this embedding
+                    // No need to handle optional here, embed_dim is not optional in this context
+                    for (0..embed_dim) |d| {
+                        const grad_pos = (b * seq_len + s) * embed_dim + d;
+                        const param_pos = token_id * embed_dim + d;
+
+                        // Bounds checking
+                        if (grad_pos >= grad_buf.len) {
+                            std.debug.print("Warning: Grad pos out of bounds in embedding_lookup gradient: {}/{}\n", .{ grad_pos, grad_buf.len });
+                            continue;
+                        }
+
+                        if (param_pos >= d_params_buf.len) {
+                            std.debug.print("Warning: Param pos out of bounds in embedding_lookup gradient: {}/{}\n", .{ param_pos, d_params_buf.len });
+                            continue;
+                        }
+
+                        d_params_buf[param_pos] += grad_buf[grad_pos];
+                    }
                 }
             }
-        }
 
-        return d_params;
-    }
-};
+            return d_params;
+        }
+    };
+}
 
 // --- Comptime AutoDiff Plan Generator ---
 // This section defines the comptime function to generate gradient plans from forward plans
 
 /// AutoDiffPlan wraps a forward plan and provides backward functionality
-pub fn AutoDiffPlan(comptime ForwardPlanType: type) type {
+pub fn AutoDiffPlan(comptime ForwardPlanType: type, comptime DataType: type) type {
     // Use @hasDecl for checking constants instead of @hasField
     // This fixes the detection of GradType and op_type in plan types
 
@@ -302,6 +300,8 @@ pub fn AutoDiffPlan(comptime ForwardPlanType: type) type {
             @compileError("Forward plan must define op_type for autodiff");
         }
     }
+
+    const Tensor = tensor.Tensor(DataType);
 
     return struct {
         const Self = @This();
@@ -374,6 +374,7 @@ pub fn AutoDiffPlan(comptime ForwardPlanType: type) type {
 /// Extend ops.AddPlan with gradient type information
 pub fn AddPlanWithGrad(comptime Backend: type, comptime T: type, comptime shape: ?[]const usize) type {
     const BasePlan = ops.AddPlan(Backend, T, shape);
+    const Tensor = tensor.Tensor(T);
 
     return struct {
         const Self = @This();
@@ -404,6 +405,7 @@ pub fn AddPlanWithGrad(comptime Backend: type, comptime T: type, comptime shape:
 /// Extend ops.SubtractPlan with gradient type information
 pub fn SubtractPlanWithGrad(comptime Backend: type, comptime T: type, comptime shape: ?[]const usize) type {
     const BasePlan = ops.SubtractPlan(Backend, T, shape);
+    const Tensor = tensor.Tensor(T);
 
     return struct {
         const Self = @This();
@@ -434,6 +436,7 @@ pub fn SubtractPlanWithGrad(comptime Backend: type, comptime T: type, comptime s
 /// Extend ops.MultiplyPlan with gradient type information
 pub fn MultiplyPlanWithGrad(comptime Backend: type, comptime T: type, comptime shape: ?[]const usize) type {
     const BasePlan = ops.MultiplyPlan(Backend, T, shape);
+    const Tensor = tensor.Tensor(T);
 
     return struct {
         const Self = @This();
@@ -464,6 +467,7 @@ pub fn MultiplyPlanWithGrad(comptime Backend: type, comptime T: type, comptime s
 /// Extend ops.MatmulPlan with gradient type information
 pub fn MatmulPlanWithGrad(comptime Backend: type, comptime T: type, comptime M: ?usize, comptime N: ?usize, comptime P: ?usize) type {
     const BasePlan = ops.MatmulPlan(Backend, T, M, N, P);
+    const Tensor = tensor.Tensor(T);
 
     return struct {
         const Self = @This();
@@ -494,6 +498,7 @@ pub fn MatmulPlanWithGrad(comptime Backend: type, comptime T: type, comptime M: 
 /// Extend ops.ReluPlan with gradient type information
 pub fn ReluPlanWithGrad(comptime Backend: type, comptime T: type, comptime shape: ?[]const usize) type {
     const BasePlan = ops.ReluPlan(Backend, T, shape);
+    const Tensor = tensor.Tensor(T);
 
     return struct {
         const Self = @This();
@@ -518,7 +523,7 @@ pub fn ReluPlanWithGrad(comptime Backend: type, comptime T: type, comptime shape
         /// Custom gradient implementation for ReLU
         pub fn gradient(self: Self, grad_out: Tensor, input: InputType) !GradType {
             // For ReLU, gradient is the upstream gradient where input > 0, 0 elsewhere
-            return try GradRules.relu(self.base.base.allocator, grad_out, input);
+            return try GradRules(T).relu(self.base.base.allocator, grad_out, input);
         }
     };
 }
@@ -526,6 +531,7 @@ pub fn ReluPlanWithGrad(comptime Backend: type, comptime T: type, comptime shape
 /// Extend ops.SoftmaxPlan with gradient type information
 pub fn SoftmaxPlanWithGrad(comptime Backend: type, comptime T: type, comptime batch_size: ?usize, comptime feature_size: ?usize) type {
     const BasePlan = ops.SoftmaxPlan(Backend, T, batch_size, feature_size);
+    const Tensor = tensor.Tensor(T);
 
     return struct {
         const Self = @This();
@@ -553,7 +559,7 @@ pub fn SoftmaxPlanWithGrad(comptime Backend: type, comptime T: type, comptime ba
             defer output.deinit();
 
             // Then compute the Jacobian-vector product
-            return try GradRules.softmax(self.base.base.allocator, grad_out, output, input);
+            return try GradRules(T).softmax(self.base.base.allocator, grad_out, output, input);
         }
     };
 }
@@ -561,6 +567,7 @@ pub fn SoftmaxPlanWithGrad(comptime Backend: type, comptime T: type, comptime ba
 /// Extend ops.TransposePlan with gradient type information
 pub fn TransposePlanWithGrad(comptime Backend: type, comptime T: type, comptime rows: ?usize, comptime cols: ?usize) type {
     const BasePlan = ops.TransposePlan(Backend, T, rows, cols);
+    const Tensor = tensor.Tensor(T);
 
     return struct {
         const Self = @This();
@@ -592,6 +599,7 @@ pub fn TransposePlanWithGrad(comptime Backend: type, comptime T: type, comptime 
 /// Extend ops.DividePlan with gradient type information
 pub fn DividePlanWithGrad(comptime Backend: type, comptime T: type, comptime shape: ?[]const usize) type {
     const BasePlan = ops.DividePlan(Backend, T, shape);
+    const Tensor = tensor.Tensor(T);
 
     return struct {
         const Self = @This();
@@ -622,7 +630,8 @@ pub fn DividePlanWithGrad(comptime Backend: type, comptime T: type, comptime sha
 /// Define a plan for embedding lookup operation
 pub fn EmbeddingLookupPlanWithGrad(comptime Backend: type, comptime T: type, comptime vocab_size: ?usize, comptime embed_dim: ?usize) type {
     _ = Backend; // Used at compile time for consistency with other Plan functions
-    _ = T; // Used at compile time for consistency with other Plan functions
+    const Tensor = tensor.Tensor(T);
+
     return struct {
         const Self = @This();
         const InputType = struct { params: Tensor, indices: Tensor };
@@ -640,7 +649,7 @@ pub fn EmbeddingLookupPlanWithGrad(comptime Backend: type, comptime T: type, com
         /// Compute gradients for embedding lookup
         pub fn gradient(self: Self, grad_out: Tensor, input: InputType) !GradType {
             // Delegate to the GradRules implementation for embedding lookup
-            return try GradRules.embedding_lookup(self.allocator, grad_out, input.params, input.indices);
+            return try GradRules(T).embedding_lookup(self.allocator, grad_out, input.params, input.indices);
         }
 
         pub fn run(self: Self, input: InputType) !Tensor {
@@ -673,7 +682,7 @@ pub fn EmbeddingLookupPlanWithGrad(comptime Backend: type, comptime T: type, com
             // Create output tensor with shape [batch_size, seq_len, embed_dim]
             // Use the already resolved embed_dim from earlier
             var result_dims = [_]usize{ batch_size, seq_len, resolved_embed_dim };
-            var result = try Tensor.zeros(self.allocator, &result_dims, input.params.dtype, input.params.backend);
+            var result = try Tensor.zeros(self.allocator, &result_dims, input.params.backend);
             errdefer result.deinit();
 
             // Get data buffers with safe bounds checking
@@ -695,9 +704,9 @@ pub fn EmbeddingLookupPlanWithGrad(comptime Backend: type, comptime T: type, com
                 return error.EmptyTensor;
             }
 
-            const params_buf = ptrCastHelper([*]f32, input.params.buffer.data.ptr)[0..input.params.shape.elemCount()];
-            const indices_buf = ptrCastHelper([*]f32, input.indices.buffer.data.ptr)[0..input.indices.shape.elemCount()];
-            const result_buf = ptrCastHelper([*]f32, result.buffer.data.ptr)[0..result.shape.elemCount()];
+            const params_buf = input.params.buffer.data;
+            const indices_buf = input.indices.buffer.data;
+            const result_buf = result.buffer.data;
 
             // Perform lookup
             for (0..batch_size) |b| {
@@ -755,19 +764,22 @@ pub const OpType = ops.OpType;
 // --- Tests for the New Plan-Based AutoDiff ---
 
 test "autodiff add plan" {
+    const T = f32;
+    const Tensor = tensor.Tensor(T);
+
     const allocator = std.testing.allocator;
 
     // Create test tensors with comptime-known dimensions
     const dims = [_]usize{ 2, 2 };
 
-    var a = try Tensor.zeros(allocator, &dims, .f32, .cpu);
+    var a = try Tensor.zeros(allocator, &dims, .cpu);
     defer a.deinit();
     try a.setScalar(&[_]usize{ 0, 0 }, 1.0);
     try a.setScalar(&[_]usize{ 0, 1 }, 2.0);
     try a.setScalar(&[_]usize{ 1, 0 }, 3.0);
     try a.setScalar(&[_]usize{ 1, 1 }, 4.0);
 
-    var b = try Tensor.zeros(allocator, &dims, .f32, .cpu);
+    var b = try Tensor.zeros(allocator, &dims, .cpu);
     defer b.deinit();
     try b.setScalar(&[_]usize{ 0, 0 }, 5.0);
     try b.setScalar(&[_]usize{ 0, 1 }, 6.0);
@@ -775,8 +787,8 @@ test "autodiff add plan" {
     try b.setScalar(&[_]usize{ 1, 1 }, 8.0);
 
     // Create an AddPlan with gradient support using AddPlanWithGrad
-    const PlanType = AddPlanWithGrad(ops.CpuBackend, f32, &dims);
-    const AutoDiffType = AutoDiffPlan(PlanType);
+    const PlanType = AddPlanWithGrad(ops.CpuBackend(T), T, &dims);
+    const AutoDiffType = AutoDiffPlan(PlanType, T);
 
     var auto_diff = AutoDiffType.init(allocator);
     defer auto_diff.deinit();
@@ -792,7 +804,7 @@ test "autodiff add plan" {
     try std.testing.expectEqual(@as(f32, 12.0), try output.getScalar(&[_]usize{ 1, 1 }));
 
     // Create gradient with ones
-    var grad_out = try Tensor.filled(allocator, &dims, .f32, 1.0, .cpu);
+    var grad_out = try Tensor.filled(allocator, &dims, 1.0, .cpu);
     defer grad_out.deinit();
 
     // Backward pass
@@ -813,6 +825,9 @@ test "autodiff add plan" {
 }
 
 test "autodiff matmul plan" {
+    const T = f32;
+    const Tensor = tensor.Tensor(T);
+
     const allocator = std.testing.allocator;
 
     // Use comptime dimensions
@@ -824,7 +839,7 @@ test "autodiff matmul plan" {
     const a_dims = [_]usize{ M, N };
     const b_dims = [_]usize{ N, P };
 
-    var a = try Tensor.zeros(allocator, &a_dims, .f32, .cpu);
+    var a = try Tensor.zeros(allocator, &a_dims, .cpu);
     defer a.deinit();
     try a.setScalar(&[_]usize{ 0, 0 }, 1.0);
     try a.setScalar(&[_]usize{ 0, 1 }, 2.0);
@@ -833,7 +848,7 @@ test "autodiff matmul plan" {
     try a.setScalar(&[_]usize{ 1, 1 }, 5.0);
     try a.setScalar(&[_]usize{ 1, 2 }, 6.0);
 
-    var b = try Tensor.zeros(allocator, &b_dims, .f32, .cpu);
+    var b = try Tensor.zeros(allocator, &b_dims, .cpu);
     defer b.deinit();
     try b.setScalar(&[_]usize{ 0, 0 }, 7.0);
     try b.setScalar(&[_]usize{ 0, 1 }, 8.0);
@@ -843,8 +858,8 @@ test "autodiff matmul plan" {
     try b.setScalar(&[_]usize{ 2, 1 }, 12.0);
 
     // Create a MatmulPlan with gradient support
-    const PlanType = MatmulPlanWithGrad(ops.CpuBackend, f32, M, N, P);
-    const AutoDiffType = AutoDiffPlan(PlanType);
+    const PlanType = MatmulPlanWithGrad(ops.CpuBackend(T), T, M, N, P);
+    const AutoDiffType = AutoDiffPlan(PlanType, T);
 
     var auto_diff = AutoDiffType.init(allocator);
     defer auto_diff.deinit();
@@ -861,7 +876,7 @@ test "autodiff matmul plan" {
 
     // Create gradient with ones
     const grad_dims = [_]usize{ M, P };
-    var grad_out = try Tensor.filled(allocator, &grad_dims, .f32, 1.0, .cpu);
+    var grad_out = try Tensor.filled(allocator, &grad_dims, 1.0, .cpu);
     defer grad_out.deinit();
 
     // Backward pass
@@ -892,11 +907,14 @@ test "autodiff matmul plan" {
 }
 
 test "autodiff relu plan" {
+    const T = f32;
+    const Tensor = tensor.Tensor(T);
+
     const allocator = std.testing.allocator;
 
     // Create test tensor with mixed positive and negative values
     const dims = [_]usize{ 2, 2 };
-    var a = try Tensor.zeros(allocator, &dims, .f32, .cpu);
+    var a = try Tensor.zeros(allocator, &dims, .cpu);
     defer a.deinit();
 
     try a.setScalar(&[_]usize{ 0, 0 }, -1.0);
@@ -905,8 +923,8 @@ test "autodiff relu plan" {
     try a.setScalar(&[_]usize{ 1, 1 }, 3.0);
 
     // Create a ReluPlan with gradient support
-    const PlanType = ReluPlanWithGrad(ops.CpuBackend, f32, &dims);
-    const AutoDiffType = AutoDiffPlan(PlanType);
+    const PlanType = ReluPlanWithGrad(ops.CpuBackend(T), T, &dims);
+    const AutoDiffType = AutoDiffPlan(PlanType, T);
 
     var auto_diff = AutoDiffType.init(allocator);
     defer auto_diff.deinit();
@@ -922,7 +940,7 @@ test "autodiff relu plan" {
     try std.testing.expectEqual(@as(f32, 3.0), try output.getScalar(&[_]usize{ 1, 1 }));
 
     // Create gradient with ones
-    var grad_out = try Tensor.filled(allocator, &dims, .f32, 1.0, .cpu);
+    var grad_out = try Tensor.filled(allocator, &dims, 1.0, .cpu);
     defer grad_out.deinit();
 
     // Backward pass
@@ -937,19 +955,22 @@ test "autodiff relu plan" {
 }
 
 test "autodiff divide plan" {
+    const T = f32;
+    const Tensor = tensor.Tensor(T);
+
     const allocator = std.testing.allocator;
 
     // Create test tensors with comptime dimensions
     const dims = [_]usize{ 2, 2 };
 
-    var a = try Tensor.zeros(allocator, &dims, .f32, .cpu);
+    var a = try Tensor.zeros(allocator, &dims, .cpu);
     defer a.deinit();
     try a.setScalar(&[_]usize{ 0, 0 }, 10.0);
     try a.setScalar(&[_]usize{ 0, 1 }, 20.0);
     try a.setScalar(&[_]usize{ 1, 0 }, 30.0);
     try a.setScalar(&[_]usize{ 1, 1 }, 40.0);
 
-    var b = try Tensor.zeros(allocator, &dims, .f32, .cpu);
+    var b = try Tensor.zeros(allocator, &dims, .cpu);
     defer b.deinit();
     try b.setScalar(&[_]usize{ 0, 0 }, 2.0);
     try b.setScalar(&[_]usize{ 0, 1 }, 4.0);
@@ -957,8 +978,8 @@ test "autodiff divide plan" {
     try b.setScalar(&[_]usize{ 1, 1 }, 8.0);
 
     // Create a DividePlan with gradient support
-    const PlanType = DividePlanWithGrad(ops.CpuBackend, f32, &dims);
-    const AutoDiffType = AutoDiffPlan(PlanType);
+    const PlanType = DividePlanWithGrad(ops.CpuBackend(T), T, &dims);
+    const AutoDiffType = AutoDiffPlan(PlanType, T);
 
     var auto_diff = AutoDiffType.init(allocator);
     defer auto_diff.deinit();
@@ -974,7 +995,7 @@ test "autodiff divide plan" {
     try std.testing.expectEqual(@as(f32, 5.0), try output.getScalar(&[_]usize{ 1, 1 }));
 
     // Create gradient with ones
-    var grad_out = try Tensor.filled(allocator, &dims, .f32, 1.0, .cpu);
+    var grad_out = try Tensor.filled(allocator, &dims, 1.0, .cpu);
     defer grad_out.deinit();
 
     // Backward pass
@@ -998,6 +1019,9 @@ test "autodiff divide plan" {
 }
 
 test "autodiff embedding lookup plan" {
+    const T = f32;
+    const Tensor = tensor.Tensor(T);
+
     const allocator = std.testing.allocator;
 
     // Comptime dimensions
@@ -1008,7 +1032,7 @@ test "autodiff embedding lookup plan" {
 
     // Create a simple embedding table [vocab_size=4, embed_dim=3]
     const embed_dims = [_]usize{ vocab_size, embed_dim };
-    var params = try Tensor.zeros(allocator, &embed_dims, .f32, .cpu);
+    var params = try Tensor.zeros(allocator, &embed_dims, .cpu);
     defer params.deinit();
 
     // Fill with test values
@@ -1031,7 +1055,7 @@ test "autodiff embedding lookup plan" {
 
     // Create indices tensor with shape [2, 2]
     const indices_dims = [_]usize{ batch_size, seq_len };
-    var indices = try Tensor.zeros(allocator, &indices_dims, .f32, .cpu);
+    var indices = try Tensor.zeros(allocator, &indices_dims, .cpu);
     defer indices.deinit();
 
     // Set indices: [[1, 2], [3, 0]]
@@ -1041,8 +1065,8 @@ test "autodiff embedding lookup plan" {
     try indices.setScalar(&[_]usize{ 1, 1 }, 0.0); // batch 1, pos 1: word ID 0
 
     // Create an EmbeddingLookupPlan with gradient support
-    const PlanType = EmbeddingLookupPlanWithGrad(ops.CpuBackend, f32, vocab_size, embed_dim);
-    const AutoDiffType = AutoDiffPlan(PlanType);
+    const PlanType = EmbeddingLookupPlanWithGrad(ops.CpuBackend(T), T, vocab_size, embed_dim);
+    const AutoDiffType = AutoDiffPlan(PlanType, T);
 
     var auto_diff = AutoDiffType.init(allocator);
     defer auto_diff.deinit();
@@ -1076,7 +1100,7 @@ test "autodiff embedding lookup plan" {
 
     // Create gradient with all ones
     const grad_dims = [_]usize{ batch_size, seq_len, embed_dim };
-    var grad_out = try Tensor.filled(allocator, &grad_dims, .f32, 1.0, .cpu);
+    var grad_out = try Tensor.filled(allocator, &grad_dims, 1.0, .cpu);
     defer grad_out.deinit();
 
     // Backward pass

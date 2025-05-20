@@ -4,12 +4,6 @@ const tensor = pcp.tensor;
 const ops = pcp.ops;
 const builtin = @import("builtin");
 
-/// Helper function for pointer casting
-fn ptrCastHelper(comptime T: type, ptr: anytype) T {
-    // We still need to use alignCast for pointers that require higher alignment
-    return @ptrCast(@alignCast(ptr));
-}
-
 // Simple timer to measure performance
 const Timer = struct {
     start_time: i128,
@@ -29,6 +23,8 @@ const Timer = struct {
 
 // CPU benchmark as reference for Metal implementation
 pub fn main() !void {
+    const DataType = f32;
+    const Tensor = tensor.Tensor(DataType);
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -44,17 +40,17 @@ pub fn main() !void {
     std.debug.print("Initializing tensors of size {d}x{d} and {d}x{d} for matmul benchmark...\n", .{ m, n, n, p });
 
     var a_dims = [_]usize{ m, n };
-    var a = try tensor.Tensor(f32).random(allocator, &a_dims, .cpu);
+    var a = try Tensor.random(allocator, &a_dims, .cpu);
     defer a.deinit();
 
     var b_dims = [_]usize{ n, p };
-    var b = try tensor.Tensor(f32).random(allocator, &b_dims, .cpu);
+    var b = try Tensor.random(allocator, &b_dims, .cpu);
     defer b.deinit();
 
     // Run CPU matmul
     std.debug.print("\nBenchmarking CPU matrix multiplication...\n", .{});
 
-    const MatmulPlanType = ops.MatmulPlan(ops.CpuBackend, f32, null, null, null);
+    const MatmulPlanType = ops.MatmulPlan(ops.CpuBackend(DataType), DataType, null, null, null);
     var matmul_plan = MatmulPlanType.init(allocator);
 
     // Warm-up
@@ -76,15 +72,15 @@ pub fn main() !void {
     std.debug.print("\nBenchmarking large elementwise operations ({d} elements)...\n", .{elem_size});
 
     var elem_dims = [_]usize{elem_size};
-    var e1 = try tensor.Tensor.random(allocator, &elem_dims, .f32, .cpu);
+    var e1 = try Tensor.random(allocator, &elem_dims, .cpu);
     defer e1.deinit();
 
-    var e2 = try tensor.Tensor.random(allocator, &elem_dims, .f32, .cpu);
+    var e2 = try Tensor.random(allocator, &elem_dims, .cpu);
     defer e2.deinit();
 
     // Add operation
     {
-        const AddPlanType = ops.AddPlan(ops.CpuBackend, f32, null);
+        const AddPlanType = ops.AddPlan(ops.CpuBackend(DataType), DataType, null);
         var add_plan = AddPlanType.init(allocator);
 
         // Warm-up
@@ -104,7 +100,7 @@ pub fn main() !void {
 
     // Multiply operation
     {
-        const MulPlanType = ops.MultiplyPlan(ops.CpuBackend, f32, null);
+        const MulPlanType = ops.MultiplyPlan(ops.CpuBackend(DataType), DataType, null);
         var mul_plan = MulPlanType.init(allocator);
 
         // Warm-up
@@ -124,7 +120,7 @@ pub fn main() !void {
 
     // ReLU operation
     {
-        const ReluPlanType = ops.ReluPlan(ops.CpuBackend, f32, null);
+        const ReluPlanType = ops.ReluPlan(ops.CpuBackend(DataType), DataType, null);
         var relu_plan = ReluPlanType.init(allocator);
 
         // Warm-up

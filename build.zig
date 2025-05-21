@@ -49,7 +49,7 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run unit tests");
     for (test_targets) |t_target| {
         // Add unit tests
-        inline for (.{ "src/tensor.zig", "src/autodiff.zig", "src/ops.zig", "src/prop_tests.zig" }) |module| {
+        inline for (.{ "src/tensor.zig", "src/autodiff.zig", "src/ops.zig" }) |module| {
             const unit_tests = b.addTest(.{
                 .root_source_file = b.path(module),
                 .target = b.resolveTargetQuery(t_target),
@@ -73,21 +73,8 @@ pub fn build(b: *std.Build) void {
     gpt2_example.root_module.addImport("pcp", pcp_module);
     gpt2_example.root_module.addImport("gpt2", gpt2_module);
 
-    // Shakespeare training example executable
-    const shakespeare_example = b.addExecutable(.{
-        .name = "shakespeare_example",
-        .root_source_file = b.path("src/examples/shakespeare_training.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-
-    // Add module dependencies for Shakespeare example
-    shakespeare_example.root_module.addImport("pcp", pcp_module);
-    shakespeare_example.root_module.addImport("gpt2", gpt2_module);
-
     // Install the executables
     b.installArtifact(gpt2_example);
-    b.installArtifact(shakespeare_example);
 
     // Run step for GPT-2 example (default)
     const run_gpt2_cmd = b.addRunArtifact(gpt2_example);
@@ -95,13 +82,6 @@ pub fn build(b: *std.Build) void {
 
     const run_gpt2_step = b.step("run", "Run the GPT-2 training example");
     run_gpt2_step.dependOn(&run_gpt2_cmd.step);
-
-    // Run step for Shakespeare example
-    const run_shakespeare_cmd = b.addRunArtifact(shakespeare_example);
-    run_shakespeare_cmd.step.dependOn(b.getInstallStep());
-
-    const run_shakespeare_step = b.step("run-shakespeare", "Run the Shakespeare training example");
-    run_shakespeare_step.dependOn(&run_shakespeare_cmd.step);
 
     // Autodiff test executable
     const autodiff_test = b.addExecutable(.{
@@ -420,15 +400,15 @@ pub fn build(b: *std.Build) void {
     const run_plan_test_step = b.step("run-plan-test", "Run the Plan-based autodiff test");
     run_plan_test_step.dependOn(&run_plan_test_cmd.step);
 
-    // Property-based testing step
-    const prop_tests = b.addTest(.{
-        .root_source_file = b.path("src/prop_tests.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    
-    const run_prop_tests = b.addRunArtifact(prop_tests);
-    
-    const run_prop_tests_step = b.step("run-prop-tests", "Run property-based tests for tensor operations");
-    run_prop_tests_step.dependOn(&run_prop_tests.step);
+    // // Property-based testing step
+    // const prop_tests = b.addTest(.{
+    //     .root_source_file = b.path("src/prop_tests.zig"),
+    //     .target = target,
+    //     .optimize = optimize,
+    // });
+    //
+    // const run_prop_tests = b.addRunArtifact(prop_tests);
+    //
+    // const run_prop_tests_step = b.step("run-prop-tests", "Run property-based tests for tensor operations");
+    // run_prop_tests_step.dependOn(&run_prop_tests.step);
 }

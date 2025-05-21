@@ -44,10 +44,17 @@
             NO_COLOR=1 # prevent escape codes from messing up the `nix log`
             zig build install --global-cache-dir $(pwd)/.cache -Dcpu=baseline -Doptimize=ReleaseSafe --prefix $out
           '';
-          checkPhase = ''
-            zig build test --global-cache-dir $(pwd)/.cache -Dcpu=baseline
-            zig build run-autodiff-test --global-cache-dir $(pwd)/.cache -Dcpu=baseline
-          '';
+          checkPhase = let
+            targets = [
+              "test"
+              "run"
+              "run-autodiff-test"
+              "run-comptime-examples"
+              "run-plan-test"
+            ];
+            buildCmd = target:
+              "zig build ${target} --global-cache-dir $(pwd)/.cache -Dcpu=baseline";
+          in builtins.concatStringsSep "\n" (map buildCmd targets);
         };
         # The development environment draws in the Zig compiler and ZLS.
         devShells.default = pkgs.mkShell {

@@ -2,14 +2,9 @@ const std = @import("std");
 const tensor = @import("../tensor.zig");
 const builtin = @import("builtin");
 
-/// Helper function for pointer casting
-fn ptrCastHelper(comptime T: type, ptr: anytype) T {
-    // We still need to use alignCast for pointers that require higher alignment
-    return @ptrCast(@alignCast(ptr));
-}
-
 const Allocator = std.mem.Allocator;
-const Tensor = tensor.Tensor;
+const DataType = f32;
+const Tensor = tensor.Tensor(DataType);
 const DType = tensor.DType;
 const Shape = tensor.Shape;
 const BackendType = tensor.BackendType;
@@ -63,7 +58,7 @@ extern fn MTLComputePipelineState_maxTotalThreadsPerThreadgroup(state: *MTLCompu
 extern fn MTLComputePipelineState_threadExecutionWidth(state: *MTLComputePipelineState) usize;
 // MTLSize struct that matches the Objective-C struct
 const MTLSize = extern struct {
-    width: c_ulong, 
+    width: c_ulong,
     height: c_ulong,
     depth: c_ulong,
 };
@@ -77,13 +72,13 @@ fn dispatchThreads(encoder: *MTLComputeCommandEncoder, threads: [3]usize, thread
         .height = threads[1],
         .depth = threads[2],
     };
-    
+
     const threads_per_group_mtl = MTLSize{
         .width = threadsPerThreadgroup[0],
         .height = threadsPerThreadgroup[1],
         .depth = threadsPerThreadgroup[2],
     };
-    
+
     MTLComputeCommandEncoder_dispatchThreads(encoder, threads_mtl, threads_per_group_mtl);
 }
 extern fn MTLComputeCommandEncoder_endEncoding(encoder: *MTLComputeCommandEncoder) void;
@@ -100,43 +95,43 @@ pub const MetalContext = struct {
     command_queue: ?*MTLCommandQueue = null,
     library: ?*MTLLibrary = null,
     allocator: Allocator,
-    
+
     // Compiled compute pipelines for different operations
     add_pipeline: ?*MTLComputePipelineState = null,
     subtract_pipeline: ?*MTLComputePipelineState = null,
     multiply_pipeline: ?*MTLComputePipelineState = null,
     relu_pipeline: ?*MTLComputePipelineState = null,
     matmul_pipeline: ?*MTLComputePipelineState = null,
-    
+
     pub fn init(allocator: Allocator) !MetalContext {
         // Check if running on Apple platform
         if (builtin.os.tag != .macos and builtin.os.tag != .ios) {
             return MetalError.UnsupportedPlatform;
         }
-        
+
         // Get the default Metal device
         const device = MTLCreateSystemDefaultDevice() orelse {
             return MetalError.DeviceNotFound;
         };
-        
+
         // Create a command queue
         const command_queue = MTLDevice_newCommandQueue(device) orelse {
             return MetalError.CommandQueueCreationFailed;
         };
-        
+
         // Create a Metal context
         var ctx = MetalContext{
             .device = device,
             .command_queue = command_queue,
             .allocator = allocator,
         };
-        
+
         // Compile Metal kernels
         try compileMetalCode(&ctx, metal_kernels);
-        
+
         return ctx;
     }
-    
+
     pub fn deinit(self: *MetalContext) void {
         // In a real implementation, would need to release Metal resources
         // For now, we just set them to null to avoid accidental usage
@@ -157,15 +152,15 @@ var global_metal_context: ?MetalContext = null;
 // Initialize the Metal backend
 pub fn init(allocator: Allocator) !void {
     if (global_metal_context != null) return;
-    
+
     std.debug.print("Metal backend: Starting initialization...\n", .{});
-    
+
     // Check if we're on an Apple platform
     if (builtin.os.tag != .macos and builtin.os.tag != .ios) {
         std.debug.print("Metal backend: Unsupported platform! Metal requires macOS or iOS.\n", .{});
         return MetalError.UnsupportedPlatform;
     }
-    
+
     std.debug.print("Metal backend: Getting default Metal device...\n", .{});
     const device = MTLCreateSystemDefaultDevice();
     if (device == null) {
@@ -173,14 +168,14 @@ pub fn init(allocator: Allocator) !void {
         return MetalError.DeviceNotFound;
     }
     std.debug.print("Metal backend: Metal device found.\n", .{});
-    
+
     std.debug.print("Metal backend: Creating command queue...\n", .{});
     const command_queue = MTLDevice_newCommandQueue(device.?) orelse {
         std.debug.print("Metal backend: Failed to create command queue!\n", .{});
         return MetalError.CommandQueueCreationFailed;
     };
     std.debug.print("Metal backend: Command queue created.\n", .{});
-    
+
     // Create a simple Metal context without compiling kernels
     // This will allow us to test without the compilation step
     global_metal_context = MetalContext{
@@ -188,7 +183,7 @@ pub fn init(allocator: Allocator) !void {
         .command_queue = command_queue,
         .allocator = allocator,
     };
-    
+
     std.debug.print("Metal backend: Basic initialization completed successfully.\n", .{});
     std.debug.print("Metal backend: Skipping kernel compilation for now.\n", .{});
 }
@@ -206,12 +201,12 @@ pub fn getContext() !*MetalContext {
     if (global_metal_context) |*ctx| {
         return ctx;
     }
-    
+
     return MetalError.MetalInitFailed;
 }
 
 // Metal kernel strings for various operations
-const metal_kernels = 
+const metal_kernels =
     \\#include <metal_stdlib>
     \\using namespace metal;
     \\
@@ -350,93 +345,78 @@ const metal_kernels =
 // Implementation of primitive operations for Metal backend
 pub fn hasPrimitive(comptime name: []const u8) bool {
     return std.mem.eql(u8, name, "add") or
-           std.mem.eql(u8, name, "subtract") or
-           std.mem.eql(u8, name, "multiply") or
-           std.mem.eql(u8, name, "divide") or
-           std.mem.eql(u8, name, "matmul") or
-           std.mem.eql(u8, name, "relu") or
-           std.mem.eql(u8, name, "softmax") or
-           std.mem.eql(u8, name, "transpose") or
-           std.mem.eql(u8, name, "embedding_lookup");
+        std.mem.eql(u8, name, "subtract") or
+        std.mem.eql(u8, name, "multiply") or
+        std.mem.eql(u8, name, "divide") or
+        std.mem.eql(u8, name, "matmul") or
+        std.mem.eql(u8, name, "relu") or
+        std.mem.eql(u8, name, "softmax") or
+        std.mem.eql(u8, name, "transpose") or
+        std.mem.eql(u8, name, "embedding_lookup");
 }
 
 // Element-wise add operation implementation
-pub fn add(_: type, a: Tensor, b: Tensor, result: *Tensor) void {
+pub fn add(a: Tensor, b: Tensor, result: *Tensor) void {
     if (builtin.os.tag != .macos and builtin.os.tag != .ios) {
         @panic("Metal operations only supported on Apple platforms");
     }
-    
+
     const ctx = getContext() catch @panic("Metal context not initialized");
     const device = ctx.device orelse @panic("Metal device not initialized");
     const command_queue = ctx.command_queue orelse @panic("Metal command queue not initialized");
     const add_pipeline = ctx.add_pipeline orelse @panic("Metal add pipeline not initialized");
-    
+
     // Get element count
     const elem_count = a.shape.elemCount();
-    
+
     // Create Metal buffers
-    const a_buffer = MTLDevice_newBufferWithBytes(
-        device, 
-        a.buffer.data.ptr, 
-        a.buffer.data.len, 
-        0 // MTLResourceStorageModeShared
+    const a_buffer = MTLDevice_newBufferWithBytes(device, a.buffer.data.ptr, a.buffer.data.len, 0 // MTLResourceStorageModeShared
     ) orelse @panic("Failed to create buffer for tensor a");
-    
-    const b_buffer = MTLDevice_newBufferWithBytes(
-        device, 
-        b.buffer.data.ptr, 
-        b.buffer.data.len, 
-        0 // MTLResourceStorageModeShared
+
+    const b_buffer = MTLDevice_newBufferWithBytes(device, b.buffer.data.ptr, b.buffer.data.len, 0 // MTLResourceStorageModeShared
     ) orelse @panic("Failed to create buffer for tensor b");
-    
-    const result_buffer = MTLDevice_newBufferWithLength(
-        device, 
-        result.buffer.data.len, 
-        0 // MTLResourceStorageModeShared
+
+    const result_buffer = MTLDevice_newBufferWithLength(device, result.buffer.data.len, 0 // MTLResourceStorageModeShared
     ) orelse @panic("Failed to create buffer for result tensor");
-    
+
     // Create a command buffer
     const command_buffer = MTLCommandQueue_commandBuffer(command_queue) orelse {
         @panic("Failed to create command buffer");
     };
-    
+
     // Create a compute command encoder
     const compute_encoder = MTLCommandBuffer_computeCommandEncoder(command_buffer) orelse {
         @panic("Failed to create compute command encoder");
     };
-    
+
     // Set the compute pipeline state
     MTLComputeCommandEncoder_setComputePipelineState(compute_encoder, add_pipeline);
-    
+
     // Set buffers
     MTLComputeCommandEncoder_setBuffer(compute_encoder, a_buffer, 0, 0);
     MTLComputeCommandEncoder_setBuffer(compute_encoder, b_buffer, 0, 1);
     MTLComputeCommandEncoder_setBuffer(compute_encoder, result_buffer, 0, 2);
-    
+
     // Calculate threadgroup size
     const max_threads_per_group = MTLComputePipelineState_maxTotalThreadsPerThreadgroup(add_pipeline);
     const thread_execution_width = MTLComputePipelineState_threadExecutionWidth(add_pipeline);
-    
+
     const threads_per_threadgroup = [3]usize{
         @min(max_threads_per_group, thread_execution_width),
         1,
         1,
     };
-    
+
     // Dispatch threads using our helper function
-    dispatchThreads(
-        compute_encoder,
-        [3]usize{ elem_count, 1, 1 },
-        threads_per_threadgroup
-    );
-    
+    dispatchThreads(compute_encoder, [3]usize{ elem_count, 1, 1 }, threads_per_threadgroup);
+
     // End encoding
     MTLComputeCommandEncoder_endEncoding(compute_encoder);
-    
+
     // Commit and wait
     MTLCommandBuffer_commit(command_buffer);
     MTLCommandBuffer_waitUntilCompleted(command_buffer);
-    
+
     // Copy result data back
     const result_data = MTLBuffer_contents(result_buffer);
     @memcpy(result.buffer.data, @as([*]u8, @ptrCast(result_data))[0..result.buffer.data.len]);
@@ -447,329 +427,269 @@ pub fn subtract(_: type, a: Tensor, b: Tensor, result: *Tensor) void {
     if (builtin.os.tag != .macos and builtin.os.tag != .ios) {
         @panic("Metal operations only supported on Apple platforms");
     }
-    
+
     const ctx = getContext() catch @panic("Metal context not initialized");
     const device = ctx.device orelse @panic("Metal device not initialized");
     const command_queue = ctx.command_queue orelse @panic("Metal command queue not initialized");
     const subtract_pipeline = ctx.subtract_pipeline orelse @panic("Metal subtract pipeline not initialized");
-    
+
     // Get element count
     const elem_count = a.shape.elemCount();
-    
+
     // Create Metal buffers
-    const a_buffer = MTLDevice_newBufferWithBytes(
-        device, 
-        a.buffer.data.ptr, 
-        a.buffer.data.len, 
-        0 // MTLResourceStorageModeShared
+    const a_buffer = MTLDevice_newBufferWithBytes(device, a.buffer.data.ptr, a.buffer.data.len, 0 // MTLResourceStorageModeShared
     ) orelse @panic("Failed to create buffer for tensor a");
-    
-    const b_buffer = MTLDevice_newBufferWithBytes(
-        device, 
-        b.buffer.data.ptr, 
-        b.buffer.data.len, 
-        0 // MTLResourceStorageModeShared
+
+    const b_buffer = MTLDevice_newBufferWithBytes(device, b.buffer.data.ptr, b.buffer.data.len, 0 // MTLResourceStorageModeShared
     ) orelse @panic("Failed to create buffer for tensor b");
-    
-    const result_buffer = MTLDevice_newBufferWithLength(
-        device, 
-        result.buffer.data.len, 
-        0 // MTLResourceStorageModeShared
+
+    const result_buffer = MTLDevice_newBufferWithLength(device, result.buffer.data.len, 0 // MTLResourceStorageModeShared
     ) orelse @panic("Failed to create buffer for result tensor");
-    
+
     // Create a command buffer
     const command_buffer = MTLCommandQueue_commandBuffer(command_queue) orelse {
         @panic("Failed to create command buffer");
     };
-    
+
     // Create a compute command encoder
     const compute_encoder = MTLCommandBuffer_computeCommandEncoder(command_buffer) orelse {
         @panic("Failed to create compute command encoder");
     };
-    
+
     // Set the compute pipeline state
     MTLComputeCommandEncoder_setComputePipelineState(compute_encoder, subtract_pipeline);
-    
+
     // Set buffers
     MTLComputeCommandEncoder_setBuffer(compute_encoder, a_buffer, 0, 0);
     MTLComputeCommandEncoder_setBuffer(compute_encoder, b_buffer, 0, 1);
     MTLComputeCommandEncoder_setBuffer(compute_encoder, result_buffer, 0, 2);
-    
+
     // Calculate threadgroup size
     const max_threads_per_group = MTLComputePipelineState_maxTotalThreadsPerThreadgroup(subtract_pipeline);
     const thread_execution_width = MTLComputePipelineState_threadExecutionWidth(subtract_pipeline);
-    
+
     const threads_per_threadgroup = [3]usize{
         @min(max_threads_per_group, thread_execution_width),
         1,
         1,
     };
-    
+
     // Dispatch threads using our helper function
-    dispatchThreads(
-        compute_encoder,
-        [3]usize{ elem_count, 1, 1 },
-        threads_per_threadgroup
-    );
-    
+    dispatchThreads(compute_encoder, [3]usize{ elem_count, 1, 1 }, threads_per_threadgroup);
+
     // End encoding
     MTLComputeCommandEncoder_endEncoding(compute_encoder);
-    
+
     // Commit and wait
     MTLCommandBuffer_commit(command_buffer);
     MTLCommandBuffer_waitUntilCompleted(command_buffer);
-    
+
     // Copy result data back
     const result_data = MTLBuffer_contents(result_buffer);
     @memcpy(result.buffer.data, @as([*]u8, @ptrCast(result_data))[0..result.buffer.data.len]);
 }
 
 // Element-wise multiply operation implementation
-pub fn multiply(_: type, a: Tensor, b: Tensor, result: *Tensor) void {
+pub fn multiply(a: Tensor, b: Tensor, result: *Tensor) void {
     if (builtin.os.tag != .macos and builtin.os.tag != .ios) {
         @panic("Metal operations only supported on Apple platforms");
     }
-    
+
     const ctx = getContext() catch @panic("Metal context not initialized");
     const device = ctx.device orelse @panic("Metal device not initialized");
     const command_queue = ctx.command_queue orelse @panic("Metal command queue not initialized");
     const multiply_pipeline = ctx.multiply_pipeline orelse @panic("Metal multiply pipeline not initialized");
-    
+
     // Get element count
     const elem_count = a.shape.elemCount();
-    
+
     // Create Metal buffers
-    const a_buffer = MTLDevice_newBufferWithBytes(
-        device, 
-        a.buffer.data.ptr, 
-        a.buffer.data.len, 
-        0 // MTLResourceStorageModeShared
+    const a_buffer = MTLDevice_newBufferWithBytes(device, a.buffer.data.ptr, a.buffer.data.len, 0 // MTLResourceStorageModeShared
     ) orelse @panic("Failed to create buffer for tensor a");
-    
-    const b_buffer = MTLDevice_newBufferWithBytes(
-        device, 
-        b.buffer.data.ptr, 
-        b.buffer.data.len, 
-        0 // MTLResourceStorageModeShared
+
+    const b_buffer = MTLDevice_newBufferWithBytes(device, b.buffer.data.ptr, b.buffer.data.len, 0 // MTLResourceStorageModeShared
     ) orelse @panic("Failed to create buffer for tensor b");
-    
-    const result_buffer = MTLDevice_newBufferWithLength(
-        device, 
-        result.buffer.data.len, 
-        0 // MTLResourceStorageModeShared
+
+    const result_buffer = MTLDevice_newBufferWithLength(device, result.buffer.data.len, 0 // MTLResourceStorageModeShared
     ) orelse @panic("Failed to create buffer for result tensor");
-    
+
     // Create a command buffer
     const command_buffer = MTLCommandQueue_commandBuffer(command_queue) orelse {
         @panic("Failed to create command buffer");
     };
-    
+
     // Create a compute command encoder
     const compute_encoder = MTLCommandBuffer_computeCommandEncoder(command_buffer) orelse {
         @panic("Failed to create compute command encoder");
     };
-    
+
     // Set the compute pipeline state
     MTLComputeCommandEncoder_setComputePipelineState(compute_encoder, multiply_pipeline);
-    
+
     // Set buffers
     MTLComputeCommandEncoder_setBuffer(compute_encoder, a_buffer, 0, 0);
     MTLComputeCommandEncoder_setBuffer(compute_encoder, b_buffer, 0, 1);
     MTLComputeCommandEncoder_setBuffer(compute_encoder, result_buffer, 0, 2);
-    
+
     // Calculate threadgroup size
     const max_threads_per_group = MTLComputePipelineState_maxTotalThreadsPerThreadgroup(multiply_pipeline);
     const thread_execution_width = MTLComputePipelineState_threadExecutionWidth(multiply_pipeline);
-    
+
     const threads_per_threadgroup = [3]usize{
         @min(max_threads_per_group, thread_execution_width),
         1,
         1,
     };
-    
+
     // Dispatch threads using our helper function
-    dispatchThreads(
-        compute_encoder,
-        [3]usize{ elem_count, 1, 1 },
-        threads_per_threadgroup
-    );
-    
+    dispatchThreads(compute_encoder, [3]usize{ elem_count, 1, 1 }, threads_per_threadgroup);
+
     // End encoding
     MTLComputeCommandEncoder_endEncoding(compute_encoder);
-    
+
     // Commit and wait
     MTLCommandBuffer_commit(command_buffer);
     MTLCommandBuffer_waitUntilCompleted(command_buffer);
-    
+
     // Copy result data back
     const result_data = MTLBuffer_contents(result_buffer);
     @memcpy(result.buffer.data, @as([*]u8, @ptrCast(result_data))[0..result.buffer.data.len]);
 }
 
 // Matrix multiplication
-pub fn matmul(_: type, a: Tensor, b: Tensor, result: *Tensor) void {
+pub fn matmul(a: Tensor, b: Tensor, result: *Tensor) void {
     if (builtin.os.tag != .macos and builtin.os.tag != .ios) {
         @panic("Metal operations only supported on Apple platforms");
     }
-    
+
     const ctx = getContext() catch @panic("Metal context not initialized");
     const device = ctx.device orelse @panic("Metal device not initialized");
     const command_queue = ctx.command_queue orelse @panic("Metal command queue not initialized");
     const matmul_pipeline = ctx.matmul_pipeline orelse @panic("Metal matmul pipeline not initialized");
-    
+
     // Get dimensions
     const m = a.shape.dims[0];
     const n = a.shape.dims[1];
     const p = b.shape.dims[1];
-    
+
     // Create Metal buffers
-    const a_buffer = MTLDevice_newBufferWithBytes(
-        device, 
-        a.buffer.data.ptr, 
-        a.buffer.data.len, 
-        0 // MTLResourceStorageModeShared
+    const a_buffer = MTLDevice_newBufferWithBytes(device, a.buffer.data.ptr, a.buffer.data.len, 0 // MTLResourceStorageModeShared
     ) orelse @panic("Failed to create buffer for tensor a");
-    
-    const b_buffer = MTLDevice_newBufferWithBytes(
-        device, 
-        b.buffer.data.ptr, 
-        b.buffer.data.len, 
-        0 // MTLResourceStorageModeShared
+
+    const b_buffer = MTLDevice_newBufferWithBytes(device, b.buffer.data.ptr, b.buffer.data.len, 0 // MTLResourceStorageModeShared
     ) orelse @panic("Failed to create buffer for tensor b");
-    
-    const result_buffer = MTLDevice_newBufferWithLength(
-        device, 
-        result.buffer.data.len, 
-        0 // MTLResourceStorageModeShared
+
+    const result_buffer = MTLDevice_newBufferWithLength(device, result.buffer.data.len, 0 // MTLResourceStorageModeShared
     ) orelse @panic("Failed to create buffer for result tensor");
-    
+
     // Create dimensions buffer
     const dims = [_]u32{ @intCast(m), @intCast(n), @intCast(p) };
-    const dims_buffer = MTLDevice_newBufferWithBytes(
-        device,
-        &dims,
-        dims.len * @sizeOf(u32),
-        0 // MTLResourceStorageModeShared
+    const dims_buffer = MTLDevice_newBufferWithBytes(device, &dims, dims.len * @sizeOf(u32), 0 // MTLResourceStorageModeShared
     ) orelse @panic("Failed to create buffer for dimensions");
-    
+
     // Create a command buffer
     const command_buffer = MTLCommandQueue_commandBuffer(command_queue) orelse {
         @panic("Failed to create command buffer");
     };
-    
+
     // Create a compute command encoder
     const compute_encoder = MTLCommandBuffer_computeCommandEncoder(command_buffer) orelse {
         @panic("Failed to create compute command encoder");
     };
-    
+
     // Set the compute pipeline state
     MTLComputeCommandEncoder_setComputePipelineState(compute_encoder, matmul_pipeline);
-    
+
     // Set buffers
     MTLComputeCommandEncoder_setBuffer(compute_encoder, a_buffer, 0, 0);
     MTLComputeCommandEncoder_setBuffer(compute_encoder, b_buffer, 0, 1);
     MTLComputeCommandEncoder_setBuffer(compute_encoder, result_buffer, 0, 2);
     MTLComputeCommandEncoder_setBuffer(compute_encoder, dims_buffer, 0, 3);
-    
+
     // Calculate threadgroup size
     const max_threads_per_group = MTLComputePipelineState_maxTotalThreadsPerThreadgroup(matmul_pipeline);
     const thread_execution_width = MTLComputePipelineState_threadExecutionWidth(matmul_pipeline);
-    
+
     const threads_per_threadgroup_dim = std.math.sqrt(thread_execution_width);
     const threads_per_threadgroup = [3]usize{
         @min(threads_per_threadgroup_dim, max_threads_per_group),
         @min(threads_per_threadgroup_dim, max_threads_per_group),
         1,
     };
-    
+
     // Dispatch threads using our helper function
-    dispatchThreads(
-        compute_encoder,
-        [3]usize{ p, m, 1 },
-        threads_per_threadgroup
-    );
-    
+    dispatchThreads(compute_encoder, [3]usize{ p, m, 1 }, threads_per_threadgroup);
+
     // End encoding
     MTLComputeCommandEncoder_endEncoding(compute_encoder);
-    
+
     // Commit and wait
     MTLCommandBuffer_commit(command_buffer);
     MTLCommandBuffer_waitUntilCompleted(command_buffer);
-    
+
     // Copy result data back
     const result_data = MTLBuffer_contents(result_buffer);
     @memcpy(result.buffer.data, @as([*]u8, @ptrCast(result_data))[0..result.buffer.data.len]);
 }
 
 // ReLU activation
-pub fn relu(_: type, a: Tensor, result: *Tensor) void {
+pub fn relu(a: Tensor, result: *Tensor) void {
     if (builtin.os.tag != .macos and builtin.os.tag != .ios) {
         @panic("Metal operations only supported on Apple platforms");
     }
-    
+
     const ctx = getContext() catch @panic("Metal context not initialized");
     const device = ctx.device orelse @panic("Metal device not initialized");
     const command_queue = ctx.command_queue orelse @panic("Metal command queue not initialized");
     const relu_pipeline = ctx.relu_pipeline orelse @panic("Metal relu pipeline not initialized");
-    
+
     // Get element count
     const elem_count = a.shape.elemCount();
-    
+
     // Create Metal buffers
-    const a_buffer = MTLDevice_newBufferWithBytes(
-        device, 
-        a.buffer.data.ptr, 
-        a.buffer.data.len, 
-        0 // MTLResourceStorageModeShared
+    const a_buffer = MTLDevice_newBufferWithBytes(device, a.buffer.data.ptr, a.buffer.data.len, 0 // MTLResourceStorageModeShared
     ) orelse @panic("Failed to create buffer for tensor a");
-    
-    const result_buffer = MTLDevice_newBufferWithLength(
-        device, 
-        result.buffer.data.len, 
-        0 // MTLResourceStorageModeShared
+
+    const result_buffer = MTLDevice_newBufferWithLength(device, result.buffer.data.len, 0 // MTLResourceStorageModeShared
     ) orelse @panic("Failed to create buffer for result tensor");
-    
+
     // Create a command buffer
     const command_buffer = MTLCommandQueue_commandBuffer(command_queue) orelse {
         @panic("Failed to create command buffer");
     };
-    
+
     // Create a compute command encoder
     const compute_encoder = MTLCommandBuffer_computeCommandEncoder(command_buffer) orelse {
         @panic("Failed to create compute command encoder");
     };
-    
+
     // Set the compute pipeline state
     MTLComputeCommandEncoder_setComputePipelineState(compute_encoder, relu_pipeline);
-    
+
     // Set buffers
     MTLComputeCommandEncoder_setBuffer(compute_encoder, a_buffer, 0, 0);
     MTLComputeCommandEncoder_setBuffer(compute_encoder, result_buffer, 0, 1);
-    
+
     // Calculate threadgroup size
     const max_threads_per_group = MTLComputePipelineState_maxTotalThreadsPerThreadgroup(relu_pipeline);
     const thread_execution_width = MTLComputePipelineState_threadExecutionWidth(relu_pipeline);
-    
+
     const threads_per_threadgroup = [3]usize{
         @min(max_threads_per_group, thread_execution_width),
         1,
         1,
     };
-    
+
     // Dispatch threads using our helper function
-    dispatchThreads(
-        compute_encoder,
-        [3]usize{ elem_count, 1, 1 },
-        threads_per_threadgroup
-    );
-    
+    dispatchThreads(compute_encoder, [3]usize{ elem_count, 1, 1 }, threads_per_threadgroup);
+
     // End encoding
     MTLComputeCommandEncoder_endEncoding(compute_encoder);
-    
+
     // Commit and wait
     MTLCommandBuffer_commit(command_buffer);
     MTLCommandBuffer_waitUntilCompleted(command_buffer);
-    
+
     // Copy result data back
     const result_data = MTLBuffer_contents(result_buffer);
     @memcpy(result.buffer.data, @as([*]u8, @ptrCast(result_data))[0..result.buffer.data.len]);
@@ -780,14 +700,14 @@ fn compileMetalCode(ctx: *MetalContext, code: []const u8) !void {
     if (builtin.os.tag != .macos and builtin.os.tag != .ios) {
         return MetalError.UnsupportedPlatform;
     }
-    
+
     const device = ctx.device orelse return MetalError.DeviceNotFound;
-    
+
     // Create NSString from kernel code
     const source_str = NSString_alloc();
     const source = NSString_initWithUTF8String(source_str, @ptrCast(code));
     defer NSString_release(source);
-    
+
     // Compile the Metal code
     var compile_error: ?*NSError = null;
     const library = MTLDevice_newLibraryWithSource(device, source, null, &compile_error) orelse {
@@ -795,138 +715,138 @@ fn compileMetalCode(ctx: *MetalContext, code: []const u8) !void {
         return MetalError.LibraryCreationFailed;
     };
     ctx.library = library;
-    
+
     // Create compute pipeline for each kernel
-    
+
     // 1. Add kernel
     {
         const kernel_name = NSString_alloc();
         const add_name = NSString_initWithUTF8String(kernel_name, "add_f32");
         defer NSString_release(add_name);
-        
+
         const add_function = MTLLibrary_newFunctionWithName(library, add_name) orelse {
             return MetalError.FunctionCreationFailed;
         };
-        
+
         var pipeline_error: ?*NSError = null;
         const add_pipeline = MTLDevice_newComputePipelineStateWithFunction(device, add_function, &pipeline_error) orelse {
             return MetalError.PipelineCreationFailed;
         };
-        
+
         ctx.add_pipeline = add_pipeline;
     }
-    
+
     // 2. Subtract kernel
     {
         const kernel_name = NSString_alloc();
         const subtract_name = NSString_initWithUTF8String(kernel_name, "subtract_f32");
         defer NSString_release(subtract_name);
-        
+
         const subtract_function = MTLLibrary_newFunctionWithName(library, subtract_name) orelse {
             return MetalError.FunctionCreationFailed;
         };
-        
+
         var pipeline_error: ?*NSError = null;
         const subtract_pipeline = MTLDevice_newComputePipelineStateWithFunction(device, subtract_function, &pipeline_error) orelse {
             return MetalError.PipelineCreationFailed;
         };
-        
+
         ctx.subtract_pipeline = subtract_pipeline;
     }
-    
+
     // 3. Multiply kernel
     {
         const kernel_name = NSString_alloc();
         const multiply_name = NSString_initWithUTF8String(kernel_name, "multiply_f32");
         defer NSString_release(multiply_name);
-        
+
         const multiply_function = MTLLibrary_newFunctionWithName(library, multiply_name) orelse {
             return MetalError.FunctionCreationFailed;
         };
-        
+
         var pipeline_error: ?*NSError = null;
         const multiply_pipeline = MTLDevice_newComputePipelineStateWithFunction(device, multiply_function, &pipeline_error) orelse {
             return MetalError.PipelineCreationFailed;
         };
-        
+
         ctx.multiply_pipeline = multiply_pipeline;
     }
-    
+
     // 4. ReLU kernel
     {
         const kernel_name = NSString_alloc();
         const relu_name = NSString_initWithUTF8String(kernel_name, "relu_f32");
         defer NSString_release(relu_name);
-        
+
         const relu_function = MTLLibrary_newFunctionWithName(library, relu_name) orelse {
             return MetalError.FunctionCreationFailed;
         };
-        
+
         var pipeline_error: ?*NSError = null;
         const relu_pipeline = MTLDevice_newComputePipelineStateWithFunction(device, relu_function, &pipeline_error) orelse {
             return MetalError.PipelineCreationFailed;
         };
-        
+
         ctx.relu_pipeline = relu_pipeline;
     }
-    
+
     // 5. Matmul kernel
     {
         const kernel_name = NSString_alloc();
         const matmul_name = NSString_initWithUTF8String(kernel_name, "matmul_f32");
         defer NSString_release(matmul_name);
-        
+
         const matmul_function = MTLLibrary_newFunctionWithName(library, matmul_name) orelse {
             return MetalError.FunctionCreationFailed;
         };
-        
+
         var pipeline_error: ?*NSError = null;
         const matmul_pipeline = MTLDevice_newComputePipelineStateWithFunction(device, matmul_function, &pipeline_error) orelse {
             return MetalError.PipelineCreationFailed;
         };
-        
+
         ctx.matmul_pipeline = matmul_pipeline;
     }
 }
 
 // Name our implementation functions so we can reference them without recursion
 const metal_impl = struct {
-    pub fn add(comptime T: type, a: Tensor, b: Tensor, result: *Tensor) void {
-        @import("metal.zig").add(T, a, b, result);
+    pub fn add(a: Tensor, b: Tensor, result: *Tensor) void {
+        @import("metal.zig").add(a, b, result);
     }
-    
-    pub fn subtract(comptime T: type, a: Tensor, b: Tensor, result: *Tensor) void {
-        @import("metal.zig").subtract(T, a, b, result);
+
+    pub fn subtract(a: Tensor, b: Tensor, result: *Tensor) void {
+        @import("metal.zig").subtract(a, b, result);
     }
-    
-    pub fn multiply(comptime T: type, a: Tensor, b: Tensor, result: *Tensor) void {
-        @import("metal.zig").multiply(T, a, b, result);
+
+    pub fn multiply(a: Tensor, b: Tensor, result: *Tensor) void {
+        @import("metal.zig").multiply(a, b, result);
     }
-    
-    pub fn matmul(comptime T: type, a: Tensor, b: Tensor, result: *Tensor) void {
-        @import("metal.zig").matmul(T, a, b, result);
+
+    pub fn matmul(a: Tensor, b: Tensor, result: *Tensor) void {
+        @import("metal.zig").matmul(a, b, result);
     }
-    
-    pub fn relu(comptime T: type, a: Tensor, result: *Tensor) void {
-        @import("metal.zig").relu(T, a, result);
+
+    pub fn relu(a: Tensor, result: *Tensor) void {
+        @import("metal.zig").relu(a, result);
     }
 };
 
-// Public interface for Metal operations 
+// Public interface for Metal operations
 pub const MetalBackend = struct {
     // Check if this backend implements a specific primitive operation
     pub fn hasPrimitive(comptime name: []const u8) bool {
         return std.mem.eql(u8, name, "add") or
-               std.mem.eql(u8, name, "subtract") or
-               std.mem.eql(u8, name, "multiply") or
-               std.mem.eql(u8, name, "divide") or
-               std.mem.eql(u8, name, "matmul") or
-               std.mem.eql(u8, name, "relu") or
-               std.mem.eql(u8, name, "softmax") or
-               std.mem.eql(u8, name, "transpose") or
-               std.mem.eql(u8, name, "embedding_lookup");
+            std.mem.eql(u8, name, "subtract") or
+            std.mem.eql(u8, name, "multiply") or
+            std.mem.eql(u8, name, "divide") or
+            std.mem.eql(u8, name, "matmul") or
+            std.mem.eql(u8, name, "relu") or
+            std.mem.eql(u8, name, "softmax") or
+            std.mem.eql(u8, name, "transpose") or
+            std.mem.eql(u8, name, "embedding_lookup");
     }
-    
+
     // Expose the metal implementations through our struct
     pub const add = metal_impl.add;
     pub const subtract = metal_impl.subtract;

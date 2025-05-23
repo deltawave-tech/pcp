@@ -13,105 +13,6 @@ const GPT2Config = gpt2.GPT2Config;
 
 const Tensor = pcp.tensor.Tensor(DataType);
 
-// A simple optimizer structure (Adam)
-const Adam = struct {
-    learning_rate: f32,
-    beta1: f32,
-    beta2: f32,
-    epsilon: f32,
-    t: u32, // Time step counter
-
-    // Maps for storing moment estimates
-    m_map: std.AutoHashMap(*Tensor, Tensor),
-    v_map: std.AutoHashMap(*Tensor, Tensor),
-    allocator: Allocator,
-
-    pub fn init(learning_rate: f32, beta1: f32, beta2: f32, epsilon: f32) Adam {
-        return Adam{
-            .learning_rate = learning_rate,
-            .beta1 = beta1,
-            .beta2 = beta2,
-            .epsilon = epsilon,
-            .t = 0,
-            .m_map = std.AutoHashMap(*Tensor, Tensor).init(std.heap.page_allocator),
-            .v_map = std.AutoHashMap(*Tensor, Tensor).init(std.heap.page_allocator),
-            .allocator = std.heap.page_allocator,
-        };
-    }
-
-    // A more realistic Adam optimizer implementation
-    pub fn step(self: *Adam, parameter: *Tensor, gradient: Tensor) !void {
-        // Increment time step
-        self.t += 1;
-
-        // Check if we need to initialize moment estimates for this parameter
-        if (!self.m_map.contains(parameter)) {
-            // Create first moment vector (momentum)
-            const m = try Tensor.zeros(self.allocator, parameter.shape.dims, parameter.backend);
-            try self.m_map.put(parameter, m);
-
-            // Create second moment vector (velocity)
-            const v = try Tensor.zeros(self.allocator, parameter.shape.dims, parameter.backend);
-            try self.v_map.put(parameter, v);
-        }
-
-        // Get moment vectors
-        const m = self.m_map.get(parameter).?;
-        const v = self.v_map.get(parameter).?;
-
-        // Get pointers to the data
-        const param_buf = parameter.buffer.data;
-        const grad_buf = gradient.buffer.data;
-        const m_buf = m.buffer.data;
-        const v_buf = v.buffer.data;
-
-        // Update parameters using Adam update rule
-        const lr = self.learning_rate;
-        const beta1 = self.beta1;
-        const beta2 = self.beta2;
-        const epsilon = self.epsilon;
-
-        // Compute bias correction terms
-        const beta1_t = std.math.pow(f32, beta1, @floatFromInt(self.t));
-        const beta2_t = std.math.pow(f32, beta2, @floatFromInt(self.t));
-        const bias_correction1 = 1.0 - beta1_t;
-        const bias_correction2 = 1.0 - beta2_t;
-        const lr_t = lr * @sqrt(bias_correction2) / bias_correction1;
-
-        // Apply Adam update to each parameter
-        for (param_buf, 0..) |*param, i| {
-            const g = grad_buf[i];
-
-            // Update biased first moment estimate
-            m_buf[i] = beta1 * m_buf[i] + (1.0 - beta1) * g;
-
-            // Update biased second raw moment estimate
-            v_buf[i] = beta2 * v_buf[i] + (1.0 - beta2) * g * g;
-
-            // Apply update
-            param.* -= lr_t * m_buf[i] / (@sqrt(v_buf[i]) + epsilon);
-        }
-    }
-
-    // Clean up resources
-    pub fn deinit(self: *Adam) void {
-        var it = self.m_map.iterator();
-        while (it.next()) |entry| {
-            var tensor = entry.value_ptr.*;
-            tensor.deinit();
-        }
-
-        var it2 = self.v_map.iterator();
-        while (it2.next()) |entry| {
-            var tensor = entry.value_ptr.*;
-            tensor.deinit();
-        }
-
-        self.m_map.deinit();
-        self.v_map.deinit();
-    }
-};
-
 // Simple tokenizer for toy sequences
 const Tokenizer = struct {
     vocab_size: usize,
@@ -439,10 +340,6 @@ pub fn train() !void {
     var model = try GPT2.init(allocator, config, .cpu);
     defer model.deinit();
 
-    // Create optimizer with a higher learning rate to see quicker results
-    var optimizer = Adam.init(0.01, 0.9, 0.999, 1e-8);
-    defer optimizer.deinit();
-
     // Training parameters
     const num_epochs = 10;
     const batch_size = 4;
@@ -624,10 +521,18 @@ pub fn train() !void {
         // Add embedding gradient to gradient map
         try gradients.put(&model.wte, wte_grad);
 
+        // Create optimizer with a higher learning rate to see quicker results
+        var adam_map = pcp.optimizers.AdamMap(*Tensor, DataType).init(allocator);
+        defer adam_map.deinit();
+        var adam_conf = pcp.optimizers.AdamConfiguration(DataType).default_configuration();
+        adam_conf.learning_rate = 1e-8;
+
+        _ = try adam_map.add(&model.wte, model.wte.buffer.data.len, adam_conf);
+
         // Update parameters using Adam optimizer
         var it = gradients.iterator();
         while (it.next()) |entry| {
-            try optimizer.step(entry.key_ptr.*, entry.value_ptr.*);
+            adam_map.update(entry.key_ptr.*, entry.key_ptr.*.buffer.data, entry.value_ptr.*.buffer.data);
         }
 
         std.debug.print("Applied parameter updates with Adam optimizer\n", .{});

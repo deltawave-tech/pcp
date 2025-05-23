@@ -49,7 +49,7 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run unit tests");
     for (test_targets) |t_target| {
         // Add unit tests
-        inline for (.{ "src/tensor.zig", "src/autodiff.zig", "src/ops.zig" }) |module| {
+        inline for (.{ "src/tensor.zig", "src/autodiff.zig", "src/ops.zig", "src/optimizers/adam.zig" }) |module| {
             const unit_tests = b.addTest(.{
                 .root_source_file = b.path(module),
                 .target = b.resolveTargetQuery(t_target),

@@ -1,7 +1,7 @@
 const std = @import("std");
-const tensor = @import("tensor.zig");
-
 const Allocator = std.mem.Allocator;
+
+const tensor = @import("tensor.zig");
 const Shape = tensor.Shape;
 const BackendType = tensor.BackendType;
 

@@ -7,28 +7,49 @@
 
 const std = @import("std");
 
-/// Return a Adam optimizer for type 'T'
-pub fn Adam(comptime param_count: usize, comptime T: type) type {
+pub fn AdamConfiguration(comptime DataType: type) type {
     return struct {
-        alpha: T,
-        beta1: T,
-        beta2: T,
-        epsilon: T,
+        learning_rate: DataType = 0.001,
+        beta1: DataType = 0.9,
+        beta2: DataType = 0.999,
+        epsilon: DataType = 1e-8,
+
+        pub fn default_configuration() @This() {
+            return @This(){
+                .learning_rate = 0.001,
+                .beta1 = 0.9,
+                .beta2 = 0.999,
+                .epsilon = 1e-8,
+            };
+        }
+    };
+}
+
+/// Return a Adam optimizer for type 'T'
+pub fn Adam(comptime T: type) type {
+    const ConfT = AdamConfiguration(T);
+
+    return struct {
+        allocator: std.mem.Allocator,
+        conf: ConfT,
         timestep: usize,
         m: []T,
         v: []T,
 
         /// Initialize the optimizer. Literature suggests 'alpha=0.001', 'beta1=0.9', 'beta2=0.999' and 'epsilon=1e-8'.
-        pub fn init(allocator: std.mem.Allocator, alpha: T, beta1: T, beta2: T, epsilon: T) !@This() {
+        pub fn init(allocator: std.mem.Allocator, param_count: usize, conf: ConfT) !@This() {
             return @This(){
-                .alpha = alpha,
-                .beta1 = beta1,
-                .beta2 = beta2,
-                .epsilon = epsilon,
+                .allocator = allocator,
+                .conf = conf,
                 .timestep = 0,
                 .m = try allocator.alloc(T, param_count),
                 .v = try allocator.alloc(T, param_count),
             };
+        }
+
+        pub fn deinit(self: *@This()) void {
+            self.allocator.free(self.m);
+            self.allocator.free(self.v);
         }
 
         pub fn update(self: *@This(), params: []T, grads: []const T) void {
@@ -38,22 +59,17 @@ pub fn Adam(comptime param_count: usize, comptime T: type) type {
             for (params, 0..) |*param, i| {
                 const g = grads[i];
                 // Update biased first moment estimate
-                self.m[i] = self.beta1 * self.m[i] + (1.0 - self.beta1) * g;
+                self.m[i] = self.conf.beta1 * self.m[i] + (1.0 - self.conf.beta1) * g;
                 // Update biased second raw moment estimate
-                self.v[i] = self.beta2 * self.v[i] + (1.0 - self.beta2) * g * g;
+                self.v[i] = self.conf.beta2 * self.v[i] + (1.0 - self.conf.beta2) * g * g;
                 // Compute bias-corrected first moment estimate
-                const m_hat = self.m[i] / (1.0 - std.math.pow(T, self.beta1, t));
+                const m_hat = self.m[i] / (1.0 - std.math.pow(T, self.conf.beta1, t));
                 // Compute bias-corrected second raw moment estimate
-                const v_hat = self.v[i] / (1.0 - std.math.pow(T, self.beta2, t));
+                const v_hat = self.v[i] / (1.0 - std.math.pow(T, self.conf.beta2, t));
 
                 // Update parameters
-                param.* -= self.alpha * m_hat / (std.math.sqrt(v_hat) + self.epsilon);
+                param.* -= self.conf.learning_rate * m_hat / (std.math.sqrt(v_hat) + self.conf.epsilon);
             }
-        }
-
-        pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
-            allocator.free(self.m);
-            allocator.free(self.v);
         }
     };
 }
@@ -64,17 +80,19 @@ test "adam optimizer converges to minimum of (x - 3)^2" {
     // internal state after the test.
 
     const allocator = std.testing.allocator;
+    const DataType = f32;
 
     // Initial parameter
-    const x: f32 = 0.0;
-    var params = [_]f32{x};
+    const x: DataType = 0.0;
+    var params = [_]DataType{x};
 
     // Gradient: df/dx = 2(x - 3)
-    var grads = [_]f32{0.0};
+    var grads = [_]DataType{0.0};
 
-    var adam = try Adam(1, f32).init(allocator, 0.1, 0.9, 0.999, 1e-8);
-
-    defer adam.deinit(allocator);
+    var conf = AdamConfiguration(DataType).default_configuration();
+    conf.learning_rate = 0.1;
+    var adam = try Adam(DataType).init(allocator, grads.len, conf);
+    defer adam.deinit();
 
     for (0..1000) |_| {
         grads[0] = 2.0 * (params[0] - 3.0); // compute gradient
@@ -92,17 +110,20 @@ test "adam optimizer converges to minimum of (x - 3)^2" {
 
 test "adam optimizer converges on flattened 2D parameter matrix" {
     const allocator = std.testing.allocator;
-    const Optimizer = Adam(4, f64);
+    const DataType = f64;
+    const Optimizer = Adam(DataType);
 
     // Initial parameter values
-    var params = [_]f64{ 0.0, 0.0, 0.0, 0.0 };
-    var grads = [_]f64{ 0, 0, 0, 0 };
+    var params = [_]DataType{ 0.0, 0.0, 0.0, 0.0 };
+    var grads = [_]DataType{ 0, 0, 0, 0 };
 
-    var opt = try Optimizer.init(allocator, 0.1, 0.9, 0.999, 1e-8);
-    defer opt.deinit(allocator);
+    var conf = AdamConfiguration(DataType).default_configuration();
+    conf.learning_rate = 0.1;
+    var opt = try Optimizer.init(allocator, params.len, conf);
+    defer opt.deinit();
 
     // Optimize toward target matrix: [[1, 2], [3, 4]]
-    const target = [_]f64{ 1, 2, 3, 4 };
+    const target = [_]DataType{ 1, 2, 3, 4 };
 
     for (0..1000) |_| {
         var diff_okay: bool = true;

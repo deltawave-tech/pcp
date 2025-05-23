@@ -36,9 +36,11 @@ pub fn Adam(comptime T: type) type {
         m: []T,
         v: []T,
 
+        const Self = @This();
+
         /// Initialize the optimizer. Literature suggests 'alpha=0.001', 'beta1=0.9', 'beta2=0.999' and 'epsilon=1e-8'.
-        pub fn init(allocator: std.mem.Allocator, param_count: usize, conf: ConfT) !@This() {
-            return @This(){
+        pub fn init(allocator: std.mem.Allocator, param_count: usize, conf: ConfT) !Self {
+            return Self{
                 .allocator = allocator,
                 .conf = conf,
                 .timestep = 0,
@@ -47,12 +49,12 @@ pub fn Adam(comptime T: type) type {
             };
         }
 
-        pub fn deinit(self: *@This()) void {
+        pub fn deinit(self: *Self) void {
             self.allocator.free(self.m);
             self.allocator.free(self.v);
         }
 
-        pub fn update(self: *@This(), params: []T, grads: []const T) void {
+        pub fn update(self: *Self, params: []T, grads: []const T) void {
             self.timestep += 1;
             const t: T = @floatFromInt(self.timestep);
 
@@ -70,6 +72,47 @@ pub fn Adam(comptime T: type) type {
                 // Update parameters
                 param.* -= self.conf.learning_rate * m_hat / (std.math.sqrt(v_hat) + self.conf.epsilon);
             }
+        }
+    };
+}
+
+/// A hashmap of Adam optimizers. The optimizers are stored by index type 'K'.
+pub fn AdamMap(comptime K: type, comptime DataType: type) type {
+    const AdamT = Adam(DataType);
+    const MapT = std.AutoHashMap(K, AdamT);
+    const ConfT = AdamConfiguration(DataType);
+
+    return struct {
+        allocator: std.mem.Allocator,
+        map: MapT,
+
+        const Self = @This();
+
+        pub fn init(allocator: std.mem.Allocator) Self {
+            return Self{
+                .allocator = allocator,
+                .map = MapT.init(allocator),
+            };
+        }
+
+        pub fn deinit(self: *Self) void {
+            var it = self.map.iterator();
+            while (it.next()) |entry| {
+                entry.value_ptr.*.deinit();
+            }
+            self.map.clearAndFree();
+            self.* = undefined;
+        }
+
+        pub fn add(self: *Self, key: K, param_count: usize, conf: ConfT) !AdamT {
+            const optimizer = try AdamT.init(self.allocator, param_count, conf);
+            try self.map.put(key, optimizer);
+            return optimizer;
+        }
+
+        pub fn update(self: Self, key: K, params: []DataType, grads: []const DataType) void {
+            var optimizer = self.map.get(key).?;
+            optimizer.update(params, grads);
         }
     };
 }
@@ -136,6 +179,51 @@ test "adam optimizer converges on flattened 2D parameter matrix" {
         }
         if (diff_okay) break;
         opt.update(&params, &grads);
+    }
+
+    for (params, 0..) |p, i| {
+        const diff = @abs(p - target[i]);
+        std.testing.expect(diff < 1e-3) catch {
+            std.debug.print("Mismatch at index {}: got {}, want {}\n", .{ i, p, target[i] });
+            return error.TestExpectedEqual;
+        };
+    }
+}
+
+test "AdamMap on single structure" {
+    const allocator = std.testing.allocator;
+    const DataType = f64;
+
+    // Initial parameter values
+    var params = [_]DataType{ 0.0, 0.0, 0.0, 0.0 };
+    var grads = [_]DataType{ 0, 0, 0, 0 };
+
+    var conf = AdamConfiguration(DataType).default_configuration();
+    conf.learning_rate = 0.1;
+
+    // Optimize toward target matrix: [[1, 2], [3, 4]]
+    const target = [_]DataType{ 1, 2, 3, 4 };
+
+    var adam_map = AdamMap(u8, DataType).init(allocator);
+    defer adam_map.deinit();
+
+    const optimizer = adam_map.add(0, target.len, conf) catch unreachable;
+    _ = optimizer;
+
+    for (0..1000) |n| {
+        _ = n;
+        var diff_okay: bool = true;
+        // std.debug.print("Round {}\n", .{n});
+        for (params, 0..) |p, i| {
+            grads[i] = 2.0 * (p - target[i]);
+            const diff = @abs(p - target[i]);
+            if (diff_okay and diff > 1e-3) {
+                diff_okay = false;
+            }
+        }
+        if (diff_okay) break;
+        adam_map.update(0, &params, &grads);
+        // try std.testing.expectEqual(n + 1, optimizer.timestep);
     }
 
     for (params, 0..) |p, i| {

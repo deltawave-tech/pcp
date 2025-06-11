@@ -8,6 +8,7 @@ pub const metal = @import("backends/metal.zig");
 
 pub const optimizers = struct {
     pub usingnamespace @import("optimizers/adam.zig");
+    pub usingnamespace @import("optimizers/nesterov.zig");
 };
 
 test {

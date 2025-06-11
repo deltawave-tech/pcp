@@ -58,7 +58,7 @@
         };
         # The development environment draws in the Zig compiler and ZLS.
         devShells.default = pkgs.mkShell {
-          nativeBuildInputs = with pkgs; [ zig zlspkgs.zls ];
+          nativeBuildInputs = with pkgs; [ lldb zig zlspkgs.zls ];
           shellHook = ''
             echo "Zig development environment loaded"
             echo "Zig version: $(zig version)"

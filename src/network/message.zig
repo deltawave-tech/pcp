@@ -88,7 +88,7 @@ test "MessageEnvelope round trip JSON" {
     const json_str = buffer.items;
 
     // Debug print (optional)
-    std.debug.print("Serialized JSON: {s}\n", .{json_str});
+    // std.debug.print("Serialized JSON: {s}\n", .{json_str});
 
     const parsed = try MessageEnvelope.fromJsonString(json_str, allocator);
     defer parsed.deinit();

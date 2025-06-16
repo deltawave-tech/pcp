@@ -3,8 +3,10 @@ const Allocator = std.mem.Allocator;
 const json = std.json;
 
 pub const MessageEnvelope = struct {
-    recipient: NodeId,
-    sender: NodeId,
+    recipient_node: NodeId,
+    recipient_service: ServiceId,
+    sender_node: NodeId,
+    sender_service: ServiceId,
     msg_type: []const u8,
     msg_id: MessageId,
     data: std.json.Value,
@@ -25,6 +27,7 @@ pub const MessageEnvelope = struct {
 
 /// A (possibly random) node id.
 pub const NodeId = u8;
+pub const ServiceId = []const u8;
 
 /// A (possibly random) message id.
 pub const MessageId = u8;
@@ -59,8 +62,10 @@ test "MessageEnvelope round trip JSON" {
     const allocator = std.testing.allocator;
 
     const original = MessageEnvelope{
-        .recipient = 1,
-        .sender = 2,
+        .recipient_node = 1,
+        .recipient_service = "serviceA",
+        .sender_node = 2,
+        .sender_service = "serviceB",
         .msg_type = "text",
         .msg_id = 3,
         .data = std.json.Value{ .string = "foo" },
@@ -72,8 +77,10 @@ test "MessageEnvelope round trip JSON" {
     const myHandler = struct {
         fn test_handler(msg: MessageEnvelope) !void {
             //// Assertions
-            try std.testing.expectEqual(original.recipient, msg.recipient);
-            try std.testing.expectEqual(original.sender, msg.sender);
+            try std.testing.expectEqual(original.recipient_node, msg.recipient_node);
+            try std.testing.expectEqualStrings(original.recipient_service, msg.recipient_service);
+            try std.testing.expectEqual(original.sender_node, msg.sender_node);
+            try std.testing.expectEqualStrings(original.sender_service, msg.sender_service);
             try std.testing.expectEqualStrings(original.msg_type, msg.msg_type);
             try std.testing.expectEqual(original.msg_id, msg.msg_id);
             try std.testing.expectEqual("string", @tagName(msg.data));

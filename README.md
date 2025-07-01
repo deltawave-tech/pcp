@@ -1,95 +1,114 @@
 # PCP - Planetary Compute Protocol
 
-A distributed tensor computation framework written in Zig, designed for training and inference of large neural networks across planetary-scale compute clusters.
+A distributed tensor computation framework written in Zig, designed for training and inference of large neural networks across planetary-scale compute clusters. PCP uses MLIR (Multi-Level Intermediate Representation) for high-performance tensor operations and automatic differentiation.
 
 ## Features
 
-- Pure Zig implementation with no external dependencies
-- Static tensor shapes checked at compile-time with Zig's comptime
-- Compile-time operation plan generation for optimized execution
-- Automatic gradient calculation with comptime-derived rules
-- Memory-safe tensor operations with proper cleanup
-- Embedding layers with correct gradient flow
-- Reference-counted tensor management
-- Cross-platform backend support
-  - CPU
+- **MLIR-based computation**: Leverages MLIR for tensor operations with StableHLO dialect
+- **Vector-Jacobian Product (VJP) autodiff**: Efficient reverse-mode automatic differentiation
+- **Pure Zig implementation**: Zero external dependencies except MLIR/LLVM
+- **Static tensor shapes**: Compile-time shape validation with Zig's comptime
+- **Memory-safe operations**: Proper tensor lifecycle management
+- **Cross-platform backend support**:
+  - CPU (via MLIR execution)
   - Apple Silicon via Metal (WIP)
-  - NVIDIA (todo)
-  - AMD (todo))
-- Distributed training using actor model (planned)
+  - NVIDIA (planned via MLIR GPU dialect)
+  - AMD (planned via MLIR GPU dialect)
+- **Distributed training**: Actor model for planetary-scale computation (planned)
+
+## Architecture
+
+PCP transforms high-level tensor operations into optimized MLIR computation graphs:
+
+```
+Zig Tensor Ops → StableHLO MLIR → Optimized Execution
+     ↓              ↓                    ↓
+   VJP Rules → Gradient Graph → Automatic Differentiation
+```
+
+### Core Components
+
+- **StableHLO Dialect Wrapper**: Clean Zig interface to MLIR operations
+- **MLIRBuilder**: Constructs computation graphs using MLIR C API
+- **VJP Autodiff Engine**: Graph-to-graph automatic differentiation
+- **Tensor Abstraction**: High-level tensor operations over MLIR values
 
 ## Project Structure
 
-- `src/tensor.zig` - Core tensor implementation
-- `src/ops.zig` - Tensor operations with comptime plan generation
-- `src/autodiff.zig` - Automatic differentiation with gradient rules
-- `src/plan_example.zig` - Example of using the comptime plan system
-- `src/backends/` - Hardware-specific backends
-  - `metal.zig` - Metal backend for Apple Silicon
-- `src/models/` - Neural network model implementations
-  - `gpt2.zig` - GPT-2 transformer model (wip)
-- `src/examples/` - Example applications
-  - `gpt2_training.zig` - Training a mini GPT-2 model (wip)
-  - `autodiff_test.zig` - Memory leak tests and benchmarks
+```
+src/
+├── mlir.zig                    # Core MLIR wrapper types
+├── mlir/
+│   ├── c.zig                   # MLIR C API bindings
+│   └── dialects/
+│       └── stablehlo.zig       # StableHLO dialect wrapper
+├── ops.zig                     # High-level tensor operations
+├── autodiff.zig                # VJP-based automatic differentiation
+├── tensor.zig                  # Tensor abstraction layer
+├── backends/
+│   └── metal.zig              # Metal backend for Apple Silicon
+├── models/
+│   └── gpt2.zig               # GPT-2 transformer implementation
+└── examples/
+    ├── mlir_test.zig          # MLIR integration tests
+    ├── tensor_mlir_test.zig   # Tensor-MLIR bridge tests
+    └── gpt2_training.zig      # GPT-2 training example
+```
 
-## Memory Management
+## MLIR Integration
 
-- All tensors and computational graph nodes track their own memory
-- Reference counting for efficient tensor reuse and proper cleanup
-- Proper cleanup of intermediate tensors during backward pass
-- Robust gradient flow through embedding layers and complex operations
-- Safe handling of tensor references throughout the computation graph
-- Bounds checking and overflow protection for numerical stability
+PCP uses MLIR's StableHLO dialect for tensor operations:
 
-## Comptime Plan System
+```zig
+// High-level tensor operation
+const result = try ops.add(builder, tensor_a, tensor_b);
 
-PCP uses Zig's compile-time features to optimize tensor operations:
+// Compiles to StableHLO MLIR:
+// %result = stablehlo.add %tensor_a, %tensor_b : tensor<2x2xf32>
+```
 
-- Operations are defined as comptime-generated Plans
-- Plans encapsulate shape information and operation logic
-- Backend-specific optimizations can be applied at compile time
-- Gradient rules are automatically applied to forward operations
-- Error handling is streamlined with errdefer for cleanup
-- Plans can be composed to build complex operations
+### Automatic Differentiation
 
-### Architectural Improvements
+VJP-based reverse-mode autodiff transforms forward graphs to gradient graphs:
 
-1. **Consistency**: All plan types follow a uniform structure with:
-   - Required declarations (`GradType`, `op_type`)
-   - Standard interfaces (`init`, `run`)
-   - Common error handling patterns
+```zig
+// Forward: z = x * y + w
+const xy = try ops.multiply(builder, x, y);
+const z = try ops.add(builder, xy, w);
 
-2. **Comptime Optimizations**:
-   - Shape validation at compile time when possible
-   - Plan fusion for combining operations
-   - Specialized implementations based on input types
-   - Gradient rule generation from forward operations
-
-3. **Runtime Safety**:
-   - Fallback validation for dynamic shapes
-   - Bounds checking for tensor operations
-   - Consistent memory management patterns
-
+// Autodiff creates gradient graph:
+// dz/dx = grad_z * y
+// dz/dy = grad_z * x  
+// dz/dw = grad_z
+```
 
 ## Getting Started
 
 ### Prerequisites
 
-- Zig compiler (0.14.x)
-- For Metal backend: macOS with Apple Silicon
+- **Zig compiler**: 0.14.x or later
+- **LLVM/MLIR**: Built with C API bindings enabled
+- **For Metal backend**: macOS with Apple Silicon
 
-### Zig Version Compatibility
+### Building MLIR Support
 
-This project is compatible with Zig 0.14.x. The following changes were made to ensure compatibility:
+PCP requires LLVM/MLIR with C API bindings. The build system automatically detects MLIR installations:
 
-1. Updated all code to use the Zig 0.14 `std.Random` module for random number generation
-2. Standardized pointer casting with a helper function:
-   ```zig
-   fn ptrCastHelper(comptime T: type, ptr: anytype) T {
-       // We still need to use alignCast for pointers that require higher alignment
-       return @ptrCast(@alignCast(ptr));
-   }
-   ```
+```bash
+# macOS with Homebrew (basic support)
+brew install llvm
+
+# Or build from source for full MLIR support
+git clone --depth=1 --branch=release/20.x https://github.com/llvm/llvm-project.git
+mkdir llvm-build && cd llvm-build
+cmake -G "Ninja" ../llvm-project/llvm \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DLLVM_ENABLE_PROJECTS="mlir;clang" \
+  -DMLIR_ENABLE_BINDINGS_C=ON \
+  -DMLIR_ENABLE_EXECUTION_ENGINE=ON \
+  -DCMAKE_INSTALL_PREFIX=$HOME/local/llvm-pcp
+ninja && ninja install
+```
 
 ### Building and Running
 
@@ -97,40 +116,105 @@ This project is compatible with Zig 0.14.x. The following changes were made to e
 # Build the library
 zig build
 
-# Run tests
+# Run unit tests
 zig build test
 
-# Run benchmark and memory tests
+# Test MLIR dialect wrappers
+zig build test-dialects
+
+# Run MLIR integration tests
+zig build run-mlir-test
+
+# Test tensor-MLIR bridge
+zig build run-tensor-mlir-test
+
+# Run autodiff tests
 zig build run-autodiff-test
 
-# Run the GPT-2 training example
-zig build run-gpt2
+# Run GPT-2 training example
+zig build run
 
-# Run the comptime plan examples
-zig build run-comptime-examples
+# Run Metal backend tests (macOS only)
+zig build run-metal-test
+```
 
-# Run the Plan-based autodiff test (recommended)
-zig build run-plan-test
+## Memory Management
+
+- **MLIR-managed**: Computation graphs managed by MLIR context
+- **Reference counting**: Efficient tensor reuse and cleanup
+- **Safe tensor lifecycle**: Proper cleanup of intermediate values
+- **Bounds checking**: Overflow protection for numerical stability
+
+## API Example
+
+```zig
+const std = @import("std");
+const pcp = @import("pcp");
+
+pub fn main() !void {
+    var gpa = std.heap.GeneralPurposeAllocator(.{});
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+    
+    // Create MLIR builder
+    var builder = try pcp.ops.MLIRBuilder.init(allocator);
+    defer builder.deinit();
+    
+    // Create tensors (shapes known at compile time)
+    const shape = &[_]usize{2, 2};
+    var a = try pcp.tensor.Tensor.zeros(allocator, shape, .f32, .cpu);
+    var b = try pcp.tensor.Tensor.ones(allocator, shape, .f32, .cpu);
+    defer a.deinit();
+    defer b.deinit();
+    
+    // Perform operations (compiled to MLIR)
+    const c = try pcp.ops.add(&builder, a, b);
+    const d = try pcp.ops.multiply(&builder, c, a);
+    
+    // Automatic differentiation
+    var autodiff = pcp.autodiff.AutoDiff.init(allocator, &builder);
+    const grad_fn = try autodiff.grad(d.operation);
+    
+    std.debug.print("Computation graph built successfully!\n", .{});
+}
 ```
 
 ## Roadmap
 
-- [x] Core tensor implementation
-- [x] Basic operations (add, matmul, etc.)
-- [x] Autodiff engine with memory management
-- [x] Training examples with text generation
-- [x] Embedding layers with proper gradient flow
-- [x] Comptime Plan-based operation design
-- [x] Automatic gradient rule generation with comptime
-- [x] Centralize all plan definitions in ops.zig with consistent structure
-- [x] Tie gradient computation directly to operation plans
-- [x] Implemented AutoDiffPlan wrapper for all operations
-- [x] Added dedicated test for Plan-based autodiff
-- [ ] Comptime operation fusion for complex gradients
-- [ ] Enhance shape validation for dynamic dimensions
-- [ ] Complete Metal backend implementation
-- [ ] Actor-based distributed training
+**Core Infrastructure**
+- [x] MLIR C API bindings
+- [x] StableHLO dialect wrapper
+- [x] VJP-based automatic differentiation
+- [x] Tensor abstraction over MLIR values
+- [x] MLIRBuilder for graph construction
+
+**Operations & Models**
+- [x] Basic tensor operations (add, multiply, matmul, ReLU)
+- [x] GPT-2 transformer implementation
+- [ ] Complete operation set (conv2d, batch_norm, etc.)
+- [ ] Pre-trained model loading
+
+**Backends & Optimization**
+- [x] CPU execution via MLIR
+- [ ] Metal backend completion
+- [ ] MLIR optimization passes
+- [ ] JIT compilation
+- [ ] GPU dialect integration
+
+**Distributed Training**
+- [ ] Actor-based compute nodes
+- [ ] Gradient aggregation protocols
+- [ ] Fault-tolerant training
 - [ ] Decentralized optimization algorithms
+
+## Contributing
+
+PCP uses MLIR for high-performance tensor computation. When contributing:
+
+1. **Operations**: Add new ops to `src/mlir/dialects/stablehlo.zig`
+2. **VJP Rules**: Update `src/autodiff.zig` with gradient rules
+3. **Testing**: Ensure MLIR integration tests pass
+4. **Documentation**: Update examples with new features
 
 ## License
 

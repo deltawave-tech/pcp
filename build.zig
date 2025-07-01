@@ -10,9 +10,259 @@ const test_targets = [_]std.Target.Query{
     .{ .cpu_arch = .x86_64, .os_tag = .windows },
 };
 
+// MLIR configuration
+const MLIRConfig = struct {
+    enabled: bool = false,
+    llvm_config_path: ?[]const u8 = null,
+    lib_dir: ?[]const u8 = null,
+    include_dir: ?[]const u8 = null,
+};
+
+// Attempt to find LLVM/MLIR installation
+fn detectMLIR(b: *std.Build) MLIRConfig {
+    var config = MLIRConfig{};
+    
+    // Try to find llvm-config in common locations
+    const llvm_config_candidates = [_][]const u8{
+        "llvm-config",
+        "llvm-config-18",
+        "llvm-config-17",
+        "llvm-config-16",
+        "/usr/local/bin/llvm-config",
+        "/opt/homebrew/bin/llvm-config",
+        "/opt/homebrew/opt/llvm/bin/llvm-config", // Homebrew keg-only install
+        "/usr/bin/llvm-config",
+    };
+    
+    for (llvm_config_candidates) |candidate| {
+        const result = std.process.Child.run(.{
+            .allocator = b.allocator,
+            .argv = &[_][]const u8{ candidate, "--version" },
+        }) catch continue;
+        
+        if (result.term == .Exited and result.term.Exited == 0) {
+            config.enabled = true;
+            config.llvm_config_path = b.dupe(candidate);
+            std.debug.print("Found LLVM at: {s}\n", .{candidate});
+            break;
+        }
+    }
+    
+    if (config.enabled and config.llvm_config_path != null) {
+        // Get library directory
+        const lib_result = std.process.Child.run(.{
+            .allocator = b.allocator,
+            .argv = &[_][]const u8{ config.llvm_config_path.?, "--libdir" },
+        }) catch {
+            config.enabled = false;
+            return config;
+        };
+        
+        if (lib_result.term == .Exited and lib_result.term.Exited == 0) {
+            const lib_dir = std.mem.trim(u8, lib_result.stdout, " \n\r\t");
+            config.lib_dir = b.dupe(lib_dir);
+        }
+        
+        // Get include directory
+        const inc_result = std.process.Child.run(.{
+            .allocator = b.allocator,
+            .argv = &[_][]const u8{ config.llvm_config_path.?, "--includedir" },
+        }) catch {
+            config.enabled = false;
+            return config;
+        };
+        
+        if (inc_result.term == .Exited and inc_result.term.Exited == 0) {
+            const inc_dir = std.mem.trim(u8, inc_result.stdout, " \n\r\t");
+            config.include_dir = b.dupe(inc_dir);
+        }
+        
+        std.debug.print("MLIR Configuration:\n", .{});
+        std.debug.print("  Library directory: {s}\n", .{config.lib_dir orelse "unknown"});
+        std.debug.print("  Include directory: {s}\n", .{config.include_dir orelse "unknown"});
+    } else {
+        std.debug.print("LLVM/MLIR not found. MLIR features will be disabled.\n", .{});
+        std.debug.print("To enable MLIR support, install LLVM with MLIR enabled:\n", .{});
+        std.debug.print("  macOS: brew install llvm\n", .{});
+        std.debug.print("  Ubuntu: apt install llvm-dev libmlir-dev\n", .{});
+        std.debug.print("  Or build from source with -DLLVM_ENABLE_PROJECTS=mlir\n", .{});
+    }
+    
+    return config;
+}
+
+// Helper function to execute a command and capture its output
+fn getCommandOutput(b: *std.Build, argv: []const []const u8) ![]const u8 {
+    const result = std.process.Child.run(.{
+        .allocator = b.allocator,
+        .argv = argv,
+    }) catch {
+        std.debug.print("Failed to run {s}\n", .{argv});
+        return error.CmdFailed;
+    };
+    
+    if (result.term != .Exited or result.term.Exited != 0) {
+        std.debug.print("Command {s} failed with exit code {}\n", .{ argv, result.term });
+        return error.CmdFailed;
+    }
+    
+    return b.allocator.dupe(u8, std.mem.trim(u8, result.stdout, " \n\r\t"));
+}
+
+// Enhanced MLIR support using correct llvm-config component-based approach (Expert-corrected)
+fn addMLIRSupport(b: *std.Build, target: *std.Build.Step.Compile, mlir_config: MLIRConfig) void {
+    if (!mlir_config.enabled) {
+        std.debug.panic("MLIR is required but not found. Please install LLVM with MLIR support.\n", .{});
+    }
+    
+    const llvm_config_path = mlir_config.llvm_config_path orelse {
+        std.debug.panic("llvm-config path not found\n", .{});
+        return;
+    };
+    
+    // Define the components we need from MLIR and LLVM (expert-corrected)
+    const mlir_components = [_][]const u8{
+        "mlir-c-runner-utils", "mlir-capi", "mlir-execution-engine", 
+        "mlir-runner-utils", "mlir-spirv-serialization",
+        "stablehlo", "gpu", "linalg", "scf", "vector", "async",
+        "MLIRToSPIRV", "SPIRVToLLVM", // Might need these for different paths
+        "mlir-support", "mlir-ir", "mlir-pass",
+        "core", "support", "demangle"
+    };
+
+    // Construct the command for llvm-config with components
+    var cmd_list = std.ArrayList([]const u8).init(b.allocator);
+    defer cmd_list.deinit();
+    cmd_list.append(llvm_config_path) catch @panic("OOM");
+    cmd_list.append("--libs") catch @panic("OOM");
+    cmd_list.appendSlice(&mlir_components) catch @panic("OOM");
+
+    const mlir_libs_str = getCommandOutput(b, cmd_list.items) catch |err| {
+        std.debug.print("Failed to run llvm-config with components. Error: {s}\n", .{@errorName(err)});
+        std.debug.print("Falling back to manual library linking...\n", .{});
+        addMLIRSupportFallback(b, target, mlir_config);
+        return;
+    };
+    
+    const system_libs = getCommandOutput(b, &[_][]const u8{llvm_config_path, "--system-libs"}) catch {
+        std.debug.print("Failed to get system libs from llvm-config\n", .{});
+        return;
+    };
+    
+    const ldflags = getCommandOutput(b, &[_][]const u8{llvm_config_path, "--ldflags"}) catch {
+        std.debug.print("Failed to get ldflags from llvm-config\n", .{});
+        return;
+    };
+    
+    // Split the output of llvm-config and link each library (expert-corrected approach)
+    var lib_iter = std.mem.splitSequence(u8, mlir_libs_str, " ");
+    while (lib_iter.next()) |lib_flag| {
+        if (lib_flag.len > 0) {
+            // llvm-config might return paths or -l flags. Handle both.
+            if (std.mem.startsWith(u8, lib_flag, "-L")) {
+                target.addLibraryPath(.{ .cwd_relative = lib_flag[2..] });
+            } else if (std.mem.startsWith(u8, lib_flag, "-l")) {
+                target.linkSystemLibrary(lib_flag[2..]);
+            } else {
+                // If it's a direct path to a .a or .dylib, link it directly
+                target.addObjectFile(.{ .cwd_relative = lib_flag });
+            }
+        }
+    }
+
+    // Link system libraries
+    var sys_iter = std.mem.splitSequence(u8, system_libs, " ");
+    while (sys_iter.next()) |lib_flag| {
+        if (lib_flag.len > 0) {
+            if (std.mem.startsWith(u8, lib_flag, "-l")) {
+                target.linkSystemLibrary(lib_flag[2..]);
+            }
+        }
+    }
+
+    // Add linker flags
+    var flag_iter = std.mem.splitSequence(u8, ldflags, " ");
+    while (flag_iter.next()) |flag| {
+        if (flag.len > 0 and std.mem.startsWith(u8, flag, "-L")) {
+            target.addLibraryPath(.{ .cwd_relative = flag[2..] });
+        }
+    }
+    
+    // Add include directory
+    if (mlir_config.include_dir) |inc_dir| {
+        target.addIncludePath(.{ .cwd_relative = inc_dir });
+    }
+    
+    // Add library directory
+    if (mlir_config.lib_dir) |lib_dir| {
+        target.addLibraryPath(.{ .cwd_relative = lib_dir });
+    }
+    
+    // EXTREMELY IMPORTANT: Link the C++ standard library (expert-corrected)
+    // On macOS (and Clang environments), this is libc++
+    target.linkLibCpp();
+    
+    std.debug.print("Successfully configured MLIR support using expert-corrected llvm-config\n", .{});
+}
+
+// Fallback MLIR support for when llvm-config fails
+fn addMLIRSupportFallback(b: *std.Build, target: *std.Build.Step.Compile, mlir_config: MLIRConfig) void {
+    _ = b;
+    
+    // Add include directory
+    if (mlir_config.include_dir) |inc_dir| {
+        target.addIncludePath(.{ .cwd_relative = inc_dir });
+    }
+    
+    // Add library directory
+    if (mlir_config.lib_dir) |lib_dir| {
+        target.addLibraryPath(.{ .cwd_relative = lib_dir });
+    }
+    
+    // Link against MLIR C API libraries in dependency order
+    const mlir_libs = [_][]const u8{
+        // Core MLIR C API
+        "MLIRCAPIIR",
+        "MLIRCAPIRegisterEverything", 
+        "MLIRCAPIFunc",
+        "MLIRCAPIArith",
+        "MLIRCAPISCF",
+        "MLIRCAPITransforms",
+        
+        // Dialect libraries for StableHLO -> GPU pipeline
+        "MLIRStableHLO",
+        "MLIRGPU", 
+        "MLIRLinalg",
+        "MLIRVector",
+        "MLIRAsync",
+        "MLIRSCF",
+        "MLIRArith",
+        "MLIRFunc",
+        
+        // SPIR-V support
+        "MLIRSPIRV",
+        "MLIRSPIRVSerialization",
+        
+        // Core MLIR libraries
+        "MLIRSupport",
+        "MLIR",
+        "LLVM",
+    };
+    
+    for (mlir_libs) |lib| {
+        target.linkSystemLibrary(lib);
+    }
+    
+    // Link against C++ standard library (required for LLVM/MLIR)
+    target.linkLibCpp();
+}
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    
+    // Detect MLIR availability
+    const mlir_config = detectMLIR(b);
 
     // Create the Metal bridge object file if on macOS
     var metal_bridge_lib: ?*std.Build.Step.Compile = null;
@@ -68,6 +318,28 @@ pub fn build(b: *std.Build) void {
         }
     }
 
+    // Dialect wrapper test executable
+    const dialect_test = b.addExecutable(.{
+        .name = "test_dialect_wrappers",
+        .root_source_file = b.path("test_dialect_wrappers.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    
+    if (mlir_config.enabled) {
+        addMLIRSupport(b, dialect_test, mlir_config);
+    } else {
+        addMLIRSupportFallback(b, dialect_test, mlir_config);
+    }
+    
+    if (builtin.os.tag == .macos and metal_bridge_lib != null) {
+        dialect_test.linkLibrary(metal_bridge_lib.?);
+    }
+    
+    const run_dialect_test = b.addRunArtifact(dialect_test);
+    const dialect_test_step = b.step("test-dialects", "Test MLIR dialect wrappers");
+    dialect_test_step.dependOn(&run_dialect_test.step);
+
     // GPT-2 training example executable
     const gpt2_example = b.addExecutable(.{
         .name = "gpt2_example",
@@ -79,6 +351,9 @@ pub fn build(b: *std.Build) void {
     // Add module dependencies for GPT-2 example
     gpt2_example.root_module.addImport("pcp", pcp_module);
     gpt2_example.root_module.addImport("gpt2", gpt2_module);
+    
+    // Add MLIR support to GPT-2 example
+    addMLIRSupport(b, gpt2_example, mlir_config);
 
     // Install the executables
     b.installArtifact(gpt2_example);
@@ -100,6 +375,9 @@ pub fn build(b: *std.Build) void {
 
     // Add module dependencies for autodiff test
     autodiff_test.root_module.addImport("pcp", pcp_module);
+    
+    // Add MLIR support to autodiff test
+    addMLIRSupport(b, autodiff_test, mlir_config);
 
     // Install the test executable
     b.installArtifact(autodiff_test);
@@ -121,6 +399,9 @@ pub fn build(b: *std.Build) void {
 
     // Add module dependencies for comptime examples
     comptime_examples.root_module.addImport("pcp", pcp_module);
+    
+    // Add MLIR support to comptime examples
+    addMLIRSupport(b, comptime_examples, mlir_config);
 
     // Install the executable
     b.installArtifact(comptime_examples);
@@ -142,6 +423,9 @@ pub fn build(b: *std.Build) void {
 
     // Add module dependencies for Metal test
     metal_test.root_module.addImport("pcp", pcp_module);
+    
+    // Add MLIR support to metal test
+    addMLIRSupport(b, metal_test, mlir_config);
 
     // Link Metal bridge on macOS
     if (builtin.os.tag == .macos) {
@@ -170,6 +454,9 @@ pub fn build(b: *std.Build) void {
 
     // Add module dependencies for Metal benchmark
     metal_benchmark.root_module.addImport("pcp", pcp_module);
+    
+    // Add MLIR support to metal benchmark
+    addMLIRSupport(b, metal_benchmark, mlir_config);
 
     // Link Metal bridge on macOS with extra debugging
     if (builtin.os.tag == .macos) {
@@ -396,6 +683,9 @@ pub fn build(b: *std.Build) void {
 
     // Add module dependencies
     plan_test.root_module.addImport("pcp", pcp_module);
+    
+    // Add MLIR support to plan test
+    addMLIRSupport(b, plan_test, mlir_config);
 
     // Install the executable
     b.installArtifact(plan_test);
@@ -406,6 +696,54 @@ pub fn build(b: *std.Build) void {
 
     const run_plan_test_step = b.step("run-plan-test", "Run the Plan-based autodiff test");
     run_plan_test_step.dependOn(&run_plan_test_cmd.step);
+
+    // MLIR integration test executable
+    const mlir_test = b.addExecutable(.{
+        .name = "mlir_test",
+        .root_source_file = b.path("src/examples/mlir_test.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    // Add module dependencies for MLIR test
+    mlir_test.root_module.addImport("pcp", pcp_module);
+    
+    // Add MLIR support to MLIR test
+    addMLIRSupport(b, mlir_test, mlir_config);
+
+    // Install the executable
+    b.installArtifact(mlir_test);
+
+    // Run step for MLIR test
+    const run_mlir_test_cmd = b.addRunArtifact(mlir_test);
+    run_mlir_test_cmd.step.dependOn(&mlir_test.step);
+
+    const run_mlir_test_step = b.step("run-mlir-test", "Run the MLIR integration test");
+    run_mlir_test_step.dependOn(&run_mlir_test_cmd.step);
+
+    // MLIR Tensor architecture test executable
+    const tensor_mlir_test = b.addExecutable(.{
+        .name = "tensor_mlir_test",
+        .root_source_file = b.path("src/examples/tensor_mlir_test.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    // Add module dependencies for tensor MLIR test
+    tensor_mlir_test.root_module.addImport("pcp", pcp_module);
+    
+    // Add MLIR support to tensor test
+    addMLIRSupport(b, tensor_mlir_test, mlir_config);
+
+    // Install the executable
+    b.installArtifact(tensor_mlir_test);
+
+    // Run step for tensor MLIR test
+    const run_tensor_mlir_test_cmd = b.addRunArtifact(tensor_mlir_test);
+    run_tensor_mlir_test_cmd.step.dependOn(&tensor_mlir_test.step);
+
+    const run_tensor_mlir_test_step = b.step("run-tensor-mlir-test", "Run the MLIR tensor architecture test");
+    run_tensor_mlir_test_step.dependOn(&run_tensor_mlir_test_cmd.step);
 
     // // Property-based testing step
     // const prop_tests = b.addTest(.{

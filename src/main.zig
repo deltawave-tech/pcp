@@ -1,9 +1,15 @@
 // PCP - Planetary Compute Protocol
 // A distributed tensor computation framework
 
+// MLIR-based tensor and operations system
 pub const tensor = @import("tensor.zig");
-pub const autodiff = @import("autodiff.zig");
 pub const ops = @import("ops.zig");
+pub const mlir = @import("mlir.zig");
+pub const mlir_ctx = @import("mlir_ctx.zig");
+
+// Legacy systems (will be phased out)
+pub const tensor_legacy = @import("tensor_legacy.zig");
+pub const autodiff = @import("autodiff.zig");
 pub const metal = @import("backends/metal.zig");
 
 pub const optimizers = struct {

@@ -58,6 +58,25 @@ pub const MessageHandlerRegistry = struct {
     }
 };
 
+pub fn expectEqualMessages(expected: MessageEnvelope, actual: MessageEnvelope) error{TestExpectedEqual}!void {
+    try std.testing.expectEqual(expected.recipient_node, actual.recipient_node);
+    try std.testing.expectEqualStrings(expected.recipient_service, actual.recipient_service);
+    try std.testing.expectEqual(expected.sender_node, actual.sender_node);
+    try std.testing.expectEqualStrings(expected.sender_service, actual.sender_service);
+    try std.testing.expectEqualStrings(expected.msg_type, actual.msg_type);
+    try std.testing.expectEqual(expected.msg_id, actual.msg_id);
+
+    try std.testing.expectEqual(@tagName(expected.data), @tagName(actual.data));
+    switch (actual.data) {
+        json.Value.string => {
+            try std.testing.expectEqualStrings(expected.data.string, actual.data.string);
+        },
+        else => {
+            _ = undefined;
+        },
+    }
+}
+
 test "MessageEnvelope round trip JSON" {
     const allocator = std.testing.allocator;
 
@@ -75,16 +94,8 @@ test "MessageEnvelope round trip JSON" {
     defer registry.deinit();
     // A handler to parse JSON string back to MessageEnvelope
     const myHandler = struct {
-        fn test_handler(msg: MessageEnvelope) !void {
-            //// Assertions
-            try std.testing.expectEqual(original.recipient_node, msg.recipient_node);
-            try std.testing.expectEqualStrings(original.recipient_service, msg.recipient_service);
-            try std.testing.expectEqual(original.sender_node, msg.sender_node);
-            try std.testing.expectEqualStrings(original.sender_service, msg.sender_service);
-            try std.testing.expectEqualStrings(original.msg_type, msg.msg_type);
-            try std.testing.expectEqual(original.msg_id, msg.msg_id);
-            try std.testing.expectEqual("string", @tagName(msg.data));
-            try std.testing.expectEqualStrings(original.data.string, msg.data.string);
+        fn test_handler(msg: MessageEnvelope) error{TestExpectedEqual}!void {
+            try expectEqualMessages(original, msg);
         }
     }.test_handler;
     try registry.register("text", myHandler);

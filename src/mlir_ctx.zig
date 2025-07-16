@@ -14,47 +14,90 @@ pub const MLIRContext = struct {
     const Self = @This();
     
     pub fn init(allocator: Allocator) !Self {
+        // Register all passes and dialects first
+        std.debug.print("MLIRContext.init: Registering all passes...\n", .{});
+        c.registerAllPasses();
+
+        std.debug.print("MLIRContext.init: Creating MLIR context...\n", .{});
+        
         // Create MLIR context
         const context = c.contextCreate();
         c.contextSetAllowUnregisteredDialects(context, true);
         
+        std.debug.print("MLIRContext.init: Creating dialect registry...\n", .{});
+        
         // Create dialect registry and register all required dialects
         const registry = c.dialectRegistryCreate();
         
-        // Register all dialects at once (most robust approach)
+        std.debug.print("MLIRContext.init: Registering all dialects...\n", .{});
         c.registerAllDialects(registry);
         
-        // Register specific dialects we need for the pipeline
-        c.registerStableHLODialect(registry);
-        c.registerGPUDialect(registry);
-        c.registerLinalgDialect(registry);
-        c.registerSPIRVDialect(registry);
-        c.registerVectorDialect(registry);
-        c.registerAsyncDialect(registry);
+        std.debug.print("MLIRContext.init: Loading dialects into context...\n", .{});
         
         // Load all available dialects into the context
         c.dialectRegistryLoadAll(registry, context);
         
-        // Register all MLIR passes
-        c.mlirRegisterAllPasses();
+        std.debug.print("MLIRContext.init: Creating pass manager...\n", .{});
         
         // Create pass manager for StableHLO → GPU → SPIR-V pipeline
-        var stablehlo_to_spirv_pm = try mlir.PassManager.init(mlir.Context{ .handle = context });
+        const stablehlo_to_spirv_pm = try mlir.PassManager.init(mlir.Context{ .handle = context });
         
-        // Setup the lowering pipeline: StableHLO → Linalg → GPU → SPIR-V
-        // This is a standard pipeline for targeting GPUs via SPIR-V
-        const spirv_pipeline =
-            // 1. First, canonicalize and simplify the StableHLO graph
-            "canonicalize,cse," ++
-            // 2. Legalize StableHLO ops to Linalg ops on tensors
-            "stablehlo-legalize-to-linalg," ++
-            // 3. Convert Linalg ops to GPU kernels (creates gpu.launch_func)
-            "convert-linalg-to-gpu-launch," ++
-            // 4. Lower the GPU ops to the SPIR-V dialect
-            "gpu-to-spirv";
+        // --- FIX: PROPER SPIR-V PIPELINE ---
+        // Full SPIR-V pipeline - let's debug what's failing
+        const pipeline_str = "builtin.module(stablehlo-legalize-to-linalg,canonicalize,cse,linalg-bufferize,canonicalize,cse,convert-linalg-to-gpu,canonicalize,cse,gpu-kernel-outlining,gpu-to-spirv)";
         
-        var opm_gpu = stablehlo_to_spirv_pm.asOpPassManager();
-        try opm_gpu.addPipeline(spirv_pipeline);
+        std.debug.print("MLIRContext.init: Attempting to add full SPIR-V pipeline: \"{s}\"\n", .{pipeline_str});
+        
+        // Get the OpPassManager and add the pipeline
+        std.debug.print("MLIRContext.init: Getting OpPassManager...\n", .{});
+        const opm = stablehlo_to_spirv_pm.asOpPassManager();
+        std.debug.print("MLIRContext.init: Got OpPassManager successfully\n", .{});
+        
+        // Add debug information and error handling
+        std.debug.print("MLIRContext.init: About to call addPipeline...\n", .{});
+        
+        // Try with a much simpler pipeline first to test if addPipeline works at all
+        const simple_pipeline = "canonicalize";
+        std.debug.print("MLIRContext.init: Testing simple pipeline: \"{s}\"\n", .{simple_pipeline});
+        
+        opm.addPipeline(simple_pipeline) catch |simple_err| {
+            std.debug.print("MLIRContext.init: Even simple pipeline failed: {}\n", .{simple_err});
+            return simple_err;
+        };
+        
+        std.debug.print("MLIRContext.init: Simple pipeline worked! Now trying full pipeline...\n", .{});
+        
+        opm.addPipeline(pipeline_str) catch |err| {
+            std.debug.print("MLIRContext.init: ERROR adding pipeline: {}\n", .{err});
+            std.debug.print("MLIRContext.init: Pipeline that failed: \"{s}\"\n", .{pipeline_str});
+            
+            // Try to add passes one by one to identify the problematic one
+            std.debug.print("MLIRContext.init: Testing individual passes...\n", .{});
+            
+            const test_passes = [_][]const u8{
+                "builtin.module(canonicalize)",
+                "builtin.module(cse)",
+                "builtin.module(stablehlo-legalize-to-linalg)",
+                "builtin.module(linalg-bufferize)",
+                "builtin.module(convert-linalg-to-gpu)",
+                "builtin.module(gpu-kernel-outlining)",
+                "builtin.module(gpu-to-spirv)",
+            };
+            
+            for (test_passes) |test_pass| {
+                std.debug.print("MLIRContext.init: Testing pass: {s}\n", .{test_pass});
+                opm.addPipeline(test_pass) catch |pass_err| {
+                    std.debug.print("MLIRContext.init: FAILED pass: {s} - error: {}\n", .{test_pass, pass_err});
+                    continue;
+                };
+                std.debug.print("MLIRContext.init: SUCCESS pass: {s}\n", .{test_pass});
+            }
+            
+            return err;
+        };
+
+        std.debug.print("MLIRContext.init: Successfully added SPIR-V pipeline!\n", .{});
+        // --- END FIX ---
         
         std.debug.print("Initialized MLIR context with StableHLO → GPU → SPIR-V pipeline\n", .{});
         
@@ -76,10 +119,15 @@ pub const MLIRContext = struct {
     pub fn lowerToSPIRV(self: *Self, module: mlir.Module) !void {
         std.debug.print("Lowering MLIR module through StableHLO → GPU → SPIR-V pipeline...\n", .{});
         
-        const result = try self.stablehlo_to_spirv_pm.runOnOp(module.op());
-        if (mlir.isFailure(result)) {
-            return error.MLIRLoweringFailed;
-        }
+        // Debug: Dump module before lowering
+        std.debug.print("--- Module BEFORE lowering ---\n", .{});
+        module.op().dump();
+        
+        try self.stablehlo_to_spirv_pm.runOnOp(module.op());
+        
+        // Debug: Dump module after lowering
+        std.debug.print("--- Module AFTER lowering ---\n", .{});
+        module.op().dump();
         
         std.debug.print("✓ Successfully lowered module to SPIR-V dialect\n", .{});
     }
@@ -108,7 +156,7 @@ pub const MLIRContext = struct {
         c.operationWalk(module.op().handle, &kernelNameExtractor, &walk_ctx);
         
         const result = names.toOwnedSlice();
-        std.debug.print("✓ Extracted {} GPU kernel names from module\n", .{result.len});
+        std.debug.print("✓ Extracted {} GPU kernel names from module\n", .{names.items.len});
         return result;
     }
     
@@ -136,7 +184,7 @@ pub const MLIRContext = struct {
         if (std.mem.eql(u8, op_name, "gpu.func")) {
             // The kernel name is stored in the `sym_name` attribute.
             const attr = c.operationGetAttributeByName(op, "sym_name");
-            if (attr != null and c.attributeIsAString(attr)) {
+            if (@intFromPtr(attr) != 0 and c.attributeIsAString(attr)) {
                 const string_attr = @as(*c.MlirStringAttribute, @ptrCast(attr));
                 const sym_name_ref = c.stringAttributeGetValue(string_attr);
                 const sym_name = c.fromStringRef(sym_name_ref);

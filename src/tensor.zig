@@ -22,7 +22,7 @@ pub const DType = enum {
         };
     }
 
-    /// Convert from MLIR type to DType (following expert pattern)
+    /// Convert from MLIR type to DType
     pub fn fromMlirType(mlir_type: mlir.Type) DType {
         // Simple implementation - could be enhanced with proper type introspection
         _ = mlir_type;
@@ -86,7 +86,7 @@ pub const Shape = struct {
         return mlir.Type.rankedTensorType(ctx, self.dims, element_type);
     }
 
-    /// Create Shape from MLIR RankedTensorType (following expert pattern)
+    /// Create Shape from MLIR RankedTensorType
     pub fn fromMLIR(shaped_type: mlir.RankedTensorType, allocator: Allocator) !Shape {
         const tensor_rank = shaped_type.getRank();
         var dims = try allocator.alloc(i64, tensor_rank);
@@ -182,7 +182,20 @@ pub fn Tensor(comptime T: type) type {
             // No-op: MLIR context manages memory
         }
 
-        // --- MLIR-based operations (following expert pattern) ---
+        /// Creates a tensor from a host slice of data.
+        pub fn fromSlice(comptime D: type, builder: *MLIRBuilder, host_slice: []const D, dims: []const i64) !Self {
+            if (D != f32) {
+                // For now, only support f32 for simplicity. Extend as needed.
+                return error.UnsupportedDTypeForFromSlice;
+            }
+            const dtype = DType.f32;
+            const shape = try Shape.init(builder.allocator, dims, dtype);
+
+            const host_bytes = std.mem.sliceAsBytes(host_slice);
+            return Self.newConstant(builder, host_bytes, shape);
+        }
+
+        // --- MLIR-based operations ---
         // These are wrappers around the standalone functions in ops_mlir.zig
 
         pub fn add(self: Self, other: Self) !Self {

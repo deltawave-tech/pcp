@@ -8,7 +8,7 @@
 bool hasMetalDevice(void);
 
 // Metal device and context
-id<MTLDevice> MTLCreateSystemDefaultDevice(void);
+id<MTLDevice> MTL_CreateSystemDefaultDevice(void);
 id<MTLCommandQueue> MTLDevice_newCommandQueue(id<MTLDevice> device);
 id<MTLLibrary> MTLDevice_newLibraryWithSource(id<MTLDevice> device, NSString *source, NSDictionary *options, NSError **err);
 id<MTLFunction> MTLLibrary_newFunctionWithName(id<MTLLibrary> library, NSString *name);
@@ -16,6 +16,7 @@ id<MTLComputePipelineState> MTLDevice_newComputePipelineStateWithFunction(id<MTL
 id<MTLBuffer> MTLDevice_newBufferWithBytes(id<MTLDevice> device, const void *bytes, NSUInteger length, MTLResourceOptions options);
 id<MTLBuffer> MTLDevice_newBufferWithLength(id<MTLDevice> device, NSUInteger length, MTLResourceOptions options);
 void* MTLBuffer_contents(id<MTLBuffer> buffer);
+NSUInteger MTLBuffer_length(id<MTLBuffer> buffer);
 id<MTLCommandBuffer> MTLCommandQueue_commandBuffer(id<MTLCommandQueue> queue);
 id<MTLComputeCommandEncoder> MTLCommandBuffer_computeCommandEncoder(id<MTLCommandBuffer> buffer);
 void MTLComputeCommandEncoder_setComputePipelineState(id<MTLComputeCommandEncoder> encoder, id<MTLComputePipelineState> state);

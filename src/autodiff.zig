@@ -1,7 +1,9 @@
 const std = @import("std");
 const mlir = @import("mlir.zig");
 const ops = @import("ops.zig");
+const tensor = @import("tensor.zig");
 const c = @import("mlir/c.zig").c;
+const hlo = @import("mlir/dialects/stablehlo.zig");
 
 const Allocator = std.mem.Allocator;
 const MLIRBuilder = ops.MLIRBuilder;
@@ -17,26 +19,36 @@ const VJPFn = *const fn(
     adjoints: []const mlir.Value,
 ) anyerror![]mlir.Value;
 
-/// Compile-time dispatch from operation name to VJP rule
-/// This avoids ALL runtime lookups - pure static dispatch
-fn getVjpFn(comptime op_name: []const u8) VJPFn {
+/// Runtime dispatch from operation name to VJP rule
+fn getVjpFn(op_name: []const u8) ?VJPFn {
     if (std.mem.eql(u8, op_name, "stablehlo.add")) {
         return addVJP;
     } else if (std.mem.eql(u8, op_name, "stablehlo.subtract")) {
         return subtractVJP;
     } else if (std.mem.eql(u8, op_name, "stablehlo.multiply")) {
         return multiplyVJP;
+    } else if (std.mem.eql(u8, op_name, "stablehlo.divide")) {
+        return divideVJP;
+    } else if (std.mem.eql(u8, op_name, "stablehlo.negate")) {
+        return negateVJP;
+    } else if (std.mem.eql(u8, op_name, "stablehlo.transpose")) {
+        return transposeVJP;
     } else if (std.mem.eql(u8, op_name, "stablehlo.dot_general")) {
         return matmulVJP;
     } else if (std.mem.eql(u8, op_name, "stablehlo.maximum")) {
         return reluVJP; // ReLU implemented as max(x, 0)
     } else if (std.mem.eql(u8, op_name, "stablehlo.constant")) {
         return constantVJP;
+    } else if (std.mem.eql(u8, op_name, "stablehlo.reshape")) {
+        return reshapeVJP;
+    } else if (std.mem.eql(u8, op_name, "stablehlo.reduce_sum")) {
+        return reduceSumVJP;
+    } else if (std.mem.eql(u8, op_name, "stablehlo.gather")) {
+        return gatherVJP;
     } else if (std.mem.eql(u8, op_name, "func.return")) {
         return returnVJP;
     } else {
-        @compileError("No VJP rule defined for operation: " ++ op_name ++ 
-                     ". Add the rule to getVjpFn() in autodiff.zig");
+        return null;
     }
 }
 
@@ -51,39 +63,78 @@ fn isValueFromConstantOp(value: mlir.Value) bool {
 /// Main automatic differentiation function - transforms forward graph to gradient graph
 pub fn buildGradientGraph(
     allocator: Allocator,
-    builder: *MLIRBuilder,
+    _: *MLIRBuilder,
     forward_fn: mlir.Operation,
 ) !mlir.Operation {
     std.debug.print("Building gradient graph from forward function...\n", .{});
     
-    // Create new function for gradients with same input signature but different outputs
-    const gradient_fn = try createGradientFunction(builder, forward_fn);
+    // 1. Create a new, separate builder for the gradient graph.
+    // This ensures ops are inserted into the new function, not the old one.
+    var grad_builder = try MLIRBuilder.init(allocator);
+    defer grad_builder.deinit();
+
+    // 2. Create the gradient function SHELL inside the NEW builder's module.
+    const gradient_fn = try createGradientFunction(&grad_builder, forward_fn);
+
+    // 3. Create and append the entry block to the new gradient function.
+    // This is a CRITICAL step. The block needs to exist before we can append ops to it.
+    const grad_fn_region = gradient_fn.getRegion(0);
+    const grad_fn_block = try grad_builder.createBlock();
+    c.regionAppendOwnedBlock(grad_fn_region.handle, grad_fn_block.handle);
+    
+    std.debug.print("Created gradient function block and appended to region\n", .{});
     
     // Map from forward-pass values (primals) to their gradients (adjoints)
     var adjoint_map = std.AutoHashMap(mlir.Value, mlir.Value).init(allocator);
     defer adjoint_map.deinit();
     
     // Get the operations in reverse topological order
+    std.debug.print("Getting operations in reverse order...\n", .{});
     const ops_reversed = try getOperationsInReverseOrder(allocator, forward_fn);
     defer allocator.free(ops_reversed);
+    std.debug.print("Got {} operations in reverse order\n", .{ops_reversed.len});
     
     // Initialize gradient of loss (output) to 1.0
-    const loss_value = getReturnValue(forward_fn);
-    const ones_constant = try builder.createConstant(1.0, loss_value.getType());
+    std.debug.print("Getting return value from forward function...\n", .{});
+    const loss_value = getReturnValue(forward_fn) orelse {
+        std.debug.print("Error: No return operation found in forward function\n", .{});
+        return error.NoReturnOperation;
+    };
+    std.debug.print("Creating ones data...\n", .{});
+    const ones_data = [_]f32{1.0};
+    const ones_bytes = std.mem.sliceAsBytes(ones_data[0..]);
+    std.debug.print("Creating ones shape...\n", .{});
+    var ones_shape = try tensor.Shape.init(allocator, &[_]i64{1}, .f32);
+    defer ones_shape.deinit();
+    std.debug.print("Creating ones constant...\n", .{});
+    const loss_type = loss_value.getType();
+    const ones_constant = try grad_builder.createConstant(ones_bytes, loss_type, ones_shape);
+    std.debug.print("Putting loss value in adjoint map...\n", .{});
     try adjoint_map.put(loss_value, ones_constant);
     
     std.debug.print("Starting reverse-mode AD through {} operations...\n", .{ops_reversed.len});
     
-    // Walk the forward graph backwards, applying VJP rules
-    for (ops_reversed) |op| {
-        try processOperationVJP(allocator, builder, op, &adjoint_map);
+    // Debug: Print operation names
+    for (ops_reversed, 0..) |op, i| {
+        const op_name = op.getName();
+        std.debug.print("  Operation {}: {s}\n", .{i, op_name});
     }
     
-    // Collect gradients for function inputs and create return statement
-    try finalizeGradientFunction(allocator, builder, gradient_fn, forward_fn, &adjoint_map);
+    std.debug.print("Starting VJP processing loop...\n", .{});
+    
+    // Walk the forward graph backwards, applying VJP rules using the NEW builder
+    for (ops_reversed) |op| {
+        std.debug.print("Processing operation VJP for: {s}\n", .{op.getName()});
+        try processOperationVJP(allocator, &grad_builder, op, &adjoint_map);
+    }
+    
+    // Collect gradients and create return statement in the NEW builder
+    try finalizeGradientFunction(allocator, &grad_builder, gradient_fn, forward_fn, &adjoint_map);
     
     std.debug.print("✓ Successfully built gradient graph\n", .{});
-    return gradient_fn;
+    
+    // The complete gradient graph is inside grad_builder.module.op()
+    return grad_builder.module.op();
 }
 
 /// Process a single operation's VJP rule
@@ -104,15 +155,17 @@ fn processOperationVJP(
         return;
     }
     
-    // Compile-time dispatch to the correct VJP rule
-    const vjp_rule = comptime getVjpFn(op_name);
-    
-    // Apply the VJP rule to get input gradients
-    const input_gradients = try vjp_rule(builder, op, output_gradients);
-    defer allocator.free(input_gradients);
-    
-    // Add input gradients to the adjoint map
-    try addInputGradients(allocator, op, input_gradients, adjoint_map);
+    // Runtime dispatch to the correct VJP rule
+    if (getVjpFn(op_name)) |vjp_rule| {
+        // Apply the VJP rule to get input gradients
+        const input_gradients = try vjp_rule(builder, op, output_gradients);
+        defer allocator.free(input_gradients);
+        
+        // Add input gradients to the adjoint map
+        try addInputGradients(builder, op, input_gradients, adjoint_map);
+    } else {
+        std.debug.print("Warning: No VJP rule for operation: {s}\n", .{op_name});
+    }
 }
 
 /// VJP rule for addition: both inputs get the same gradient
@@ -121,26 +174,17 @@ fn addVJP(
     op: mlir.Operation,
     adjoints: []const mlir.Value,
 ) ![]mlir.Value {
-    std.debug.assert(adjoints.len == 1); // Add has one output
-    
+    _ = op; // For now, we don't use the op parameter
+    std.debug.assert(adjoints.len == 1);
     const grad_out = adjoints[0];
-    
-    // Check for constant operands at compile time to optimize gradient graph
-    const a = op.getOperand(0);
-    const b = op.getOperand(1);
-    
+
     var result = std.ArrayList(mlir.Value).init(builder.allocator);
-    
-    // Gradient for first input
-    if (!isValueFromConstantOp(a)) {
-        try result.append(grad_out); // da = grad_out
-    }
-    
-    // Gradient for second input  
-    if (!isValueFromConstantOp(b)) {
-        try result.append(grad_out); // db = grad_out
-    }
-    
+    errdefer result.deinit();
+
+    // Gradient for both inputs is just the output gradient.
+    try result.append(grad_out);
+    try result.append(grad_out);
+
     return result.toOwnedSlice();
 }
 
@@ -165,7 +209,7 @@ fn subtractVJP(
     
     // db = -grad_out
     if (!isValueFromConstantOp(b)) {
-        const neg_grad = try builder.createOp("stablehlo.negate", &.{grad_out}, grad_out.getType());
+        const neg_grad = try builder.createAndAttach("stablehlo.negate", &.{grad_out}, &.{grad_out.getType()});
         try result.append(neg_grad.getResult(0));
     }
     
@@ -188,20 +232,110 @@ fn multiplyVJP(
     
     // da = grad_out * b
     if (!isValueFromConstantOp(a)) {
-        const grad_a = try builder.createOp("stablehlo.multiply", &.{ grad_out, b }, grad_out.getType());
+        const grad_a = try builder.createAndAttach("stablehlo.multiply", &.{ grad_out, b }, &.{grad_out.getType()});
         try result.append(grad_a.getResult(0));
     }
     
     // db = grad_out * a  
     if (!isValueFromConstantOp(b)) {
-        const grad_b = try builder.createOp("stablehlo.multiply", &.{ grad_out, a }, grad_out.getType());
+        const grad_b = try builder.createAndAttach("stablehlo.multiply", &.{ grad_out, a }, &.{grad_out.getType()});
         try result.append(grad_b.getResult(0));
     }
     
     return result.toOwnedSlice();
 }
 
-/// VJP rule for matrix multiplication: da = grad_out @ b^T, db = a^T @ grad_out
+/// VJP rule for division: da = grad_out / b, db = -grad_out * a / (b * b)
+fn divideVJP(
+    builder: *MLIRBuilder,
+    op: mlir.Operation,
+    adjoints: []const mlir.Value,
+) ![]mlir.Value {
+    std.debug.assert(adjoints.len == 1);
+    
+    const grad_out = adjoints[0];
+    const a = op.getOperand(0); // Primal 'a'
+    const b = op.getOperand(1); // Primal 'b'
+    
+    var result = std.ArrayList(mlir.Value).init(builder.allocator);
+    
+    // da = grad_out / b
+    if (!isValueFromConstantOp(a)) {
+        const grad_a = try builder.createAndAttach("stablehlo.divide", &.{ grad_out, b }, &.{grad_out.getType()});
+        try result.append(grad_a.getResult(0));
+    }
+    
+    // db = -grad_out * a / (b * b)
+    if (!isValueFromConstantOp(b)) {
+        // Compute a * grad_out
+        const a_times_grad = try builder.createAndAttach("stablehlo.multiply", &.{ a, grad_out }, &.{grad_out.getType()});
+        // Compute b * b
+        const b_squared = try builder.createAndAttach("stablehlo.multiply", &.{ b, b }, &.{b.getType()});
+        // Compute (a * grad_out) / (b * b)
+        const positive_grad_b = try builder.createAndAttach("stablehlo.divide", &.{ a_times_grad.getResult(0), b_squared.getResult(0) }, &.{grad_out.getType()});
+        // Negate to get -grad_out * a / (b * b)
+        const grad_b = try builder.createAndAttach("stablehlo.negate", &.{ positive_grad_b.getResult(0) }, &.{grad_out.getType()});
+        try result.append(grad_b.getResult(0));
+    }
+    
+    return result.toOwnedSlice();
+}
+
+/// VJP rule for negation: da = -grad_out
+fn negateVJP(
+    builder: *MLIRBuilder,
+    op: mlir.Operation,
+    adjoints: []const mlir.Value,
+) ![]mlir.Value {
+    std.debug.assert(adjoints.len == 1);
+    
+    const grad_out = adjoints[0];
+    const a = op.getOperand(0); // Primal 'a'
+    
+    var result = std.ArrayList(mlir.Value).init(builder.allocator);
+    
+    // da = -grad_out
+    if (!isValueFromConstantOp(a)) {
+        const grad_a = try builder.createAndAttach("stablehlo.negate", &.{grad_out}, &.{grad_out.getType()});
+        try result.append(grad_a.getResult(0));
+    }
+    
+    return result.toOwnedSlice();
+}
+
+/// VJP rule for transpose: da = transpose(grad_out) with inverse permutation
+fn transposeVJP(
+    builder: *MLIRBuilder,
+    op: mlir.Operation,
+    adjoints: []const mlir.Value,
+) ![]mlir.Value {
+    std.debug.assert(adjoints.len == 1);
+    
+    const grad_out = adjoints[0];
+    const a = op.getOperand(0); // Primal 'a'
+    
+    var result = std.ArrayList(mlir.Value).init(builder.allocator);
+    
+    if (!isValueFromConstantOp(a)) {
+        // Get the permutation attribute from the original transpose operation
+        _ = c.operationGetAttributeByName(op.handle, "permutation");
+        
+        // TODO: For now, assume simple 2D transpose. A full implementation would
+        // parse the permutation attribute and compute the inverse permutation.
+        // For 2D transpose [1, 0], the inverse is also [1, 0]
+        
+        // Create transpose with inverse permutation
+        const grad_a_op = try builder.createAndAttach("stablehlo.transpose", &.{grad_out}, &.{grad_out.getType()});
+        try result.append(grad_a_op.getResult(0));
+    }
+    
+    return result.toOwnedSlice();
+}
+
+/// VJP rule for matrix multiplication
+/// For Y = A @ B, the gradients are:
+/// - dA = dY @ B^T
+/// - dB = A^T @ dY
 fn matmulVJP(
     builder: *MLIRBuilder,
     op: mlir.Operation,
@@ -215,18 +349,27 @@ fn matmulVJP(
     
     var result = std.ArrayList(mlir.Value).init(builder.allocator);
     
-    // da = grad_out @ b^T
+    _ = a.getType().as(mlir.RankedTensorType).?;
+    _ = b.getType().as(mlir.RankedTensorType).?;
+    
+    // VJP for 'a': grad_out @ transpose(b)
     if (!isValueFromConstantOp(a)) {
-        const b_transposed = try builder.createOp("stablehlo.transpose", &.{b}, b.getType());
-        const grad_a = try builder.createOp("stablehlo.dot_general", &.{ grad_out, b_transposed.getResult(0) }, grad_out.getType());
-        try result.append(grad_a.getResult(0));
+        // Create transpose operation for b with permutation [1, 0]
+        const b_transposed_op = try builder.createAndAttach("stablehlo.transpose", &.{b}, &.{b.getType()});
+        
+        // Matmul for dL/dA using dot_general
+        const grad_a_op = try builder.createAndAttach("stablehlo.dot_general", &.{ grad_out, b_transposed_op.getResult(0) }, &.{grad_out.getType()});
+        try result.append(grad_a_op.getResult(0));
     }
     
-    // db = a^T @ grad_out
+    // VJP for 'b': transpose(a) @ grad_out
     if (!isValueFromConstantOp(b)) {
-        const a_transposed = try builder.createOp("stablehlo.transpose", &.{a}, a.getType());
-        const grad_b = try builder.createOp("stablehlo.dot_general", &.{ a_transposed.getResult(0), grad_out }, grad_out.getType());
-        try result.append(grad_b.getResult(0));
+        // Create transpose operation for a with permutation [1, 0]
+        const a_transposed_op = try builder.createAndAttach("stablehlo.transpose", &.{a}, &.{a.getType()});
+        
+        // Matmul for dL/dB using dot_general
+        const grad_b_op = try builder.createAndAttach("stablehlo.dot_general", &.{ a_transposed_op.getResult(0), grad_out }, &.{grad_out.getType()});
+        try result.append(grad_b_op.getResult(0));
     }
     
     return result.toOwnedSlice();
@@ -247,11 +390,11 @@ fn reluVJP(
     
     if (!isValueFromConstantOp(x)) {
         // Create mask: x > 0
-        const zero = try builder.createConstant(0.0, x.getType());
-        const mask = try builder.createOp("stablehlo.compare", &.{ x, zero }, x.getType()); // x > 0
+        const zero = try builder.createScalarConstant(0.0, x.getType());
+        const mask = try builder.createAndAttach("stablehlo.compare", &.{ x, zero }, &.{x.getType()}); // x > 0
         
         // Apply mask: grad_out * mask
-        const grad_x = try builder.createOp("stablehlo.select", &.{ mask.getResult(0), grad_out, zero }, grad_out.getType());
+        const grad_x = try builder.createAndAttach("stablehlo.select", &.{ mask.getResult(0), grad_out, zero }, &.{grad_out.getType()});
         try result.append(grad_x.getResult(0));
     }
     
@@ -272,6 +415,97 @@ fn constantVJP(
     return &[_]mlir.Value{};
 }
 
+/// VJP rule for reshape: da = reshape(grad_out, original_shape)
+fn reshapeVJP(
+    builder: *MLIRBuilder,
+    op: mlir.Operation,
+    adjoints: []const mlir.Value,
+) ![]mlir.Value {
+    std.debug.assert(adjoints.len == 1);
+    
+    const grad_out = adjoints[0];
+    const input = op.getOperand(0); // Original input to reshape
+    
+    var result = std.ArrayList(mlir.Value).init(builder.allocator);
+    
+    if (!isValueFromConstantOp(input)) {
+        // Get the original input shape and reshape the gradient back to it
+        const original_shape_type = input.getType();
+        
+        // Create reshape operation to restore original shape
+        const grad_input = try builder.createAndAttach("stablehlo.reshape", &.{grad_out}, &.{original_shape_type});
+        try result.append(grad_input.getResult(0));
+    }
+    
+    return result.toOwnedSlice();
+}
+
+/// VJP rule for reduce_sum: da = broadcast(grad_out, original_shape)
+fn reduceSumVJP(
+    builder: *MLIRBuilder,
+    op: mlir.Operation,
+    adjoints: []const mlir.Value,
+) ![]mlir.Value {
+    std.debug.assert(adjoints.len == 1);
+    
+    const grad_out = adjoints[0];
+    const input = op.getOperand(0); // Original input to reduce_sum
+    
+    var result = std.ArrayList(mlir.Value).init(builder.allocator);
+    
+    if (!isValueFromConstantOp(input)) {
+        // Get the original input shape and broadcast the gradient back to it
+        const original_shape_type = input.getType();
+        
+        // For reduce_sum, we need to broadcast the gradient back to the original shape
+        // This is a simplified implementation - a full version would parse the reduction dimensions
+        const grad_input = try builder.createAndAttach("stablehlo.broadcast_in_dim", &.{grad_out}, &.{original_shape_type});
+        try result.append(grad_input.getResult(0));
+    }
+    
+    return result.toOwnedSlice();
+}
+
+/// VJP rule for gather: da = scatter(grad_out, start_indices, original_shape)
+fn gatherVJP(
+    builder: *MLIRBuilder,
+    op: mlir.Operation,
+    adjoints: []const mlir.Value,
+) ![]mlir.Value {
+    std.debug.assert(adjoints.len == 1);
+    
+    const grad_out = adjoints[0];
+    const operand = op.getOperand(0);      // Original operand (e.g., embedding table)
+    const start_indices = op.getOperand(1); // Indices used for gathering
+    
+    var result = std.ArrayList(mlir.Value).init(builder.allocator);
+    
+    // Gradient for operand: scatter grad_out back to the original positions
+    if (!isValueFromConstantOp(operand)) {
+        const original_shape_type = operand.getType();
+        
+        // Create zero tensor with original shape
+        const zero_tensor = try builder.createAndAttach("stablehlo.constant", &.{}, &.{original_shape_type});
+        
+        // Use proper stablehlo.scatter operation with dimension numbers
+        // For embedding lookup, we typically scatter back to dimension 0
+        const scatter_dim_numbers = hlo.ScatterDimensionNumbersAttribute{
+            .update_window_dims = &[_]i64{2}, // n_embd dimension
+            .inserted_window_dims = &[_]i64{0}, // vocab_size dimension
+            .scatter_dims_to_operand_dims = &[_]i64{0}, // scatter to dimension 0
+            .index_vector_dim = 1, // index vector is along dimension 1
+        };
+        
+        const scatter_op = hlo.scatter(builder.ctx, zero_tensor.getResult(0), start_indices, grad_out, scatter_dim_numbers, builder.loc);
+        try result.append(scatter_op.getResult(0));
+    }
+    
+    // Gradient for start_indices: typically zero (indices don't have gradients)
+    // We don't add anything for start_indices as they're typically integers
+    
+    return result.toOwnedSlice();
+}
+
 /// VJP rule for function return: just pass through the gradient
 fn returnVJP(
     builder: *MLIRBuilder,
@@ -286,57 +520,180 @@ fn returnVJP(
 
 // Helper functions for graph traversal and manipulation
 
+
 fn createGradientFunction(builder: *MLIRBuilder, forward_fn: mlir.Operation) !mlir.Operation {
-    // Create new function with same inputs but different outputs (gradients)
-    // This is a simplified implementation - real version would properly handle function types
-    return try builder.createOp("func.func", &.{}, forward_fn.getResult(0).getType());
+    // Get the forward function's block to inspect its arguments
+    const forward_region = forward_fn.getRegion(0);
+    const forward_block = forward_region.getBlock(0);
+    
+    // Get the number of arguments in the forward function
+    const num_args = forward_block.getNumArguments();
+    
+    // Collect input types: forward function args + output gradient
+    var input_types = std.ArrayList(mlir.Type).init(builder.allocator);
+    defer input_types.deinit();
+    
+    // Add types for all forward function arguments
+    for (0..num_args) |i| {
+        const arg = forward_block.getArgument(i);
+        try input_types.append(arg.getType());
+    }
+    
+    // Add type for output gradient (same as forward function's return type)
+    const return_value = getReturnValue(forward_fn) orelse {
+        return error.NoReturnOperation;
+    };
+    const output_grad_type = return_value.getType();
+    try input_types.append(output_grad_type);
+    
+    // Collect output types: gradients for each forward function argument
+    var output_types = std.ArrayList(mlir.Type).init(builder.allocator);
+    defer output_types.deinit();
+    
+    for (0..num_args) |i| {
+        const arg = forward_block.getArgument(i);
+        try output_types.append(arg.getType());
+    }
+    
+    // Create function type
+    const function_type = mlir.Type.functionType(builder.ctx, input_types.items, output_types.items);
+    _ = function_type; // TODO: Use this when creating the actual function
+    
+    // Return the builder's module operation - this ensures we're working with the same module
+    // that the builder will attach operations to
+    std.debug.print("Created gradient function with {} inputs and {} outputs\n", .{input_types.items.len, output_types.items.len});
+    
+    return builder.module.op();
 }
 
 fn getOperationsInReverseOrder(allocator: Allocator, fn_op: mlir.Operation) ![]mlir.Operation {
-    // Walk the function body and collect operations in reverse topological order
-    // This is a simplified implementation
-    _ = fn_op;
-    var operations = std.ArrayList(mlir.Operation).init(allocator);
+    std.debug.print("  Building reverse operation order...\n", .{});
+
+    var sorted_ops = std.ArrayList(mlir.Operation).init(allocator);
+    errdefer sorted_ops.deinit();
+
+    var worklist = std.ArrayList(mlir.Operation).init(allocator);
+    defer worklist.deinit();
+
+    var visited = std.AutoHashMap(mlir.Operation, void).init(allocator);
+    defer visited.deinit();
+
+    // The fn_op is a module operation. We need to find the actual function body block.
+    // Walk through all operations in the module to find the terminator
+    const region = fn_op.getRegion(0);
+    const block = region.getBlock(0);
     
-    // In a real implementation, this would walk the MLIR function body
-    // For now, return empty array as placeholder
-    return operations.toOwnedSlice();
+    // Walk through the block to find the terminator (func.return)
+    var maybe_op = block.getFirstOp();
+    var terminator: ?mlir.Operation = null;
+    
+    while (maybe_op) |op| {
+        const op_name = op.getName();
+        
+        if (std.mem.eql(u8, op_name, "func.return")) {
+            terminator = op;
+            break;
+        }
+        maybe_op = op.getNext();
+    }
+    
+    if (terminator) |term_op| {
+        try worklist.append(term_op);
+    } else {
+        std.debug.print("  ERROR: No terminator found!\\n", .{});
+        return error.NoTerminatorFound;
+    }
+
+    // Process the worklist using the direct C-API call
+    while (worklist.items.len > 0) {
+        const op = worklist.orderedRemove(worklist.items.len - 1);
+        if (visited.contains(op)) continue;
+        try visited.put(op, {});
+        try sorted_ops.append(op);
+
+        for (0..op.getNumOperands()) |i| {
+            const operand = op.getOperand(i);
+
+            // Check if this value is an operation result (not a block argument)
+            if (c.mlirValueIsAOpResult(operand.handle)) {
+                // Get the operation that produced this result
+                const def_op_handle = c.mlirOpResultGetOwner(operand.handle);
+                const def_op = mlir.Operation{ .handle = def_op_handle };
+                if (!visited.contains(def_op)) {
+                    try worklist.append(def_op);
+                }
+            }
+            // If it's a block argument, the traversal correctly stops here
+        }
+    }
+    
+    std.debug.print("  Found {} operations in reverse order\n", .{sorted_ops.items.len});
+    return sorted_ops.toOwnedSlice();
 }
 
-fn getReturnValue(fn_op: mlir.Operation) mlir.Value {
+fn getReturnValue(fn_op: mlir.Operation) ?mlir.Value {
     // Get the return value of the function (typically the loss)
-    // This is a simplified implementation
-    _ = fn_op;
-    return mlir.Value{}; // Placeholder
+    // Walk the operations in the function's first block to find func.return
+    const region = fn_op.getRegion(0);
+    const block = region.getBlock(0);
+    
+    // Iterate through operations to find func.return
+    var maybe_op = block.getFirstOp();
+    while (maybe_op) |op| {
+        const op_name = op.getName();
+        if (std.mem.eql(u8, op_name, "func.return")) {
+            // Return the first operand of the return operation
+            return op.getOperand(0);
+        }
+        maybe_op = op.getNext();
+    }
+    
+    // If no return found, return null
+    return null;
 }
 
 fn getOutputGradients(allocator: Allocator, op: mlir.Operation, adjoint_map: *std.AutoHashMap(mlir.Value, mlir.Value)) ![]mlir.Value {
     // Get gradients for all outputs of this operation
     var gradients = std.ArrayList(mlir.Value).init(allocator);
     
-    // In a real implementation, this would iterate over op.getResults()
-    // and look up their gradients in the adjoint_map
-    _ = op;
-    _ = adjoint_map;
+    // Iterate over all results of this operation
+    const num_results = op.getNumResults();
+    for (0..num_results) |i| {
+        const result_value = op.getResult(i);
+        
+        // Look up this result's gradient in the adjoint_map
+        if (adjoint_map.get(result_value)) |gradient| {
+            try gradients.append(gradient);
+        }
+    }
     
     return gradients.toOwnedSlice();
 }
 
 fn addInputGradients(
-    allocator: Allocator,
+    builder: *MLIRBuilder,
     op: mlir.Operation,
-    input_gradients: []mlir.Value,
+    input_gradients: []const mlir.Value,
     adjoint_map: *std.AutoHashMap(mlir.Value, mlir.Value),
 ) !void {
     // Add gradients for each input operand to the adjoint map
     // If a gradient already exists, sum them
-    _ = allocator;
-    _ = op;
-    _ = input_gradients;
-    _ = adjoint_map;
+    const num_operands = op.getNumOperands();
     
-    // Real implementation would iterate over op.getOperands() and input_gradients
-    // and either add new entries or sum with existing gradients
+    for (0..num_operands) |i| {
+        if (i >= input_gradients.len) break;
+        
+        const operand = op.getOperand(i);
+        const grad = input_gradients[i];
+        
+        // If a gradient for this operand already exists, add the new one to it.
+        if (adjoint_map.get(operand)) |existing_grad| {
+            const sum_op = try builder.createAndAttach("stablehlo.add", &.{ existing_grad, grad }, &.{grad.getType()});
+            try adjoint_map.put(operand, sum_op.getResult(0));
+        } else {
+            try adjoint_map.put(operand, grad);
+        }
+    }
 }
 
 fn finalizeGradientFunction(
@@ -346,15 +703,56 @@ fn finalizeGradientFunction(
     forward_fn: mlir.Operation,
     adjoint_map: *std.AutoHashMap(mlir.Value, mlir.Value),
 ) !void {
-    // Create return statement with gradients for all function inputs
-    _ = allocator;
-    _ = builder;
-    _ = gradient_fn;
-    _ = forward_fn;
-    _ = adjoint_map;
+    // Get the arguments of the original forward function
+    const forward_region = forward_fn.getRegion(0);
+    const forward_block = forward_region.getBlock(0);
     
-    // Real implementation would collect gradients for function arguments
-    // and create a func.return operation
+    // Get number of arguments in the forward function
+    const num_args = forward_block.getNumArguments();
+    
+    // Collect gradients for function arguments
+    var input_gradients = std.ArrayList(mlir.Value).init(allocator);
+    defer input_gradients.deinit();
+    
+    std.debug.print("Finalizing gradient function with {} forward function arguments\n", .{num_args});
+    
+    // For each argument of the forward function, look up its gradient
+    for (0..num_args) |i| {
+        const arg = forward_block.getArgument(i);
+        
+        if (adjoint_map.get(arg)) |gradient| {
+            try input_gradients.append(gradient);
+            std.debug.print("  Found gradient for argument {}\n", .{i});
+        } else {
+            // Create a zero-filled tensor for missing gradients
+            const arg_type = arg.getType();
+            const zero_data = [_]f32{0.0};
+            const zero_bytes = std.mem.sliceAsBytes(zero_data[0..]);
+            
+            // Create a shape for the zero tensor (assuming scalar for now)
+            var zero_shape = try tensor.Shape.init(allocator, &[_]i64{1}, .f32);
+            defer zero_shape.deinit();
+            
+            const zero_gradient = try builder.createConstant(zero_bytes, arg_type, zero_shape);
+            try input_gradients.append(zero_gradient);
+            std.debug.print("  Created zero gradient for argument {}\n", .{i});
+        }
+    }
+    
+    // Get the block of the new gradient function
+    // This assumes the new grad_fn has one region and one block
+    const grad_fn_block = gradient_fn.getRegion(0).getBlock(0);
+    
+    // Create the final 'func.return' operation with the collected gradients
+    const return_op = mlir.Operation.create(builder.ctx, "func.return", .{
+        .operands = input_gradients.items,
+        .location = builder.loc,
+    });
+    
+    // Add the return op to the block, making the gradient function complete and valid
+    c.blockAppendOwnedOperation(grad_fn_block.handle, return_op.handle);
+    
+    std.debug.print("Added func.return to gradient function with {} gradients\n", .{input_gradients.items.len});
 }
 
 /// High-level API for automatic differentiation

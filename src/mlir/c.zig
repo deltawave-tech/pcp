@@ -37,6 +37,8 @@ pub const c = struct {
         length: usize,
     };
     
+    // String utilities (will be defined later in the file)
+    
     // Logical result for MLIR operations
     pub const MlirLogicalResult = extern struct {
         value: i8,
@@ -77,23 +79,39 @@ pub const c = struct {
     extern fn mlirOperationPrint(op: *MlirOperation, callback: *const fn([*]const u8, usize, ?*anyopaque) callconv(.C) void, userData: ?*anyopaque) void;
     extern fn mlirOperationDump(op: *MlirOperation) void;
     extern fn mlirOperationGetResult(op: *MlirOperation, pos: isize) *MlirValue;
-    extern fn mlirOperationGetOperand(op: *MlirOperation, pos: isize) *MlirValue;
-    extern fn mlirOperationGetName(op: *MlirOperation) *MlirIdentifier;
-    extern fn mlirIdentifierStr(identifier: *MlirIdentifier) MlirStringRef;
-    extern fn mlirOperationGetAttributeByName(operation: *MlirOperation, name: MlirStringRef) *MlirAttribute;
+    pub extern fn mlirOperationGetOperand(op: *MlirOperation, pos: isize) *MlirValue;
+    pub extern fn mlirOperationGetName(op: *MlirOperation) *MlirIdentifier;
+    pub extern fn mlirIdentifierStr(identifier: *MlirIdentifier) MlirStringRef;
+    pub extern fn mlirOperationGetAttributeByName(operation: *MlirOperation, name: MlirStringRef) *MlirAttribute;
+    pub extern fn mlirOperationGetLocation(op: *MlirOperation) *MlirLocation;
+    pub extern fn mlirOperationGetNumAttributes(op: *MlirOperation) isize;
+    pub extern fn mlirOperationGetAttribute(op: *MlirOperation, pos: isize) MlirNamedAttribute;
+    pub extern fn mlirTypeAttrGetType(attr: *MlirAttribute) *MlirType;
+    
+    // Graph traversal operations
+    extern fn mlirOperationGetRegion(op: *MlirOperation, pos: isize) *MlirRegion;
+    extern fn mlirRegionGetFirstBlock(region: *MlirRegion) *MlirBlock;
+    extern fn mlirBlockGetFirstOperation(block: *MlirBlock) *MlirOperation;
+    extern fn mlirBlockGetTerminator(block: *MlirBlock) *MlirOperation;
+    extern fn mlirRegionCreate() *MlirRegion;
+    extern fn mlirRegionAppendOwnedBlock(region: *MlirRegion, block: *MlirBlock) void;
+    extern fn mlirOperationGetNextInBlock(op: *MlirOperation) *MlirOperation;
+    extern fn mlirOperationGetNumOperands(op: *MlirOperation) isize;
+    extern fn mlirOperationGetNumResults(op: *MlirOperation) isize;
     
     // Operation state operations
     extern fn mlirOperationStateGet(name: MlirStringRef, location: *MlirLocation) MlirOperationState;
-    extern fn mlirOperationStateAddOperands(state: *MlirOperationState, n: isize, operands: [*]*MlirValue) void;
-    extern fn mlirOperationStateAddResults(state: *MlirOperationState, n: isize, results: [*]*MlirType) void;
-    extern fn mlirOperationStateAddAttributes(state: *MlirOperationState, n: isize, attributes: [*]*MlirNamedAttribute) void;
+    pub extern fn mlirOperationStateAddOperands(state: *MlirOperationState, n: isize, operands: [*]*MlirValue) void;
+    pub extern fn mlirOperationStateAddResults(state: *MlirOperationState, n: isize, results: [*]*MlirType) void;
+    pub extern fn mlirOperationStateAddAttributes(state: *MlirOperationState, n: isize, attributes: [*]*MlirNamedAttribute) void;
+    extern fn mlirOperationStateAddOwnedRegions(state: *MlirOperationState, n: isize, regions: [*]*MlirRegion) void;
     
     // Named attribute
     pub const MlirNamedAttribute = extern struct {
-        name: MlirIdentifier,
+        name: *MlirIdentifier,
         attribute: *MlirAttribute,
     };
-    extern fn mlirNamedAttributeGet(name: MlirStringRef, attr: *MlirAttribute) MlirNamedAttribute;
+    pub extern fn mlirNamedAttributeGet(name: MlirStringRef, attr: *MlirAttribute) MlirNamedAttribute;
     
     // Type operations
     extern fn mlirF32TypeGet(ctx: *MlirContext) *MlirType;
@@ -107,7 +125,16 @@ pub const c = struct {
     
     // Value operations
     extern fn mlirValueGetType(value: *MlirValue) *MlirType;
-    extern fn mlirBlockAddArgument(block: *MlirBlock, type: *MlirType, loc: *MlirLocation) *MlirValue;
+    pub extern fn mlirBlockAddArgument(block: *MlirBlock, type: *MlirType, loc: *MlirLocation) *MlirValue;
+    pub extern fn mlirValueIsAOpResult(value: *MlirValue) bool;
+    pub extern fn mlirOpResultGetOwner(value: *MlirValue) *MlirOperation;
+    extern fn mlirStringRefFromString(str: [*:0]const u8) MlirStringRef;
+    extern fn mlirBlockGetArgument(block: *MlirBlock, pos: isize) *MlirValue;
+    extern fn mlirBlockGetNumArguments(block: *MlirBlock) isize;
+    
+    // Function type operations
+    extern fn mlirFunctionTypeGet(ctx: *MlirContext, numInputs: isize, inputs: [*]const *MlirType, numResults: isize, results: [*]const *MlirType) *MlirType;
+    extern fn mlirTypeAttr(type: *MlirType) *MlirAttribute;
     
     // OpBuilder operations (TODO: Find correct MLIR C API functions)
     // extern fn mlirOpBuilderCreate(ctx: *MlirContext) *MlirOpBuilder;
@@ -122,15 +149,29 @@ pub const c = struct {
     
     // Attribute operations for constants
     extern fn mlirAttributeGetNull() *MlirAttribute;
-    extern fn mlirDenseElementsAttrRawBufferGet(shapedType: *MlirType, rawBufferSize: usize, rawBuffer: *const anyopaque) *MlirAttribute;
-    extern fn mlirFloatAttrDoubleGet(ctx: *MlirContext, type: *MlirType, value: f64) *MlirAttribute;
-    extern fn mlirIntegerAttrGet(type: *MlirType, value: i64) *MlirAttribute;
-    extern fn mlirDenseI64ArrayGet(ctx: *MlirContext, size: isize, values: [*]const i64) *MlirAttribute;
+    pub extern fn mlirDenseElementsAttrRawBufferGet(shapedType: *MlirType, rawBufferSize: usize, rawBuffer: *const anyopaque) *MlirAttribute;
+    pub extern fn mlirFloatAttrDoubleGet(ctx: *MlirContext, type: *MlirType, value: f64) *MlirAttribute;
+    pub extern fn mlirIntegerAttrGet(type: *MlirType, value: i64) *MlirAttribute;
+    pub extern fn mlirDenseI64ArrayGet(ctx: *MlirContext, size: isize, values: [*]const i64) *MlirAttribute;
     extern fn mlirAttributeIsAString(attr: *MlirAttribute) bool;
+    extern fn mlirStringAttrGet(ctx: *MlirContext, str: MlirStringRef) *MlirAttribute;
+    // Functions to extract data from dense elements attributes
+    pub extern fn mlirDenseElementsAttrGetRawData(attr: *MlirAttribute) *const anyopaque;
+    // pub extern fn mlirDenseElementsAttrGetNumElements(attr: *MlirAttribute) isize; // Not available in current MLIR build
+    pub extern fn mlirAttributeIsADenseElements(attr: *MlirAttribute) bool;
+    
+    // Dictionary attribute operations
+    pub extern fn mlirDictionaryAttrGet(
+        ctx: *MlirContext,
+        numElements: isize,
+        elements: [*]const MlirNamedAttribute
+    ) *MlirAttribute;
+    
+    pub extern fn mlirIdentifierGet(ctx: *MlirContext, str: MlirStringRef) *MlirIdentifier;
     
     // String attribute functions
     pub const MlirStringAttribute = opaque {};
-    extern fn mlirStringAttributeGetValue(attr: *MlirStringAttribute) MlirStringRef;
+    // extern fn mlirStringAttributeGetValue(attr: *MlirStringAttribute) MlirStringRef; // Not available in current MLIR build
     
     // Pass manager operations
     extern fn mlirPassManagerCreate(ctx: *MlirContext) *MlirPassManager;
@@ -140,17 +181,20 @@ pub const c = struct {
     extern fn mlirOpPassManagerAddPipeline(opm: *MlirOpPassManager, pipelineElements: MlirStringRef, callback: ?*const fn(MlirLogicalResult, ?*anyopaque) callconv(.C) void, userData: ?*anyopaque) MlirLogicalResult;
     
     // Pass and dialect registration
-    extern fn mlirRegisterAllDialects(registry: *MlirDialectRegistry) void;
-    pub extern fn mlirRegisterAllPasses() void;
     extern fn mlirContextLoadAllAvailableDialects(ctx: *MlirContext) void;
+    extern fn mlirRegisterAllPasses() void;
     
-    // NEW: Specific dialect registration functions
-    extern fn mlirRegisterStableHLODialect(registry: *MlirDialectRegistry) void;
-    extern fn mlirRegisterGPUDialect(registry: *MlirDialectRegistry) void;
-    extern fn mlirRegisterLinalgDialect(registry: *MlirDialectRegistry) void;
-    extern fn mlirRegisterSPIRVDialect(registry: *MlirDialectRegistry) void;
-    extern fn mlirRegisterVectorDialect(registry: *MlirDialectRegistry) void;
-    extern fn mlirRegisterAsyncDialect(registry: *MlirDialectRegistry) void;
+    // Register Everything - Manual declarations instead of linking the library
+    extern fn mlirRegisterAllDialects(registry: *MlirDialectRegistry) void;
+    extern fn mlirRegisterAllLLVMTranslations(ctx: *MlirContext) void;
+    
+    // NEW: Specific dialect registration functions (commented out - not available in current MLIR build)
+    // extern fn mlirRegisterStableHLODialect(registry: *MlirDialectRegistry) void;
+    // extern fn mlirRegisterGPUDialect(registry: *MlirDialectRegistry) void;
+    // extern fn mlirRegisterLinalgDialect(registry: *MlirDialectRegistry) void;
+    // extern fn mlirRegisterSPIRVDialect(registry: *MlirDialectRegistry) void;
+    // extern fn mlirRegisterVectorDialect(registry: *MlirDialectRegistry) void;
+    // extern fn mlirRegisterAsyncDialect(registry: *MlirDialectRegistry) void;
     
     // Dialect handle operations (for registering specific dialects)
     pub const MlirDialectHandle = opaque {};
@@ -164,9 +208,10 @@ pub const c = struct {
     
     // NEW: Translation to Target Formats (SPIR-V)
     pub const MlirStringCallback = *const fn(MlirStringRef, ?*anyopaque) callconv(.C) void;
+    // SPIR-V translation functions - implemented in spirv_bridge.cpp
     extern fn mlirTranslateModuleToSPIRV(
         module: *MlirModule,
-        writer: MlirStringCallback,
+        callback: MlirStringCallback,
         userData: ?*anyopaque,
     ) MlirLogicalResult;
     
@@ -199,6 +244,7 @@ pub const c = struct {
             .length = str.len,
         };
     }
+    
     
     pub fn stringRefToString(sref: MlirStringRef, allocator: std.mem.Allocator) ![]u8 {
         const result = try allocator.alloc(u8, sref.length);
@@ -236,9 +282,6 @@ pub const c = struct {
         mlirDialectRegistryDestroy(registry);
     }
     
-    pub fn registerAllDialects(registry: *MlirDialectRegistry) void {
-        mlirRegisterAllDialects(registry);
-    }
     
     pub fn dialectRegistryLoadAll(registry: *MlirDialectRegistry, ctx: *MlirContext) void {
         _ = registry; // Unused in new API
@@ -260,6 +303,18 @@ pub const c = struct {
     
     pub fn passManagerRunOnOp(pm: *MlirPassManager, op: *MlirOperation) MlirLogicalResult {
         return mlirPassManagerRunOnOp(pm, op);
+    }
+    
+    pub fn registerAllPasses() void {
+        mlirRegisterAllPasses();
+    }
+    
+    pub fn registerAllDialects(registry: *MlirDialectRegistry) void {
+        mlirRegisterAllDialects(registry);
+    }
+    
+    pub fn registerAllLLVMTranslations(ctx: *MlirContext) void {
+        mlirRegisterAllLLVMTranslations(ctx);
     }
     
     pub fn opPassManagerAddPipeline(opm: *MlirOpPassManager, pipeline: []const u8) MlirLogicalResult {
@@ -297,6 +352,10 @@ pub const c = struct {
         return mlirOperationStateGet(stringRefFromString(name), location);
     }
     
+    pub fn operationStateAddOwnedRegions(state: *MlirOperationState, n: isize, regions: [*]*MlirRegion) void {
+        mlirOperationStateAddOwnedRegions(state, n, regions);
+    }
+    
     pub fn operationGetResult(op: *MlirOperation, pos: isize) *MlirValue {
         return mlirOperationGetResult(op, pos);
     }
@@ -308,6 +367,40 @@ pub const c = struct {
     pub fn operationDump(op: *MlirOperation) void {
         mlirOperationDump(op);
     }
+    
+    // Graph traversal wrapper functions
+    pub fn operationGetRegion(op: *MlirOperation, pos: isize) *MlirRegion {
+        return mlirOperationGetRegion(op, pos);
+    }
+    
+    pub fn regionGetFirstBlock(region: *MlirRegion) *MlirBlock {
+        return mlirRegionGetFirstBlock(region);
+    }
+    
+    pub fn regionCreate() *MlirRegion {
+        return mlirRegionCreate();
+    }
+    
+    pub fn blockGetFirstOperation(block: *MlirBlock) *MlirOperation {
+        return mlirBlockGetFirstOperation(block);
+    }
+    
+    pub fn operationGetNextInBlock(op: *MlirOperation) *MlirOperation {
+        return mlirOperationGetNextInBlock(op);
+    }
+    
+    pub fn operationGetNumOperands(op: *MlirOperation) isize {
+        return mlirOperationGetNumOperands(op);
+    }
+    
+    pub fn operationGetNumResults(op: *MlirOperation) isize {
+        return mlirOperationGetNumResults(op);
+    }
+    
+    pub fn blockGetTerminator(block: *MlirBlock) *MlirOperation {
+        return mlirBlockGetTerminator(block);
+    }
+    
     
     // Type wrapper functions
     pub fn floatTypeGetF32(ctx: *MlirContext) *MlirType {
@@ -351,30 +444,30 @@ pub const c = struct {
         mlirDialectHandleInsertDialect(handle, registry);
     }
     
-    // NEW: Dialect registration wrapper functions
-    pub fn registerStableHLODialect(registry: *MlirDialectRegistry) void {
-        mlirRegisterStableHLODialect(registry);
-    }
+    // NEW: Dialect registration wrapper functions (commented out - not available in current MLIR build)
+    // pub fn registerStableHLODialect(registry: *MlirDialectRegistry) void {
+    //     mlirRegisterStableHLODialect(registry);
+    // }
     
-    pub fn registerGPUDialect(registry: *MlirDialectRegistry) void {
-        mlirRegisterGPUDialect(registry);
-    }
+    // pub fn registerGPUDialect(registry: *MlirDialectRegistry) void {
+    //     mlirRegisterGPUDialect(registry);
+    // }
     
-    pub fn registerLinalgDialect(registry: *MlirDialectRegistry) void {
-        mlirRegisterLinalgDialect(registry);
-    }
+    // pub fn registerLinalgDialect(registry: *MlirDialectRegistry) void {
+    //     mlirRegisterLinalgDialect(registry);
+    // }
     
-    pub fn registerSPIRVDialect(registry: *MlirDialectRegistry) void {
-        mlirRegisterSPIRVDialect(registry);
-    }
+    // pub fn registerSPIRVDialect(registry: *MlirDialectRegistry) void {
+    //     mlirRegisterSPIRVDialect(registry);
+    // }
     
-    pub fn registerVectorDialect(registry: *MlirDialectRegistry) void {
-        mlirRegisterVectorDialect(registry);
-    }
+    // pub fn registerVectorDialect(registry: *MlirDialectRegistry) void {
+    //     mlirRegisterVectorDialect(registry);
+    // }
     
-    pub fn registerAsyncDialect(registry: *MlirDialectRegistry) void {
-        mlirRegisterAsyncDialect(registry);
-    }
+    // pub fn registerAsyncDialect(registry: *MlirDialectRegistry) void {
+    //     mlirRegisterAsyncDialect(registry);
+    // }
     
     // NEW: Translation wrapper functions
     pub fn translateModuleToSPIRV(
@@ -403,6 +496,22 @@ pub const c = struct {
         return mlirOperationGetAttributeByName(operation, stringRefFromString(name));
     }
     
+    pub fn operationGetNumAttributes(op: *MlirOperation) isize {
+        return mlirOperationGetNumAttributes(op);
+    }
+    
+    pub fn operationGetAttribute(op: *MlirOperation, pos: isize) MlirNamedAttribute {
+        return mlirOperationGetAttribute(op, pos);
+    }
+    
+    pub fn operationGetLocation(op: *MlirOperation) *MlirLocation {
+        return mlirOperationGetLocation(op);
+    }
+    
+    pub fn regionAppendOwnedBlock(region: *MlirRegion, block: *MlirBlock) void {
+        mlirRegionAppendOwnedBlock(region, block);
+    }
+    
     pub fn identifierStr(identifier: *MlirIdentifier) MlirStringRef {
         return mlirIdentifierStr(identifier);
     }
@@ -413,7 +522,9 @@ pub const c = struct {
     }
     
     pub fn stringAttributeGetValue(attr: *MlirStringAttribute) MlirStringRef {
-        return mlirStringAttributeGetValue(attr);
+        // return mlirStringAttributeGetValue(attr); // Not available in current MLIR build
+        _ = attr;
+        return MlirStringRef{ .data = "placeholder", .length = 11 };
     }
     
     // Helper function to convert MlirStringRef to Zig string
@@ -461,6 +572,22 @@ pub const c = struct {
         return mlirBlockInsertArgument(block, pos, arg_type, loc);
     }
     
+    pub fn blockGetArgument(block: *MlirBlock, pos: isize) *MlirValue {
+        return mlirBlockGetArgument(block, pos);
+    }
+    
+    pub fn blockGetNumArguments(block: *MlirBlock) isize {
+        return mlirBlockGetNumArguments(block);
+    }
+    
+    pub fn functionTypeGet(ctx: *MlirContext, inputs: []const *MlirType, results: []const *MlirType) *MlirType {
+        return mlirFunctionTypeGet(ctx, @intCast(inputs.len), inputs.ptr, @intCast(results.len), results.ptr);
+    }
+    
+    pub fn typeAttr(type_val: *MlirType) *MlirAttribute {
+        return mlirTypeAttr(type_val);
+    }
+    
     pub fn blockAppendOwnedOperation(block: *MlirBlock, operation: *MlirOperation) void {
         mlirBlockAppendOwnedOperation(block, operation);
     }
@@ -476,6 +603,18 @@ pub const c = struct {
     
     pub fn denseElementsAttrRawBufferGet(shaped_type: *MlirType, raw_buffer_size: usize, raw_buffer: *const anyopaque) *MlirAttribute {
         return mlirDenseElementsAttrRawBufferGet(shaped_type, raw_buffer_size, raw_buffer);
+    }
+    
+    pub fn identifierGet(ctx: *MlirContext, str: []const u8) *MlirIdentifier {
+        return mlirIdentifierGet(ctx, stringRefFromString(str));
+    }
+
+    pub fn dictionaryAttrGet(ctx: *MlirContext, elements: []const MlirNamedAttribute) *MlirAttribute {
+        return mlirDictionaryAttrGet(ctx, @intCast(elements.len), elements.ptr);
+    }
+    
+    pub fn stringAttrGet(ctx: *MlirContext, str: []const u8) *MlirAttribute {
+        return mlirStringAttrGet(ctx, stringRefFromString(str));
     }
     
 };

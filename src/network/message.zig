@@ -32,6 +32,16 @@ pub const ServiceId = []const u8;
 /// A (possibly random) message id.
 pub const MessageId = u8;
 
+/// Message types for DiLoCo distributed training
+pub const MessageType = struct {
+    pub const JOIN_REQUEST = "JoinRequest";
+    pub const JOIN_ACCEPT = "JoinAccept";
+    pub const START_INNER_LOOP = "StartInnerLoop";
+    pub const INNER_LOOP_COMPLETE = "InnerLoopComplete";
+    pub const SHUTDOWN = "Shutdown";
+    pub const HEARTBEAT = "Heartbeat";
+};
+
 pub const MessageHandler = *const fn (MessageEnvelope) anyerror!void;
 
 pub const MessageHandlerRegistry = struct {

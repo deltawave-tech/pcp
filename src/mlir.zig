@@ -143,18 +143,31 @@ pub const Context = struct {
             
             // Add operands
             for (args.operands) |operand| {
-                c.c.mlirOperationStateAddOperands(&state, 1, &operand.handle);
+                var operand_handle = operand.handle;
+                c.c.mlirOperationStateAddOperands(&state, 1, @ptrCast(&operand_handle));
             }
             
             // Add results  
             for (args.results) |result_type| {
-                c.c.mlirOperationStateAddResults(&state, 1, &result_type.handle);
+                var result_handle = result_type.handle;
+                c.c.mlirOperationStateAddResults(&state, 1, @ptrCast(&result_handle));
             }
             
             // Add attributes
-            for (args.attributes) |attr_pair| {
-                const name_ref = c.c.stringRefFromString(attr_pair[0]);
-                c.c.mlirOperationStateAddAttributes(&state, 1, &c.c.mlirNamedAttributeGet(name_ref, attr_pair[1].handle));
+            if (args.attributes.len > 0) {
+                var named_attrs = std.ArrayList(c.c.MlirNamedAttribute).init(std.heap.page_allocator);
+                defer named_attrs.deinit();
+                
+                for (args.attributes) |attr_pair| {
+                    const name_id = c.c.identifierGet(ctx.handle, attr_pair[0]);
+                    const named_attr = c.c.MlirNamedAttribute{
+                        .name = name_id,
+                        .attribute = attr_pair[1].handle,
+                    };
+                    named_attrs.append(named_attr) catch unreachable;
+                }
+                
+                c.c.mlirOperationStateAddAttributes(&state, @intCast(named_attrs.items.len), @ptrCast(named_attrs.items.ptr));
             }
             
             const handle = c.c.operationCreate(&state);
@@ -186,7 +199,88 @@ pub const Context = struct {
         pub fn getName(self: Self) []const u8 {
             const name_id = c.c.operationGetName(self.handle);
             const name_ref = c.c.identifierStr(name_id);
-            return c.c.stringRefToSlice(name_ref);
+            return c.c.fromStringRef(name_ref);
+        }
+        
+        pub fn getRegion(self: Self, index: usize) Region {
+            return Region{ .handle = c.c.operationGetRegion(self.handle, @intCast(index)) };
+        }
+        
+        pub fn getNext(self: Self) ?Self {
+            const next_op = c.c.operationGetNextInBlock(self.handle);
+            if (@intFromPtr(next_op) == 0) return null;
+            return Self{ .handle = next_op };
+        }
+        
+        pub fn getNumOperands(self: Self) usize {
+            return @intCast(c.c.operationGetNumOperands(self.handle));
+        }
+        
+        pub fn getNumResults(self: Self) usize {
+            return @intCast(c.c.operationGetNumResults(self.handle));
+        }
+        
+        pub fn getLocation(self: Self) Location {
+            return Location{ .handle = c.c.operationGetLocation(self.handle) };
+        }
+        
+        pub fn getNumAttributes(self: Self) usize {
+            return @intCast(c.c.operationGetNumAttributes(self.handle));
+        }
+        
+        pub fn getAttribute(self: Self, index: usize) c.c.MlirNamedAttribute {
+            return c.c.operationGetAttribute(self.handle, @intCast(index));
+        }
+    };
+    
+    /// MLIR Region - represents a CFG region
+    pub const Region = struct {
+        handle: *c.c.MlirRegion,
+        
+        const Self = @This();
+        
+        pub fn getBlock(self: Self, index: usize) Block {
+            _ = index; // For now, just get the first block
+            return Block{ .handle = c.c.regionGetFirstBlock(self.handle) };
+        }
+        
+        pub fn appendOwnedBlock(self: Self, block: Block) void {
+            c.c.regionAppendOwnedBlock(self.handle, block.handle);
+        }
+    };
+    
+    /// MLIR Block - represents a basic block
+    pub const Block = struct {
+        handle: *c.c.MlirBlock,
+        
+        const Self = @This();
+        
+        pub fn getFirstOp(self: Self) ?Operation {
+            const first_op = c.c.blockGetFirstOperation(self.handle);
+            if (@intFromPtr(first_op) == 0) return null;
+            return Operation{ .handle = first_op };
+        }
+        
+        pub fn addArgument(self: Self, arg_type: Type, loc: Location) Value {
+            return Value{ .handle = c.c.mlirBlockAddArgument(self.handle, arg_type.handle, loc.handle) };
+        }
+        
+        pub fn getLastOp(self: Self) ?Operation {
+            const terminator = c.c.blockGetTerminator(self.handle);
+            if (@intFromPtr(terminator) == 0) return null;
+            return Operation{ .handle = terminator };
+        }
+        
+        pub fn getArgument(self: Self, index: usize) Value {
+            return Value{ .handle = c.c.blockGetArgument(self.handle, @intCast(index)) };
+        }
+        
+        pub fn getNumArguments(self: Self) usize {
+            return @intCast(c.c.blockGetNumArguments(self.handle));
+        }
+        
+        pub fn appendOwnedOperation(self: Self, operation: Operation) void {
+            c.c.blockAppendOwnedOperation(self.handle, operation.handle);
         }
     };
     
@@ -197,7 +291,9 @@ pub const Context = struct {
         const Self = @This();
         
         pub fn init(context: Context) !Self {
+            std.debug.print("PassManager.init: Creating pass manager with context handle = {}\n", .{@intFromPtr(context.handle)});
             const handle = c.c.passManagerCreate(context.handle);
+            std.debug.print("PassManager.init: Created pass manager with handle = {}\n", .{@intFromPtr(handle)});
             return Self{ .handle = handle };
         }
         
@@ -266,6 +362,25 @@ pub const Context = struct {
             }
             return null;
         }
+        
+        /// Create a function type with given inputs and results
+        pub fn functionType(context: Context, inputs: []const Type, results: []const Type) Self {
+            var input_handles = std.ArrayList(*c.c.MlirType).init(std.heap.page_allocator);
+            defer input_handles.deinit();
+            
+            for (inputs) |input| {
+                input_handles.append(input.handle) catch unreachable;
+            }
+            
+            var result_handles = std.ArrayList(*c.c.MlirType).init(std.heap.page_allocator);
+            defer result_handles.deinit();
+            
+            for (results) |result| {
+                result_handles.append(result.handle) catch unreachable;
+            }
+            
+            return Self{ .handle = c.c.functionTypeGet(context.handle, input_handles.items, result_handles.items) };
+        }
     };
 
     /// MLIR Value - represents SSA values in the IR
@@ -278,6 +393,7 @@ pub const Context = struct {
         pub fn getType(self: Self) Type {
             return Type{ .handle = c.c.valueGetType(self.handle) };
         }
+        
     };
     
     /// MLIR Attribute - represents compile-time constants and metadata
@@ -300,6 +416,27 @@ pub const Context = struct {
         /// Create a dense array attribute for i64 values
         pub fn denseI64ArrayAttr(context: Context, values: []const i64) Self {
             return Self{ .handle = c.c.mlirDenseI64ArrayGet(context.handle, @intCast(values.len), values.ptr) };
+        }
+        
+        /// Create a dense elements attribute from host data
+        pub fn denseElementsAttr(context: Context, shaped_type: Type, host_data: []const u8) Self {
+            _ = context;
+            return Self{ .handle = c.c.mlirDenseElementsAttrRawBufferGet(shaped_type.handle, host_data.len, host_data.ptr) };
+        }
+        
+        /// Create a dictionary attribute from named attributes.
+        pub fn dictionary(context: Context, named_attrs: []const c.c.MlirNamedAttribute) Self {
+            return Self{ .handle = c.c.dictionaryAttrGet(context.handle, named_attrs) };
+        }
+        
+        /// Create a type attribute from a type
+        pub fn typeAttr(type_val: Type) Self {
+            return Self{ .handle = c.c.typeAttr(type_val.handle) };
+        }
+        
+        /// Create a string attribute
+        pub fn stringAttr(context: Context, value: []const u8) Self {
+            return Self{ .handle = c.c.stringAttrGet(context.handle, value) };
         }
     };
     
@@ -342,16 +479,6 @@ pub const Context = struct {
         const Self = @This();
     };
 
-    /// MLIR Block - represents a basic block
-    pub const Block = struct {
-        handle: *c.c.MlirBlock,
-        
-        const Self = @This();
-        
-        pub fn addArgument(self: Self, arg_type: Type, loc: Location) Value {
-            return Value{ .handle = c.c.blockAddArgument(self.handle, arg_type.handle, loc.handle) };
-        }
-    };
 
     /// MLIR Location - source location information
     pub const Location = struct {
@@ -384,6 +511,16 @@ pub const Context = struct {
         pub fn getElementType(self: Self) Type {
             return Type{ .handle = c.c.shapedTypeGetElementType(self.handle) };
         }
+        
+        /// Get the shape as a slice of dimensions
+        pub fn getShape(self: Self) []i64 {
+            const rank = self.getRank();
+            var shape = std.heap.page_allocator.alloc(i64, rank) catch unreachable;
+            for (0..rank) |i| {
+                shape[i] = self.getDimension(i);
+            }
+            return shape;
+        }
     };
     
     /// Helper functions
@@ -396,10 +533,15 @@ pub const Context = struct {
     }
     
     pub fn registerAllPasses() void {
-        c.c.mlirRegisterAllPasses();
+        c.c.registerAllPasses();
     }
     
     /// String utilities for MLIR C API
     pub fn stringRefToSlice(ref: c.c.MlirStringRef) []const u8 {
         return ref.data[0..ref.length];
     }
+
+/// MLIR Dialects
+pub const dialects = struct {
+    pub const stablehlo = @import("mlir/dialects/stablehlo.zig");
+};

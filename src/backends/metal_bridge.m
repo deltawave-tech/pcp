@@ -13,9 +13,11 @@ bool hasMetalDevice(void) {
 // Custom implementation for safer Metal device creation
 // This function needs to be marked with __attribute__((visibility("default")))
 // to ensure it's exported correctly for Zig FFI
+// Wrapper for Metal device creation - renamed to avoid conflict with system function
 __attribute__((visibility("default")))
-id<MTLDevice> MTLCreateSystemDefaultDevice(void) {
+id<MTLDevice> MTL_CreateSystemDefaultDevice(void) {
     @autoreleasepool {
+        // Use the system Metal function directly from the framework  
         id<MTLDevice> device = MTLCreateSystemDefaultDevice();
         if (device) {
             NSLog(@"Metal device created successfully: %@", device.name);
@@ -105,6 +107,10 @@ id<MTLBuffer> MTLDevice_newBufferWithLength(id<MTLDevice> device, NSUInteger len
 
 void* MTLBuffer_contents(id<MTLBuffer> buffer) {
     return [buffer contents];
+}
+
+NSUInteger MTLBuffer_length(id<MTLBuffer> buffer) {
+    return [buffer length];
 }
 
 id<MTLCommandBuffer> MTLCommandQueue_commandBuffer(id<MTLCommandQueue> queue) {

@@ -8,7 +8,6 @@ pub const mlir = @import("mlir.zig");
 pub const mlir_ctx = @import("mlir_ctx.zig");
 
 // Legacy systems (will be phased out)
-pub const tensor_legacy = @import("tensor_legacy.zig");
 pub const autodiff = @import("autodiff.zig");
 pub const metal = @import("backends/metal.zig");
 

@@ -22,8 +22,13 @@ const MLIRConfig = struct {
 fn detectMLIR(b: *std.Build) MLIRConfig {
     var config = MLIRConfig{};
     
-    // Try to find llvm-config in common locations
+    // Try to find llvm-config in common locations - prioritize local build
     const llvm_config_candidates = [_][]const u8{
+        // Check our local build first - use absolute path
+        "/Users/philipp/_projects/pcp/llvm-build/bin/llvm-config",
+        // Check our local build first
+        "llvm-build/bin/llvm-config",
+        "./llvm-build/bin/llvm-config",
         "llvm-config",
         "llvm-config-18",
         "llvm-config-17",
@@ -109,7 +114,7 @@ fn getCommandOutput(b: *std.Build, argv: []const []const u8) ![]const u8 {
     return b.allocator.dupe(u8, std.mem.trim(u8, result.stdout, " \n\r\t"));
 }
 
-// Enhanced MLIR support using correct llvm-config component-based approach (Expert-corrected)
+// MLIR support using manual library linking
 fn addMLIRSupport(b: *std.Build, target: *std.Build.Step.Compile, mlir_config: MLIRConfig) void {
     if (!mlir_config.enabled) {
         std.debug.panic("MLIR is required but not found. Please install LLVM with MLIR support.\n", .{});
@@ -120,71 +125,36 @@ fn addMLIRSupport(b: *std.Build, target: *std.Build.Step.Compile, mlir_config: M
         return;
     };
     
-    // Define the components we need from MLIR and LLVM (expert-corrected)
-    const mlir_components = [_][]const u8{
-        "mlir-c-runner-utils", "mlir-capi", "mlir-execution-engine", 
-        "mlir-runner-utils", "mlir-spirv-serialization",
-        "stablehlo", "gpu", "linalg", "scf", "vector", "async",
-        "MLIRToSPIRV", "SPIRVToLLVM", // Might need these for different paths
-        "mlir-support", "mlir-ir", "mlir-pass",
-        "core", "support", "demangle"
-    };
-
-    // Construct the command for llvm-config with components
-    var cmd_list = std.ArrayList([]const u8).init(b.allocator);
-    defer cmd_list.deinit();
-    cmd_list.append(llvm_config_path) catch @panic("OOM");
-    cmd_list.append("--libs") catch @panic("OOM");
-    cmd_list.appendSlice(&mlir_components) catch @panic("OOM");
-
-    const mlir_libs_str = getCommandOutput(b, cmd_list.items) catch |err| {
-        std.debug.print("Failed to run llvm-config with components. Error: {s}\n", .{@errorName(err)});
-        std.debug.print("Falling back to manual library linking...\n", .{});
-        addMLIRSupportFallback(b, target, mlir_config);
-        return;
-    };
-    
-    const system_libs = getCommandOutput(b, &[_][]const u8{llvm_config_path, "--system-libs"}) catch {
+    // Try llvm-config but don't fail if it doesn't work
+    const system_libs = getCommandOutput(b, &[_][]const u8{llvm_config_path, "--system-libs"}) catch blk: {
         std.debug.print("Failed to get system libs from llvm-config\n", .{});
-        return;
+        break :blk "";
     };
     
-    const ldflags = getCommandOutput(b, &[_][]const u8{llvm_config_path, "--ldflags"}) catch {
+    const ldflags = getCommandOutput(b, &[_][]const u8{llvm_config_path, "--ldflags"}) catch blk: {
         std.debug.print("Failed to get ldflags from llvm-config\n", .{});
-        return;
+        break :blk "";
     };
     
-    // Split the output of llvm-config and link each library (expert-corrected approach)
-    var lib_iter = std.mem.splitSequence(u8, mlir_libs_str, " ");
-    while (lib_iter.next()) |lib_flag| {
-        if (lib_flag.len > 0) {
-            // llvm-config might return paths or -l flags. Handle both.
-            if (std.mem.startsWith(u8, lib_flag, "-L")) {
-                target.addLibraryPath(.{ .cwd_relative = lib_flag[2..] });
-            } else if (std.mem.startsWith(u8, lib_flag, "-l")) {
-                target.linkSystemLibrary(lib_flag[2..]);
-            } else {
-                // If it's a direct path to a .a or .dylib, link it directly
-                target.addObjectFile(.{ .cwd_relative = lib_flag });
+    // Link system libraries if available
+    if (system_libs.len > 0) {
+        var sys_iter = std.mem.splitSequence(u8, system_libs, " ");
+        while (sys_iter.next()) |lib_flag| {
+            if (lib_flag.len > 0) {
+                if (std.mem.startsWith(u8, lib_flag, "-l")) {
+                    target.linkSystemLibrary(lib_flag[2..]);
+                }
             }
         }
     }
 
-    // Link system libraries
-    var sys_iter = std.mem.splitSequence(u8, system_libs, " ");
-    while (sys_iter.next()) |lib_flag| {
-        if (lib_flag.len > 0) {
-            if (std.mem.startsWith(u8, lib_flag, "-l")) {
-                target.linkSystemLibrary(lib_flag[2..]);
+    // Add linker flags if available
+    if (ldflags.len > 0) {
+        var flag_iter = std.mem.splitSequence(u8, ldflags, " ");
+        while (flag_iter.next()) |flag| {
+            if (flag.len > 0 and std.mem.startsWith(u8, flag, "-L")) {
+                target.addLibraryPath(.{ .cwd_relative = flag[2..] });
             }
-        }
-    }
-
-    // Add linker flags
-    var flag_iter = std.mem.splitSequence(u8, ldflags, " ");
-    while (flag_iter.next()) |flag| {
-        if (flag.len > 0 and std.mem.startsWith(u8, flag, "-L")) {
-            target.addLibraryPath(.{ .cwd_relative = flag[2..] });
         }
     }
     
@@ -198,55 +168,102 @@ fn addMLIRSupport(b: *std.Build, target: *std.Build.Step.Compile, mlir_config: M
         target.addLibraryPath(.{ .cwd_relative = lib_dir });
     }
     
-    // EXTREMELY IMPORTANT: Link the C++ standard library (expert-corrected)
-    // On macOS (and Clang environments), this is libc++
-    target.linkLibCpp();
-    
-    std.debug.print("Successfully configured MLIR support using expert-corrected llvm-config\n", .{});
-}
-
-// Fallback MLIR support for when llvm-config fails
-fn addMLIRSupportFallback(b: *std.Build, target: *std.Build.Step.Compile, mlir_config: MLIRConfig) void {
-    _ = b;
-    
-    // Add include directory
-    if (mlir_config.include_dir) |inc_dir| {
-        target.addIncludePath(.{ .cwd_relative = inc_dir });
-    }
-    
-    // Add library directory
-    if (mlir_config.lib_dir) |lib_dir| {
-        target.addLibraryPath(.{ .cwd_relative = lib_dir });
-    }
-    
-    // Link against MLIR C API libraries in dependency order
+    // Manual library linking - link against MLIR libraries that we have built
     const mlir_libs = [_][]const u8{
-        // Core MLIR C API
-        "MLIRCAPIIR",
-        "MLIRCAPIRegisterEverything", 
-        "MLIRCAPIFunc",
-        "MLIRCAPIArith",
-        "MLIRCAPISCF",
-        "MLIRCAPITransforms",
-        
-        // Dialect libraries for StableHLO -> GPU pipeline
-        "MLIRStableHLO",
-        "MLIRGPU", 
-        "MLIRLinalg",
-        "MLIRVector",
-        "MLIRAsync",
-        "MLIRSCF",
-        "MLIRArith",
-        "MLIRFunc",
-        
-        // SPIR-V support
-        "MLIRSPIRV",
-        "MLIRSPIRVSerialization",
-        
         // Core MLIR libraries
+        "MLIRIR",
         "MLIRSupport",
-        "MLIR",
-        "LLVM",
+        "MLIRCAPIIR",
+        "MLIRCAPIRegisterEverything",
+        "MLIRCAPIArith",
+        "MLIRCAPIAsync",
+        "MLIRCAPIControlFlow",
+        "MLIRCAPIAMDGPU",
+        "MLIRAnalysis",
+        "MLIRDialect",
+        "MLIRParser",
+        "MLIRPass",
+        "MLIRRewrite",
+        "MLIRAsmParser",
+        "MLIRBytecodeReader",
+        "MLIRCallInterfaces",
+        "MLIRCastInterfaces",
+        "MLIRControlFlowInterfaces",
+        "MLIRDataLayoutInterfaces",
+        "MLIRDestinationStyleOpInterface",
+        "MLIRDialectUtils",
+        "MLIRFunctionInterfaces",
+        "MLIRInferIntRangeCommon",
+        "MLIRInferIntRangeInterface",
+        "MLIRInferTypeOpInterface",
+        "MLIRLoopLikeInterface",
+        "MLIRMemRefDialect",
+        "MLIRMemorySlotInterfaces",
+        "MLIRPDLDialect",
+        "MLIRPDLInterpDialect",
+        "MLIRPDLToPDLInterp",
+        "MLIRParallelCombiningOpInterface",
+        "MLIRPresburger",
+        "MLIRRewritePDL",
+        "MLIRShapedOpInterfaces",
+        "MLIRSideEffectInterfaces",
+        "MLIRTableGen",
+        "MLIRTblgenLib",
+        "MLIRUBDialect",
+        "MLIRValueBoundsOpInterface",
+        "MLIRViewLikeInterface",
+        "MLIRSubsetOpInterface",
+        "MLIRTensorDialect",
+        
+        // Dialect libraries
+        "MLIRAffineDialect",
+        "MLIRArithDialect",
+        "MLIRArithUtils",
+        "MLIRComplexDialect",
+        "MLIRControlFlowDialect",
+        "MLIRBytecodeWriter",
+        "MLIRBytecodeOpInterface",
+        
+        // SPIR-V libraries
+        "MLIRSPIRVDialect",
+        "MLIRSPIRVSerialization",
+        "MLIRSPIRVBinaryUtils",
+        
+        // Core LLVM libraries
+        "LLVMCore",
+        "LLVMSupport",
+        "LLVMDemangle",
+        "LLVMBinaryFormat",
+        "LLVMBitstreamReader",
+        "LLVMRemarks",
+        "LLVMBitReader",
+        "LLVMBitWriter",
+        "LLVMTransformUtils",
+        "LLVMAnalysis",
+        "LLVMProfileData",
+        "LLVMSymbolize",
+        "LLVMDebugInfoDWARF",
+        "LLVMDebugInfoCodeView",
+        "LLVMDebugInfoMSF",
+        "LLVMDebugInfoPDB",
+        "LLVMTargetParser",
+        "LLVMTextAPI",
+        "LLVMFrontendAtomic",
+        "LLVMFrontendOffloading",
+        "LLVMFrontendOpenMP",
+        "LLVMObject",
+        "LLVMIRReader",
+        "LLVMAsmParser",
+        "LLVMInstCombine",
+        "LLVMScalarOpts",
+        "LLVMAggressiveInstCombine",
+        "LLVMCodeGenTypes",
+        "LLVMSandboxIR",
+        "LLVMTableGen",
+        "LLVMDebugInfoBTF",
+        "LLVMCGData",
+        "LLVMMC",
+        "LLVMMCParser",
     };
     
     for (mlir_libs) |lib| {
@@ -282,6 +299,52 @@ pub fn build(b: *std.Build) void {
         metal_bridge_lib.?.linkFramework("Foundation");
         metal_bridge_lib.?.linkFramework("Metal");
     }
+
+    // Create SPIR-V bridge library if MLIR is available
+    var spirv_bridge_lib: ?*std.Build.Step.Compile = null;
+    if (mlir_config.enabled) {
+        spirv_bridge_lib = b.addStaticLibrary(.{
+            .name = "spirv_bridge",
+            .target = target,
+            .optimize = optimize,
+        });
+
+        spirv_bridge_lib.?.addCSourceFile(.{
+            .file = b.path("src/mlir/spirv_bridge.cpp"),
+            .flags = &[_][]const u8{"-std=c++17"},
+        });
+
+        if (mlir_config.include_dir) |include_dir| {
+            spirv_bridge_lib.?.addIncludePath(.{ .cwd_relative = include_dir });
+        }
+        
+        // Add MLIR include directory from project
+        spirv_bridge_lib.?.addIncludePath(.{ .cwd_relative = "llvm-project/mlir/include" });
+        
+        // Add build directory includes for generated headers
+        spirv_bridge_lib.?.addIncludePath(.{ .cwd_relative = "llvm-build/include" });
+        if (mlir_config.lib_dir) |lib_dir| {
+            spirv_bridge_lib.?.addLibraryPath(.{ .cwd_relative = lib_dir });
+        }
+        
+        const spirv_libs = [_][]const u8{
+            "MLIRCAPIIR",
+            "MLIRIR",
+            "MLIRSPIRVDialect",
+            "MLIRSPIRVSerialization",
+            "MLIRSPIRVBinaryUtils",
+            "MLIRSupport",
+            "LLVMSupport",
+            "LLVMCore",
+        };
+        
+        for (spirv_libs) |lib| {
+            spirv_bridge_lib.?.linkSystemLibrary(lib);
+        }
+        
+        spirv_bridge_lib.?.linkLibCpp();
+    }
+
 
     // Create the main PCP module
     const pcp_module = b.addModule("pcp", .{
@@ -326,10 +389,10 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     
-    if (mlir_config.enabled) {
-        addMLIRSupport(b, dialect_test, mlir_config);
-    } else {
-        addMLIRSupportFallback(b, dialect_test, mlir_config);
+    addMLIRSupport(b, dialect_test, mlir_config);
+    
+    if (spirv_bridge_lib != null) {
+        dialect_test.linkLibrary(spirv_bridge_lib.?);
     }
     
     if (builtin.os.tag == .macos and metal_bridge_lib != null) {
@@ -354,6 +417,10 @@ pub fn build(b: *std.Build) void {
     
     // Add MLIR support to GPT-2 example
     addMLIRSupport(b, gpt2_example, mlir_config);
+    
+    if (spirv_bridge_lib != null) {
+        gpt2_example.linkLibrary(spirv_bridge_lib.?);
+    }
 
     // Install the executables
     b.installArtifact(gpt2_example);
@@ -378,6 +445,10 @@ pub fn build(b: *std.Build) void {
     
     // Add MLIR support to autodiff test
     addMLIRSupport(b, autodiff_test, mlir_config);
+    
+    if (spirv_bridge_lib != null) {
+        autodiff_test.linkLibrary(spirv_bridge_lib.?);
+    }
 
     // Install the test executable
     b.installArtifact(autodiff_test);
@@ -388,6 +459,129 @@ pub fn build(b: *std.Build) void {
 
     const run_autodiff_test_step = b.step("run-autodiff-test", "Run the autodiff Plan-based tests");
     run_autodiff_test_step.dependOn(&run_autodiff_test_cmd.step);
+
+    // MLIR Autodiff Simple Test executable
+    const mlir_autodiff_simple_test = b.addExecutable(.{
+        .name = "mlir_autodiff_simple_test",
+        .root_source_file = b.path("src/examples/mlir_autodiff_simple_test.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    // Add module dependencies for MLIR autodiff simple test
+    mlir_autodiff_simple_test.root_module.addImport("pcp", pcp_module);
+    
+    // Add MLIR support to MLIR autodiff simple test
+    addMLIRSupport(b, mlir_autodiff_simple_test, mlir_config);
+    
+    if (spirv_bridge_lib != null) {
+        mlir_autodiff_simple_test.linkLibrary(spirv_bridge_lib.?);
+    }
+    
+
+    // Install the test executable
+    b.installArtifact(mlir_autodiff_simple_test);
+
+    // Run step for MLIR autodiff simple test
+    const run_mlir_autodiff_simple_test_cmd = b.addRunArtifact(mlir_autodiff_simple_test);
+    run_mlir_autodiff_simple_test_cmd.step.dependOn(&mlir_autodiff_simple_test.step);
+
+    const run_mlir_autodiff_simple_test_step = b.step("run-mlir-autodiff-simple-test", "Run the MLIR autodiff simple test");
+    run_mlir_autodiff_simple_test_step.dependOn(&run_mlir_autodiff_simple_test_cmd.step);
+
+    // MLIR autodiff matmul test executable
+    const mlir_autodiff_matmul_test = b.addExecutable(.{
+        .name = "mlir_autodiff_matmul_test",
+        .root_source_file = b.path("src/examples/mlir_autodiff_matmul_test.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    // Add module dependencies for MLIR autodiff matmul test
+    mlir_autodiff_matmul_test.root_module.addImport("pcp", pcp_module);
+    
+    // Add MLIR support to MLIR autodiff matmul test
+    addMLIRSupport(b, mlir_autodiff_matmul_test, mlir_config);
+    
+    if (spirv_bridge_lib != null) {
+        mlir_autodiff_matmul_test.linkLibrary(spirv_bridge_lib.?);
+    }
+    
+
+    // Install the test executable
+    b.installArtifact(mlir_autodiff_matmul_test);
+
+    // Run step for MLIR autodiff matmul test
+    const run_mlir_autodiff_matmul_test_cmd = b.addRunArtifact(mlir_autodiff_matmul_test);
+    run_mlir_autodiff_matmul_test_cmd.step.dependOn(&mlir_autodiff_matmul_test.step);
+
+    const run_mlir_autodiff_matmul_test_step = b.step("run-mlir-autodiff-matmul-test", "Run the MLIR autodiff matmul test");
+    run_mlir_autodiff_matmul_test_step.dependOn(&run_mlir_autodiff_matmul_test_cmd.step);
+
+    // MLIR autodiff verification test executable
+    const mlir_autodiff_verification_test = b.addExecutable(.{
+        .name = "mlir_autodiff_verification_test",
+        .root_source_file = b.path("src/examples/mlir_autodiff_verification_test.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    // Add module dependencies for MLIR autodiff verification test
+    mlir_autodiff_verification_test.root_module.addImport("pcp", pcp_module);
+    
+    // Add MLIR support to MLIR autodiff verification test
+    addMLIRSupport(b, mlir_autodiff_verification_test, mlir_config);
+    
+    if (spirv_bridge_lib != null) {
+        mlir_autodiff_verification_test.linkLibrary(spirv_bridge_lib.?);
+    }
+    
+
+    // Link Metal bridge on macOS
+    if (builtin.os.tag == .macos) {
+        mlir_autodiff_verification_test.linkFramework("Foundation");
+        mlir_autodiff_verification_test.linkFramework("Metal");
+        mlir_autodiff_verification_test.linkLibrary(metal_bridge_lib.?);
+    }
+
+    // Install the test executable
+    b.installArtifact(mlir_autodiff_verification_test);
+
+    // Run step for MLIR autodiff verification test
+    const run_mlir_autodiff_verification_test_cmd = b.addRunArtifact(mlir_autodiff_verification_test);
+    run_mlir_autodiff_verification_test_cmd.step.dependOn(&mlir_autodiff_verification_test.step);
+
+    const run_mlir_autodiff_verification_test_step = b.step("run-mlir-autodiff-verification-test", "Run the MLIR autodiff verification test");
+    run_mlir_autodiff_verification_test_step.dependOn(&run_mlir_autodiff_verification_test_cmd.step);
+
+    // Simple multiply test executable
+    const mlir_simple_multiply_test = b.addExecutable(.{
+        .name = "mlir_simple_multiply_test",
+        .root_source_file = b.path("src/examples/mlir_simple_multiply_test.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    // Add module dependencies for simple multiply test
+    mlir_simple_multiply_test.root_module.addImport("pcp", pcp_module);
+    
+    // Add MLIR support to simple multiply test
+    addMLIRSupport(b, mlir_simple_multiply_test, mlir_config);
+    
+    if (spirv_bridge_lib != null) {
+        mlir_simple_multiply_test.linkLibrary(spirv_bridge_lib.?);
+    }
+    
+
+    // Install the test executable
+    b.installArtifact(mlir_simple_multiply_test);
+
+    // Run step for simple multiply test
+    const run_mlir_simple_multiply_test_cmd = b.addRunArtifact(mlir_simple_multiply_test);
+    run_mlir_simple_multiply_test_cmd.step.dependOn(&mlir_simple_multiply_test.step);
+
+    const run_mlir_simple_multiply_test_step = b.step("run-mlir-simple-multiply-test", "Run the MLIR simple multiply test");
+    run_mlir_simple_multiply_test_step.dependOn(&run_mlir_simple_multiply_test_cmd.step);
 
     // Comptime Plan examples executable
     const comptime_examples = b.addExecutable(.{
@@ -402,6 +596,11 @@ pub fn build(b: *std.Build) void {
     
     // Add MLIR support to comptime examples
     addMLIRSupport(b, comptime_examples, mlir_config);
+    
+    if (spirv_bridge_lib != null) {
+        comptime_examples.linkLibrary(spirv_bridge_lib.?);
+    }
+    
 
     // Install the executable
     b.installArtifact(comptime_examples);
@@ -426,6 +625,11 @@ pub fn build(b: *std.Build) void {
     
     // Add MLIR support to metal test
     addMLIRSupport(b, metal_test, mlir_config);
+    
+    if (spirv_bridge_lib != null) {
+        metal_test.linkLibrary(spirv_bridge_lib.?);
+    }
+    
 
     // Link Metal bridge on macOS
     if (builtin.os.tag == .macos) {
@@ -457,6 +661,11 @@ pub fn build(b: *std.Build) void {
     
     // Add MLIR support to metal benchmark
     addMLIRSupport(b, metal_benchmark, mlir_config);
+    
+    if (spirv_bridge_lib != null) {
+        metal_benchmark.linkLibrary(spirv_bridge_lib.?);
+    }
+    
 
     // Link Metal bridge on macOS with extra debugging
     if (builtin.os.tag == .macos) {
@@ -686,6 +895,11 @@ pub fn build(b: *std.Build) void {
     
     // Add MLIR support to plan test
     addMLIRSupport(b, plan_test, mlir_config);
+    
+    if (spirv_bridge_lib != null) {
+        plan_test.linkLibrary(spirv_bridge_lib.?);
+    }
+    
 
     // Install the executable
     b.installArtifact(plan_test);
@@ -710,6 +924,11 @@ pub fn build(b: *std.Build) void {
     
     // Add MLIR support to MLIR test
     addMLIRSupport(b, mlir_test, mlir_config);
+    
+    if (spirv_bridge_lib != null) {
+        mlir_test.linkLibrary(spirv_bridge_lib.?);
+    }
+    
 
     // Install the executable
     b.installArtifact(mlir_test);
@@ -734,6 +953,11 @@ pub fn build(b: *std.Build) void {
     
     // Add MLIR support to tensor test
     addMLIRSupport(b, tensor_mlir_test, mlir_config);
+    
+    if (spirv_bridge_lib != null) {
+        tensor_mlir_test.linkLibrary(spirv_bridge_lib.?);
+    }
+    
 
     // Install the executable
     b.installArtifact(tensor_mlir_test);

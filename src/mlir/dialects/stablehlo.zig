@@ -64,6 +64,16 @@ pub fn constant(ctx: mlir.Context, args: struct {
     });
 }
 
+/// Creates a zero constant tensor
+pub fn zeroConstant(ctx: mlir.Context, shape: []const i64, element_type: mlir.Type) mlir.Operation {
+    const tensor_type = mlir.Type.rankedTensorType(ctx, shape, element_type);
+    const zero_attr = mlir.Attribute.floatAttr(ctx, 0.0, element_type);
+    return constant(ctx, .{
+        .value = zero_attr,
+        .result_type = tensor_type,
+    });
+}
+
 /// Creates a stablehlo.maximum operation (used for ReLU)
 pub fn maximum(ctx: mlir.Context, lhs: mlir.Value, rhs: mlir.Value, loc: mlir.Location) mlir.Operation {
     return mlir.Operation.create(ctx, "stablehlo.maximum", .{
@@ -78,6 +88,87 @@ pub fn minimum(ctx: mlir.Context, lhs: mlir.Value, rhs: mlir.Value, loc: mlir.Lo
     return mlir.Operation.create(ctx, "stablehlo.minimum", .{
         .operands = &.{ lhs, rhs },
         .results = &.{lhs.getType()},
+        .location = loc,
+    });
+}
+
+/// Creates a stablehlo.exponential operation
+pub fn exponential(ctx: mlir.Context, operand: mlir.Value, loc: mlir.Location) mlir.Operation {
+    return mlir.Operation.create(ctx, "stablehlo.exponential", .{
+        .operands = &.{operand},
+        .results = &.{operand.getType()},
+        .location = loc,
+    });
+}
+
+/// Creates a stablehlo.reduce_max operation
+pub fn reduce_max(ctx: mlir.Context, operand: mlir.Value, dimensions: []const i64, loc: mlir.Location) mlir.Operation {
+    const dimensions_attr = mlir.Attribute.denseI64ArrayAttr(ctx, dimensions);
+    
+    // Calculate result shape by removing reduced dimensions
+    const input_type = operand.getType().as(mlir.RankedTensorType) orelse unreachable;
+    const input_shape = input_type.getShape();
+    const element_type = input_type.getElementType();
+    
+    // For simplicity, assume single dimension reduction for now
+    var result_shape = std.ArrayList(i64).init(std.heap.page_allocator);
+    defer result_shape.deinit();
+    
+    for (input_shape, 0..) |dim, i| {
+        var is_reduced = false;
+        for (dimensions) |red_dim| {
+            if (i == red_dim) {
+                is_reduced = true;
+                break;
+            }
+        }
+        if (!is_reduced) {
+            result_shape.append(dim) catch unreachable;
+        }
+    }
+    
+    const result_type = mlir.Type.rankedTensorType(ctx, result_shape.items, element_type);
+    
+    return mlir.Operation.create(ctx, "stablehlo.reduce_max", .{
+        .operands = &.{operand},
+        .results = &.{result_type},
+        .attributes = &.{.{ "dimensions", dimensions_attr }},
+        .location = loc,
+    });
+}
+
+/// Creates a stablehlo.reduce_sum operation
+pub fn reduce_sum(ctx: mlir.Context, operand: mlir.Value, dimensions: []const i64, loc: mlir.Location) mlir.Operation {
+    const dimensions_attr = mlir.Attribute.denseI64ArrayAttr(ctx, dimensions);
+    
+    // Calculate result shape by removing reduced dimensions
+    const input_type = operand.getType().as(mlir.RankedTensorType) orelse unreachable;
+    const input_shape = input_type.getShape();
+    const element_type = input_type.getElementType();
+    
+    // For simplicity, assume single dimension reduction for now
+    var result_shape = std.ArrayList(i64).init(std.heap.page_allocator);
+    defer result_shape.deinit();
+    
+    for (input_shape, 0..) |dim, i| {
+        var is_reduced = false;
+        for (dimensions) |red_dim| {
+            if (i == red_dim) {
+                is_reduced = true;
+                break;
+            }
+        }
+        if (!is_reduced) {
+            result_shape.append(dim) catch unreachable;
+        }
+    }
+    
+    const result_type = mlir.Type.rankedTensorType(ctx, result_shape.items, element_type);
+    
+    return mlir.Operation.create(ctx, "stablehlo.reduce_sum", .{
+        .operands = &.{operand},
+        .results = &.{result_type},
+        .attributes = &.{.{ "dimensions", dimensions_attr }},
         .location = loc,
     });
 }
@@ -325,8 +416,8 @@ pub fn scalarConstant(ctx: mlir.Context, value: f64, element_type: mlir.Type) ml
     });
 }
 
-/// Create a zero constant of given shape and type
-pub fn zeroConstant(ctx: mlir.Context, shape: []const i64, element_type: mlir.Type) mlir.Operation {
+/// Create a zero constant of given shape and type (renamed to avoid duplicate)
+pub fn zeroTensor(ctx: mlir.Context, shape: []const i64, element_type: mlir.Type) mlir.Operation {
     const attr = mlir.Attribute.floatAttr(ctx, 0.0, element_type);
     const tensor_type = mlir.Type.tensor(shape, element_type);
     
@@ -344,5 +435,143 @@ pub fn onesConstant(ctx: mlir.Context, shape: []const i64, element_type: mlir.Ty
     return constant(ctx, .{
         .value = attr,
         .result_type = tensor_type,
+    });
+}
+
+/// Attribute for stablehlo.gather dimension numbers.
+pub const GatherDimensionNumbersAttribute = struct {
+    offset_dims: []const i64,
+    collapsed_slice_dims: []const i64,
+    start_index_map: []const i64,
+    index_vector_dim: i64,
+
+    pub fn asAttr(self: @This(), ctx: mlir.Context) mlir.Attribute {
+        const c_api = @import("../../mlir/c.zig").c;
+
+        // 1. Create attributes for each field
+        const offset_dims_attr = mlir.Attribute.denseI64ArrayAttr(ctx, self.offset_dims);
+        const collapsed_slice_dims_attr = mlir.Attribute.denseI64ArrayAttr(ctx, self.collapsed_slice_dims);
+        const start_index_map_attr = mlir.Attribute.denseI64ArrayAttr(ctx, self.start_index_map);
+        const index_vector_dim_attr = mlir.Attribute.integerAttr(ctx, self.index_vector_dim, mlir.Type.f32Type(ctx));
+
+        // 2. Create identifiers for attribute names
+        const offset_id = c_api.identifierGet(ctx.handle, "offset_dims");
+        const collapsed_id = c_api.identifierGet(ctx.handle, "collapsed_slice_dims");
+        const start_map_id = c_api.identifierGet(ctx.handle, "start_index_map");
+        const index_vec_id = c_api.identifierGet(ctx.handle, "index_vector_dim");
+
+        // 3. Create named attributes
+        const named_attrs = [_]c_api.MlirNamedAttribute{
+            .{ .name = offset_id, .attribute = offset_dims_attr.handle },
+            .{ .name = collapsed_id, .attribute = collapsed_slice_dims_attr.handle },
+            .{ .name = start_map_id, .attribute = start_index_map_attr.handle },
+            .{ .name = index_vec_id, .attribute = index_vector_dim_attr.handle },
+        };
+
+        // 4. Create and return the dictionary attribute
+        return mlir.Attribute.dictionary(ctx, &named_attrs);
+    }
+};
+
+/// Creates a stablehlo.gather operation for embedding lookups.
+pub fn gather(
+    ctx: mlir.Context,
+    operand: mlir.Value, // The embedding table (e.g., shape [vocab_size, n_embd])
+    start_indices: mlir.Value, // The token IDs to look up (e.g., shape [batch, seq_len])
+    dimension_numbers: GatherDimensionNumbersAttribute,
+    slice_sizes: []const i64,
+    loc: mlir.Location,
+) mlir.Operation {
+    const dim_numbers_attr = dimension_numbers.asAttr(ctx);
+    const slice_sizes_attr = mlir.Attribute.denseI64ArrayAttr(ctx, slice_sizes);
+
+    // Infer the result type
+    const operand_type = operand.getType().as(mlir.RankedTensorType).?;
+    const element_type = operand_type.getElementType();
+    
+    // Simplified result type inference. A full implementation is more complex.
+    // For embedding lookup: [batch, seq_len, n_embd]
+    const start_indices_type = start_indices.getType().as(mlir.RankedTensorType).?;
+    var result_dims = std.ArrayList(i64).init(std.heap.page_allocator);
+    defer result_dims.deinit();
+    
+    // Get the batch and sequence dimensions from start_indices
+    const start_shape = start_indices_type.getShape();
+    for (start_shape) |d| {
+        result_dims.append(d) catch @panic("OOM");
+    }
+    // Append the embedding dimension
+    result_dims.append(slice_sizes[1]) catch @panic("OOM");
+
+    const result_type = mlir.Type.tensor(result_dims.items, element_type);
+
+    return mlir.Operation.create(ctx, "stablehlo.gather", .{
+        .operands = &.{ operand, start_indices },
+        .results = &.{result_type},
+        .attributes = &.{
+            .{ "dimension_numbers", dim_numbers_attr },
+            .{ "slice_sizes", slice_sizes_attr },
+        },
+        .location = loc,
+    });
+}
+
+/// Attribute for stablehlo.scatter dimension numbers.
+pub const ScatterDimensionNumbersAttribute = struct {
+    update_window_dims: []const i64,
+    inserted_window_dims: []const i64,
+    scatter_dims_to_operand_dims: []const i64,
+    index_vector_dim: i64,
+
+    pub fn asAttr(self: @This(), ctx: mlir.Context) mlir.Attribute {
+        const c_api = @import("../../mlir/c.zig").c;
+
+        // Create attributes for each field
+        const update_window_dims_attr = mlir.Attribute.denseI64ArrayAttr(ctx, self.update_window_dims);
+        const inserted_window_dims_attr = mlir.Attribute.denseI64ArrayAttr(ctx, self.inserted_window_dims);
+        const scatter_dims_to_operand_dims_attr = mlir.Attribute.denseI64ArrayAttr(ctx, self.scatter_dims_to_operand_dims);
+        const index_vector_dim_attr = mlir.Attribute.integerAttr(ctx, self.index_vector_dim, mlir.Type.f32Type(ctx));
+
+        // Create identifiers for attribute names
+        const update_window_id = c_api.identifierGet(ctx.handle, "update_window_dims");
+        const inserted_window_id = c_api.identifierGet(ctx.handle, "inserted_window_dims");
+        const scatter_dims_id = c_api.identifierGet(ctx.handle, "scatter_dims_to_operand_dims");
+        const index_vec_id = c_api.identifierGet(ctx.handle, "index_vector_dim");
+
+        // Create named attributes
+        const named_attrs = [_]c_api.MlirNamedAttribute{
+            .{ .name = update_window_id, .attribute = update_window_dims_attr.handle },
+            .{ .name = inserted_window_id, .attribute = inserted_window_dims_attr.handle },
+            .{ .name = scatter_dims_id, .attribute = scatter_dims_to_operand_dims_attr.handle },
+            .{ .name = index_vec_id, .attribute = index_vector_dim_attr.handle },
+        };
+
+        // Create and return the dictionary attribute
+        return mlir.Attribute.dictionary(ctx, &named_attrs);
+    }
+};
+
+/// Creates a stablehlo.scatter operation for gradient backpropagation.
+/// This is the inverse of gather - it takes updates and indices and scatters them into a larger tensor.
+pub fn scatter(
+    ctx: mlir.Context,
+    operand: mlir.Value, // The tensor to scatter into (e.g., shape [vocab_size, n_embd])
+    scatter_indices: mlir.Value, // The indices to scatter at (e.g., shape [batch, seq_len])
+    updates: mlir.Value, // The values to scatter (e.g., shape [batch, seq_len, n_embd])
+    dimension_numbers: ScatterDimensionNumbersAttribute,
+    loc: mlir.Location,
+) mlir.Operation {
+    const dim_numbers_attr = dimension_numbers.asAttr(ctx);
+
+    // Result type is the same as the operand type
+    const result_type = operand.getType();
+
+    return mlir.Operation.create(ctx, "stablehlo.scatter", .{
+        .operands = &.{ operand, scatter_indices, updates },
+        .results = &.{result_type},
+        .attributes = &.{
+            .{ "scatter_dimension_numbers", dim_numbers_attr },
+        },
+        .location = loc,
     });
 }

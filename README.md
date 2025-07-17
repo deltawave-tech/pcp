@@ -6,62 +6,32 @@ PCP is a distributed tensor computation framework written in Zig. It employs MLI
 
 PCP transforms high-level tensor operations into optimized MLIR computation graphs. The system's design is centered on a forward-pass graph construction, which is then used to derive a corresponding gradient graph for automatic differentiation.
 
-### Modular Protocol Controller (PCP) Architecture
+### Distributed Training Overview
 
 ```
-┌───────────────┐    ┌─────────────────────┐    ┌───────────────────────┐
-│ Model         │    │ Training Algorithm  │    │ Distributed System    │
-│ (GPT-2)       │◀──▶│ (DiLoCo)            │◀──▶│ (Shepherd + Workers)  │
-├───────────────┤    ├─────────────────────┤    ├───────────────────────┤
-│ • Forward     │    │ • Parameter Sync    │    │ • TCP Communication   │
-│ • MLIR Graph  │    │ • MLIR Optimizers   │    │ • Message Protocol    │
-│ • Autodiff    │    │ • Inner/Outer Loop  │    │ • Graph Distribution  │
-└───────────────┘    └─────────────────────┘    └───────────────────────┘
-       │                       │                           │
-       └───────────────────────┼───────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────┐
+│                            Controller                                │
+├──────────────────────────────────────────────────────────────────────┤
+│  ┌─────────┐ + ┌───────────┐ = ┌─────────────────────────────────┐   │
+│  │ Model   │   │ Algorithm │   │ MLIR Training Graph            │   │
+│  │         │   │           │   │ (Forward + Autodiff + Update)  │   │
+│  └─────────┘   └───────────┘   └─────────────────────────────────┘   │
+└──────────────────────────────┬───────────────────────────────────────┘
+                               │ Serialize & Send
                                ▼
-    ┌──────────────────────────────────────────────────────────────────┐
-    │                    MLIR Compilation Pipeline                     │
-    │                                                                  │
-    │  ┌─────────────┐   ┌──────────────┐   ┌─────────────────────┐   │
-    │  │ StableHLO   │──▶│ GPU/SPIR-V   │──▶│ Backend Execution   │   │
-    │  │ Graph       │   │ Lowering     │   │ (Metal/CUDA/CPU)    │   │
-    │  └─────────────┘   └──────────────┘   └─────────────────────┘   │
-    └──────────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────┐
+│                           Workers                                    │
+├──────────────────────────────────────────────────────────────────────┤
+│ Receive MLIR → Compile to GPU → Execute → Send Results Back         │
+└──────────────────────────────────────────────────────────────────────┘
 ```
 
-### MLIR Lowering Pipeline
+### MLIR Compilation Pipeline
 
 ```
-┌─────────────────┐    passes    ┌─────────────────┐    translation
-│ StableHLO       │ ───────────▶  │ GPU Dialect     │ ──────────────▶
-│ Dialect         │               │ (gpu.launch)    │
-│                 │               │                 │
-│ • stablehlo.add │               │ • gpu.func      │
-│ • stablehlo.mul │               │ • gpu.thread_id │
-│ • stablehlo.dot │               │ • gpu.memcpy    │
-└─────────────────┘               └─────────────────┘
-                                           │
-                                           ▼ passes
-                                  ┌─────────────────┐    translation
-                                  │ SPIR-V Dialect  │ ──────────────▶
-                                  │ (spirv.*)       │
-                                  │                 │
-                                  │ • spirv.func    │
-                                  │ • spirv.fadd    │
-                                  │ • spirv.load    │
-                                  └─────────────────┘
-                                           │
-                                           ▼
-                    ┌─────────────────────────────────────────────────┐
-                    │              Backend Targets                    │
-                    ├─────────────────┬─────────────────┬─────────────┤
-                    │ Metal (MSL)     │ CUDA (PTX)      │ CPU (LLVM)  │
-                    │                 │                 │             │
-                    │ • MTLLibrary    │ • CUmodule      │ • JIT/AOT   │
-                    │ • MTLFunction   │ • CUfunction    │ • Native    │
-                    │ • MTLBuffer     │ • CUdeviceptr   │ • Vectorized│
-                    └─────────────────┴─────────────────┴─────────────┘
+┌─────────┐   ┌─────────────┐   ┌───────┐   ┌─────────────────┐
+│StableHLO│ → │ GPU Dialect │ → │SPIR-V │ → │Metal/CUDA/CPU   │
+└─────────┘   └─────────────┘   └───────┘   └─────────────────┘
 ```
 
 This architecture is implemented through several key components:

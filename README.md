@@ -13,8 +13,8 @@ PCP transforms high-level tensor operations into optimized MLIR computation grap
 │                            Controller                                │
 ├──────────────────────────────────────────────────────────────────────┤
 │  ┌─────────┐ + ┌───────────┐ = ┌─────────────────────────────────┐   │
-│  │ Model   │   │ Algorithm │   │ MLIR Training Graph            │   │
-│  │         │   │           │   │ (Forward + Autodiff + Update)  │   │
+│  │ Model   │   │ Algorithm │   │ MLIR Training Graph             │   │
+│  │         │   │           │   │ (Forward + Autodiff + Update)   │   │
 │  └─────────┘   └───────────┘   └─────────────────────────────────┘   │
 └──────────────────────────────┬───────────────────────────────────────┘
                                │ Serialize & Send
@@ -22,7 +22,7 @@ PCP transforms high-level tensor operations into optimized MLIR computation grap
 ┌──────────────────────────────────────────────────────────────────────┐
 │                           Workers                                    │
 ├──────────────────────────────────────────────────────────────────────┤
-│ Receive MLIR → Compile to GPU → Execute → Send Results Back         │
+│ Receive MLIR → Compile to GPU → Execute → Send Results Back          │
 └──────────────────────────────────────────────────────────────────────┘
 ```
 

@@ -1,379 +1,353 @@
 # PCP Documentation
 
-A comprehensive guide to the MLIR-based tensor computation framework.
+A comprehensive guide to the distributed MLIR-based tensor computation framework.
 
 ## Table of Contents
 
 1. [Architecture Overview](#architecture-overview)
-2. [Core Components](#core-components)
+2. [Distributed Training System](#distributed-training-system)
 3. [MLIR Integration](#mlir-integration)
 4. [Automatic Differentiation](#automatic-differentiation)
-5. [API Reference](#api-reference)
-6. [Examples](#examples)
-7. [Best Practices](#best-practices)
+5. [Backend Execution](#backend-execution)
+6. [Monitoring and Dashboard](#monitoring-and-dashboard)
+7. [API Reference](#api-reference)
 
 ## Architecture Overview
 
-PCP transforms high-level tensor operations into optimized MLIR computation graphs:
+PCP is a distributed training framework that combines models and algorithms to create MLIR computation graphs, then distributes them to workers for GPU execution:
 
 ```
-Zig Tensor API → MLIRBuilder → StableHLO MLIR → Execution
-      ↓             ↓              ↓             ↓
-  VJP Rules → Gradient Graph → Optimized Code → Results
+┌──────────────────────────────────────────────────────────────────────┐
+│                            Controller                                │
+├──────────────────────────────────────────────────────────────────────┤
+│  ┌─────────┐ + ┌───────────┐ = ┌─────────────────────────────────┐   │
+│  │ Model   │   │ Algorithm │   │ MLIR Training Graph             │   │
+│  │         │   │           │   │ (Forward + Autodiff + Update)   │   │
+│  └─────────┘   └───────────┘   └─────────────────────────────────┘   │
+└──────────────────────────────┬───────────────────────────────────────┘
+                               │ Serialize & Send
+                               ▼
+┌──────────────────────────────────────────────────────────────────────┐
+│                           Workers                                    │
+├──────────────────────────────────────────────────────────────────────┤
+│ Receive MLIR → Compile to GPU → Execute → Send Results Back          │
+└──────────────────────────────────────────────────────────────────────┘
 ```
 
 ### Core Layers
 
-1. **Tensor Abstraction**: High-level tensor operations with shape validation
-2. **MLIR Builder**: Constructs computation graphs using MLIR C API
-3. **StableHLO Dialect**: Clean Zig wrapper for StableHLO operations
-4. **VJP Autodiff**: Vector-Jacobian Product automatic differentiation
-5. **Execution Engine**: MLIR-based compilation and execution
+1. **Distributed Coordination**: Shepherd coordinator manages worker nodes via TCP
+2. **MLIR Graph Construction**: Builds complete training graphs with autodiff
+3. **Backend Execution**: Cross-platform GPU execution via SPIR-V bridge
+4. **Real-time Monitoring**: TUI dashboard for training metrics and system status
 
-## Core Components
+## Distributed Training System
 
-### MLIRBuilder
+### Shepherd Coordinator (`src/controllers/shepherd.zig`)
 
-Central component for building computation graphs:
+The central coordinator that manages the distributed training process:
 
 ```zig
-const builder = try ops.MLIRBuilder.init(allocator);
-defer builder.deinit();
+var shepherd = Shepherd.init(allocator);
+defer shepherd.deinit();
 
-// Create tensors and operations
-const result = try ops.add(&builder, tensor_a, tensor_b);
+// Start TCP server and wait for workers
+try shepherd.startServer(8080);
+try shepherd.run();
 ```
 
-**Key methods:**
-- `init(allocator)`: Initialize with MLIR context
-- `createConstant(value, type)`: Create constant values
-- `createOp(name, operands, result_type)`: Create generic operations
-- `deinit()`: Clean up MLIR context
+**Key responsibilities:**
+- Combine models and algorithms into complete MLIR training graphs
+- Serialize MLIR modules and broadcast to workers
+- Collect training results and coordinate parameter updates
+- Manage distributed training lifecycle
 
-### StableHLO Dialect Wrapper
+### Worker Nodes (`src/worker.zig`)
 
-Clean Zig interface to MLIR StableHLO operations in `src/mlir/dialects/stablehlo.zig`:
+Execute MLIR training graphs on local hardware:
 
 ```zig
-// Element-wise operations
-pub fn add(ctx: Context, lhs: Value, rhs: Value, loc: Location) Operation
-pub fn multiply(ctx: Context, lhs: Value, rhs: Value, loc: Location) Operation
+var worker = Worker.init(allocator, backend);
+defer worker.deinit();
 
-// Matrix operations  
-pub fn dot_general(ctx: Context, lhs: Value, rhs: Value, args: DotArgs) Operation
-
-// Activation functions
-pub fn maximum(ctx: Context, lhs: Value, rhs: Value, loc: Location) Operation // ReLU
-
-// Tensor manipulation
-pub fn transpose(ctx: Context, operand: Value, permutation: []const i64, loc: Location) Operation
-pub fn reshape(ctx: Context, operand: Value, result_shape: []const i64, loc: Location) Operation
+// Connect to shepherd and enter training loop
+try worker.connect("127.0.0.1", 8080);
+try worker.run();
 ```
 
-### Tensor Operations
+**Worker execution flow:**
+1. Receive serialized MLIR module from shepherd
+2. Deserialize and compile to GPU (SPIR-V → Metal/CUDA)
+3. Execute training step with local data
+4. Send updated parameters back to shepherd
 
-High-level tensor operations in `src/ops.zig`:
+### Training Algorithms (`src/algorithms/`)
+
+PCP implements distributed training algorithms like DiLoCo:
 
 ```zig
-// Element-wise operations
-pub fn add(builder: *MLIRBuilder, a: Tensor, b: Tensor) !Tensor
-pub fn subtract(builder: *MLIRBuilder, a: Tensor, b: Tensor) !Tensor 
-pub fn multiply(builder: *MLIRBuilder, a: Tensor, b: Tensor) !Tensor
-pub fn divide(builder: *MLIRBuilder, a: Tensor, b: Tensor) !Tensor
+var diloco = try DiLoCo.init(allocator, &shepherd, config, executor);
+defer diloco.deinit();
 
-// Matrix operations
-pub fn matmul(builder: *MLIRBuilder, a: Tensor, b: Tensor) !Tensor
-
-// Activation functions
-pub fn relu(builder: *MLIRBuilder, a: Tensor) !Tensor
-
-// Tensor manipulation
-pub fn transpose(builder: *MLIRBuilder, a: Tensor, permutation: []const i64) !Tensor
-pub fn reshape(builder: *MLIRBuilder, a: Tensor, new_shape: []const i64) !Tensor
+// Start distributed training
+try diloco.run();
 ```
 
 ## MLIR Integration
 
-### C API Bindings
+### Compilation Pipeline
 
-`src/mlir/c.zig` provides comprehensive MLIR C API bindings:
-
-```zig
-// Context management
-extern fn mlirContextCreate() *MlirContext;
-extern fn mlirContextDestroy(ctx: *MlirContext) void;
-
-// Operation creation  
-extern fn mlirOperationCreate(state: *MlirOperationState) *MlirOperation;
-
-// Type system
-extern fn mlirRankedTensorTypeGet(rank: isize, shape: [*]const i64, elementType: *MlirType) *MlirType;
-
-// Value operations
-extern fn mlirValueGetType(value: *MlirValue) *MlirType;
+```
+┌─────────┐   ┌─────────────┐   ┌───────┐   ┌─────────────────┐
+│StableHLO│ → │ GPU Dialect │ → │SPIR-V │ → │Metal/CUDA/CPU   │
+└─────────┘   └─────────────┘   └───────┘   └─────────────────┘
 ```
 
-### MLIR Wrapper Types
+### StableHLO Integration
 
-`src/mlir.zig` provides safe Zig wrappers:
+PCP integrates StableHLO as an external LLVM project with pass registration:
+
+```cpp
+// src/mlir/pass_anchors.cpp
+extern "C" void mlirForceLoadAllRequiredPasses() {
+    // StableHLO passes
+    mlir::stablehlo::registerAllPasses();
+
+    // Core MLIR passes for lowering pipeline
+    (void)mlir::createCanonicalizerPass;
+    (void)mlir::createConvertGpuOpsToSPIRVopsPass;
+    // ... additional passes
+}
+```
+
+### MLIR Context Management (`src/mlir_ctx.zig`)
+
+Manages MLIR contexts and module serialization/deserialization:
 
 ```zig
-pub const Context = struct {
-    handle: *c.MlirContext,
-    
-    pub fn init() !Self
-    pub fn deinit(self: Self) void
+pub const MLIRContext = struct {
+    context: mlir.Context,
+
+    pub fn init(allocator: Allocator) !Self
+    pub fn deinit(self: *Self) void
+    pub fn getContext(self: *Self) mlir.Context
 };
 
-pub const Operation = struct {
-    handle: *c.MlirOperation,
-    
-    pub fn create(ctx: Context, op_name: []const u8, args: CreateArgs) Self
-    pub fn getResult(self: Self, index: usize) Value
-    pub fn deinit(self: Self) void
-};
+// Serialize MLIR modules for network transmission
+pub fn serializeMLIRModule(allocator: Allocator, module: mlir.Module) ![]u8
 
-pub const Value = struct {
-    handle: *c.MlirValue,
-    
-    pub fn getType(self: Self) Type
-};
+// Deserialize MLIR modules on worker nodes
+pub fn deserializeMLIRModule(allocator: Allocator, context: mlir.Context, data: []const u8) !mlir.Module
 ```
 
 ## Automatic Differentiation
 
-### VJP-Based Reverse Mode AD
+### Function-as-a-Unit Pattern
 
-PCP implements Vector-Jacobian Product (VJP) automatic differentiation:
+PCP uses a Function-as-a-Unit approach where complete training functions are differentiated:
 
 ```zig
-// VJP function signature
-const VJPFn = *const fn(
+// Create forward+loss function that autodiff can process
+fn buildForwardAndLossFunction(builder: *MLIRBuilder) !mlir.Operation {
+    // Define function: func(params, inputs, targets) -> (loss)
+    const func_op = mlir.Operation.create(builder.ctx, "func.func", .{
+        .attributes = &.{
+            .{ "function_type", mlir.Attribute.typeAttr(func_type) },
+            .{ "sym_name", mlir.Attribute.stringAttr(builder.ctx, "forward_and_loss_fn") },
+        },
+    });
+
+    // Build forward computation and loss calculation inside function
+    // ...
+
+    return func_op;
+}
+```
+
+### Gradient Graph Generation (`src/autodiff.zig`)
+
+The autodiff system generates gradient functions automatically:
+
+```zig
+// Generate gradient function from forward function
+pub fn buildGradientGraph(
+    allocator: Allocator,
     builder: *MLIRBuilder,
-    op: mlir.Operation,
-    adjoints: []const mlir.Value,
-) anyerror![]mlir.Value;
+    forward_fn: mlir.Operation
+) !void {
+    // Apply autodiff transformation to create gradient function
+    // The result is a new func.func that computes gradients
+}
 ```
 
-### Compile-Time VJP Dispatch
+### Complete Training Graph Construction
 
-Operations are mapped to their VJP rules at compile time:
+Training algorithms build complete MLIR modules with forward, gradient, and update logic:
 
 ```zig
-fn getVjpFn(comptime op_name: []const u8) VJPFn {
-    if (std.mem.eql(u8, op_name, "stablehlo.add")) {
-        return addVJP;
-    } else if (std.mem.eql(u8, op_name, "stablehlo.multiply")) {
-        return multiplyVJP;
-    // ... more operations
-    } else {
-        @compileError("No VJP rule defined for: " ++ op_name);
+// Build complete worker training graph
+fn buildWorkerTrainingGraph(self: *DiLoCo) ![]u8 {
+    // 1. Create forward+loss function
+    const forward_fn = try self.buildForwardAndLossFunction(&builder);
+
+    // 2. Differentiate to create gradient function
+    _ = try autodiff.buildGradientGraph(self.allocator, &builder, forward_fn);
+
+    // 3. Create main orchestration function that calls both
+    const main_func = try self.buildMainFunction(&builder);
+
+    // 4. Serialize complete module for workers
+    return try serializeMLIRModule(self.allocator, builder.module);
+}
+```
+
+## Backend Execution
+
+### Backend Abstraction (`src/backends/worker_backend.zig`)
+
+PCP provides a backend-agnostic interface for executing MLIR modules:
+
+```zig
+pub const WorkerBackend = struct {
+    ptr: *anyopaque,
+    vtable: *const VTable,
+
+    pub const VTable = struct {
+        executeTrainingStep: *const fn(ptr: *anyopaque, mlir_module: mlir.Module, inputs: [][]const u8) anyerror![][]u8,
+        deinit: *const fn(ptr: *anyopaque) void,
+    };
+};
+```
+
+### Metal Backend (`src/backends/metal.zig`)
+
+Cross-platform GPU execution through SPIR-V bridge:
+
+```zig
+pub const MetalBackend = struct {
+    // Execution flow: MLIR → SPIR-V → Metal Shading Language → MTLLibrary
+    pub fn executeTrainingStep(
+        self: *Self,
+        mlir_module: mlir.Module,
+        inputs: [][]const u8
+    ) ![][]u8 {
+        // 1. Lower MLIR to SPIR-V
+        const spirv_binary = try self.lowerToSPIRV(mlir_module);
+
+        // 2. Cross-compile SPIR-V to MSL using SPIRV-Cross
+        const msl_source = try self.spirvToMSL(spirv_binary);
+
+        // 3. Compile MSL to Metal library and execute
+        return try self.executeOnMetal(msl_source, inputs);
     }
-}
+};
 ```
 
-### VJP Rules
+### SPIR-V Bridge (`src/mlir/spirv_bridge.cpp`)
 
-Each operation implements its mathematical gradient:
+Handles MLIR to SPIR-V translation and cross-compilation:
 
-```zig
-// Addition: both inputs get same gradient
-fn addVJP(builder: *MLIRBuilder, op: Operation, adjoints: []const Value) ![]Value {
-    const grad_out = adjoints[0];
-    return &.{ grad_out, grad_out }; // da = db = grad_out
-}
+```cpp
+// Lower MLIR module to SPIR-V binary
+extern "C" bool mlirLowerToSPIRV(
+    MlirModule module,
+    uint8_t** spirv_data,
+    size_t* spirv_size
+);
 
-// Multiplication: da = grad_out * b, db = grad_out * a  
-fn multiplyVJP(builder: *MLIRBuilder, op: Operation, adjoints: []const Value) ![]Value {
-    const grad_out = adjoints[0];
-    const a = op.getOperand(0);
-    const b = op.getOperand(1);
-    
-    const grad_a = try builder.createOp("stablehlo.multiply", &.{ grad_out, b }, grad_out.getType());
-    const grad_b = try builder.createOp("stablehlo.multiply", &.{ grad_out, a }, grad_out.getType());
-    
-    return &.{ grad_a.getResult(0), grad_b.getResult(0) };
-}
-
-// Matrix multiplication: da = grad_out @ b^T, db = a^T @ grad_out
-fn matmulVJP(builder: *MLIRBuilder, op: Operation, adjoints: []const Value) ![]Value {
-    const grad_out = adjoints[0];
-    const a = op.getOperand(0);
-    const b = op.getOperand(1);
-    
-    const b_t = try builder.createOp("stablehlo.transpose", &.{b}, b.getType());
-    const a_t = try builder.createOp("stablehlo.transpose", &.{a}, a.getType()); 
-    
-    const grad_a = try builder.createOp("stablehlo.dot_general", &.{ grad_out, b_t.getResult(0) }, grad_out.getType());
-    const grad_b = try builder.createOp("stablehlo.dot_general", &.{ a_t.getResult(0), grad_out }, grad_out.getType());
-    
-    return &.{ grad_a.getResult(0), grad_b.getResult(0) };
-}
+// Cross-compile SPIR-V to Metal Shading Language
+extern "C" bool spirvCrossCompileToMSL(
+    const uint8_t* spirv_data,
+    size_t spirv_size,
+    char** msl_source
+);
 ```
 
-### AutoDiff API
+## Monitoring and Dashboard
 
-High-level automatic differentiation interface:
+### TUI Dashboard (`src/dashboard.zig`)
+
+Real-time training monitoring with terminal user interface:
 
 ```zig
-var autodiff = AutoDiff.init(allocator, &builder);
+pub const Dashboard = struct {
+    pub fn init(allocator: Allocator) !Self
+    pub fn start(self: *Self) !void
+    pub fn stop(self: *Self) void
 
-// Transform forward function to gradient function
-const grad_fn = try autodiff.grad(forward_fn);
+    // Updates displayed in real-time
+    pub fn updateTrainingStatus(self: *Self, status: TrainingStatus) void
+    pub fn updateMetrics(self: *Self, epoch: u64, loss: f32, workers: u32) void
+    pub fn updateEpochTime(self: *Self, time_ms: u64) void
+};
+```
 
-// Get both value and gradients
-const value_and_grad_fn = try autodiff.valueAndGrad(forward_fn);
+**Dashboard features:**
+- Real-time training metrics (loss, epoch time, worker count)
+- System resource monitoring
+- Training algorithm status
+- Network connectivity status
+- MLIR compilation and execution logs
+
+### Monitoring System (`src/monitoring.zig`)
+
+Centralized metrics collection and reporting:
+
+```zig
+// Global monitoring state
+pub fn setStatus(status: TrainingStatus) void
+pub fn setMetrics(epoch: u64, loss: f32, worker_count: u32) void
+pub fn setEpochTime(time_ms: u64) void
+pub fn setModelInfo(param_count: usize, learning_rate: f32) void
+
+// Retrieve current metrics
+pub fn getMetrics() TrainingMetrics
+pub fn getStatus() TrainingStatus
 ```
 
 ## API Reference
 
-### Tensor Creation
+### Running Distributed Training
 
-```zig
-// Create tensors
-var tensor = try Tensor.zeros(allocator, &[_]usize{2, 3}, .f32, .cpu);
-var tensor = try Tensor.ones(allocator, &[_]usize{2, 3}, .f32, .cpu);
-var tensor = try Tensor.filled(allocator, &[_]usize{2, 3}, .f32, 5.0, .cpu);
-var tensor = try Tensor.random(allocator, &[_]usize{2, 3}, .f32, .cpu);
+Start a distributed training session with shepherd and workers:
 
-// From data
-const data = &[_]f32{ 1.0, 2.0, 3.0, 4.0 };
-var tensor = try Tensor.fromSlice(allocator, data, &[_]usize{2, 2}, .cpu);
+```bash
+# Terminal 1: Start shepherd coordinator
+zig run src/main_distributed.zig -- --shepherd --workers 2
+
+# Terminal 2: Start first worker
+zig run src/main_distributed.zig -- --worker --connect 127.0.0.1:8080
+
+# Terminal 3: Start second worker
+zig run src/main_distributed.zig -- --worker --connect 127.0.0.1:8080
 ```
 
-### Basic Operations
+### Key File Structure
 
-```zig
-// Arithmetic operations
-const c = try ops.add(&builder, a, b);
-const c = try ops.subtract(&builder, a, b);  
-const c = try ops.multiply(&builder, a, b);
-const c = try ops.divide(&builder, a, b);
-
-// Matrix operations
-const c = try ops.matmul(&builder, a, b);
-
-// Activation functions
-const activated = try ops.relu(&builder, input);
-
-// Tensor manipulation
-const transposed = try ops.transpose(&builder, tensor, &[_]i64{1, 0});
-const reshaped = try ops.reshape(&builder, tensor, &[_]i64{4, 2});
+```
+src/
+├── controllers/shepherd.zig      # Distributed training coordinator
+├── worker.zig                    # Worker node implementation
+├── algorithms/diloco.zig          # DiLoCo distributed training algorithm
+├── backends/                     # Hardware execution backends
+│   ├── worker_backend.zig        # Backend abstraction interface
+│   └── metal.zig                 # Metal GPU backend
+├── mlir/                         # MLIR integration layer
+│   ├── c.zig                     # MLIR C API bindings
+│   ├── pass_anchors.cpp          # StableHLO pass registration
+│   └── spirv_bridge.cpp          # SPIR-V compilation bridge
+├── autodiff.zig                  # Function-as-a-Unit autodiff
+├── dashboard.zig                 # TUI monitoring dashboard
+├── monitoring.zig                # Metrics collection system
+└── execution.zig                 # Backend execution abstraction
 ```
 
-### Memory Management
+### Development Workflow
 
-```zig
-// All tensors must be properly freed
-var tensor = try Tensor.zeros(allocator, shape, .f32, .cpu);
-defer tensor.deinit();
+1. **Model Development**: Create models that generate MLIR computation graphs
+2. **Algorithm Integration**: Implement training algorithms that combine models with autodiff
+3. **Backend Testing**: Verify GPU execution through SPIR-V bridge
+4. **Distributed Deployment**: Scale training across multiple worker nodes
+5. **Monitoring**: Use TUI dashboard for real-time training observation
 
-// MLIRBuilder manages MLIR context
-var builder = try ops.MLIRBuilder.init(allocator);
-defer builder.deinit();
-```
-
-## Examples
-
-### Basic Neural Network
-
-```zig
-const std = @import("std");
-const pcp = @import("pcp");
-
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{});
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
-    
-    // Create MLIR builder
-    var builder = try pcp.ops.MLIRBuilder.init(allocator);
-    defer builder.deinit();
-    
-    // Create tensors
-    const shape = &[_]usize{2, 2};
-    var x = try pcp.tensor.Tensor.ones(allocator, shape, .f32, .cpu);
-    var w = try pcp.tensor.Tensor.random(allocator, shape, .f32, .cpu);
-    defer x.deinit();
-    defer w.deinit();
-    
-    // Forward pass: output = relu(x @ w)
-    const matmul_result = try pcp.ops.matmul(&builder, x, w);
-    const output = try pcp.ops.relu(&builder, matmul_result);
-    defer matmul_result.deinit();
-    defer output.deinit();
-    
-    // Automatic differentiation
-    var autodiff = pcp.autodiff.AutoDiff.init(allocator, &builder);
-    const grad_fn = try autodiff.grad(output.operation);
-    
-    std.debug.print("Forward pass completed!\n", .{});
-}
-```
-
-### GPT-2 Model
-
-```zig
-// Create GPT-2 model with MLIR operations
-var model = try GPT2.init(allocator, config, .cpu);
-defer model.deinit();
-
-// Forward pass
-const logits = try model.forward(&builder, input_ids);
-defer logits.deinit();
-
-// Compute gradients
-var autodiff = AutoDiff.init(allocator, &builder);
-const grad_fn = try autodiff.grad(logits.operation);
-```
-
-## Best Practices
-
-### Memory Management
-
-1. **Always use defer**: Every tensor and builder must be cleaned up
-   ```zig
-   var tensor = try Tensor.zeros(allocator, shape, .f32, .cpu);
-   defer tensor.deinit(); // Always defer cleanup
-   ```
-
-2. **One builder per computation**: Create MLIRBuilder once per computation graph
-   ```zig
-   var builder = try MLIRBuilder.init(allocator);
-   defer builder.deinit();
-   // Use same builder for all related operations
-   ```
-
-3. **Clean up intermediate results**: Free temporary tensors promptly
-   ```zig
-   const temp = try ops.add(&builder, a, b);
-   defer temp.deinit(); // Clean up intermediate results
-   const result = try ops.multiply(&builder, temp, c);
-   ```
-
-### Error Handling
-
-1. **Propagate errors**: Use `try` for all tensor operations
-   ```zig
-   const result = try ops.matmul(&builder, a, b); // Propagate errors
-   ```
-
-2. **Handle shape mismatches**: Operations validate tensor shapes
-   ```zig
-   // This will return error.IncompatibleShapes if shapes don't match
-   const result = try ops.add(&builder, a, b);
-   ```
-
-### Performance
-
-1. **Batch operations**: Group related operations in single builder
-2. **Use appropriate data types**: f32 for most ML, f16 for memory efficiency
-3. **Leverage MLIR optimizations**: Let MLIR optimize the computation graph
-
-### MLIR Integration
-
-1. **Understand operation mapping**: Know how Zig ops map to StableHLO
-2. **Use dialect wrappers**: Prefer wrapper functions over raw C API
-3. **Handle MLIR resources**: Ensure proper cleanup of MLIR contexts
-
-This documentation covers the essential aspects of using PCP's MLIR-based tensor computation framework. For implementation details, refer to the source code and examples.
+This documentation covers the current distributed MLIR-based training architecture. The system is designed for scalable, cross-platform ML training with real-time monitoring and GPU acceleration.

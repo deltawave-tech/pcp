@@ -73,7 +73,7 @@ pub fn NesterovMLIR(comptime T: type) type {
             // Step 1: Compute lookahead parameters
             // lookahead = params - momentum * velocity
             const momentum_velocity = try ops.multiply(self.builder, momentum_tensor, self.velocity.?);
-            const lookahead = try ops.subtract(self.builder, params, momentum_velocity);
+            _ = try ops.subtract(self.builder, params, momentum_velocity);
 
             // NOTE: In a real implementation, gradients should be recomputed at lookahead position
             // For now, we assume gradients are already computed at the lookahead position

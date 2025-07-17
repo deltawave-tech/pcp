@@ -3,6 +3,8 @@ const tensor = @import("../tensor.zig");
 const mlir = @import("../mlir.zig");
 const ops = @import("../ops.zig");
 const mlir_ctx = @import("../mlir_ctx.zig");
+const execution = @import("../execution.zig");
+const worker_backend = @import("worker_backend.zig");
 const builtin = @import("builtin");
 const c = @import("../mlir/c.zig").c;
 
@@ -165,17 +167,38 @@ pub const MLIRMetalExecutionEngine = struct {
         self.compiled_library = null;
         self.mlir_context = null;
     }
+
+    /// Provide the generic Executor interface for algorithms
+    /// This decouples algorithms from knowing about Metal specifically
+    pub fn asExecutor(self: *MLIRMetalExecutionEngine) execution.Executor {
+        return .{
+            .ptr = self,
+            .vtable = &.{
+                .materialize = metal_materialize,
+                .deinit = metal_executor_deinit,
+            },
+        };
+    }
+
+    /// Provide the generic WorkerBackend interface for workers
+    /// This allows workers to execute training steps without knowing about Metal
+    pub fn asWorkerBackend(self: *MLIRMetalExecutionEngine) worker_backend.WorkerBackend {
+        return .{
+            .ptr = self,
+            .vtable = &.{
+                .executeTrainingStep = metal_execute_training_step,
+                .deinit = metal_worker_backend_deinit,
+            },
+        };
+    }
     
     /// Execute an MLIR module on Metal hardware
     /// Execute a specific function operation with tensor inputs and outputs
-    pub fn executeFunction(self: *MLIRMetalExecutionEngine, func_op: mlir.Operation, inputs: []const Tensor, outputs: []Tensor) ![][]f32 {
-        // 1. Create a new module to hold the function for compilation
-        const temp_module = try mlir.Module.createEmpty(mlir.Context{ .handle = self.mlir_context.?.context });
-        defer temp_module.deinit();
+    pub fn executeFunction(self: *MLIRMetalExecutionEngine, func_module: mlir.Module, inputs: []const Tensor, outputs: []Tensor) ![][]f32 {
+        // FIXED: Since autodiff now works in single context, we can use the module 
+        // that contains the function directly instead of cloning
         
-        // 2. CLONE the gradient function into the new module using the new utility
-        const cloned_func_op = try self.cloneFunctionToModule(func_op, temp_module);
-        _ = cloned_func_op; // cloned_func_op is now inside temp_module
+        // The module is now passed directly, eliminating the need for cloning
         
         // 3. Extract REAL data from the input Tensors using extractDataFromConstantOp
         var input_arrays = std.ArrayList([]const f32).init(self.allocator);
@@ -203,8 +226,8 @@ pub const MLIRMetalExecutionEngine = struct {
             try output_arrays.append(try self.allocator.alloc(f32, 1));
         }
         
-        // 5. Execute the module containing ONLY the cloned function
-        try self.executeMLIRModule(temp_module, input_arrays.items, output_arrays.items);
+        // 5. Execute the module directly (no cloning needed)
+        try self.executeMLIRModule(func_module, input_arrays.items, output_arrays.items);
         
         // 6. Copy results back to output tensors (if provided) and prepare return data
         var result_arrays = std.ArrayList([]f32).init(self.allocator);
@@ -237,133 +260,7 @@ pub const MLIRMetalExecutionEngine = struct {
         return result_arrays.toOwnedSlice();
     }
     
-    /// Clone a function operation to a destination module using ValueMap approach
-    fn cloneFunctionToModule(
-        self: *MLIRMetalExecutionEngine,
-        source_fn_op: mlir.Operation,
-        dest_module: mlir.Module,
-    ) !mlir.Operation {
-        // A map from old MlirValue handles to new MlirValue handles
-        var value_map = std.AutoHashMap(mlir.Value, mlir.Value).init(self.allocator);
-        defer value_map.deinit();
-        
-        // --- 1. Get signature from the source function ---
-        _ = c.operationGetAttributeByName(source_fn_op.handle, "function_type");
-        // Note: This function doesn't return null - it returns a valid attribute or the operation fails
-        
-        // --- 2. Create the new function shell in the destination module ---
-        const location = mlir.Location.unknown(mlir.Context{ .handle = self.mlir_context.?.context });
-        const op_name_str = "func.func";
-        
-        var new_op_state = c.operationStateGet(op_name_str, location.handle);
-        
-        // Copy attributes from source function
-        var attributes = std.ArrayList(c.MlirNamedAttribute).init(self.allocator);
-        defer attributes.deinit();
-        
-        const num_attrs = source_fn_op.getNumAttributes();
-        for (0..num_attrs) |i| {
-            const attr = source_fn_op.getAttribute(i);
-            try attributes.append(attr);
-        }
-        
-        if (attributes.items.len > 0) {
-            c.mlirOperationStateAddAttributes(&new_op_state, @intCast(attributes.items.len), @ptrCast(attributes.items.ptr));
-        }
-        
-        // Create a region for the function body
-        const region = c.regionCreate();
-        c.operationStateAddOwnedRegions(&new_op_state, 1, @ptrCast(@constCast(&region)));
-        
-        // Create the new function operation
-        const dest_fn_op = mlir.Operation{ .handle = c.operationCreate(&new_op_state) };
-        
-        // Add the function to the destination module
-        const dest_module_body = c.moduleGetBody(dest_module.handle);
-        c.blockAppendOwnedOperation(dest_module_body, dest_fn_op.handle);
-        
-        // Create an entry block for the new function
-        const dest_region = dest_fn_op.getRegion(0);
-        // Create empty arrays for block arguments
-        const args: [*]*c.MlirType = undefined;
-        const locs: [*]*c.MlirLocation = undefined;
-        const dest_block = mlir.Block{ .handle = c.blockCreate(0, args, locs) };
-        dest_region.appendOwnedBlock(dest_block);
-        
-        // --- 3. Map block arguments ---
-        const source_block = source_fn_op.getRegion(0).getBlock(0);
-        const num_args = source_block.getNumArguments();
-        
-        for (0..num_args) |i| {
-            const old_arg = source_block.getArgument(i);
-            const new_arg = dest_block.addArgument(old_arg.getType(), location);
-            try value_map.put(old_arg, new_arg);
-        }
-        
-        // --- 4. Iterate and rebuild operations ---
-        var maybe_op = source_block.getFirstOp();
-        while (maybe_op) |old_op| {
-            // Prepare state for the new operation
-            const old_op_name = old_op.getName();
-            var op_state = c.operationStateGet(old_op_name, old_op.getLocation().handle);
-            
-            // Remap operands
-            var new_operands = std.ArrayList(*c.MlirValue).init(self.allocator);
-            defer new_operands.deinit();
-            
-            for (0..old_op.getNumOperands()) |i| {
-                const old_operand = old_op.getOperand(i);
-                const new_operand = value_map.get(old_operand) orelse {
-                    return error.UnmappedOperand;
-                };
-                try new_operands.append(new_operand.handle);
-            }
-            
-            if (new_operands.items.len > 0) {
-                c.mlirOperationStateAddOperands(&op_state, @intCast(new_operands.items.len), new_operands.items.ptr);
-            }
-            
-            // Copy result types
-            var result_types = std.ArrayList(*c.MlirType).init(self.allocator);
-            defer result_types.deinit();
-            
-            for (0..old_op.getNumResults()) |i| {
-                const old_result = old_op.getResult(i);
-                try result_types.append(old_result.getType().handle);
-            }
-            
-            if (result_types.items.len > 0) {
-                c.mlirOperationStateAddResults(&op_state, @intCast(result_types.items.len), result_types.items.ptr);
-            }
-            
-            // Copy attributes
-            var op_attributes = std.ArrayList(c.MlirNamedAttribute).init(self.allocator);
-            defer op_attributes.deinit();
-            
-            const num_op_attrs = old_op.getNumAttributes();
-            for (0..num_op_attrs) |i| {
-                const attr = old_op.getAttribute(i);
-                try op_attributes.append(attr);
-            }
-            
-            if (op_attributes.items.len > 0) {
-                c.mlirOperationStateAddAttributes(&op_state, @intCast(op_attributes.items.len), @ptrCast(op_attributes.items.ptr));
-            }
-            
-            // Create the new operation
-            const new_op = mlir.Operation{ .handle = c.operationCreate(&op_state) };
-            dest_block.appendOwnedOperation(new_op);
-            
-            // Update the value map with the new results
-            for (0..old_op.getNumResults()) |i| {
-                try value_map.put(old_op.getResult(i), new_op.getResult(i));
-            }
-            
-            maybe_op = old_op.getNext();
-        }
-        
-        return dest_fn_op;
-    }
+    
     
     /// Extract data from a stablehlo.constant operation
     fn extractDataFromConstantOp(self: *MLIRMetalExecutionEngine, value: mlir.Value) ![]const f32 {
@@ -677,3 +574,80 @@ pub const MLIRMetalBackend = struct {
         return true; // Placeholder
     }
 };
+
+// Executor interface implementation functions
+/// The concrete implementation of the vtable materialize function
+fn metal_materialize(ptr: *anyopaque, t: tensor.Tensor(void)) ![]u8 {
+    const self: *MLIRMetalExecutionEngine = @ptrCast(@alignCast(ptr));
+    
+    // 1. Create a temporary module with just a return operation for this tensor
+    var temp_builder = try ops.MLIRBuilder.init(self.allocator);
+    defer temp_builder.deinit();
+    
+    // Create a simple function that returns the tensor value
+    const return_op = try temp_builder.createAndAttach("func.return", &.{t.value}, &.{});
+    _ = return_op;
+
+    // 2. Determine output buffer size from tensor shape
+    const elem_count = t.shape.elemCount();
+    const byte_count = elem_count * t.shape.dtype.sizeInBytes();
+    const output_bytes = try self.allocator.alloc(u8, byte_count);
+
+    // 3. Convert the []u8 to a [][]f32 for the current executeMLIRModule signature
+    const output_f32_slice: []f32 = @alignCast(std.mem.bytesAsSlice(f32, output_bytes));
+
+    // 4. Execute the module through the complete MLIR pipeline
+    // Inputs are empty since this tensor represents the final computation result
+    var output_slices = [_][]f32{output_f32_slice};
+    try self.executeMLIRModule(temp_builder.module, &.{}, output_slices[0..]);
+    
+    return output_bytes;
+}
+
+/// Executor deinit vtable function
+fn metal_executor_deinit(ptr: *anyopaque) void {
+    const self: *MLIRMetalExecutionEngine = @ptrCast(@alignCast(ptr));
+    self.deinit();
+}
+
+// WorkerBackend interface implementation functions
+/// Execute a training step defined by an MLIR module
+fn metal_execute_training_step(ptr: *anyopaque, mlir_module: mlir.Module, inputs: [][]const u8) ![][]u8 {
+    const self: *MLIRMetalExecutionEngine = @ptrCast(@alignCast(ptr));
+    
+    // 1. Lower the MLIR module through the complete StableHLO → SPIR-V → Metal pipeline
+    if (self.mlir_context) |ctx| {
+        try ctx.lowerToSPIRV(mlir_module);
+    }
+    
+    // 2. Convert input bytes to Metal buffers and execute the training step
+    // This is where the full compiled MLIR graph executes on Metal hardware
+    
+    // For now, this is a placeholder that shows the structure:
+    // In a full implementation, this would:
+    // - Create Metal buffers from input bytes
+    // - Execute the lowered compute shaders
+    // - Return updated parameters and loss as byte arrays
+    
+    var outputs = try self.allocator.alloc([]u8, 2); // parameters + loss
+    
+    // Placeholder: echo back the first input as "updated parameters"
+    if (inputs.len > 0) {
+        outputs[0] = try self.allocator.dupe(u8, inputs[0]);
+    } else {
+        outputs[0] = try self.allocator.alloc(u8, 0);
+    }
+    
+    // Placeholder: create dummy loss value (4 bytes for f32)
+    outputs[1] = try self.allocator.alloc(u8, 4);
+    const loss_value: f32 = 0.5; // Dummy loss
+    @memcpy(outputs[1], std.mem.asBytes(&loss_value));
+    
+    return outputs;
+}
+
+/// WorkerBackend deinit vtable function
+fn metal_worker_backend_deinit(ptr: *anyopaque) void {
+    const self: *MLIRMetalExecutionEngine = @ptrCast(@alignCast(ptr));
+    self.deinit();
+}

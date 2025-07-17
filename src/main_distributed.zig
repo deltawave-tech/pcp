@@ -11,11 +11,17 @@ const shepherd = @import("controllers/shepherd.zig");
 const worker = @import("worker.zig");
 const diloco = @import("algorithms/diloco.zig");
 const training_algorithm = @import("algorithms/training_algorithm.zig");
+const backend_selection = @import("backend_selection.zig");
+const ops = @import("ops.zig");
+const mlir = @import("mlir.zig");
+const autodiff = @import("autodiff.zig");
+const dashboard = @import("dashboard.zig");
 
 const Shepherd = shepherd.Shepherd;
 const Worker = worker.Worker;
 const DiLoCo = diloco.DiLoCo;
 const DiLoCoConfig = diloco.DiLoCoConfig;
+const MLIRBuilder = ops.MLIRBuilder;
 
 /// Command line arguments
 const Args = struct {
@@ -29,7 +35,7 @@ const Args = struct {
         worker,
     };
     
-    pub fn parse(allocator: Allocator, args: [][]const u8) !Args {
+    pub fn parse(_: Allocator, args: [][:0]u8) !Args {
         if (args.len < 2) {
             return Args{
                 .mode = .shepherd,
@@ -91,45 +97,58 @@ const Args = struct {
     }
     
     pub fn printUsage() void {
-        print("Usage: pcp_distributed [options]\n");
-        print("Options:\n");
-        print("  --shepherd           Run as Shepherd coordinator (default)\n");
-        print("  --worker             Run as Worker\n");
-        print("  --connect <host:port> Connect to Shepherd at host:port\n");
-        print("  --host <host>        Host to bind/connect to (default: 127.0.0.1)\n");
-        print("  --port <port>        Port to bind/connect to (default: 8080)\n");
-        print("  --workers <count>    Number of workers to wait for (default: 2)\n");
-        print("  --help               Show this help message\n");
+        print("Usage: pcp_distributed [options]\n", .{});
+        print("Options:\n", .{});
+        print("  --shepherd           Run as Shepherd coordinator (default)\n", .{});
+        print("  --worker             Run as Worker\n", .{});
+        print("  --connect <host:port> Connect to Shepherd at host:port\n", .{});
+        print("  --host <host>        Host to bind/connect to (default: 127.0.0.1)\n", .{});
+        print("  --port <port>        Port to bind/connect to (default: 8080)\n", .{});
+        print("  --workers <count>    Number of workers to wait for (default: 2)\n", .{});
+        print("  --help               Show this help message\n", .{});
     }
 };
 
+
 /// Run as Shepherd coordinator
 fn runShepherd(allocator: Allocator, args: Args) !void {
-    print("👹 Starting Shepherd coordinator...\n");
+    print("👹 Starting Shepherd coordinator...\n", .{});
     print("   Host: {s}\n", .{args.host});
     print("   Port: {}\n", .{args.port});
     print("   Waiting for {} workers\n", .{args.workers});
+    print("   Backend: Metal (M3 Mac Pro)\n", .{});
     
-    var shepherd_controller = Shepherd.init(allocator);
-    defer shepherd_controller.deinit();
+    // NEW: Use the backend selection system
+    var system = try backend_selection.DistributedTrainingSystem.init(
+        allocator,
+        .metal // We are on a Mac
+    );
+    defer system.deinit();
+
+    // Now use system.shepherd instead of a local variable
+    const shepherd_controller = &system.shepherd;
     
-    // Create and configure DiLoCo algorithm
     const diloco_config = DiLoCoConfig.default();
-    var diloco_algo = DiLoCo.init(allocator, &shepherd_controller, diloco_config);
+    
+    // The `createDiLoCoAlgorithm` helper is perfect here.
+    var diloco_algo = try system.createDiLoCoAlgorithm(diloco_config);
     defer diloco_algo.deinit();
     
-    // Set the algorithm in the shepherd
     var training_algo = diloco_algo.asTrainingAlgorithm();
     shepherd_controller.setAlgorithm(&training_algo);
     
     // Start listening for workers in a separate thread
-    const listen_thread = try std.Thread.spawn(.{}, shepherdListenThread, .{ &shepherd_controller, args.host, args.port });
+    const listen_thread = try std.Thread.spawn(.{}, shepherdListenThread, .{ shepherd_controller, args.host, args.port });
     listen_thread.detach();
+    
+    // Start the TUI dashboard in its own thread
+    const dashboard_thread = try std.Thread.spawn(.{}, dashboard.runDashboard, .{});
+    defer dashboard_thread.join();
     
     // Wait for workers and start training
     try shepherd_controller.startTraining(args.workers);
     
-    print("🌑 Training completed successfully!\n");
+    print("🌑 Training completed successfully!\n", .{});
 }
 
 /// Shepherd listening thread
@@ -139,10 +158,15 @@ fn shepherdListenThread(shepherd_controller: *Shepherd, host: []const u8, port: 
 
 /// Run as Worker
 fn runWorker(allocator: Allocator, args: Args) !void {
-    print("🐉 Starting Worker...\n");
+    print("🐉 Starting Worker...\n", .{});
     print("   Connecting to: {s}:{}\n", .{ args.host, args.port });
+    print("   Backend: Metal (M3 Mac Pro)\n", .{});
     
-    var worker_instance = Worker.init(allocator);
+    // NEW: Use the backend selection system
+    const backend = backend_selection.Backend.selectDefault();
+    const worker_backend = try backend_selection.createWorkerBackend(allocator, backend);
+    
+    var worker_instance = Worker.init(allocator, worker_backend);
     defer worker_instance.deinit();
     
     // Connect to shepherd
@@ -153,7 +177,7 @@ fn runWorker(allocator: Allocator, args: Args) !void {
     // Start worker main loop
     try worker_instance.run();
     
-    print("👋 Worker shutting down\n");
+    print("👋 Worker shutting down\n", .{});
 }
 
 /// Main function
@@ -176,8 +200,15 @@ pub fn main() !void {
     
     const args = try Args.parse(allocator, process_args);
     
-    print("🪐 PCP Distributed Training System\n");
-    print("=====================================\n");
+    print("🪐 PCP Distributed Training System\n", .{});
+    print("=====================================\n", .{});
+    
+    // Debug: Print parsed arguments
+    print("Mode: {s}\n", .{@tagName(args.mode)});
+    print("Host: {s}\n", .{args.host});
+    print("Port: {}\n", .{args.port});
+    print("Workers: {}\n", .{args.workers});
+    print("=====================================\n", .{});
     
     switch (args.mode) {
         .shepherd => try runShepherd(allocator, args),
@@ -202,7 +233,7 @@ pub fn testDistributedSystem(allocator: Allocator) !void {
 }
 
 /// Integration test - run a mini distributed training session
-pub fn testIntegration(allocator: Allocator) !void {
+pub fn testIntegration(_: Allocator) !void {
     std.log.info("Running integration test...");
     
     // This would spawn a shepherd and multiple workers in separate threads

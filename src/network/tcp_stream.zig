@@ -41,7 +41,7 @@ pub const TcpStreamManager = struct {
     pub fn receive(stream: net.Stream, allocator: Allocator) !MessageEnvelope {
         // Read the length prefix (4 bytes for u32)
         var length_bytes: [4]u8 = undefined;
-        try stream.readAll(&length_bytes);
+        _ = try stream.readAll(&length_bytes);
         const data_length = std.mem.readInt(u32, &length_bytes, .little);
         
         // Sanity check - prevent excessive memory allocation
@@ -52,7 +52,7 @@ pub const TcpStreamManager = struct {
         // Read exactly data_length bytes
         const json_data = try allocator.alloc(u8, data_length);
         defer allocator.free(json_data);
-        try stream.readAll(json_data);
+        _ = try stream.readAll(json_data);
         
         // Parse JSON back to MessageEnvelope
         const parsed = try MessageEnvelope.fromJsonString(json_data, allocator);

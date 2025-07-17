@@ -63,23 +63,20 @@ fn isValueFromConstantOp(value: mlir.Value) bool {
 /// Main automatic differentiation function - transforms forward graph to gradient graph
 pub fn buildGradientGraph(
     allocator: Allocator,
-    _: *MLIRBuilder,
+    builder: *MLIRBuilder,
     forward_fn: mlir.Operation,
 ) !mlir.Operation {
     std.debug.print("Building gradient graph from forward function...\n", .{});
     
-    // 1. Create a new, separate builder for the gradient graph.
-    // This ensures ops are inserted into the new function, not the old one.
-    var grad_builder = try MLIRBuilder.init(allocator);
-    defer grad_builder.deinit();
+    // FIXED: Use the existing builder to maintain single context
+    // This ensures gradient graph is built in the same context as forward graph
+    
+    // 1. Create the gradient function within the existing module/context  
+    const gradient_fn = try createGradientFunction(builder, forward_fn);
 
-    // 2. Create the gradient function SHELL inside the NEW builder's module.
-    const gradient_fn = try createGradientFunction(&grad_builder, forward_fn);
-
-    // 3. Create and append the entry block to the new gradient function.
-    // This is a CRITICAL step. The block needs to exist before we can append ops to it.
+    // 2. Create and append the entry block to the gradient function
     const grad_fn_region = gradient_fn.getRegion(0);
-    const grad_fn_block = try grad_builder.createBlock();
+    const grad_fn_block = try builder.createBlock();
     c.regionAppendOwnedBlock(grad_fn_region.handle, grad_fn_block.handle);
     
     std.debug.print("Created gradient function block and appended to region\n", .{});
@@ -108,7 +105,7 @@ pub fn buildGradientGraph(
     defer ones_shape.deinit();
     std.debug.print("Creating ones constant...\n", .{});
     const loss_type = loss_value.getType();
-    const ones_constant = try grad_builder.createConstant(ones_bytes, loss_type, ones_shape);
+    const ones_constant = try builder.createConstant(ones_bytes, loss_type, ones_shape);
     std.debug.print("Putting loss value in adjoint map...\n", .{});
     try adjoint_map.put(loss_value, ones_constant);
     
@@ -122,19 +119,21 @@ pub fn buildGradientGraph(
     
     std.debug.print("Starting VJP processing loop...\n", .{});
     
-    // Walk the forward graph backwards, applying VJP rules using the NEW builder
+    // Walk the forward graph backwards, applying VJP rules using the SHARED builder
     for (ops_reversed) |op| {
         std.debug.print("Processing operation VJP for: {s}\n", .{op.getName()});
-        try processOperationVJP(allocator, &grad_builder, op, &adjoint_map);
+        try processOperationVJP(allocator, builder, op, &adjoint_map);
     }
     
-    // Collect gradients and create return statement in the NEW builder
-    try finalizeGradientFunction(allocator, &grad_builder, gradient_fn, forward_fn, &adjoint_map);
+    // Collect gradients and create return statement using the SHARED builder
+    try finalizeGradientFunction(allocator, builder, gradient_fn, forward_fn, &adjoint_map);
     
     std.debug.print("✓ Successfully built gradient graph\n", .{});
+    std.debug.print("--- Gradient Graph (now safe to dump!) ---\n", .{});
+    gradient_fn.dump();
     
-    // The complete gradient graph is inside grad_builder.module.op()
-    return grad_builder.module.op();
+    // Return the gradient function (not the whole module)
+    return gradient_fn;
 }
 
 /// Process a single operation's VJP rule
@@ -318,15 +317,60 @@ fn transposeVJP(
     
     if (!isValueFromConstantOp(a)) {
         // Get the permutation attribute from the original transpose operation
-        _ = c.operationGetAttributeByName(op.handle, "permutation");
+        const permutation_attr = c.operationGetAttributeByName(op.handle, "permutation");
         
-        // TODO: For now, assume simple 2D transpose. A full implementation would
-        // parse the permutation attribute and compute the inverse permutation.
-        // For 2D transpose [1, 0], the inverse is also [1, 0]
-        
-        // Create transpose with inverse permutation
-        const grad_a_op = try builder.createAndAttach("stablehlo.transpose", &.{grad_out}, &.{grad_out.getType()});
-        try result.append(grad_a_op.getResult(0));
+        if (@intFromPtr(permutation_attr) != 0) {
+            // Get the rank to know how many elements in permutation
+            const input_type = a.getType().as(mlir.RankedTensorType).?;
+            const rank = input_type.getRank();
+            
+            // For DenseI64ArrayAttr, we need to parse it manually
+            // For now, use a simplified approach - assume common cases
+            var permutation = try builder.allocator.alloc(i64, rank);
+            defer builder.allocator.free(permutation);
+            
+            // Common case: 2D transpose [1, 0]
+            if (rank == 2) {
+                permutation[0] = 1;
+                permutation[1] = 0;
+            } else {
+                // General case: reverse all dimensions  
+                for (0..rank) |i| {
+                    permutation[i] = @intCast(rank - 1 - i);
+                }
+            }
+            
+            // Compute inverse permutation: if perm[i] = j, then inv_perm[j] = i
+            var inv_permutation = try builder.allocator.alloc(i64, rank);
+            defer builder.allocator.free(inv_permutation);
+            
+            for (permutation, 0..) |target_dim, source_dim| {
+                inv_permutation[@intCast(target_dim)] = @intCast(source_dim);
+            }
+            
+            // Create the inverse permutation attribute
+            const inv_perm_attr = c.mlirDenseI64ArrayGet(builder.ctx.handle, @intCast(rank), inv_permutation.ptr);
+            
+            // Create transpose operation with inverse permutation
+            var state = c.operationStateGet("stablehlo.transpose", builder.loc.handle);
+            c.mlirOperationStateAddOperands(&state, 1, @ptrCast(@constCast(&grad_out.handle)));
+            c.mlirOperationStateAddResults(&state, 1, @ptrCast(@constCast(&a.getType().handle)));
+            
+            // Add the permutation attribute
+            const attr_name = c.identifierGet(builder.ctx.handle, "permutation");
+            const named_attr = c.MlirNamedAttribute{ .name = attr_name, .attribute = inv_perm_attr };
+            c.mlirOperationStateAddAttributes(&state, 1, @ptrCast(@constCast(&named_attr)));
+            
+            const transpose_op = c.operationCreate(&state);
+            const body_block = builder.module.op().getRegion(0).getBlock(0);
+            body_block.appendOwnedOperation(mlir.Operation{ .handle = transpose_op });
+            
+            try result.append(mlir.Value{ .handle = c.operationGetResult(transpose_op, 0) });
+        } else {
+            // Fallback: assume simple 2D transpose [1, 0] -> [1, 0] (self-inverse)
+            const grad_a_op = try builder.createAndAttach("stablehlo.transpose", &.{grad_out}, &.{a.getType()});
+            try result.append(grad_a_op.getResult(0));
+        }
     }
     
     return result.toOwnedSlice();
@@ -456,11 +500,60 @@ fn reduceSumVJP(
     if (!isValueFromConstantOp(input)) {
         // Get the original input shape and broadcast the gradient back to it
         const original_shape_type = input.getType();
+        const input_tensor_type = original_shape_type.as(mlir.RankedTensorType).?;
+        _ = input_tensor_type; // Suppress unused variable warning
         
-        // For reduce_sum, we need to broadcast the gradient back to the original shape
-        // This is a simplified implementation - a full version would parse the reduction dimensions
-        const grad_input = try builder.createAndAttach("stablehlo.broadcast_in_dim", &.{grad_out}, &.{original_shape_type});
-        try result.append(grad_input.getResult(0));
+        // Get the dimensions attribute from the reduce_sum operation
+        const dimensions_attr = c.operationGetAttributeByName(op.handle, "dimensions");
+        
+        if (@intFromPtr(dimensions_attr) != 0) {
+            // Parse the dimensions that were reduced
+            // For DenseI64ArrayAttr, we need manual parsing
+            // For now, create broadcast_dimensions manually
+            
+            // The broadcast_dimensions should contain all dimensions from the original shape
+            // that were NOT in the reduction dimensions
+            var broadcast_dims = std.ArrayList(i64).init(builder.allocator);
+            defer broadcast_dims.deinit();
+            
+            // Simple heuristic: if grad_out is scalar (rank 0), all dims were reduced
+            const grad_out_type = grad_out.getType().as(mlir.RankedTensorType).?;
+            const grad_rank = grad_out_type.getRank();
+            
+            if (grad_rank == 0) {
+                // Full reduction to scalar - broadcast_dimensions is empty for scalar broadcast
+                const grad_input = try builder.createAndAttach("stablehlo.broadcast", &.{grad_out}, &.{original_shape_type});
+                try result.append(grad_input.getResult(0));
+            } else {
+                // Partial reduction - compute which dimensions remain
+                // For now, assume reduction kept the first grad_rank dimensions
+                for (0..@intCast(grad_rank)) |i| {
+                    try broadcast_dims.append(@intCast(i));
+                }
+                
+                // Create broadcast_in_dim with proper dimensions
+                const broadcast_dims_attr = c.mlirDenseI64ArrayGet(builder.ctx.handle, @intCast(broadcast_dims.items.len), broadcast_dims.items.ptr);
+                
+                var state = c.operationStateGet("stablehlo.broadcast_in_dim", builder.loc.handle);
+                c.mlirOperationStateAddOperands(&state, 1, @ptrCast(@constCast(&grad_out.handle)));
+                c.mlirOperationStateAddResults(&state, 1, @ptrCast(@constCast(&original_shape_type.handle)));
+                
+                // Add the broadcast_dimensions attribute
+                const attr_name = c.identifierGet(builder.ctx.handle, "broadcast_dimensions");
+                const named_attr = c.MlirNamedAttribute{ .name = attr_name, .attribute = broadcast_dims_attr };
+                c.mlirOperationStateAddAttributes(&state, 1, @ptrCast(@constCast(&named_attr)));
+                
+                const broadcast_op = c.operationCreate(&state);
+                const body_block = builder.module.op().getRegion(0).getBlock(0);
+                body_block.appendOwnedOperation(mlir.Operation{ .handle = broadcast_op });
+                
+                try result.append(mlir.Value{ .handle = c.operationGetResult(broadcast_op, 0) });
+            }
+        } else {
+            // Fallback: assume full reduction and use simple broadcast
+            const grad_input = try builder.createAndAttach("stablehlo.broadcast", &.{grad_out}, &.{original_shape_type});
+            try result.append(grad_input.getResult(0));
+        }
     }
     
     return result.toOwnedSlice();
@@ -557,13 +650,39 @@ fn createGradientFunction(builder: *MLIRBuilder, forward_fn: mlir.Operation) !ml
     
     // Create function type
     const function_type = mlir.Type.functionType(builder.ctx, input_types.items, output_types.items);
-    _ = function_type; // TODO: Use this when creating the actual function
     
-    // Return the builder's module operation - this ensures we're working with the same module
-    // that the builder will attach operations to
+    // Create the gradient function using the C API directly for proper region setup
+    const location = builder.loc;
+    var op_state = c.operationStateGet("func.func", location.handle);
+    
+    // Add attributes
+    const sym_name_attr = mlir.Attribute.stringAttr(builder.ctx, "gradient_function");
+    const function_type_attr = mlir.Attribute.typeAttr(function_type);
+    
+    const sym_name_id = c.identifierGet(builder.ctx.handle, "sym_name");
+    const function_type_id = c.identifierGet(builder.ctx.handle, "function_type");
+    
+    var attributes = [_]c.MlirNamedAttribute{
+        c.MlirNamedAttribute{ .name = sym_name_id, .attribute = sym_name_attr.handle },
+        c.MlirNamedAttribute{ .name = function_type_id, .attribute = function_type_attr.handle },
+    };
+    
+    c.mlirOperationStateAddAttributes(&op_state, 2, @ptrCast(&attributes));
+    
+    // Create and add a region for the function body
+    const region = c.regionCreate();
+    c.operationStateAddOwnedRegions(&op_state, 1, @ptrCast(@constCast(&region)));
+    
+    // Create the operation
+    const grad_fn = mlir.Operation{ .handle = c.operationCreate(&op_state) };
+    
+    // Add the gradient function to the module
+    const module_body = c.moduleGetBody(builder.module.handle);
+    c.blockAppendOwnedOperation(module_body, grad_fn.handle);
+    
     std.debug.print("Created gradient function with {} inputs and {} outputs\n", .{input_types.items.len, output_types.items.len});
     
-    return builder.module.op();
+    return grad_fn;
 }
 
 fn getOperationsInReverseOrder(allocator: Allocator, fn_op: mlir.Operation) ![]mlir.Operation {

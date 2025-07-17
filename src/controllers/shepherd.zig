@@ -8,12 +8,15 @@ const ArrayList = std.ArrayList;
 const tcp_stream = @import("../network/tcp_stream.zig");
 const message = @import("../network/message.zig");
 const training_algorithm = @import("../algorithms/training_algorithm.zig");
+const execution = @import("../execution.zig");
+const monitoring = @import("../monitoring.zig");
 
 const TcpServer = tcp_stream.TcpServer;
 const TcpStreamManager = tcp_stream.TcpStreamManager;
 const MessageEnvelope = message.MessageEnvelope;
 const MessageType = message.MessageType;
 const NodeId = message.NodeId;
+const Executor = execution.Executor;
 
 /// Represents a connected worker
 pub const WorkerConnection = struct {
@@ -42,6 +45,7 @@ pub const WorkerConnection = struct {
 };
 
 /// Shepherd coordinates distributed training across workers
+/// Now accepts an Executor to make algorithms backend-agnostic
 pub const Shepherd = struct {
     allocator: Allocator,
     server: ?TcpServer,
@@ -49,6 +53,7 @@ pub const Shepherd = struct {
     next_node_id: NodeId,
     is_running: bool,
     algorithm: ?*training_algorithm.TrainingAlgorithm, // Training algorithm interface
+    executor: ?Executor, // Generic execution backend for algorithms
     
     const Self = @This();
     
@@ -60,6 +65,7 @@ pub const Shepherd = struct {
             .next_node_id = 1, // Start from 1, 0 is reserved for coordinator
             .is_running = false,
             .algorithm = null,
+            .executor = null,
         };
     }
     
@@ -73,6 +79,11 @@ pub const Shepherd = struct {
             worker.stream.close();
         }
         self.worker_pool.deinit();
+        
+        // Clean up executor if owned
+        if (self.executor) |executor| {
+            executor.deinit();
+        }
     }
     
     /// Start listening for worker connections
@@ -125,6 +136,9 @@ pub const Shepherd = struct {
         const worker = WorkerConnection.init(assigned_node_id, stream);
         try self.worker_pool.append(worker);
         
+        // Update monitoring
+        monitoring.setWorkerCount(self.worker_pool.items.len);
+        
         std.log.info("Worker {} connected from {}", .{ assigned_node_id, stream });
         
         // Send JoinAccept response
@@ -155,6 +169,8 @@ pub const Shepherd = struct {
             const msg = TcpStreamManager.receive(stream, self.allocator) catch |err| {
                 std.log.warn("Worker {} disconnected: {}", .{ worker_id, err });
                 self.removeWorker(worker_id);
+                // Update monitoring after worker removal
+                monitoring.setWorkerCount(self.worker_pool.items.len);
                 return;
             };
             
@@ -180,7 +196,7 @@ pub const Shepherd = struct {
     }
     
     /// Handle inner loop completion from worker
-    fn handleInnerLoopComplete(self: *Self, worker_id: NodeId, msg: MessageEnvelope) !void {
+    fn handleInnerLoopComplete(_: *Self, worker_id: NodeId, msg: MessageEnvelope) !void {
         std.log.info("Worker {} completed inner loop", .{worker_id});
         
         // TODO: Process the parameters from the message
@@ -198,6 +214,8 @@ pub const Shepherd = struct {
             if (worker.node_id == worker_id) {
                 _ = self.worker_pool.swapRemove(i);
                 std.log.info("Removed worker {} from pool", .{worker_id});
+                // Update monitoring after worker removal
+                monitoring.setWorkerCount(self.worker_pool.items.len);
                 return;
             }
         }
@@ -213,6 +231,16 @@ pub const Shepherd = struct {
         self.algorithm = algorithm;
     }
     
+    /// Set the executor for algorithms to use
+    pub fn setExecutor(self: *Self, executor: Executor) void {
+        self.executor = executor;
+    }
+    
+    /// Get the executor for algorithms to use
+    pub fn getExecutor(self: *Self) ?Executor {
+        return self.executor;
+    }
+    
     /// Start training once we have enough workers
     pub fn startTraining(self: *Self, required_workers: usize) !void {
         std.log.info("Waiting for {} workers to join...", .{required_workers});
@@ -226,9 +254,9 @@ pub const Shepherd = struct {
         
         if (self.algorithm) |algo| {
             try algo.run();
-            std.log.info("Training algorithm completed successfully");
+            std.log.info("Training algorithm completed successfully", .{});
         } else {
-            std.log.warn("No training algorithm set");
+            std.log.warn("No training algorithm set", .{});
         }
     }
     
@@ -259,7 +287,7 @@ pub const Shepherd = struct {
     
     /// Collect responses from all workers
     pub fn collectFromWorkers(self: *Self, expected_msg_type: []const u8) !ArrayList(MessageEnvelope) {
-        var responses = ArrayList(MessageEnvelope).init(self.allocator);
+        const responses = ArrayList(MessageEnvelope).init(self.allocator);
         var received_count: usize = 0;
         
         // This is a simplified version - in practice, you'd need more sophisticated

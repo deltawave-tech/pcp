@@ -6,46 +6,17 @@ const net = std.net;
 const Allocator = std.mem.Allocator;
 const tcp_stream = @import("network/tcp_stream.zig");
 const message = @import("network/message.zig");
-const adam_mlir = @import("optimizers/adam_mlir.zig");
-const ops = @import("ops.zig");
+const worker_backend = @import("backends/worker_backend.zig");
 const mlir = @import("mlir.zig");
-const tensor = @import("tensor.zig");
+const mlir_ctx = @import("mlir_ctx.zig");
 
 const TcpClient = tcp_stream.TcpClient;
 const TcpStreamManager = tcp_stream.TcpStreamManager;
 const MessageEnvelope = message.MessageEnvelope;
 const MessageType = message.MessageType;
 const NodeId = message.NodeId;
+const WorkerBackend = worker_backend.WorkerBackend;
 
-/// Local model state for worker training
-const LocalModel = struct {
-    parameters: []f32,
-    gradients: []f32,
-    
-    const Self = @This();
-    
-    pub fn init(allocator: Allocator, param_count: usize) !Self {
-        const parameters = try allocator.alloc(f32, param_count);
-        const gradients = try allocator.alloc(f32, param_count);
-        
-        return Self{
-            .parameters = parameters,
-            .gradients = gradients,
-        };
-    }
-    
-    pub fn deinit(self: Self) void {
-        // Note: caller is responsible for freeing the slices
-    }
-    
-    pub fn updateParameters(self: *Self, new_params: []const f32) void {
-        std.mem.copy(f32, self.parameters, new_params);
-    }
-    
-    pub fn getParameters(self: Self) []const f32 {
-        return self.parameters;
-    }
-};
 
 /// Worker state
 pub const WorkerState = enum {
@@ -57,45 +28,41 @@ pub const WorkerState = enum {
 };
 
 /// Worker that connects to Shepherd and performs training
+/// Now backend-agnostic using the WorkerBackend interface
 pub const Worker = struct {
     allocator: Allocator,
     client: TcpClient,
     node_id: ?NodeId,
     state: WorkerState,
     is_running: bool,
-    // MLIR training infrastructure
-    mlir_builder: ?*ops.MLIRBuilder,
-    adam_optimizer: ?*adam_mlir.AdamMLIR(f32),
-    local_model: ?LocalModel,
+    
+    // Backend abstraction - handles all MLIR compilation and execution
+    backend: WorkerBackend,
+    
+    // MLIR context for deserializing modules
+    mlir_context: ?*mlir_ctx.MLIRContext,
     
     const Self = @This();
     
-    pub fn init(allocator: Allocator) Self {
+    pub fn init(allocator: Allocator, backend: WorkerBackend) Self {
         return Self{
             .allocator = allocator,
             .client = TcpClient.init(allocator),
             .node_id = null,
             .state = .disconnected,
             .is_running = false,
-            .mlir_builder = null,
-            .adam_optimizer = null,
-            .local_model = null,
+            .backend = backend,
+            .mlir_context = null,
         };
     }
     
     pub fn deinit(self: *Self) void {
         self.client.deinit();
+        self.backend.deinit();
         
-        if (self.adam_optimizer) |optimizer| {
-            optimizer.deinit();
-        }
-        
-        if (self.mlir_builder) |builder| {
-            builder.deinit();
-        }
-        
-        if (self.local_model) |model| {
-            model.deinit();
+        if (self.mlir_context) |ctx| {
+            ctx.deinit();
+            self.allocator.destroy(ctx);
         }
     }
     
@@ -119,7 +86,7 @@ pub const Worker = struct {
         );
         
         try self.client.send(join_request);
-        std.log.debug("Sent JoinRequest to Shepherd");
+        std.log.debug("Sent JoinRequest to Shepherd", .{});
         
         // Wait for JoinAccept
         const join_accept = try self.client.receive();
@@ -171,29 +138,74 @@ pub const Worker = struct {
     
     /// Handle StartInnerLoop command from Shepherd
     fn handleStartInnerLoop(self: *Self, msg: MessageEnvelope) !void {
-        std.log.info("Worker {} starting inner loop", .{self.node_id.?});
+        std.log.info("Worker {} received training graph.", .{self.node_id.?});
         self.state = .training;
-        
-        // Initialize MLIR infrastructure if not already done
-        if (self.mlir_builder == null) {
-            try self.initializeMLIRInfrastructure();
+
+        // Initialize MLIR context if needed
+        if (self.mlir_context == null) {
+            self.mlir_context = try self.allocator.create(mlir_ctx.MLIRContext);
+            self.mlir_context.?.* = try mlir_ctx.MLIRContext.init(self.allocator);
         }
+
+        // 1. Parse the delimiter-based payload (simpler than JSON)
+        const payload_bytes = switch (msg.data) {
+            .string => |s| s,
+            else => return error.InvalidMessageFormat,
+        };
         
-        // Deserialize master parameters from message payload
-        const master_params = try self.deserializeMasterParameters(msg);
-        defer self.allocator.free(master_params);
-        
-        // Initialize local model with master parameters
-        try self.initializeLocalModel(master_params);
-        
-        // Run local training loop using MLIR-based Adam optimizer
-        try self.runLocalTrainingLoop();
-        
-        // Serialize final local parameters
-        const final_params = try self.serializeLocalParameters();
-        defer self.allocator.free(final_params);
-        
-        // Send InnerLoopComplete response
+        const delimiter = "|||PARAMS|||";
+        const split_point = std.mem.indexOf(u8, payload_bytes, delimiter) orelse return error.InvalidPayload;
+
+        const graph_str = payload_bytes[0..split_point];
+        const params_bytes = payload_bytes[split_point + delimiter.len ..];
+
+        // 2. Parse the MLIR module from the graph string
+        const module = try mlir_ctx.deserializeMLIRModule(self.allocator, self.mlir_context.?.getContext(), graph_str);
+        defer module.deinit();
+
+        // 3. Generate RANDOM data for this test run on the worker
+        // This simulates having a local dataset shard.
+        const batch_size = 4;
+        const seq_length = 12;
+        const data_size_bytes = batch_size * seq_length * 4; // 4 bytes/f32
+
+        const random_data = try self.allocator.alloc(u8, data_size_bytes);
+        defer self.allocator.free(random_data);
+        // In a real scenario, you'd fill this with actual token IDs.
+        // For now, zeros are fine for testing the execution pipeline.
+        @memset(random_data, 0);
+
+        // 4. Package inputs for the backend: [master_params, input_ids, targets]
+        // The order MUST match the function signature defined in the Shepherd!
+        const inputs = &[_][]const u8{
+            params_bytes, // from shepherd
+            random_data,  // input_ids
+            random_data,  // targets (can be the same for this test)
+        };
+
+        // 5. Execute the training step on the backend
+        const outputs = try self.backend.executeTrainingStep(module, inputs);
+        defer {
+            for (outputs) |o| self.allocator.free(o);
+            self.allocator.free(outputs);
+        }
+
+        // 6. Send BOTH outputs (updated_params, loss) back to the shepherd.
+        // We'll use a simple delimiter again.
+        var response_payload = std.ArrayList(u8).init(self.allocator);
+        defer response_payload.deinit();
+
+        if (outputs.len > 0) {
+            try response_payload.appendSlice(outputs[0]); // Updated params
+        }
+        try response_payload.appendSlice("|||LOSS|||");
+        if (outputs.len > 1) {
+            try response_payload.appendSlice(outputs[1]); // Loss
+        }
+
+        const final_payload_bytes = try response_payload.toOwnedSlice();
+        defer self.allocator.free(final_payload_bytes);
+
         const response = tcp_stream.createMessage(
             self.node_id.?, // our node_id
             "worker", // our service
@@ -201,174 +213,21 @@ pub const Worker = struct {
             "shepherd", // shepherd service
             MessageType.INNER_LOOP_COMPLETE,
             msg.msg_id + 1,
-            std.json.Value{ .string = final_params }, // serialized parameters
+            std.json.Value{ .string = std.mem.span(final_payload_bytes) },
         );
         
         try self.client.send(response);
-        std.log.info("Worker {} completed inner loop", .{self.node_id.?});
-        
+        std.log.info("Worker {} completed inner loop and sent results.", .{self.node_id.?});
         self.state = .connected;
     }
     
-    /// Initialize MLIR infrastructure for training
-    fn initializeMLIRInfrastructure(self: *Self) !void {
-        // Initialize MLIR builder
-        self.mlir_builder = try self.allocator.create(ops.MLIRBuilder);
-        self.mlir_builder.? = try ops.MLIRBuilder.init(self.allocator);
-        
-        // Initialize Adam optimizer
-        const element_type = mlir.Type.f32Type(self.mlir_builder.?.ctx);
-        const adam_config = adam_mlir.AdamMLIRConfiguration(f32).default_configuration();
-        
-        self.adam_optimizer = try self.allocator.create(adam_mlir.AdamMLIR(f32));
-        self.adam_optimizer.? = try adam_mlir.AdamMLIR(f32).init(
-            self.allocator,
-            self.mlir_builder.?,
-            adam_config,
-            element_type,
-        );
-        
-        std.log.info("Worker {} initialized MLIR infrastructure", .{self.node_id.?});
-    }
     
-    /// Deserialize master parameters from message (matches DiLoCo format)
-    fn deserializeMasterParameters(self: *Self, msg: MessageEnvelope) ![]f32 {
-        const param_data = switch (msg.data) {
-            .string => |s| s,
-            else => return error.InvalidMessageFormat,
-        };
-        
-        if (param_data.len < @sizeOf(usize)) {
-            return error.InvalidData;
-        }
-        
-        // Read parameter count
-        const param_count = std.mem.readInt(usize, param_data[0..@sizeOf(usize)], .little);
-        const params = try self.allocator.alloc(f32, param_count);
-        
-        // Read all parameters
-        var offset = @sizeOf(usize);
-        for (params) |*param| {
-            if (offset + @sizeOf(f32) > param_data.len) {
-                return error.InvalidData;
-            }
-            param.* = std.mem.readInt(f32, param_data[offset..offset + @sizeOf(f32)], .little);
-            offset += @sizeOf(f32);
-        }
-        
-        std.log.debug("Worker {} deserialized {} parameters from {} bytes", .{ self.node_id.?, param_count, param_data.len });
-        return params;
-    }
     
-    /// Initialize local model with master parameters
-    fn initializeLocalModel(self: *Self, master_params: []const f32) !void {
-        if (self.local_model) |model| {
-            model.deinit();
-        }
-        
-        self.local_model = try LocalModel.init(self.allocator, master_params.len);
-        self.local_model.?.updateParameters(master_params);
-        
-        std.log.info("Worker {} initialized local model with {} parameters", .{
-            self.node_id.?, master_params.len
-        });
-    }
     
-    /// Run local training loop using MLIR-based optimization
-    fn runLocalTrainingLoop(self: *Self) !void {
-        if (self.local_model == null or self.adam_optimizer == null or self.mlir_builder == null) {
-            return error.NotInitialized;
-        }
-        
-        const inner_loop_steps = 10; // DiLoCo tau parameter
-        std.log.info("Worker {} running {} inner loop steps", .{ self.node_id.?, inner_loop_steps });
-        
-        for (0..inner_loop_steps) |step| {
-            // Create parameter and gradient tensors
-            const param_shape = &[_]i64{@intCast(self.local_model.?.parameters.len)};
-            const param_tensor = try self.createTensorFromArray(self.local_model.?.parameters, param_shape);
-            
-            // Simulate gradient computation (in practice, this would come from forward/backward pass)
-            const grad_tensor = try self.computeSimulatedGradients(param_tensor);
-            
-            // Update parameters using MLIR Adam optimizer
-            const updated_params = try self.adam_optimizer.?.update(param_tensor, grad_tensor);
-            
-            // Extract updated parameters back to local model
-            try self.extractTensorToArray(updated_params, self.local_model.?.parameters);
-            
-            std.log.debug("Worker {} completed training step {}", .{ self.node_id.?, step + 1 });
-        }
-        
-        std.log.info("Worker {} completed local training loop", .{self.node_id.?});
-    }
     
-    /// Create MLIR tensor from parameter array
-    fn createTensorFromArray(self: *Self, array: []const f32, shape: []const i64) !tensor.Tensor(void) {
-        const element_type = mlir.Type.f32Type(self.mlir_builder.?.ctx);
-        
-        // Convert f32 array to bytes for MLIR
-        const byte_data = std.mem.sliceAsBytes(array);
-        const tensor_type = mlir.Type.rankedTensorType(self.mlir_builder.?.ctx, shape, element_type);
-        
-        // Create constant tensor from host data
-        const value = try self.mlir_builder.?.createConstant(byte_data, tensor_type, undefined);
-        
-        return try self.mlir_builder.?.newTensor(value);
-    }
     
-    /// Compute simulated gradients (placeholder for real gradient computation)
-    fn computeSimulatedGradients(self: *Self, param_tensor: tensor.Tensor(void)) !tensor.Tensor(void) {
-        // Simplified gradient computation - in practice, this would be computed
-        // from the forward and backward pass through the neural network
-        
-        // For now, just create small random gradients
-        const shape = param_tensor.shape.dims;
-        const element_type = mlir.Type.f32Type(self.mlir_builder.?.ctx);
-        
-        // Create small random gradient tensor
-        return try ops.constant(self.mlir_builder.?, 0.001, shape, element_type);
-    }
     
-    /// Extract tensor values back to array
-    fn extractTensorToArray(self: *Self, tensor_val: tensor.Tensor(void), array: []f32) !void {
-        // Simplified extraction - in practice, would need proper MLIR value extraction
-        // For now, just add small noise to simulate parameter updates
-        _ = tensor_val;
-        
-        var rng = std.rand.DefaultPrng.init(12345);
-        for (array) |*param| {
-            param.* += rng.random().floatNorm(f32) * 0.001;
-        }
-        
-        std.log.debug("Worker {} extracted {} parameters from tensor", .{ self.node_id.?, array.len });
-    }
     
-    /// Serialize local parameters for transmission (matches DiLoCo format)
-    fn serializeLocalParameters(self: *Self) ![]u8 {
-        if (self.local_model == null) {
-            return error.ModelNotInitialized;
-        }
-        
-        // Binary serialization to match DiLoCo format
-        var buffer = std.ArrayList(u8).init(self.allocator);
-        defer buffer.deinit();
-        
-        const params = self.local_model.?.parameters;
-        
-        // Write parameter count first
-        try buffer.appendSlice(std.mem.asBytes(&params.len));
-        
-        // Write all parameters as binary data
-        for (params) |param| {
-            try buffer.appendSlice(std.mem.asBytes(&param));
-        }
-        
-        const result = try self.allocator.dupe(u8, buffer.items);
-        std.log.debug("Worker {} serialized {} parameters to {} bytes", .{ self.node_id.?, params.len, result.len });
-        
-        return result;
-    }
     
     /// Handle Shutdown command from Shepherd
     fn handleShutdown(self: *Self, msg: MessageEnvelope) void {
@@ -419,7 +278,16 @@ pub const Worker = struct {
 pub fn testWorker(allocator: Allocator) !void {
     std.log.info("Testing Worker...");
     
-    var worker = Worker.init(allocator);
+    // Create a mock backend for testing
+    const mock_backend = WorkerBackend{
+        .ptr = undefined,
+        .vtable = &.{
+            .executeTrainingStep = mockExecuteTrainingStep,
+            .deinit = mockBackendDeinit,
+        },
+    };
+    
+    var worker = Worker.init(allocator, mock_backend);
     defer worker.deinit();
     
     // Test basic initialization
@@ -427,4 +295,16 @@ pub fn testWorker(allocator: Allocator) !void {
     try std.testing.expectEqual(@as(?NodeId, null), worker.getNodeId());
     
     std.log.info("✓ Worker test completed");
+}
+
+// Mock functions for testing
+fn mockExecuteTrainingStep(ptr: *anyopaque, mlir_module: mlir.Module, inputs: [][]const u8) ![][]u8 {
+    _ = ptr;
+    _ = mlir_module;
+    _ = inputs;
+    return &[_][]u8{};
+}
+
+fn mockBackendDeinit(ptr: *anyopaque) void {
+    _ = ptr;
 }

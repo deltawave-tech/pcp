@@ -1,221 +1,119 @@
-# PCP - Planetary Compute Protocol
+# PCP
 
-A distributed tensor computation framework written in Zig, designed for training and inference of large neural networks across planetary-scale compute clusters. PCP uses MLIR (Multi-Level Intermediate Representation) for high-performance tensor operations and automatic differentiation.
+PCP is a distributed tensor computation framework written in Zig. It employs MLIR as its core intermediate representation to provide a compiler-driven approach to automatic differentiation, hardware acceleration, and optimization.
 
-## Features
+## Core Architecture
 
-- **MLIR-based computation**: Leverages MLIR for tensor operations with StableHLO dialect
-- **Vector-Jacobian Product (VJP) autodiff**: Efficient reverse-mode automatic differentiation
-- **Pure Zig implementation**: Zero external dependencies except MLIR/LLVM
-- **Static tensor shapes**: Compile-time shape validation with Zig's comptime
-- **Memory-safe operations**: Proper tensor lifecycle management
-- **Cross-platform backend support**:
-  - CPU (via MLIR execution)
-  - Apple Silicon via Metal (WIP)
-  - NVIDIA (planned via MLIR GPU dialect)
-  - AMD (planned via MLIR GPU dialect)
-- **Distributed training**: Actor model for planetary-scale computation (planned)
+PCP transforms high-level tensor operations into optimized MLIR computation graphs. The system's design is centered on a forward-pass graph construction, which is then used to derive a corresponding gradient graph for automatic differentiation.
 
-## Architecture
-
-PCP transforms high-level tensor operations into optimized MLIR computation graphs:
+### Modular Protocol Controller (PCP) Architecture
 
 ```
-Zig Tensor Ops → StableHLO MLIR → Optimized Execution
-     ↓              ↓                    ↓
-   VJP Rules → Gradient Graph → Automatic Differentiation
+┌───────────────┐    ┌─────────────────────┐    ┌───────────────────────┐
+│ Model         │    │ Training Algorithm  │    │ Distributed System    │
+│ (GPT-2)       │◀──▶│ (DiLoCo)            │◀──▶│ (Shepherd + Workers)  │
+├───────────────┤    ├─────────────────────┤    ├───────────────────────┤
+│ • Forward     │    │ • Parameter Sync    │    │ • TCP Communication   │
+│ • MLIR Graph  │    │ • MLIR Optimizers   │    │ • Message Protocol    │
+│ • Autodiff    │    │ • Inner/Outer Loop  │    │ • Graph Distribution  │
+└───────────────┘    └─────────────────────┘    └───────────────────────┘
+       │                       │                           │
+       └───────────────────────┼───────────────────────────┘
+                               ▼
+    ┌──────────────────────────────────────────────────────────────────┐
+    │                    MLIR Compilation Pipeline                     │
+    │                                                                  │
+    │  ┌─────────────┐   ┌──────────────┐   ┌─────────────────────┐   │
+    │  │ StableHLO   │──▶│ GPU/SPIR-V   │──▶│ Backend Execution   │   │
+    │  │ Graph       │   │ Lowering     │   │ (Metal/CUDA/CPU)    │   │
+    │  └─────────────┘   └──────────────┘   └─────────────────────┘   │
+    └──────────────────────────────────────────────────────────────────┘
 ```
 
-### Core Components
+### MLIR Lowering Pipeline
 
-- **StableHLO Dialect Wrapper**: Clean Zig interface to MLIR operations
-- **MLIRBuilder**: Constructs computation graphs using MLIR C API
-- **VJP Autodiff Engine**: Graph-to-graph automatic differentiation
-- **Tensor Abstraction**: High-level tensor operations over MLIR values
+```
+┌─────────────────┐    passes    ┌─────────────────┐    translation
+│ StableHLO       │ ───────────▶  │ GPU Dialect     │ ──────────────▶
+│ Dialect         │               │ (gpu.launch)    │
+│                 │               │                 │
+│ • stablehlo.add │               │ • gpu.func      │
+│ • stablehlo.mul │               │ • gpu.thread_id │
+│ • stablehlo.dot │               │ • gpu.memcpy    │
+└─────────────────┘               └─────────────────┘
+                                           │
+                                           ▼ passes
+                                  ┌─────────────────┐    translation
+                                  │ SPIR-V Dialect  │ ──────────────▶
+                                  │ (spirv.*)       │
+                                  │                 │
+                                  │ • spirv.func    │
+                                  │ • spirv.fadd    │
+                                  │ • spirv.load    │
+                                  └─────────────────┘
+                                           │
+                                           ▼
+                    ┌─────────────────────────────────────────────────┐
+                    │              Backend Targets                    │
+                    ├─────────────────┬─────────────────┬─────────────┤
+                    │ Metal (MSL)     │ CUDA (PTX)      │ CPU (LLVM)  │
+                    │                 │                 │             │
+                    │ • MTLLibrary    │ • CUmodule      │ • JIT/AOT   │
+                    │ • MTLFunction   │ • CUfunction    │ • Native    │
+                    │ • MTLBuffer     │ • CUdeviceptr   │ • Vectorized│
+                    └─────────────────┴─────────────────┴─────────────┘
+```
+
+This architecture is implemented through several key components:
+
+- **MLIR as the Core IR**: Computations are represented as MLIR graphs using the stablehlo dialect.
+- **Tensor Abstraction**: Tensors (`src/tensor.zig`) are symbolic handles to `mlir.Value`, representing nodes in the computation graph rather than immediate data buffers.
+- **MLIRBuilder**: A stateful builder (`src/ops.zig`) constructs the MLIR graph via the MLIR C API.
+- **StableHLO Dialect Wrapper**: A clean, idiomatic Zig interface (`src/mlir/dialects/stablehlo.zig`) for creating stablehlo operations.
+- **Graph-to-Graph Automatic Differentiation**: The framework features a VJP-based autodiff engine (`src/autodiff.zig`). It performs a graph-to-graph transformation by applying Vector-Jacobian Product (VJP) rules to the forward-pass graph, thereby generating a new MLIR graph that computes the necessary gradients.
+- **Distributed Training System**: The framework supports distributed training using a Shepherd (coordinator) and Worker model. It implements the DiLoCo algorithm (`src/algorithms/diloco.zig`) for low-communication training. Both global and local parameter updates are managed through MLIR-based optimizers (`src/optimizers/*_mlir.zig`) that construct their update logic as sub-graphs.
+- **JIT-Compiled Execution Backend**: PCP includes a just-in-time (JIT) execution engine for Apple's Metal framework (`src/backends/metal.zig`). The compilation pipeline is as follows:
+  - **Lowering**: The stablehlo graph is lowered through gpu and spirv dialects.
+  - **Translation**: The spirv dialect module is translated to a SPIR-V binary.
+  - **Cross-Compilation**: The SPIR-V binary is translated to Metal Shading Language (MSL).
+  - **Runtime Compilation**: The MSL source is compiled into a native MTLLibrary for execution on the GPU.
 
 ## Project Structure
 
 ```
-src/
-├── mlir.zig                    # Core MLIR wrapper types
-├── mlir/
-│   ├── c.zig                   # MLIR C API bindings
-│   └── dialects/
-│       └── stablehlo.zig       # StableHLO dialect wrapper
-├── ops.zig                     # High-level tensor operations
-├── autodiff.zig                # VJP-based automatic differentiation
-├── tensor.zig                  # Tensor abstraction layer
-├── backends/
-│   └── metal.zig              # Metal backend for Apple Silicon
-├── models/
-│   └── gpt2.zig               # GPT-2 transformer implementation
-└── examples/
-    ├── mlir_test.zig          # MLIR integration tests
-    ├── tensor_mlir_test.zig   # Tensor-MLIR bridge tests
-    └── gpt2_training.zig      # GPT-2 training example
+.
+└── src
+    ├── algorithms/              # Distributed training algorithms and interfaces (DiLoCo).
+    ├── backends/                # Hardware execution backends (Metal).
+    ├── controllers/             # The Shepherd coordinator node.
+    ├── examples/                # Usage examples and component tests.
+    ├── mlir/                    # MLIR C-API wrappers, dialect definitions, and bridges.
+    ├── models/                  # Model definitions (GPT-2) as MLIR graphs.
+    ├── network/                 # TCP communication and messaging protocol.
+    ├── optimizers/              # MLIR-based optimizers (Adam, Nesterov).
+    ├── autodiff.zig             # VJP-based automatic differentiation engine.
+    ├── main_distributed.zig     # Entry point for the distributed system.
+    ├── mlir.zig, mlir_ctx.zig   # Core MLIR context and API wrappers.
+    ├── ops.zig                  # MLIR operation graph-building functions.
+    ├── tensor.zig               # The symbolic Tensor data structure.
+    └── worker.zig               # The worker compute node.
 ```
 
-## MLIR Integration
+## Usage
 
-PCP uses MLIR's StableHLO dialect for tensor operations:
+To run the distributed training demonstration, which starts one Shepherd and two Workers:
 
-```zig
-// High-level tensor operation
-const result = try ops.add(builder, tensor_a, tensor_b);
-
-// Compiles to StableHLO MLIR:
-// %result = stablehlo.add %tensor_a, %tensor_b : tensor<2x2xf32>
-```
-
-### Automatic Differentiation
-
-VJP-based reverse-mode autodiff transforms forward graphs to gradient graphs:
-
-```zig
-// Forward: z = x * y + w
-const xy = try ops.multiply(builder, x, y);
-const z = try ops.add(builder, xy, w);
-
-// Autodiff creates gradient graph:
-// dz/dx = grad_z * y
-// dz/dy = grad_z * x  
-// dz/dw = grad_z
-```
-
-## Getting Started
-
-### Prerequisites
-
-- **Zig compiler**: 0.14.x or later
-- **LLVM/MLIR**: Built with C API bindings enabled
-- **For Metal backend**: macOS with Apple Silicon
-
-### Building MLIR Support
-
-PCP requires LLVM/MLIR with C API bindings. The build system automatically detects MLIR installations:
-
+### Start the Shepherd Node:
 ```bash
-# macOS with Homebrew (basic support)
-brew install llvm
-
-# Or build from source for full MLIR support
-git clone --depth=1 --branch=release/20.x https://github.com/llvm/llvm-project.git
-mkdir llvm-build && cd llvm-build
-cmake -G "Ninja" ../llvm-project/llvm \
-  -DCMAKE_BUILD_TYPE=Release \
-  -DLLVM_ENABLE_PROJECTS="mlir;clang" \
-  -DMLIR_ENABLE_BINDINGS_C=ON \
-  -DMLIR_ENABLE_EXECUTION_ENGINE=ON \
-  -DCMAKE_INSTALL_PREFIX=$HOME/local/llvm-pcp
-ninja && ninja install
+zig run src/main_distributed.zig -- --shepherd --workers 2
 ```
 
-### Building and Running
-
+### Start the First Worker Node (new terminal):
 ```bash
-# Build the library
-zig build
-
-# Run unit tests
-zig build test
-
-# Test MLIR dialect wrappers
-zig build test-dialects
-
-# Run MLIR integration tests
-zig build run-mlir-test
-
-# Test tensor-MLIR bridge
-zig build run-tensor-mlir-test
-
-# Run autodiff tests
-zig build run-autodiff-test
-
-# Run GPT-2 training example
-zig build run
-
-# Run Metal backend tests (macOS only)
-zig build run-metal-test
+zig run src/main_distributed.zig -- --worker --connect 127.0.0.1:8080
 ```
 
-## Memory Management
-
-- **MLIR-managed**: Computation graphs managed by MLIR context
-- **Reference counting**: Efficient tensor reuse and cleanup
-- **Safe tensor lifecycle**: Proper cleanup of intermediate values
-- **Bounds checking**: Overflow protection for numerical stability
-
-## API Example
-
-```zig
-const std = @import("std");
-const pcp = @import("pcp");
-
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{});
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
-    
-    // Create MLIR builder
-    var builder = try pcp.ops.MLIRBuilder.init(allocator);
-    defer builder.deinit();
-    
-    // Create tensors (shapes known at compile time)
-    const shape = &[_]usize{2, 2};
-    var a = try pcp.tensor.Tensor.zeros(allocator, shape, .f32, .cpu);
-    var b = try pcp.tensor.Tensor.ones(allocator, shape, .f32, .cpu);
-    defer a.deinit();
-    defer b.deinit();
-    
-    // Perform operations (compiled to MLIR)
-    const c = try pcp.ops.add(&builder, a, b);
-    const d = try pcp.ops.multiply(&builder, c, a);
-    
-    // Automatic differentiation
-    var autodiff = pcp.autodiff.AutoDiff.init(allocator, &builder);
-    const grad_fn = try autodiff.grad(d.operation);
-    
-    std.debug.print("Computation graph built successfully!\n", .{});
-}
+### Start the Second Worker Node (new terminal):
+```bash
+zig run src/main_distributed.zig -- --worker --connect 127.0.0.1:8080
 ```
-
-## Roadmap
-
-**Core Infrastructure**
-- [x] MLIR C API bindings
-- [x] StableHLO dialect wrapper
-- [x] VJP-based automatic differentiation
-- [x] Tensor abstraction over MLIR values
-- [x] MLIRBuilder for graph construction
-
-**Operations & Models**
-- [x] Basic tensor operations (add, multiply, matmul, ReLU)
-- [x] GPT-2 transformer implementation
-- [ ] Complete operation set (conv2d, batch_norm, etc.)
-- [ ] Pre-trained model loading
-
-**Backends & Optimization**
-- [x] CPU execution via MLIR
-- [ ] Metal backend completion
-- [ ] MLIR optimization passes
-- [ ] JIT compilation
-- [ ] GPU dialect integration
-
-**Distributed Training**
-- [ ] Actor-based compute nodes
-- [ ] Gradient aggregation protocols
-- [ ] Fault-tolerant training
-- [ ] Decentralized optimization algorithms
-
-## Contributing
-
-PCP uses MLIR for high-performance tensor computation. When contributing:
-
-1. **Operations**: Add new ops to `src/mlir/dialects/stablehlo.zig`
-2. **VJP Rules**: Update `src/autodiff.zig` with gradient rules
-3. **Testing**: Ensure MLIR integration tests pass
-4. **Documentation**: Update examples with new features
-
-## License
-
-This project is licensed under the MIT License - see the LICENSE file for details.

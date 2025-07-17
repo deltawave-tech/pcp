@@ -36,5 +36,12 @@ deps/
 # Custom ignore
 notes.md
 
+# Third party dependencies (built locally)
+third_party/
+llvm-project/
+llvm-build/
+stablehlo/
+SPIRV-Cross/
+
 # Nix artifacts
 result

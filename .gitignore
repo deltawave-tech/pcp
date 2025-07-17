@@ -43,5 +43,8 @@ llvm-build/
 stablehlo/
 SPIRV-Cross/
 
+# Data files (not tracked)
+data/
+
 # Nix artifacts
 result

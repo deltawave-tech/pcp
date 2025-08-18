@@ -292,6 +292,10 @@ fn addMLIRSupport(b: *std.Build, target: *std.Build.Step.Compile, mlir_config: M
         "MLIRAffineTransforms",       // For lower-affine
         "MLIRMemRefTransforms",       // For bufferization and memref passes (already included)
         "MLIRCAPIConversion",         // For conversion pass registration
+        "MLIRConvertToLLVMPass",     // For general LLVM conversion infrastructure
+        "MLIRFuncToLLVM",            // For createConvertFuncToLLVMPass
+        "MLIRGPUToLLVMSPV",          // For createGpuToLLVMConversionPass
+        "MLIRReconcileUnrealizedCasts", // For createReconcileUnrealizedCastsPass
         
         // Dependencies of the passes above
         "MLIRLinalgDialect",          // Target dialect for the legalization
@@ -393,6 +397,7 @@ pub fn build(b: *std.Build) void {
                 "-std=c++17",
                 "-Ithird_party/stablehlo",
                 "-Illvm-build/include",
+                "-Illvm-build/tools/stablehlo",
             },
         });
 
@@ -400,14 +405,14 @@ pub fn build(b: *std.Build) void {
             spirv_bridge_lib.?.addIncludePath(.{ .cwd_relative = include_dir });
         }
         
-        // Add MLIR include directory from project
+        // Add MLIR include directories
         spirv_bridge_lib.?.addIncludePath(.{ .cwd_relative = "llvm-project/mlir/include" });
-        
-        // Add build directory includes for generated headers
+        spirv_bridge_lib.?.addIncludePath(.{ .cwd_relative = "llvm-build/tools/mlir/include" });
         spirv_bridge_lib.?.addIncludePath(.{ .cwd_relative = "llvm-build/include" });
         
         // NEW: Add StableHLO include paths
         spirv_bridge_lib.?.addIncludePath(.{ .cwd_relative = "third_party/stablehlo" });
+        spirv_bridge_lib.?.addIncludePath(.{ .cwd_relative = "llvm-build/tools/stablehlo" });
         
         // Add SPIRV-Cross include paths
         spirv_bridge_lib.?.addIncludePath(.{ .cwd_relative = "SPIRV-Cross" });
@@ -1181,6 +1186,25 @@ pub fn build(b: *std.Build) void {
 
     const run_main_distributed_step = b.step("run-distributed", "Run the distributed training system");
     run_main_distributed_step.dependOn(&run_main_distributed_cmd.step);
+
+    // Demo-only executable (no MLIR/StableHLO dependencies)
+    const demo_exe = b.addExecutable(.{
+        .name = "pcp_demo",
+        .root_source_file = b.path("src/main_distributed_demo.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    
+    b.installArtifact(demo_exe);
+    
+    const run_demo_cmd = b.addRunArtifact(demo_exe);
+    if (b.args) |args| {
+        run_demo_cmd.addArgs(args);
+    }
+    run_demo_cmd.step.dependOn(&demo_exe.step);
+    
+    const run_demo_step = b.step("run-demo", "Run the demo distributed training system (no MLIR)");
+    run_demo_step.dependOn(&run_demo_cmd.step);
 
     // // Property-based testing step
     // const prop_tests = b.addTest(.{

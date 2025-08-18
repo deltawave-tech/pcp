@@ -16,6 +16,7 @@ const worker = @import("worker.zig");
 
 // Backend implementations
 const metal_backend = @import("backends/metal.zig");
+const demo_backend = @import("backends/demo.zig");
 // const cuda_backend = @import("backends/cuda.zig");  // Future
 // const cpu_backend = @import("backends/cpu.zig");    // Future
 
@@ -30,6 +31,7 @@ pub const Backend = enum {
     metal,
     cuda,
     cpu,
+    demo,
     
     /// Automatically select the best backend for the current platform
     pub fn selectDefault() Backend {
@@ -49,6 +51,11 @@ pub fn createExecutor(allocator: Allocator, backend: Backend) !Executor {
             try metal_backend.init(allocator);
             const engine = try metal_backend.getExecutionEngine();
             break :blk engine.asExecutor();
+        },
+        .demo => {
+            // Demo backend for demonstration purposes
+            std.log.info("Using demo backend for simulated execution", .{});
+            return createMockExecutor();
         },
         .cuda => {
             // TODO: Implement CUDA backend
@@ -71,6 +78,12 @@ pub fn createWorkerBackend(allocator: Allocator, backend: Backend) !WorkerBacken
             try metal_backend.init(allocator);
             const engine = try metal_backend.getExecutionEngine();
             break :blk engine.asWorkerBackend();
+        },
+        .demo => blk: {
+            // Demo backend for demonstration purposes
+            std.log.info("Using demo worker backend for simulated execution", .{});
+            const demo = try demo_backend.DemoBackend.init(allocator);
+            break :blk demo.asWorkerBackend();
         },
         .cuda => {
             // TODO: Implement CUDA backend
@@ -96,7 +109,17 @@ pub const DistributedTrainingSystem = struct {
     
     /// Initialize the distributed training system
     pub fn init(allocator: Allocator, backend: Backend) !Self {
-        std.log.info("Initializing distributed training system with {} backend", .{backend});
+        return initWithDemo(allocator, backend, false);
+    }
+    
+    /// Initialize the distributed training system with optional demo mode
+    pub fn initWithDemo(allocator: Allocator, preferred_backend: Backend, demo_execution: bool) !Self {
+        const backend = if (demo_execution) Backend.demo else preferred_backend;
+        
+        std.log.info("Initializing distributed training system with {} backend{s}", .{ 
+            backend, 
+            if (demo_execution) " (demo mode)" else ""
+        });
         
         // Create the executor for algorithms
         const executor = try createExecutor(allocator, backend);

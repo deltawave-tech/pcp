@@ -177,11 +177,12 @@ pub const Worker = struct {
 
         // 4. Package inputs for the backend: [master_params, input_ids, targets]
         // The order MUST match the function signature defined in the Shepherd!
-        const inputs = &[_][]const u8{
+        const inputs_array = [_][]const u8{
             params_bytes, // from shepherd
             random_data,  // input_ids
             random_data,  // targets (can be the same for this test)
         };
+        const inputs: [][]const u8 = @constCast(&inputs_array);
 
         // 5. Execute the training step on the backend
         const outputs = try self.backend.executeTrainingStep(module, inputs);
@@ -213,7 +214,7 @@ pub const Worker = struct {
             "shepherd", // shepherd service
             MessageType.INNER_LOOP_COMPLETE,
             msg.msg_id + 1,
-            std.json.Value{ .string = std.mem.span(final_payload_bytes) },
+            std.json.Value{ .string = final_payload_bytes },
         );
         
         try self.client.send(response);

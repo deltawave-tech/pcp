@@ -24,25 +24,24 @@ extern "C" {
 // This forces the linker to include all required pass libraries,
 // ensuring their C++ static initializers run and register the passes.
 void mlirForceLoadAllRequiredPasses() {
-  // StableHLO
-  mlir::stablehlo::registerAllPasses();
+  // StableHLO pass registration
+  mlir::stablehlo::registerPassPipelines();
 
-  // Canonicalization and cleanup
-  (void)mlir::createCanonicalizerPass;
+  // Canonicalization and cleanup - use default parameters for overloaded functions
+  (void)mlir::createCanonicalizerPass();
   (void)mlir::createCSEPass;
 
-  // Core Conversions
-  (void)mlir::createConvertFuncToLLVMPass;
-  (void)mlir::createConvertLinalgToLoopsPass; // This is the C++ function for "linalg-to-loops"
-  (void)mlir::createConvertSCFToCFPass;
+  // Core Conversions - use default parameters
+  (void)mlir::createConvertFuncToLLVMPass();
+  (void)mlir::createConvertLinalgToLoopsPass;
+  (void)mlir::createSCFToControlFlowPass; // Updated API name
 
-  // GPU and SPIR-V Conversions
-  (void)mlir::createGpuToLLVMConversionPass;
-  (void)mlir::createConvertGpuOpsToSPIRVopsPass; // Correct pass for GPU -> SPIR-V
+  // GPU and SPIR-V Conversions - use default parameters
+  (void)mlir::createGpuToLLVMConversionPass();
+  (void)mlir::createConvertGPUToSPIRVPass; // Updated API name
 
   // Bufferization
   (void)mlir::bufferization::createEmptyTensorToAllocTensorPass;
-  (void)mlir::createLinalgBufferizePass;
 
   // Original anchors
   (void)mlir::createConvertLinalgToAffineLoopsPass; // Anchors Linalg

@@ -33,6 +33,7 @@ pub const DiLoCoConfig = struct {
     nesterov_momentum: f32,
     parameter_averaging: bool,
     param_count: usize, // Number of model parameters
+    demo_execution: bool, // Whether to use demo mode
     
     pub fn default() DiLoCoConfig {
         return DiLoCoConfig{
@@ -41,6 +42,7 @@ pub const DiLoCoConfig = struct {
             .nesterov_momentum = 0.9,
             .parameter_averaging = true,
             .param_count = 1000, // Default parameter count
+            .demo_execution = false, // Default to real execution
         };
     }
 };
@@ -259,6 +261,15 @@ pub const DiLoCo = struct {
     /// Build the complete worker training graph as MLIR module using Function-as-a-Unit pattern
     /// This creates: forward_fn -> autodiff -> main_fn that orchestrates the full training step
     fn buildWorkerTrainingGraph(self: *Self) ![]u8 {
+        // Check if we should use demo mode based on configuration
+        const is_demo_mode = self.config.demo_execution;
+        
+        if (is_demo_mode) {
+            std.log.info("DiLoCo: Using demo mode - generating simulated MLIR module...", .{});
+            const demo_backend = @import("../backends/demo.zig");
+            return try demo_backend.simulateModuleSerialization(self.allocator, "DiLoCo Training Graph");
+        }
+        
         std.log.info("DiLoCo: Building REAL autodiff-enabled worker training graph with Function-as-a-Unit pattern...", .{});
         var builder = try ops.MLIRBuilder.init(self.allocator);
         defer builder.deinit();

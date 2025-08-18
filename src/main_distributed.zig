@@ -29,6 +29,7 @@ const Args = struct {
     host: []const u8,
     port: u16,
     workers: usize,
+    demo_execution: bool,
     
     const Mode = enum {
         shepherd,
@@ -42,6 +43,7 @@ const Args = struct {
                 .host = "127.0.0.1",
                 .port = 8080,
                 .workers = 2,
+                .demo_execution = false,
             };
         }
         
@@ -49,6 +51,7 @@ const Args = struct {
         var host: []const u8 = "127.0.0.1";
         var port: u16 = 8080;
         var workers: usize = 2;
+        var demo_execution: bool = false;
         
         var i: usize = 1;
         while (i < args.len) {
@@ -84,6 +87,8 @@ const Args = struct {
                         host = connect_str;
                     }
                 }
+            } else if (std.mem.eql(u8, args[i], "--demo-execution")) {
+                demo_execution = true;
             }
             i += 1;
         }
@@ -93,6 +98,7 @@ const Args = struct {
             .host = host,
             .port = port,
             .workers = workers,
+            .demo_execution = demo_execution,
         };
     }
     
@@ -105,6 +111,7 @@ const Args = struct {
         print("  --host <host>        Host to bind/connect to (default: 127.0.0.1)\n", .{});
         print("  --port <port>        Port to bind/connect to (default: 8080)\n", .{});
         print("  --workers <count>    Number of workers to wait for (default: 2)\n", .{});
+        print("  --demo-execution     Use simulated execution for demonstration\n", .{});
         print("  --help               Show this help message\n", .{});
     }
 };
@@ -116,19 +123,25 @@ fn runShepherd(allocator: Allocator, args: Args) !void {
     print("   Host: {s}\n", .{args.host});
     print("   Port: {}\n", .{args.port});
     print("   Waiting for {} workers\n", .{args.workers});
-    print("   Backend: Metal (M3 Mac Pro)\n", .{});
+    if (args.demo_execution) {
+        print("   Backend: Demo (Simulated Execution)\n", .{});
+    } else {
+        print("   Backend: Metal (M3 Mac Pro)\n", .{});
+    }
     
     // NEW: Use the backend selection system
-    var system = try backend_selection.DistributedTrainingSystem.init(
+    var system = try backend_selection.DistributedTrainingSystem.initWithDemo(
         allocator,
-        .metal // We are on a Mac
+        .metal, // We are on a Mac
+        args.demo_execution
     );
     defer system.deinit();
 
     // Now use system.shepherd instead of a local variable
     const shepherd_controller = &system.shepherd;
     
-    const diloco_config = DiLoCoConfig.default();
+    var diloco_config = DiLoCoConfig.default();
+    diloco_config.demo_execution = args.demo_execution;
     
     // The `createDiLoCoAlgorithm` helper is perfect here.
     var diloco_algo = try system.createDiLoCoAlgorithm(diloco_config);
@@ -160,10 +173,14 @@ fn shepherdListenThread(shepherd_controller: *Shepherd, host: []const u8, port: 
 fn runWorker(allocator: Allocator, args: Args) !void {
     print("🐉 Starting Worker...\n", .{});
     print("   Connecting to: {s}:{}\n", .{ args.host, args.port });
-    print("   Backend: Metal (M3 Mac Pro)\n", .{});
+    if (args.demo_execution) {
+        print("   Backend: Demo (Simulated Execution)\n", .{});
+    } else {
+        print("   Backend: Metal (M3 Mac Pro)\n", .{});
+    }
     
     // NEW: Use the backend selection system
-    const backend = backend_selection.Backend.selectDefault();
+    const backend = if (args.demo_execution) backend_selection.Backend.demo else backend_selection.Backend.selectDefault();
     const worker_backend = try backend_selection.createWorkerBackend(allocator, backend);
     
     var worker_instance = Worker.init(allocator, worker_backend);

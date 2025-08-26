@@ -153,9 +153,9 @@ fn runShepherd(allocator: Allocator, args: Args) !void {
     const listen_thread = try std.Thread.spawn(.{}, shepherdListenThread, .{ shepherd_controller, args.host, args.port });
     listen_thread.detach();
     
-    // Start the TUI dashboard in its own thread (temporarily disabled for debugging)
-    // const dashboard_thread = try std.Thread.spawn(.{}, dashboard.runDashboard, .{});
-    // defer dashboard_thread.join();
+    // Start the TUI dashboard in its own thread
+    const dashboard_thread = try std.Thread.spawn(.{}, dashboard.runDashboard, .{});
+    defer dashboard_thread.join();
     
     // Wait for workers and start training
     print("🔄 Waiting for workers to connect...\n", .{});

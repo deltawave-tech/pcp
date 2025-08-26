@@ -123,15 +123,11 @@ pub const MLIRBuilder = struct {
         op_name: []const u8,
         operands: []const mlir.Value,
         result_types: []const mlir.Type,
-        // Add optional attributes parameter
-        options: struct {
-            attributes: []const struct { []const u8, mlir.Attribute } = &.{},
-        } = .{},
     ) !mlir.Operation {
         const op = mlir.Operation.create(self.ctx, op_name, .{
             .operands = operands,
             .results = result_types,
-            .attributes = options.attributes, // Pass attributes here
+            .attributes = &.{}, // Empty attributes for now
             .location = self.loc,
         });
 
@@ -167,8 +163,8 @@ fn broadcastTensors(builder: *MLIRBuilder, a: Tensor, b: Tensor) !struct { Tenso
     try target_shape_list.resize(max_rank);
 
     for (0..max_rank) |i| {
-        const a_dim = if (i < a_rank) a.shape.dims[a_rank - 1 - i] else 1;
-        const b_dim = if (i < b_rank) b.shape.dims[b_rank - 1 - i] else 1;
+        const a_dim = if (i < a_rank) a.shape.getDimension(a_rank - 1 - i) else 1;
+        const b_dim = if (i < b_rank) b.shape.getDimension(b_rank - 1 - i) else 1;
 
         if (a_dim != b_dim and a_dim != 1 and b_dim != 1) {
             return error.IncompatibleBroadcastShapes;
@@ -179,7 +175,7 @@ fn broadcastTensors(builder: *MLIRBuilder, a: Tensor, b: Tensor) !struct { Tenso
 
     // 2. Broadcast 'a' if necessary
     var a_broadcasted = a;
-    if (!std.mem.eql(i64, a.shape.dims, target_shape)) {
+    if (!a.shape.eqlDims(target_shape)) {
         // Create the broadcast_dimensions attribute, which maps original dims to target dims
         var broadcast_dims = std.ArrayList(i64).init(builder.allocator);
         defer broadcast_dims.deinit();
@@ -194,7 +190,7 @@ fn broadcastTensors(builder: *MLIRBuilder, a: Tensor, b: Tensor) !struct { Tenso
 
     // 3. Broadcast 'b' if necessary
     var b_broadcasted = b;
-    if (!std.mem.eql(i64, b.shape.dims, target_shape)) {
+    if (!b.shape.eqlDims(target_shape)) {
         var broadcast_dims = std.ArrayList(i64).init(builder.allocator);
         defer broadcast_dims.deinit();
         const rank_diff = max_rank - b_rank;
@@ -261,25 +257,25 @@ pub fn matmul(builder: *MLIRBuilder, a: Tensor, b: Tensor) !Tensor {
     
     // Case 1: 2D x 2D matrix multiplication
     if (a_rank == 2 and b_rank == 2) {
-        if (a.shape.dims[1] != b.shape.dims[0]) {
+        if (a.shape.getDimension(1) != b.shape.getDimension(0)) {
             return error.IncompatibleShapes;
         }
     }
     // Case 2: 3D x 2D (batched matrix multiplication)
     else if (a_rank == 3 and b_rank == 2) {
-        if (a.shape.dims[2] != b.shape.dims[0]) {
+        if (a.shape.getDimension(2) != b.shape.getDimension(0)) {
             return error.IncompatibleShapes;
         }
     }
     // Case 3: 2D x 3D (broadcasting)
     else if (a_rank == 2 and b_rank == 3) {
-        if (a.shape.dims[1] != b.shape.dims[1]) {
+        if (a.shape.getDimension(1) != b.shape.getDimension(1)) {
             return error.IncompatibleShapes;
         }
     }
     // Case 4: 3D x 3D (batched)
     else if (a_rank == 3 and b_rank == 3) {
-        if (a.shape.dims[0] != b.shape.dims[0] or a.shape.dims[2] != b.shape.dims[1]) {
+        if (a.shape.getDimension(0) != b.shape.getDimension(0) or a.shape.getDimension(2) != b.shape.getDimension(1)) {
             return error.IncompatibleShapes;
         }
     }
@@ -336,7 +332,10 @@ pub fn matmul(builder: *MLIRBuilder, a: Tensor, b: Tensor) !Tensor {
 pub fn relu(builder: *MLIRBuilder, a: Tensor) !Tensor {
     // Create zero constant with same type as input
     const element_type = a.value.getType().as(mlir.RankedTensorType).?.getElementType();
-    const zero_op = hlo.zeroConstant(builder.ctx, a.shape.dims, element_type);
+    // Get dimensions as slice for hlo API
+    const dims = try a.shape.getDims(builder.allocator);
+    defer builder.allocator.free(dims);
+    const zero_op = hlo.zeroConstant(builder.ctx, dims, element_type);
     const zero_value = zero_op.getResult(0);
 
     // Use maximum operation: max(a, 0)

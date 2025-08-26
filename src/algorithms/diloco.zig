@@ -6,7 +6,7 @@ const ArrayList = std.ArrayList;
 const training_algorithm = @import("training_algorithm.zig");
 const shepherd = @import("../controllers/shepherd.zig");
 const message = @import("../network/message.zig");
-const binary_protocol = @import("../network/binary_protocol.zig");
+const binary_protocol = @import("../network/capnp_zig_wrapper.zig");
 const nesterov_mlir = @import("../optimizers/nesterov_mlir.zig");
 const autodiff = @import("../autodiff.zig");
 const ops = @import("../ops.zig");
@@ -393,7 +393,7 @@ pub const DiLoCo = struct {
         std.log.info("Training graph sent to {} workers for caching.", .{self.coordinator.getWorkerCount()});
     }
 
-    /// Broadcast master parameters to all workers using binary protocol
+    /// Broadcast master parameters to all workers using Cap'n Proto
     fn broadcastMasterParameters(self: *Self) !void {
         if (self.master_parameters == null) {
             return error.ParametersNotInitialized;
@@ -403,63 +403,70 @@ pub const DiLoCo = struct {
         const serialized_params = try self.executor.materialize(self.master_parameters.?);
         defer self.allocator.free(serialized_params);
 
-        // Create binary WorkerPayload
+        // Create WorkerPayload and serialize with Cap'n Proto
         const worker_payload = binary_protocol.WorkerPayload{
             .params = serialized_params,
         };
+        const capnp_bytes = try worker_payload.serialize(self.allocator);
+        defer self.allocator.free(capnp_bytes);
 
-        // Serialize to binary format
-        const payload_bytes = try worker_payload.serialize(self.allocator);
-        defer self.allocator.free(payload_bytes);
+        // Base64 encode the binary data
+        const b64_len = std.base64.standard.Encoder.calcSize(capnp_bytes.len);
+        const b64_encoded_payload = try self.allocator.alloc(u8, b64_len);
+        defer self.allocator.free(b64_encoded_payload);
+        
+        const encoded_len = std.base64.standard.Encoder.encode(b64_encoded_payload, capnp_bytes).len;
 
         // Create JSON payload with Base64-encoded binary data
-        const json_payload = std.json.Value{ .string = payload_bytes };
+        const json_payload = std.json.Value{ .string = b64_encoded_payload[0..encoded_len] };
 
-        // Broadcast StartInnerLoop message with binary protocol
+        // Broadcast StartInnerLoop message with Cap'n Proto
         try self.coordinator.broadcastToWorkers(MessageType.START_INNER_LOOP, json_payload);
 
-        std.log.debug("Broadcasted binary-encoded parameters to {} workers", .{self.coordinator.getWorkerCount()});
+        std.log.debug("Broadcasted Cap'n Proto encoded parameters to {} workers", .{self.coordinator.getWorkerCount()});
     }
 
-    /// Collect results from workers after inner loop using binary protocol
+    /// Collect results from workers after inner loop using Cap'n Proto
     fn collectWorkerResults(self: *Self) !ArrayList(WorkerResult) {
-        std.log.info("Collecting results from workers", .{});
-
-        // Collect InnerLoopComplete messages from all workers
+        std.log.info("Collecting Cap'n Proto results from workers", .{});
         const responses = try self.coordinator.collectFromWorkers(MessageType.INNER_LOOP_COMPLETE);
         defer responses.deinit();
 
         var results = ArrayList(WorkerResult).init(self.allocator);
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
 
         for (responses.items) |response| {
-            // Parse worker result from message - binary format
-            const binary_data = switch (response.data) {
+            // 1. Extract the Base64 string payload
+            const b64_encoded_payload = switch (response.data) {
                 .string => |s| s,
                 else => return error.InvalidMessageFormat,
             };
 
-            // Deserialize with binary protocol
-            const shepherd_payload = try binary_protocol.ShepherdPayload.deserialize(self.allocator, binary_data);
-            defer shepherd_payload.deinit(self.allocator);
+            // 2. Base64-decode the payload to get the binary Cap'n Proto data
+            const capnp_len = try std.base64.standard.Decoder.calcSizeForSlice(b64_encoded_payload);
+            const capnp_bytes = try arena.allocator().alloc(u8, capnp_len);
+            try std.base64.standard.Decoder.decode(capnp_bytes, b64_encoded_payload);
 
-            // Convert loss f32 to bytes for compatibility with existing code
-            const loss_bytes = try self.allocator.alloc(u8, @sizeOf(f32));
-            std.mem.writeInt(u32, loss_bytes[0..4], @as(u32, @bitCast(shepherd_payload.loss)), .little);
+            // 3. Deserialize the binary data using Cap'n Proto
+            const reader = try binary_protocol.ShepherdPayload.Reader.init(capnp_bytes);
+            defer reader.deinit();
 
-            // Duplicate parameter bytes for ownership
-            const params = try self.allocator.dupe(u8, shepherd_payload.updated_params);
+            // 4. Extract the data and build the WorkerResult
+            const params_bytes = try reader.getUpdatedParams();
+            const loss_value = try reader.getLoss();
 
+            // The WorkerResult struct expects owned slices, so we must dupe the data.
             const result = WorkerResult{
                 .node_id = response.sender_node,
-                .parameter_bytes = params,
-                .loss_bytes = loss_bytes,
+                .parameter_bytes = try self.allocator.dupe(u8, params_bytes),
+                .loss = loss_value,
                 .steps_completed = self.config.tau,
             };
-
             try results.append(result);
         }
 
-        std.log.info("Collected binary results from {} workers", .{results.items.len});
+        std.log.info("Collected {} Cap'n Proto results from workers", .{results.items.len});
         return results;
     }
 
@@ -536,11 +543,7 @@ pub const DiLoCo = struct {
         var total_loss: f32 = 0.0;
 
         for (worker_results.items) |result| {
-            // Parse loss from bytes - assume it's a single f32
-            if (result.loss_bytes.len >= @sizeOf(f32)) {
-                const loss_value: f32 = @bitCast(std.mem.readInt(u32, result.loss_bytes[0..4], .little));
-                total_loss += loss_value;
-            }
+            total_loss += result.loss;
         }
 
         return total_loss / @as(f32, @floatFromInt(worker_results.items.len));
@@ -551,7 +554,7 @@ pub const DiLoCo = struct {
         const byte_data = std.mem.sliceAsBytes(array);
         const tensor_type = mlir.Type.rankedTensorType(self.mlir_builder.ctx, self.parameter_shape, self.element_type);
 
-        var shape = try tensor.Shape.init(self.allocator, self.parameter_shape, tensor.DType.f32);
+        var shape = try tensor.Shape.initWithDims(self.mlir_builder.ctx, self.parameter_shape, tensor.DType.f32);
         defer shape.deinit();
         const value = try self.mlir_builder.createConstant(byte_data, tensor_type, shape);
         return try self.mlir_builder.newTensor(value);
@@ -611,7 +614,6 @@ pub const DiLoCo = struct {
     fn cleanupWorkerResults(self: *Self, worker_results: ArrayList(WorkerResult)) void {
         for (worker_results.items) |result| {
             self.allocator.free(result.parameter_bytes);
-            self.allocator.free(result.loss_bytes);
         }
         worker_results.deinit();
     }
@@ -650,7 +652,7 @@ pub const DiLoCo = struct {
 const WorkerResult = struct {
     node_id: message.NodeId,
     parameter_bytes: []u8,
-    loss_bytes: []u8,
+    loss: f32,
     steps_completed: usize,
 };
 

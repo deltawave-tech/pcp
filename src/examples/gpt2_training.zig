@@ -99,8 +99,8 @@ const Dataset = struct {
         }
 
         const dims = [_]i64{ @intCast(batch_size), @intCast(seq_length) };
-        const input_shape = try tensorModule.Shape.init(allocator, &dims, .f32);
-        const target_shape = try tensorModule.Shape.init(allocator, &dims, .f32);
+        const input_shape = try tensorModule.Shape.initWithDims(builder.ctx, &dims, .f32);
+        const target_shape = try tensorModule.Shape.initWithDims(builder.ctx, &dims, .f32);
 
         const inputs = try Tensor.newConstant(builder, std.mem.sliceAsBytes(inputs_list.items), input_shape);
         const targets = try Tensor.newConstant(builder, std.mem.sliceAsBytes(targets_list.items), target_shape);

@@ -75,11 +75,13 @@ fn buildAdamUpdateFunction(
     const timestep = try builder.newTensor(timestep_arg);
 
     // 5. Build the Adam optimizer logic inside this function
-    const beta1_tensor = try ops.constant(builder, @as(f64, @floatCast(conf.beta1)), params.shape.dims, element_type);
-    const beta2_tensor = try ops.constant(builder, @as(f64, @floatCast(conf.beta2)), params.shape.dims, element_type);
-    const one_tensor = try ops.constant(builder, 1.0, params.shape.dims, element_type);
-    const lr_tensor = try ops.constant(builder, @as(f64, @floatCast(conf.learning_rate)), params.shape.dims, element_type);
-    const epsilon_tensor = try ops.constant(builder, @as(f64, @floatCast(conf.epsilon)), params.shape.dims, element_type);
+    const params_dims = try params.shape.getDims(builder.allocator);
+    defer builder.allocator.free(params_dims);
+    const beta1_tensor = try ops.constant(builder, @as(f64, @floatCast(conf.beta1)), params_dims, element_type);
+    const beta2_tensor = try ops.constant(builder, @as(f64, @floatCast(conf.beta2)), params_dims, element_type);
+    const one_tensor = try ops.constant(builder, 1.0, params_dims, element_type);
+    const lr_tensor = try ops.constant(builder, @as(f64, @floatCast(conf.learning_rate)), params_dims, element_type);
+    const epsilon_tensor = try ops.constant(builder, @as(f64, @floatCast(conf.epsilon)), params_dims, element_type);
 
     // Calculate (1 - beta1) and (1 - beta2)
     const one_minus_beta1 = try ops.subtract(builder, one_tensor, beta1_tensor);
@@ -97,7 +99,7 @@ fn buildAdamUpdateFunction(
     const new_v = try ops.add(builder, v_decay, v_update);
 
     // Broadcast timestep to tensor shape for power computation
-    const t_tensor = try ops.broadcast(builder, timestep, params.shape.dims);
+    const t_tensor = try ops.broadcast(builder, timestep, params_dims);
     
     // Calculate beta1^t and beta2^t using exponential operation
     const beta1_power_t = try ops.exp(builder, try ops.multiply(builder, try ops.log(builder, beta1_tensor), t_tensor));
@@ -112,7 +114,7 @@ fn buildAdamUpdateFunction(
     const v_hat = try ops.divide(builder, new_v, one_minus_beta2_t);
 
     // Compute sqrt(v_hat) + epsilon
-    const half_tensor = try ops.constant(builder, 0.5, params.shape.dims, element_type);
+    const half_tensor = try ops.constant(builder, 0.5, params_dims, element_type);
     const sqrt_v_hat = try ops.exp(builder, try ops.multiply(builder, try ops.log(builder, v_hat), half_tensor));
     const sqrt_v_hat_plus_eps = try ops.add(builder, sqrt_v_hat, epsilon_tensor);
 
@@ -178,14 +180,17 @@ pub fn AdamMLIR(comptime T: type) type {
         /// Initialize state tensors to match parameter shape
         fn initializeState(self: *Self, params: Tensor) !void {
             // Initialize m and v to zeros with same shape as params
-            const zero_op = hlo.zeroConstant(self.builder.ctx, params.shape.dims, self.element_type);
+            const params_dims = try params.shape.getDims(self.builder.allocator);
+            defer self.builder.allocator.free(params_dims);
+            
+            const zero_op = hlo.zeroConstant(self.builder.ctx, params_dims, self.element_type);
             
             // Create m state (first moment)
-            const m_op = hlo.zeroConstant(self.builder.ctx, params.shape.dims, self.element_type);
+            const m_op = hlo.zeroConstant(self.builder.ctx, params_dims, self.element_type);
             self.m_state = try self.builder.newTensor(m_op.getResult(0));
             
             // Create v state (second moment)
-            const v_op = hlo.zeroConstant(self.builder.ctx, params.shape.dims, self.element_type);
+            const v_op = hlo.zeroConstant(self.builder.ctx, params_dims, self.element_type);
             self.v_state = try self.builder.newTensor(v_op.getResult(0));
         }
 
@@ -265,7 +270,9 @@ pub fn AdamMLIR(comptime T: type) type {
         /// Compute square root using power operation
         fn computeSqrt(self: *Self, input: Tensor) !Tensor {
             // sqrt(x) = x^0.5
-            const half_tensor = try ops.constant(self.builder, 0.5, input.shape.dims, self.element_type);
+            const input_dims = try input.shape.getDims(self.builder.allocator);
+            defer self.builder.allocator.free(input_dims);
+            const half_tensor = try ops.constant(self.builder, 0.5, input_dims, self.element_type);
             return try self.computePower(input, half_tensor);
         }
 

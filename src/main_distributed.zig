@@ -140,8 +140,7 @@ fn runShepherd(allocator: Allocator, args: Args) !void {
     // Now use system.shepherd instead of a local variable
     const shepherd_controller = &system.shepherd;
     
-    var diloco_config = DiLoCoConfig.default();
-    diloco_config.demo_execution = args.demo_execution;
+    const diloco_config = DiLoCoConfig.default();
     
     // The `createDiLoCoAlgorithm` helper is perfect here.
     var diloco_algo = try system.createDiLoCoAlgorithm(diloco_config);
@@ -154,12 +153,16 @@ fn runShepherd(allocator: Allocator, args: Args) !void {
     const listen_thread = try std.Thread.spawn(.{}, shepherdListenThread, .{ shepherd_controller, args.host, args.port });
     listen_thread.detach();
     
-    // Start the TUI dashboard in its own thread
-    const dashboard_thread = try std.Thread.spawn(.{}, dashboard.runDashboard, .{});
-    defer dashboard_thread.join();
+    // Start the TUI dashboard in its own thread (temporarily disabled for debugging)
+    // const dashboard_thread = try std.Thread.spawn(.{}, dashboard.runDashboard, .{});
+    // defer dashboard_thread.join();
     
     // Wait for workers and start training
-    try shepherd_controller.startTraining(args.workers);
+    print("🔄 Waiting for workers to connect...\n", .{});
+    shepherd_controller.startTraining(args.workers) catch |err| {
+        print("❌ Training failed with error: {}\n", .{err});
+        return err;
+    };
     
     print("🌑 Training completed successfully!\n", .{});
 }
@@ -183,7 +186,7 @@ fn runWorker(allocator: Allocator, args: Args) !void {
     const backend = if (args.demo_execution) backend_selection.Backend.demo else backend_selection.Backend.selectDefault();
     const worker_backend = try backend_selection.createWorkerBackend(allocator, backend);
     
-    var worker_instance = Worker.init(allocator, worker_backend);
+    var worker_instance = try Worker.init(allocator, worker_backend);
     defer worker_instance.deinit();
     
     // Connect to shepherd

@@ -10,7 +10,7 @@ const Tensor = pcp.tensor.Tensor(void);
 
 // Helper function to create random tensors with MLIR
 fn createRandomTensor(builder: *MLIRBuilder, dims: []const i64, dtype: DType, scale: f32) !Tensor {
-    var shape = try Shape.init(builder.allocator, dims, dtype);
+    var shape = try Shape.initWithDims(builder.ctx, dims, dtype);
     errdefer shape.deinit();
     
     const elem_count = shape.elemCount();
@@ -272,7 +272,7 @@ pub fn LayerNorm(comptime DataType: type) type {
             // Full implementation would need reduce_mean and reduce_variance.
             // We will approximate with reduce_sum and element count.
             const last_dim_idx = x.shape.rank() - 1;
-            const last_dim_size = x.shape.dims[last_dim_idx];
+            const last_dim_size = x.shape.getDimension(last_dim_idx);
             
             // Step 1: Calculate mean along last dimension
             var sum = try pcp.ops.reduceSum(builder, x, &[_]i64{@intCast(last_dim_idx)});
@@ -494,7 +494,7 @@ pub fn GPT2(comptime DataType: type) type {
         // Forward pass with the model using MLIR operations
         pub fn forward(self: *@This(), input_ids: Tensor, builder: *MLIRBuilder) !Tensor {
             // Safety check for large dimensions
-            if (input_ids.shape.dims[0] > 10000 or input_ids.shape.dims[1] > 10000) {
+            if (input_ids.shape.getDimension(0) > 10000 or input_ids.shape.getDimension(1) > 10000) {
                 return error.InputDimensionsTooLarge;
             }
 
@@ -502,7 +502,7 @@ pub fn GPT2(comptime DataType: type) type {
             defer input_ids.deinit();
 
             // Assume input_ids is a batch of token IDs [batch, seq_len]
-            const seq_len = input_ids.shape.dims[1];
+            const seq_len = input_ids.shape.getDimension(1);
 
             // Step 1: Real token embedding lookup using stablehlo.gather
             const token_embeddings = try pcp.ops.gather(builder, self.wte, input_ids, .{
@@ -515,7 +515,7 @@ pub fn GPT2(comptime DataType: type) type {
 
             // Step 2: Position embeddings using gather
             // Create a tensor of position IDs: [0, 1, 2, ..., seq_len-1]
-            const batch_size = input_ids.shape.dims[0];
+            const batch_size = input_ids.shape.getDimension(0);
             const n_embd = self.config.n_embd;
             
             // Create position IDs array

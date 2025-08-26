@@ -1,7 +1,6 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const json = std.json;
-const binary_protocol = @import("binary_protocol.zig");
 
 pub const MessageEnvelope = struct {
     recipient_node: NodeId,

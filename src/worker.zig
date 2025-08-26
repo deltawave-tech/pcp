@@ -6,7 +6,7 @@ const net = std.net;
 const Allocator = std.mem.Allocator;
 const tcp_stream = @import("network/tcp_stream.zig");
 const message = @import("network/message.zig");
-const binary_protocol = @import("network/binary_protocol.zig");
+const binary_protocol = @import("network/capnp_zig_wrapper.zig");
 const worker_backend = @import("backends/worker_backend.zig");
 const mlir = @import("mlir.zig");
 const mlir_ctx = @import("mlir_ctx.zig");
@@ -170,7 +170,7 @@ pub const Worker = struct {
         // No response is needed. The worker is now ready for START_INNER_LOOP.
     }
     
-    /// Handle StartInnerLoop command from Shepherd using binary protocol
+    /// Handle StartInnerLoop command from Shepherd using Cap'n Proto
     fn handleStartInnerLoop(self: *Self, msg: MessageEnvelope) !void {
         self.state = .training;
 
@@ -180,19 +180,26 @@ pub const Worker = struct {
             return error.GraphNotInitialized;
         };
 
-        // 2. The payload is binary-encoded data. Decode it.
-        const binary_data = switch (msg.data) {
+        // 2. The payload is Base64-encoded Cap'n Proto data
+        const b64_encoded_payload = switch (msg.data) {
             .string => |s| s,
             else => return error.InvalidMessageFormat,
         };
 
-        // 3. Deserialize with binary protocol
-        const worker_payload = try binary_protocol.WorkerPayload.deserialize(self.allocator, binary_data);
-        defer worker_payload.deinit(self.allocator);
+        // 3. Base64-decode the payload to get the binary Cap'n Proto data
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        
+        const capnp_len = try std.base64.standard.Decoder.calcSizeForSlice(b64_encoded_payload);
+        const capnp_bytes = try arena.allocator().alloc(u8, capnp_len);
+        try std.base64.standard.Decoder.decode(capnp_bytes, b64_encoded_payload);
 
-        const params_bytes = worker_payload.params;
+        // 4. Deserialize the binary data using Cap'n Proto
+        const reader = try binary_protocol.WorkerPayload.Reader.init(capnp_bytes);
+        defer reader.deinit();
+        const params_bytes = try reader.getParams();
 
-        // 4. Generate RANDOM data for this test run on the worker
+        // 5. Generate RANDOM data for this test run on the worker
         // This simulates having a local dataset shard.
         const batch_size = 4;
         const seq_length = 12;
@@ -204,45 +211,52 @@ pub const Worker = struct {
         // For now, zeros are fine for testing the execution pipeline.
         @memset(random_data, 0);
 
-        // 5. Package inputs for the backend: [master_params, input_ids, targets]
-        const inputs_array = [_][]const u8{ params_bytes, random_data, random_data };
+        // 6. Package inputs for the backend: [master_params, input_ids, targets]
+        var inputs_array = [_][]const u8{ params_bytes, random_data, random_data };
         const inputs: [][]const u8 = &inputs_array;
 
-        // 6. Execute using the CACHED module.
+        // 7. Execute using the CACHED module.
         const outputs = try self.backend.executeTrainingStep(module, inputs);
         defer {
             for (outputs) |o| self.allocator.free(o);
             self.allocator.free(outputs);
         }
 
-        // 7. Extract loss from outputs (assume it's a single f32)
+        // 8. Extract updated parameters and loss from the backend's output
+        const updated_params = if (outputs.len > 0) outputs[0] else &[_]u8{};
         var loss: f32 = 0.0;
         if (outputs.len > 1 and outputs[1].len >= @sizeOf(f32)) {
             loss = @as(f32, @bitCast(std.mem.readInt(u32, outputs[1][0..4], .little)));
         }
 
-        // 8. Create binary ShepherdPayload
+        // 9. Create and serialize the Cap'n Proto ShepherdPayload
         const shepherd_payload = binary_protocol.ShepherdPayload{
-            .updated_params = if (outputs.len > 0) outputs[0] else &[_]u8{},
+            .updated_params = updated_params,
             .loss = loss,
         };
+        const response_capnp_bytes = try shepherd_payload.serialize(self.allocator);
+        defer self.allocator.free(response_capnp_bytes);
 
-        // 9. Serialize to binary format
-        const payload_bytes = try shepherd_payload.serialize(self.allocator);
-        defer self.allocator.free(payload_bytes);
+        // 10. Base64 encode the binary payload
+        const b64_len = std.base64.standard.Encoder.calcSize(response_capnp_bytes.len);
+        const response_b64_payload = try self.allocator.alloc(u8, b64_len);
+        defer self.allocator.free(response_b64_payload);
+        
+        const encoded_len = std.base64.standard.Encoder.encode(response_b64_payload, response_capnp_bytes).len;
 
+        // 11. Create and send the message
         const response = tcp_stream.createMessage(
-            self.node_id.?, // our node_id
-            "worker", // our service
-            0, // shepherd node_id
-            "shepherd", // shepherd service
+            self.node_id.?,
+            "worker",
+            0,
+            "shepherd",
             MessageType.INNER_LOOP_COMPLETE,
             msg.msg_id + 1,
-            std.json.Value{ .string = payload_bytes },
+            std.json.Value{ .string = response_b64_payload[0..encoded_len] },
         );
         
         try self.client.send(response);
-        std.log.info("Worker {} completed inner loop and sent binary results.", .{self.node_id.?});
+        std.log.info("Worker {} completed inner loop and sent Cap'n Proto results.", .{self.node_id.?});
         self.state = .connected;
     }
     

@@ -21,18 +21,48 @@ const MLIRConfig = struct {
 // Attempt to find LLVM/MLIR installation
 fn detectMLIR(b: *std.Build) MLIRConfig {
     var config = MLIRConfig{};
-    
-    // Try to find llvm-config in common locations - prioritize local build
+
+    // 1. Prioritize an environment variable for the LLVM build directory
+    if (std.process.getEnvVarOwned(b.allocator, "LLVM_DIR")) |llvm_dir| {
+        defer b.allocator.free(llvm_dir);
+        const llvm_config_path = std.fs.path.join(b.allocator, &[_][]const u8{ llvm_dir, "bin", "llvm-config" }) catch {
+            std.debug.print("Failed to construct llvm-config path from LLVM_DIR\n", .{});
+            return config;
+        };
+        defer b.allocator.free(llvm_config_path);
+        
+        // Test if this llvm-config works
+        const result = std.process.Child.run(.{
+            .allocator = b.allocator,
+            .argv = &[_][]const u8{ llvm_config_path, "--version" },
+        }) catch |err| {
+            std.debug.print("LLVM_DIR llvm-config test failed: {}\n", .{err});
+            return config;
+        };
+        defer b.allocator.free(result.stdout);
+        defer b.allocator.free(result.stderr);
+        
+        if (result.term == .Exited and result.term.Exited == 0) {
+            config.enabled = true;
+            config.llvm_config_path = b.dupe(llvm_config_path);
+            std.debug.print("Found LLVM via LLVM_DIR at: {s}\n", .{llvm_config_path});
+            return config;
+        }
+    } else |_| {
+        // Environment variable not set, continue with auto-detection
+    }
+
+    // 2. If no environment variable, proceed with auto-detection
     const llvm_config_candidates = [_][]const u8{
-        // Check our local build first - use absolute path
-        "/Users/philipp/_projects/pcp/llvm-build/bin/llvm-config",
-        // Check our local build first
+        // Local build paths (relative to project root)
         "llvm-build/bin/llvm-config",
         "./llvm-build/bin/llvm-config",
+        // System llvm-config
         "llvm-config",
         "llvm-config-18",
         "llvm-config-17",
         "llvm-config-16",
+        // Common system installation paths
         "/usr/local/bin/llvm-config",
         "/opt/homebrew/bin/llvm-config",
         "/opt/homebrew/opt/llvm/bin/llvm-config", // Homebrew keg-only install
@@ -44,6 +74,8 @@ fn detectMLIR(b: *std.Build) MLIRConfig {
             .allocator = b.allocator,
             .argv = &[_][]const u8{ candidate, "--version" },
         }) catch continue;
+        defer b.allocator.free(result.stdout);
+        defer b.allocator.free(result.stderr);
         
         if (result.term == .Exited and result.term.Exited == 0) {
             config.enabled = true;
@@ -62,6 +94,8 @@ fn detectMLIR(b: *std.Build) MLIRConfig {
             config.enabled = false;
             return config;
         };
+        defer b.allocator.free(lib_result.stdout);
+        defer b.allocator.free(lib_result.stderr);
         
         if (lib_result.term == .Exited and lib_result.term.Exited == 0) {
             const lib_dir = std.mem.trim(u8, lib_result.stdout, " \n\r\t");
@@ -76,6 +110,8 @@ fn detectMLIR(b: *std.Build) MLIRConfig {
             config.enabled = false;
             return config;
         };
+        defer b.allocator.free(inc_result.stdout);
+        defer b.allocator.free(inc_result.stderr);
         
         if (inc_result.term == .Exited and inc_result.term.Exited == 0) {
             const inc_dir = std.mem.trim(u8, inc_result.stdout, " \n\r\t");
@@ -117,13 +153,16 @@ fn getCommandOutput(b: *std.Build, argv: []const []const u8) ![]const u8 {
 // MLIR support using manual library linking
 fn addMLIRSupport(b: *std.Build, target: *std.Build.Step.Compile, mlir_config: MLIRConfig) void {
     if (!mlir_config.enabled) {
-        std.debug.panic("MLIR is required but not found. Please install LLVM with MLIR support.\n", .{});
+        std.debug.print("==> Skipping MLIR support for '{s}': MLIR not enabled/found.\n", .{target.name});
+        return; // Return gracefully instead of panicking
     }
     
     const llvm_config_path = mlir_config.llvm_config_path orelse {
-        std.debug.panic("llvm-config path not found\n", .{});
-        return;
+        std.debug.print("==> Skipping MLIR support for '{s}': llvm-config path is null.\n", .{target.name});
+        return; // Return gracefully instead of panicking
     };
+
+    std.debug.print("==> Configuring MLIR support for '{s}' using '{s}'\n", .{target.name, llvm_config_path});
     
     // FORCE use of local ARM64 libraries by prioritizing our paths
     // Add our local library path FIRST to override system libraries
@@ -135,15 +174,19 @@ fn addMLIRSupport(b: *std.Build, target: *std.Build.Step.Compile, mlir_config: M
     target.addLibraryPath(.{ .cwd_relative = "/opt/homebrew/lib" });
     
     // Try llvm-config but don't fail if it doesn't work
+    std.debug.print("    -> Querying for system libs...\n", .{});
     const system_libs = getCommandOutput(b, &[_][]const u8{llvm_config_path, "--system-libs"}) catch blk: {
-        std.debug.print("Failed to get system libs from llvm-config\n", .{});
+        std.debug.print("    -> FAILED to get system libs from llvm-config. Continuing without them.\n", .{});
         break :blk "";
     };
-    
+    std.debug.print("    -> Found system libs: {s}\n", .{system_libs});
+
+    std.debug.print("    -> Querying for ldflags...\n", .{});
     const ldflags = getCommandOutput(b, &[_][]const u8{llvm_config_path, "--ldflags"}) catch blk: {
-        std.debug.print("Failed to get ldflags from llvm-config\n", .{});
+        std.debug.print("    -> FAILED to get ldflags from llvm-config. Continuing without them.\n", .{});
         break :blk "";
     };
+    std.debug.print("    -> Found ldflags: {s}\n", .{ldflags});
     
     // Link system libraries if available (but our paths take precedence)
     if (system_libs.len > 0) {
@@ -181,8 +224,17 @@ fn addMLIRSupport(b: *std.Build, target: *std.Build.Step.Compile, mlir_config: M
         target.addLibraryPath(.{ .cwd_relative = lib_dir });
     }
     
-    // Add SPIRV-Cross library directory (if it exists)
-    target.addLibraryPath(.{ .cwd_relative = "SPIRV-Cross/build" });
+    // Add SPIRV-Cross library directory if it exists
+    if (std.fs.cwd().access("SPIRV-Cross/build", .{})) |_| {
+        target.addLibraryPath(.{ .cwd_relative = "SPIRV-Cross/build" });
+    } else |err| switch (err) {
+        error.FileNotFound => {
+            // SPIRV-Cross not built, skip adding library path
+        },
+        else => {
+            // Some other error accessing the directory
+        },
+    }
     
     // Selective library linking - core MLIR libraries plus specific dialects and passes
     const mlir_libs = [_][]const u8{
@@ -324,15 +376,41 @@ fn addMLIRSupport(b: *std.Build, target: *std.Build.Step.Compile, mlir_config: M
         "StablehloPassUtils",         // StableHLO utility functions
         "Version",                    // VHLO version utilities
         
-        // FINAL 9 MISSING LIBRARIES - PDL and StableHLO optimizations
+        // PDL and StableHLO optimizations
         "MLIRRewritePDL",             // PDL bytecode constructor and rewrite functions
         "StablehloOptimizationPasses", // StableHLO shape folder patterns
         "StablehloTypeConversion",    // RemoveSignTypeConverter functions
         
-        // Core LLVM libraries
-        "LLVMSupport",
-        "LLVMCore",
-        "LLVMDemangle",
+        // Additional MLIR conversion libraries for LLVM conversion
+        "MLIRLLVMIR",                 // LLVM dialect for MLIR
+        "MLIRLLVMAVX512",            // LLVM AVX512 dialect
+        "MLIRLLVMCommonConversion",  // Common LLVM conversion infrastructure 
+        "MLIRVectorToLLVM",          // Vector to LLVM conversion
+        "MLIRArithToLLVM",           // Arith to LLVM conversion
+        "MLIRControlFlowToLLVM",     // Control flow to LLVM conversion
+        "MLIRIndexToLLVM",           // Index to LLVM conversion
+        "MLIRMemRefToLLVM",          // MemRef to LLVM conversion
+        "MLIRSCFToLLVM",             // SCF to LLVM conversion
+        
+        // Complete LLVM libraries from llvm-config --libs
+        "LLVMWindowsManifest", "LLVMXRay", "LLVMLibDriver", "LLVMDlltoolDriver", "LLVMTelemetry", "LLVMTextAPIBinaryReader",
+        "LLVMCoverage", "LLVMLineEditor", "LLVMAArch64Disassembler", "LLVMAArch64AsmParser", "LLVMAArch64CodeGen", 
+        "LLVMAArch64Desc", "LLVMAArch64Utils", "LLVMAArch64Info", "LLVMX86TargetMCA", "LLVMX86Disassembler", 
+        "LLVMX86AsmParser", "LLVMX86CodeGen", "LLVMX86Desc", "LLVMX86Info", "LLVMOrcDebugging", "LLVMOrcJIT", 
+        "LLVMWindowsDriver", "LLVMMCJIT", "LLVMJITLink", "LLVMInterpreter", "LLVMExecutionEngine", "LLVMRuntimeDyld", 
+        "LLVMOrcTargetProcess", "LLVMOrcShared", "LLVMDWP", "LLVMDebugInfoLogicalView", "LLVMOption", "LLVMObjCopy", 
+        "LLVMMCA", "LLVMMCDisassembler", "LLVMLTO", "LLVMPasses", "LLVMHipStdPar", "LLVMCFGuard", "LLVMCoroutines", 
+        "LLVMipo", "LLVMVectorize", "LLVMSandboxIR", "LLVMLinker", "LLVMFrontendOpenMP", "LLVMFrontendOffloading", 
+        "LLVMObjectYAML", "LLVMFrontendOpenACC", "LLVMFrontendHLSL", "LLVMFrontendDriver", "LLVMInstrumentation", 
+        "LLVMFrontendDirective", "LLVMFrontendAtomic", "LLVMExtensions", "LLVMDWARFLinkerParallel", "LLVMDWARFLinkerClassic", 
+        "LLVMDWARFLinker", "LLVMGlobalISel", "LLVMMIRParser", "LLVMAsmPrinter", "LLVMSelectionDAG", "LLVMCodeGen", 
+        "LLVMTarget", "LLVMObjCARCOpts", "LLVMCodeGenTypes", "LLVMCGData", "LLVMIRPrinter", "LLVMInterfaceStub", 
+        "LLVMFileCheck", "LLVMFuzzMutate", "LLVMScalarOpts", "LLVMInstCombine", "LLVMAggressiveInstCombine", 
+        "LLVMTransformUtils", "LLVMBitWriter", "LLVMAnalysis", "LLVMProfileData", "LLVMSymbolize", "LLVMDebugInfoBTF", 
+        "LLVMDebugInfoPDB", "LLVMDebugInfoMSF", "LLVMDebugInfoCodeView", "LLVMDebugInfoGSYM", "LLVMDebugInfoDWARF", 
+        "LLVMObject", "LLVMTextAPI", "LLVMMCParser", "LLVMIRReader", "LLVMAsmParser", "LLVMMC", "LLVMBitReader", 
+        "LLVMFuzzerCLI", "LLVMCore", "LLVMRemarks", "LLVMBitstreamReader", "LLVMBinaryFormat", "LLVMTargetParser", 
+        "LLVMTableGen", "LLVMSupport", "LLVMDemangle",
     };
     
     // Link C++ standard library first
@@ -345,13 +423,17 @@ fn addMLIRSupport(b: *std.Build, target: *std.Build.Step.Compile, mlir_config: M
 }
 
 pub fn build(b: *std.Build) void {
+    std.debug.print("==> Starting build script\n", .{});
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
     
     // Detect MLIR availability
+    std.debug.print("==> Detecting MLIR configuration\n", .{});
     const mlir_config = detectMLIR(b);
+    std.debug.print("==> MLIR detected: enabled={}, path={s}\n", .{mlir_config.enabled, mlir_config.llvm_config_path orelse "null"});
 
     // Create the Metal bridge object file if on macOS
+    std.debug.print("==> Creating Metal bridge library\n", .{});
     var metal_bridge_lib: ?*std.Build.Step.Compile = null;
     if (builtin.os.tag == .macos) {
         metal_bridge_lib = b.addStaticLibrary(.{
@@ -371,60 +453,76 @@ pub fn build(b: *std.Build) void {
     }
 
     // Create SPIR-V bridge library if MLIR is available
+    std.debug.print("==> Creating SPIRV bridge library (MLIR enabled: {})\n", .{mlir_config.enabled});
     var spirv_bridge_lib: ?*std.Build.Step.Compile = null;
     if (mlir_config.enabled) {
+        std.debug.print("    -> Adding SPIRV bridge static library\n", .{});
         spirv_bridge_lib = b.addStaticLibrary(.{
             .name = "spirv_bridge",
             .target = target,
             .optimize = optimize,
         });
+        std.debug.print("    -> SPIRV bridge library created\n", .{});
 
+        std.debug.print("    -> Adding SPIRV bridge source files\n", .{});
         spirv_bridge_lib.?.addCSourceFile(.{
             .file = b.path("src/mlir/spirv_bridge.cpp"),
             .flags = &[_][]const u8{"-std=c++17"},
         });
+        std.debug.print("    -> Added spirv_bridge.cpp\n", .{});
 
         // Add SPIRV-Cross bridge for real SPIR-V → MSL translation
+        std.debug.print("    -> Adding SPIRV-Cross bridge\n", .{});
         spirv_bridge_lib.?.addCSourceFile(.{
             .file = b.path("src/mlir/spirv_cross_bridge.cpp"),
             .flags = &[_][]const u8{"-std=c++17"},
         });
+        std.debug.print("    -> Added spirv_cross_bridge.cpp\n", .{});
 
         // Add pass anchors bridge to force-load pass libraries
+        std.debug.print("    -> Adding pass anchors bridge\n", .{});
         spirv_bridge_lib.?.addCSourceFile(.{
             .file = b.path("src/mlir/pass_anchors.cpp"),
             .flags = &[_][]const u8{
                 "-std=c++17",
-                "-Ithird_party/stablehlo",
+                "-Istablehlo",
                 "-Illvm-build/include",
                 "-Illvm-build/tools/stablehlo",
             },
         });
+        std.debug.print("    -> Added pass_anchors.cpp\n", .{});
 
+        std.debug.print("    -> Adding include paths\n", .{});
         if (mlir_config.include_dir) |include_dir| {
             spirv_bridge_lib.?.addIncludePath(.{ .cwd_relative = include_dir });
         }
         
-        // Add MLIR include directories
-        spirv_bridge_lib.?.addIncludePath(.{ .cwd_relative = "llvm-project/mlir/include" });
+        // Add MLIR and LLVM include directories
+        spirv_bridge_lib.?.addIncludePath(.{ .cwd_relative = "llvm-project/llvm/include" }); // LLVM headers
+        spirv_bridge_lib.?.addIncludePath(.{ .cwd_relative = "llvm-project/mlir/include" }); // MLIR headers
         spirv_bridge_lib.?.addIncludePath(.{ .cwd_relative = "llvm-build/tools/mlir/include" });
         spirv_bridge_lib.?.addIncludePath(.{ .cwd_relative = "llvm-build/include" });
         
         // NEW: Add StableHLO include paths
-        spirv_bridge_lib.?.addIncludePath(.{ .cwd_relative = "third_party/stablehlo" });
+        spirv_bridge_lib.?.addIncludePath(.{ .cwd_relative = "stablehlo" });
         spirv_bridge_lib.?.addIncludePath(.{ .cwd_relative = "llvm-build/tools/stablehlo" });
         
         // Add SPIRV-Cross include paths
         spirv_bridge_lib.?.addIncludePath(.{ .cwd_relative = "SPIRV-Cross" });
         spirv_bridge_lib.?.addIncludePath(.{ .cwd_relative = "SPIRV-Cross/include" });
+        // Add our local MLIR library directory FIRST  
         if (mlir_config.lib_dir) |lib_dir| {
             spirv_bridge_lib.?.addLibraryPath(.{ .cwd_relative = lib_dir });
+            std.debug.print("    -> Added MLIR library path: {s}\n", .{lib_dir});
+        } else {
+            // Fallback to project-relative MLIR build directory
+            spirv_bridge_lib.?.addLibraryPath(.{ .cwd_relative = "llvm-build/lib" });
+            std.debug.print("    -> Added fallback MLIR library path: llvm-build/lib\n", .{});
         }
         
-        // Add SPIRV-Cross library path and libraries
-        spirv_bridge_lib.?.addLibraryPath(.{ .cwd_relative = "SPIRV-Cross/build" });
-        
-        const spirv_libs = [_][]const u8{
+        std.debug.print("    -> Adding MLIR libraries\n", .{});
+        // Core MLIR/LLVM libraries (always required)
+        const core_spirv_libs = [_][]const u8{
             "MLIRCAPIIR",
             "MLIRIR",
             "MLIRSPIRVDialect",
@@ -433,7 +531,38 @@ pub fn build(b: *std.Build) void {
             "MLIRSupport",
             "LLVMSupport",
             "LLVMCore",
-            // SPIRV-Cross libraries for real SPIR-V → MSL translation
+        };
+        
+        std.debug.print("    -> Linking core SPIRV libraries ({} libraries)\n", .{core_spirv_libs.len});
+        for (core_spirv_libs) |lib| {
+            std.debug.print("      -> Linking: {s}\n", .{lib});
+            spirv_bridge_lib.?.linkSystemLibrary(lib);
+        }
+        std.debug.print("    -> Core SPIRV libraries linked successfully\n", .{});
+        
+        // Add SPIRV-Cross libraries if they're built
+        const spirv_cross_build_dir = std.fs.path.join(b.allocator, &[_][]const u8{ "SPIRV-Cross", "build" }) catch {
+            std.debug.print("Failed to construct SPIRV-Cross build path\n", .{});
+            return;
+        };
+        defer b.allocator.free(spirv_cross_build_dir);
+        
+        std.fs.cwd().access(spirv_cross_build_dir, .{}) catch |err| switch (err) {
+            error.FileNotFound => {
+                std.debug.print("Warning: SPIRV-Cross not built. Some features may be unavailable.\n", .{});
+                std.debug.print("To build SPIRV-Cross: cd SPIRV-Cross && mkdir -p build && cd build && cmake .. && make\n", .{});
+                return;
+            },
+            else => {
+                std.debug.print("Warning: Cannot access SPIRV-Cross build directory: {}\n", .{err});
+                return;
+            },
+        };
+        
+        // Add SPIRV-Cross library path and libraries (optional)
+        spirv_bridge_lib.?.addLibraryPath(.{ .cwd_relative = "SPIRV-Cross/build" });
+        
+        const spirv_cross_libs = [_][]const u8{
             "spirv-cross-msl",
             "spirv-cross-glsl",        // MSL depends on GLSL
             "spirv-cross-hlsl",        // C API uses HLSL compiler
@@ -443,18 +572,36 @@ pub fn build(b: *std.Build) void {
             "spirv-cross-c",
         };
         
-        for (spirv_libs) |lib| {
-            spirv_bridge_lib.?.linkSystemLibrary(lib);
+        std.debug.print("    -> Linking SPIRV-Cross libraries...\n", .{});
+        
+        // Only link SPIRV-Cross libraries if the build directory exists
+        if (std.fs.cwd().access("SPIRV-Cross/build", .{})) |_| {
+            std.debug.print("    -> SPIRV-Cross build found, linking libraries\n", .{});
+            for (spirv_cross_libs) |lib| {
+                spirv_bridge_lib.?.linkSystemLibrary(lib);
+            }
+            std.debug.print("    -> Successfully linked SPIRV-Cross libraries\n", .{});
+        } else |err| switch (err) {
+            error.FileNotFound => {
+                std.debug.print("    -> SPIRV-Cross not built, skipping library linking\n", .{});
+            },
+            else => {
+                std.debug.print("    -> Error accessing SPIRV-Cross directory: {}\n", .{err});
+            },
         }
         
         spirv_bridge_lib.?.linkLibCpp();
+        std.debug.print("    -> SPIRV bridge library configuration completed\n", .{});
     }
+    std.debug.print("==> SPIRV bridge section completed\n", .{});
 
 
     // Create the main PCP module
+    std.debug.print("==> Creating PCP module\n", .{});
     const pcp_module = b.addModule("pcp", .{
         .root_source_file = b.path("src/main.zig"),
     });
+    std.debug.print("==> PCP module created successfully\n", .{});
 
     // Create the GPT-2 module
     const gpt2_module = b.addModule("gpt2", .{
@@ -509,6 +656,7 @@ pub fn build(b: *std.Build) void {
     dialect_test_step.dependOn(&run_dialect_test.step);
 
     // GPT-2 training example executable
+    std.debug.print("==> Creating GPT-2 example executable\n", .{});
     const gpt2_example = b.addExecutable(.{
         .name = "gpt2_example",
         .root_source_file = b.path("src/examples/gpt2_training.zig"),
@@ -1150,6 +1298,7 @@ pub fn build(b: *std.Build) void {
     run_spirv_test_step.dependOn(&run_spirv_test_cmd.step);
 
     // Distributed training system executable (main_distributed.zig)
+    std.debug.print("==> Creating distributed training executable\n", .{});
     const main_distributed = b.addExecutable(.{
         .name = "main_distributed",
         .root_source_file = b.path("src/main_distributed.zig"),
@@ -1162,6 +1311,43 @@ pub fn build(b: *std.Build) void {
     
     // Add MLIR support to distributed training
     addMLIRSupport(b, main_distributed, mlir_config);
+
+    // 1. Define a static C++ library for our Cap'n Proto bridge
+    const capnp_bridge_lib = b.addStaticLibrary(.{
+        .name = "capnp_bridge",
+        .target = target,
+        .optimize = optimize,
+    });
+    capnp_bridge_lib.addCSourceFiles(.{
+        .files = &.{
+            "src/network/protocol.capnp.c++",
+            "src/network/capnp_bridge.cpp",
+        },
+        .flags = &.{"-std=c++17"},
+    });
+    capnp_bridge_lib.linkLibCpp(); // IMPORTANT: Link against C++ standard library
+
+    // NEW: Expose the public header directory to any executable that links this library.
+    capnp_bridge_lib.addIncludePath(b.path("src/network"));
+
+    // This part is for the library's own dependencies (it needs to find <capnp/c++.h>)
+    capnp_bridge_lib.addIncludePath(.{ .cwd_relative = "/opt/homebrew/opt/capnp/include" });
+    capnp_bridge_lib.addLibraryPath(.{ .cwd_relative = "/opt/homebrew/lib" });
+    capnp_bridge_lib.linkSystemLibrary("capnp");
+    capnp_bridge_lib.linkSystemLibrary("kj");
+    
+    // Add include paths for the main executable
+    main_distributed.addIncludePath(b.path("src/network"));
+    main_distributed.addIncludePath(.{ .cwd_relative = "/opt/homebrew/opt/capnp/include" });
+
+    // 2. Link the Zig executable against our bridge and the ARM64 Cap'n Proto libs
+    main_distributed.linkLibrary(capnp_bridge_lib);
+    // Ensure the bridge library is built before the main executable
+    main_distributed.step.dependOn(&capnp_bridge_lib.step);
+    // Explicitly use ARM64 Cap'n Proto libraries
+    main_distributed.addLibraryPath(.{ .cwd_relative = "/opt/homebrew/lib" });
+    main_distributed.linkSystemLibrary("capnp");
+    main_distributed.linkSystemLibrary("kj");
     
     if (spirv_bridge_lib != null) {
         main_distributed.linkLibrary(spirv_bridge_lib.?);
@@ -1184,8 +1370,10 @@ pub fn build(b: *std.Build) void {
     }
     run_main_distributed_cmd.step.dependOn(&main_distributed.step);
 
+    std.debug.print("==> Registering run-distributed step\n", .{});
     const run_main_distributed_step = b.step("run-distributed", "Run the distributed training system");
     run_main_distributed_step.dependOn(&run_main_distributed_cmd.step);
+    std.debug.print("==> run-distributed step registered successfully\n", .{});
 
     // Demo-only executable (no MLIR/StableHLO dependencies)
     const demo_exe = b.addExecutable(.{

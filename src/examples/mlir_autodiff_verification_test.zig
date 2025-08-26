@@ -35,7 +35,7 @@ pub const VJPVerificationTest = struct {
         
         const data = [_]f32{value};
         const bytes = std.mem.sliceAsBytes(data[0..]);
-        var shape = try tensor.Shape.init(self.allocator, &[_]i64{1}, .f32);
+        var shape = try tensor.Shape.initWithDims(self.builder.ctx, &[_]i64{1}, .f32);
         defer shape.deinit();
         
         const constant_value = try self.builder.createConstant(bytes, scalar_type, shape);
@@ -48,7 +48,7 @@ pub const VJPVerificationTest = struct {
         const matrix_type = mlir.Type.rankedTensorType(self.builder.ctx, &.{2, 2}, f32_type);
         
         const bytes = std.mem.sliceAsBytes(data[0..]);
-        var shape = try tensor.Shape.init(self.allocator, &[_]i64{2, 2}, .f32);
+        var shape = try tensor.Shape.initWithDims(self.builder.ctx, &[_]i64{2, 2}, .f32);
         defer shape.deinit();
         
         const constant_value = try self.builder.createConstant(bytes, matrix_type, shape);

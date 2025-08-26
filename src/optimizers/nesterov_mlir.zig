@@ -66,8 +66,10 @@ fn buildNesterovUpdateFunction(
     const velocity = try builder.newTensor(velocity_arg);
 
     // 5. Build the optimizer logic inside this function
-    const momentum_tensor = try ops.constant(builder, @as(f64, @floatCast(conf.momentum)), params.shape.dims, element_type);
-    const lr_tensor = try ops.constant(builder, @as(f64, @floatCast(conf.learning_rate)), params.shape.dims, element_type);
+    const params_dims = try params.shape.getDims(builder.allocator);
+    defer builder.allocator.free(params_dims);
+    const momentum_tensor = try ops.constant(builder, @as(f64, @floatCast(conf.momentum)), params_dims, element_type);
+    const lr_tensor = try ops.constant(builder, @as(f64, @floatCast(conf.learning_rate)), params_dims, element_type);
 
     // velocity = momentum * velocity + learning_rate * grads
     const momentum_velocity_update = try ops.multiply(builder, momentum_tensor, velocity);
@@ -127,7 +129,9 @@ pub fn NesterovMLIR(comptime T: type) type {
         /// Initialize velocity tensor to match parameter shape
         fn initializeVelocity(self: *Self, params: Tensor) !void {
             // Initialize velocity to zeros with same shape as params
-            const zero_op = hlo.zeroConstant(self.builder.ctx, params.shape.dims, self.element_type);
+            const params_dims = try params.shape.getDims(self.builder.allocator);
+            defer self.builder.allocator.free(params_dims);
+            const zero_op = hlo.zeroConstant(self.builder.ctx, params_dims, self.element_type);
             self.velocity = try self.builder.newTensor(zero_op.getResult(0));
         }
 
@@ -156,11 +160,7 @@ pub fn NesterovMLIR(comptime T: type) type {
             };
 
             // 3. Create the func.call operation
-            const call_op = self.builder.createAndAttach("func.call", &operands, &result_types, .{
-                .attributes = &.{
-                    .{ "callee", mlir.Attribute.stringAttr(self.builder.ctx, self.update_fn_name) },
-                },
-            }) catch |err| {
+            const call_op = self.builder.createAndAttach("func.call", &operands, &result_types) catch |err| {
                 std.log.err("Failed to create func.call for optimizer: {}", .{err});
                 // Dump the module to see what functions are available
                 self.builder.module.op().dump();
@@ -189,8 +189,10 @@ pub fn NesterovMLIR(comptime T: type) type {
             }
 
             // Create scalar constants
-            const momentum_tensor = try ops.constant(self.builder, @as(f64, @floatCast(self.conf.momentum)), params.shape.dims, self.element_type);
-            const lr_tensor = try ops.constant(self.builder, @as(f64, @floatCast(self.conf.learning_rate)), params.shape.dims, self.element_type);
+            const params_dims = try params.shape.getDims(self.builder.allocator);
+            defer self.builder.allocator.free(params_dims);
+            const momentum_tensor = try ops.constant(self.builder, @as(f64, @floatCast(self.conf.momentum)), params_dims, self.element_type);
+            const lr_tensor = try ops.constant(self.builder, @as(f64, @floatCast(self.conf.learning_rate)), params_dims, self.element_type);
 
             // Step 1: Compute lookahead parameters
             // lookahead = params - momentum * velocity

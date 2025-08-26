@@ -69,6 +69,34 @@ This architecture is implemented through several key components:
     └── worker.zig               # The worker compute node.
 ```
 
+## Building the Project
+
+### 1. Build LLVM+StableHLO
+This is a one-time step that takes about an hour.
+```sh
+./build_llvm_with_stablehlo.sh
+```
+
+### 2. Set Environment Variables (Optional)
+For better control over LLVM detection, set the `LLVM_DIR` environment variable to point to your LLVM build directory:
+```sh
+export LLVM_DIR=/path/to/your/llvm-build
+```
+
+If not set, the build system will auto-detect LLVM in common locations including:
+- `llvm-build/bin/llvm-config` (project-local build)
+- System installations via Homebrew, package managers, etc.
+
+### 3. Build the Project
+```sh
+zig build
+```
+
+### 4. Run Tests
+```sh
+zig build test
+```
+
 ## Usage
 
 To run the distributed training demonstration, which starts one Shepherd and two Workers:

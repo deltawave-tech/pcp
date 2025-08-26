@@ -41,34 +41,55 @@ pub const DType = enum {
     }
 };
 
-/// Tensor shape information - uses i64 to match MLIR dimension type
+/// Tensor shape information - queries MLIR types on-demand (no allocations)
 pub const Shape = struct {
-    dims: []const i64, // Changed from usize to i64 for MLIR compatibility
+    // Store the MLIR type as the source of truth. No Zig allocations needed.
+    mlir_type: mlir.RankedTensorType,
     dtype: DType,
-    allocator: Allocator,
 
-    pub fn init(allocator: Allocator, dimensions: []const i64, dtype: DType) !Shape {
-        const dims_copy = try allocator.dupe(i64, dimensions);
+    /// Create Shape from MLIR RankedTensorType - no allocation needed
+    pub fn init(mlir_type: mlir.RankedTensorType) !Shape {
+        const dtype = DType.fromMlirType(mlir_type.getElementType());
         return Shape{
-            .dims = dims_copy,
+            .mlir_type = mlir_type,
             .dtype = dtype,
-            .allocator = allocator,
         };
     }
 
+    /// Create Shape with explicit dimensions (for non-MLIR usage)
+    pub fn initWithDims(ctx: mlir.Context, dimensions: []const i64, dtype: DType) !Shape {
+        const element_type = dtype.toMLIRType(ctx);
+        const mlir_tensor_type = mlir.Type.rankedTensorType(ctx, dimensions, element_type);
+        const ranked_type = mlir.RankedTensorType{ .handle = mlir_tensor_type.handle };
+        return Shape{
+            .mlir_type = ranked_type,
+            .dtype = dtype,
+        };
+    }
+
+    /// deinit becomes a no-op as there is nothing to free
     pub fn deinit(self: *Shape) void {
-        self.allocator.free(self.dims);
+        _ = self;
     }
 
+    /// rank() queries the MLIR type directly
     pub fn rank(self: Shape) usize {
-        return self.dims.len;
+        return self.mlir_type.getRank();
     }
 
+    /// Get a specific dimension by index
+    pub fn getDimension(self: Shape, index: usize) i64 {
+        return self.mlir_type.getDimension(index);
+    }
+
+    /// elemCount() queries the MLIR type directly
     pub fn elemCount(self: Shape) usize {
-        if (self.dims.len == 0) return 0;
+        const rank_val = self.rank();
+        if (rank_val == 0) return 0;
 
         var result: usize = 1;
-        for (self.dims) |dim| {
+        for (0..rank_val) |i| {
+            const dim = self.getDimension(i);
             if (dim <= 0) return 0; // Handle dynamic or invalid dimensions
             result *= @intCast(dim);
         }
@@ -77,28 +98,48 @@ pub const Shape = struct {
 
     pub fn eql(self: Shape, other: Shape) bool {
         if (self.dtype != other.dtype) return false;
-        return std.mem.eql(i64, self.dims, other.dims);
-    }
-
-    /// Convert shape to MLIR tensor type
-    pub fn toMLIRType(self: Shape, ctx: mlir.Context) mlir.Type {
-        const element_type = self.dtype.toMLIRType(ctx);
-        return mlir.Type.rankedTensorType(ctx, self.dims, element_type);
-    }
-
-    /// Create Shape from MLIR RankedTensorType
-    pub fn fromMLIR(shaped_type: mlir.RankedTensorType, allocator: Allocator) !Shape {
-        const tensor_rank = shaped_type.getRank();
-        var dims = try allocator.alloc(i64, tensor_rank);
-        for (0..tensor_rank) |i| {
-            dims[i] = shaped_type.getDimension(i);
+        const self_rank = self.rank();
+        const other_rank = other.rank();
+        if (self_rank != other_rank) return false;
+        
+        for (0..self_rank) |i| {
+            if (self.getDimension(i) != other.getDimension(i)) return false;
         }
-        const dtype = DType.fromMlirType(shaped_type.getElementType());
-        return Shape{
-            .dims = dims,
-            .dtype = dtype,
-            .allocator = allocator,
-        };
+        return true;
+    }
+
+    /// Compare shape with a slice of dimensions
+    pub fn eqlDims(self: Shape, dims: []const i64) bool {
+        const self_rank = self.rank();
+        if (self_rank != dims.len) return false;
+        
+        for (0..self_rank) |i| {
+            if (self.getDimension(i) != dims[i]) return false;
+        }
+        return true;
+    }
+
+    /// Convert shape to MLIR tensor type - can reuse existing MLIR type
+    pub fn toMLIRType(self: Shape, ctx: mlir.Context) mlir.Type {
+        _ = ctx; // For now, just return the existing MLIR type
+        return mlir.Type{ .handle = self.mlir_type.handle };
+    }
+
+    /// Provide a way to get dimensions for iteration when a slice is needed
+    /// Caller must free the returned slice
+    pub fn getDims(self: Shape, allocator: Allocator) ![]i64 {
+        const rank_val = self.rank();
+        const dims_slice = try allocator.alloc(i64, rank_val);
+        for (0..rank_val) |i| {
+            dims_slice[i] = self.getDimension(i);
+        }
+        return dims_slice;
+    }
+
+    /// Create Shape from MLIR RankedTensorType - no allocation!
+    pub fn fromMLIR(shaped_type: mlir.RankedTensorType, allocator: Allocator) !Shape {
+        _ = allocator; // No longer needed
+        return Shape.init(shaped_type);
     }
 };
 
@@ -143,7 +184,7 @@ pub fn Tensor(comptime T: type) type {
 
         /// Create a tensor filled with zeros
         pub fn zeros(builder: *MLIRBuilder, dims: []const i64, dtype: DType) !Self {
-            var shape = try Shape.init(builder.allocator, dims, dtype);
+            var shape = try Shape.initWithDims(builder.ctx, dims, dtype);
             errdefer shape.deinit();
 
             // Create zero data
@@ -158,7 +199,7 @@ pub fn Tensor(comptime T: type) type {
 
         /// Create a tensor filled with a specific value
         pub fn filled(builder: *MLIRBuilder, dims: []const i64, dtype: DType, value: f32) !Self {
-            var shape = try Shape.init(builder.allocator, dims, dtype);
+            var shape = try Shape.initWithDims(builder.ctx, dims, dtype);
             errdefer shape.deinit();
 
             // Create filled data (simplified for f32 only for now)

@@ -101,7 +101,7 @@ pub fn buildGradientGraph(
     const ones_data = [_]f32{1.0};
     const ones_bytes = std.mem.sliceAsBytes(ones_data[0..]);
     std.debug.print("Creating ones shape...\n", .{});
-    var ones_shape = try tensor.Shape.init(allocator, &[_]i64{1}, .f32);
+    var ones_shape = try tensor.Shape.initWithDims(builder.ctx, &[_]i64{1}, .f32);
     defer ones_shape.deinit();
     std.debug.print("Creating ones constant...\n", .{});
     const loss_type = loss_value.getType();
@@ -849,7 +849,7 @@ fn finalizeGradientFunction(
             const zero_bytes = std.mem.sliceAsBytes(zero_data[0..]);
             
             // Create a shape for the zero tensor (assuming scalar for now)
-            var zero_shape = try tensor.Shape.init(allocator, &[_]i64{1}, .f32);
+            var zero_shape = try tensor.Shape.initWithDims(builder.ctx, &[_]i64{1}, .f32);
             defer zero_shape.deinit();
             
             const zero_gradient = try builder.createConstant(zero_bytes, arg_type, zero_shape);

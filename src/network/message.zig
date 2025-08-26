@@ -1,6 +1,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const json = std.json;
+const binary_protocol = @import("binary_protocol.zig");
 
 pub const MessageEnvelope = struct {
     recipient_node: NodeId,
@@ -23,6 +24,50 @@ pub const MessageEnvelope = struct {
     pub fn fromJsonString(json_str: []u8, allocator: Allocator) json.ParseError(json.Scanner)!json.Parsed(MessageEnvelope) {
         return try json.parseFromSlice(MessageEnvelope, allocator, json_str, .{});
     }
+    
+    /// Create MessageEnvelope with binary data (Base64 encoded)
+    pub fn createWithBinaryData(
+        recipient_node: NodeId,
+        recipient_service: ServiceId,
+        sender_node: NodeId,
+        sender_service: ServiceId,
+        msg_type: []const u8,
+        msg_id: MessageId,
+        binary_data: []const u8,
+        allocator: Allocator,
+    ) !Self {
+        // Base64 encode the binary data
+        const b64_len = std.base64.standard.Encoder.calcSize(binary_data.len);
+        const b64_encoded = try allocator.alloc(u8, b64_len);
+        defer allocator.free(b64_encoded);
+        
+        const encoded_len = std.base64.standard.Encoder.encode(b64_encoded, binary_data).len;
+        const final_encoded = try allocator.dupe(u8, b64_encoded[0..encoded_len]);
+        
+        return Self{
+            .recipient_node = recipient_node,
+            .recipient_service = recipient_service,
+            .sender_node = sender_node,
+            .sender_service = sender_service,
+            .msg_type = msg_type,
+            .msg_id = msg_id,
+            .data = std.json.Value{ .string = final_encoded },
+        };
+    }
+    
+    /// Extract binary data from MessageEnvelope (Base64 decode)
+    pub fn extractBinaryData(self: Self, allocator: Allocator) ![]u8 {
+        const b64_string = switch (self.data) {
+            .string => |s| s,
+            else => return error.InvalidMessageFormat,
+        };
+        
+        const decoded_len = try std.base64.standard.Decoder.calcSizeForSlice(b64_string);
+        const decoded = try allocator.alloc(u8, decoded_len);
+        
+        try std.base64.standard.Decoder.decode(decoded, b64_string);
+        return decoded;
+    }
 };
 
 /// A (possibly random) node id.
@@ -36,6 +81,7 @@ pub const MessageId = u8;
 pub const MessageType = struct {
     pub const JOIN_REQUEST = "JoinRequest";
     pub const JOIN_ACCEPT = "JoinAccept";
+    pub const INITIALIZE_GRAPH = "InitializeGraph";
     pub const START_INNER_LOOP = "StartInnerLoop";
     pub const INNER_LOOP_COMPLETE = "InnerLoopComplete";
     pub const SHUTDOWN = "Shutdown";

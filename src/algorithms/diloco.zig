@@ -1,18 +1,18 @@
 /// DiLoCo (Distributed Low-Communication) Algorithm Implementation
 /// Implements the DiLoCo training algorithm for distributed learning with real MLIR optimizers
-
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const ArrayList = std.ArrayList;
 const training_algorithm = @import("training_algorithm.zig");
 const shepherd = @import("../controllers/shepherd.zig");
 const message = @import("../network/message.zig");
+const binary_protocol = @import("../network/binary_protocol.zig");
 const nesterov_mlir = @import("../optimizers/nesterov_mlir.zig");
 const autodiff = @import("../autodiff.zig");
 const ops = @import("../ops.zig");
 const mlir = @import("../mlir.zig");
 const tensor = @import("../tensor.zig");
-const execution = @import("../execution.zig"); // NEW import
+const execution = @import("../execution.zig");
 const monitoring = @import("../monitoring.zig");
 
 const TrainingAlgorithm = training_algorithm.TrainingAlgorithm;
@@ -32,9 +32,8 @@ pub const DiLoCoConfig = struct {
     tau: usize, // Inner loop steps
     nesterov_momentum: f32,
     parameter_averaging: bool,
-    param_count: usize, // Number of model parameters
-    demo_execution: bool, // Whether to use demo mode
-    
+    param_count: usize,
+
     pub fn default() DiLoCoConfig {
         return DiLoCoConfig{
             .base_config = TrainingConfig.default(),
@@ -42,7 +41,6 @@ pub const DiLoCoConfig = struct {
             .nesterov_momentum = 0.9,
             .parameter_averaging = true,
             .param_count = 1000, // Default parameter count
-            .demo_execution = false, // Default to real execution
         };
     }
 };
@@ -56,42 +54,64 @@ pub const DiLoCo = struct {
     status: TrainingStatus,
     metrics: TrainingMetrics,
     current_epoch: usize,
-    
+
     // MLIR infrastructure
-    mlir_builder: *MLIRBuilder,
+    mlir_builder: MLIRBuilder,
     nesterov_optimizer: *NesterovMLIR,
     element_type: mlir.Type,
-    
+
     // Master parameters as MLIR tensors
     master_parameters: ?Tensor,
     parameter_shape: []const i64,
-    
+
     // NEW: Generic executor - replaces direct backend knowledge
     executor: Executor,
-    
+
+    // NEW: Cached serialized worker graph for one-time initialization
+    serialized_worker_graph: []u8,
+
     const Self = @This();
-    
+
     // Change the init signature to accept the generic executor
     pub fn init(allocator: Allocator, coordinator: *Shepherd, config: DiLoCoConfig, executor: Executor) !Self {
-        // Initialize MLIR infrastructure
-        const mlir_builder = try allocator.create(MLIRBuilder);
-        mlir_builder.* = try MLIRBuilder.init(allocator);
-        
+        // Initialize MLIR infrastructure directly
+        var mlir_builder = try MLIRBuilder.init(allocator);
+
         const element_type = mlir.Type.f32Type(mlir_builder.ctx);
-        
+
         // Configure and create Nesterov optimizer
         const nesterov_config = nesterov_mlir.NesterovMLIRConfiguration(f32){
             .learning_rate = config.base_config.learning_rate,
             .momentum = config.nesterov_momentum,
         };
-        
+
         const nesterov_optimizer = try allocator.create(NesterovMLIR);
-        nesterov_optimizer.* = try NesterovMLIR.init(allocator, mlir_builder, nesterov_config, element_type);
-        
+        nesterov_optimizer.* = try NesterovMLIR.init(allocator, &mlir_builder, nesterov_config, element_type);
+
         // Set up parameter shape
         const parameter_shape = try allocator.alloc(i64, 1);
         parameter_shape[0] = @intCast(config.param_count);
-        
+
+        // Create a partial instance to build the worker graph
+        var partial_self = Self{
+            .allocator = allocator,
+            .coordinator = undefined, // Not used during graph building
+            .config = config,
+            .status = .not_started,
+            .metrics = TrainingMetrics.init(),
+            .current_epoch = 0,
+            .mlir_builder = mlir_builder,
+            .nesterov_optimizer = nesterov_optimizer,
+            .element_type = element_type,
+            .master_parameters = null,
+            .parameter_shape = parameter_shape,
+            .executor = executor,
+            .serialized_worker_graph = undefined, // Will be set below
+        };
+
+        // Build the worker graph ONCE during initialization
+        const graph = try partial_self.buildWorkerTrainingGraph();
+
         return Self{
             .allocator = allocator,
             .coordinator = coordinator,
@@ -105,23 +125,26 @@ pub const DiLoCo = struct {
             .master_parameters = null,
             .parameter_shape = parameter_shape,
             .executor = executor, // Store the generic executor
+            .serialized_worker_graph = graph, // Store the pre-built graph
         };
     }
-    
+
     pub fn deinit(self: *Self) void {
         if (self.master_parameters) |params| {
             params.deinit();
         }
-        
+
         self.nesterov_optimizer.deinit();
         self.allocator.destroy(self.nesterov_optimizer);
-        
+
         self.mlir_builder.deinit();
-        self.allocator.destroy(self.mlir_builder);
-        
+
+        // Free the stored serialized graph
+        self.allocator.free(self.serialized_worker_graph);
+
         self.allocator.free(self.parameter_shape);
     }
-    
+
     /// Get TrainingAlgorithm interface
     pub fn asTrainingAlgorithm(self: *Self) TrainingAlgorithm {
         return TrainingAlgorithm{
@@ -134,94 +157,97 @@ pub const DiLoCo = struct {
             },
         };
     }
-    
+
     /// Main DiLoCo training loop
     pub fn run(ptr: *anyopaque) !void {
         const self: *Self = @ptrCast(@alignCast(ptr));
-        
+
         self.status = .initializing;
         monitoring.setStatus(.initializing);
         monitoring.setModelInfo(self.config.param_count, self.config.base_config.learning_rate);
         std.log.info("Starting DiLoCo training algorithm with MLIR optimizers", .{});
-        
+
         // Initialize master parameters
         try self.initializeMasterParameters();
-        
+
+        // PHASE 0: SETUP WORKERS (ONE-TIME)
+        try self.setupWorkers();
+
         self.status = .running;
         monitoring.setStatus(.running);
-        
+
         // Main outer loop
         for (0..self.config.base_config.outer_loop_steps) |outer_step| {
             const start_time = std.time.milliTimestamp();
             std.log.info("DiLoCo outer loop step {}/{}", .{ outer_step + 1, self.config.base_config.outer_loop_steps });
-            
+
             // Phase 1: Broadcast master parameters to all workers
             try self.broadcastMasterParameters();
-            
+
             // Phase 2: Collect results from workers after inner loop
             const worker_results = try self.collectWorkerResults();
             defer self.cleanupWorkerResults(worker_results);
-            
+
             // Phase 3: Update master parameters using MLIR Nesterov optimizer
             try self.updateMasterParametersMLIR(worker_results);
-            
+
             // Update metrics
             self.metrics.outer_loop_count += 1;
             self.current_epoch += 1;
-            
+
             // Calculate epoch time and update monitoring
             const end_time = std.time.milliTimestamp();
             const epoch_time_ms: u64 = @intCast(end_time - start_time);
             monitoring.setEpochTime(epoch_time_ms);
             monitoring.setMetrics(self.current_epoch, self.metrics.loss, self.coordinator.getWorkerCount());
-            
+
             // Check convergence or stopping conditions
             if (self.shouldStop()) {
                 break;
             }
         }
-        
+
         self.status = .completed;
         monitoring.setStatus(.completed);
         std.log.info("DiLoCo training completed", .{});
     }
-    
+
     /// Initialize master parameters using MLIR
     fn initializeMasterParameters(self: *Self) !void {
         // Create initial parameter values
         const param_data = try self.allocator.alloc(f32, self.config.param_count);
         defer self.allocator.free(param_data);
-        
+
         // Initialize with Xavier/Glorot initialization
         var rng = std.Random.DefaultPrng.init(12345);
         const scale = std.math.sqrt(2.0 / @as(f32, @floatFromInt(self.config.param_count)));
-        
+
         for (param_data) |*param| {
             param.* = rng.random().floatNorm(f32) * scale;
         }
-        
+
         // Convert to MLIR tensor
         self.master_parameters = try self.createTensorFromArray(param_data);
-        
+
         std.log.info("Initialized master parameters with {} elements using Xavier initialization", .{self.config.param_count});
     }
-    
+
     /// Create a dedicated forward+loss function that will be differentiated
     /// This is a well-formed func.func operation that autodiff can process
     fn buildForwardAndLossFunction(self: *Self, builder: *ops.MLIRBuilder) !mlir.Operation {
         const f32_type = mlir.Type.f32Type(builder.ctx);
         const param_count = self.config.param_count;
-        
+
         // Define types
         const params_type = mlir.Type.rankedTensorType(builder.ctx, &.{@intCast(param_count)}, f32_type);
-        const data_type = mlir.Type.rankedTensorType(builder.ctx, &.{4, 12}, f32_type);
+        const data_type = mlir.Type.rankedTensorType(builder.ctx, &.{ 4, 12 }, f32_type);
         const loss_type = mlir.Type.rankedTensorType(builder.ctx, &.{}, f32_type); // Scalar loss
-        
+
         // Define the function type: func(params, inputs, targets) -> (loss)
         const input_types = [_]mlir.Type{ params_type, data_type, data_type };
-        const result_types = [_]mlir.Type{ loss_type };
+        const result_types = [_]mlir.Type{loss_type};
         const func_type = mlir.Type.functionType(builder.ctx, &input_types, &result_types);
-        
+
         // Create the func.func operation with attributes
         const func_op = mlir.Operation.create(builder.ctx, "func.func", .{
             .operands = &.{},
@@ -232,44 +258,35 @@ pub const DiLoCo = struct {
             },
             .location = builder.loc,
         });
-        
+
         // Create a block for the function body
         const region = func_op.getRegion(0);
         const block = try builder.createBlock();
         region.appendOwnedBlock(block);
-        
+
         // Add block arguments
         const params_arg = block.addArgument(params_type, builder.loc);
         const inputs_arg = block.addArgument(data_type, builder.loc);
         _ = block.addArgument(data_type, builder.loc); // targets_arg (unused in simple example)
-        
+
         // Build the forward/loss computation inside this function
         const param_tensor = try builder.newTensor(params_arg);
         const input_flat = try ops.reshape(builder, try builder.newTensor(inputs_arg), &.{@intCast(param_count)});
-        
+
         // Simple MSE loss computation
         const diff = try ops.subtract(builder, param_tensor, input_flat);
         const squared = try ops.multiply(builder, diff, diff);
         const loss = try ops.reduceSum(builder, squared, &.{0});
-        
+
         // Return the loss
         _ = try builder.createAndAttach("func.return", &.{loss.value}, &.{});
-        
+
         return func_op;
     }
 
     /// Build the complete worker training graph as MLIR module using Function-as-a-Unit pattern
     /// This creates: forward_fn -> autodiff -> main_fn that orchestrates the full training step
     fn buildWorkerTrainingGraph(self: *Self) ![]u8 {
-        // Check if we should use demo mode based on configuration
-        const is_demo_mode = self.config.demo_execution;
-        
-        if (is_demo_mode) {
-            std.log.info("DiLoCo: Using demo mode - generating simulated MLIR module...", .{});
-            const demo_backend = @import("../backends/demo.zig");
-            return try demo_backend.simulateModuleSerialization(self.allocator, "DiLoCo Training Graph");
-        }
-        
         std.log.info("DiLoCo: Building REAL autodiff-enabled worker training graph with Function-as-a-Unit pattern...", .{});
         var builder = try ops.MLIRBuilder.init(self.allocator);
         defer builder.deinit();
@@ -277,30 +294,30 @@ pub const DiLoCo = struct {
         // === Part 1: Create the forward+loss function to be differentiated ===
         std.log.info("Creating forward+loss function...", .{});
         const forward_fn = try self.buildForwardAndLossFunction(&builder);
-        
-        // === Part 2: Differentiate the forward function ===  
+
+        // === Part 2: Differentiate the forward function ===
         std.log.info("Differentiating forward function with autodiff.buildGradientGraph...", .{});
         _ = try autodiff.buildGradientGraph(self.allocator, &builder, forward_fn);
-        
+
         // The autodiff system will name the gradient function predictably
         // For now, we'll use the convention that it names it "forward_and_loss_fn_grad"
         const grad_fn_name = "forward_and_loss_fn_grad";
-        
+
         // === Part 3: Create the main worker function that orchestrates everything ===
         std.log.info("Creating main worker orchestration function...", .{});
-        
+
         // Define types for main function
         const f32_type = mlir.Type.f32Type(builder.ctx);
         const param_count = self.config.param_count;
         const params_type = mlir.Type.rankedTensorType(builder.ctx, &.{@intCast(param_count)}, f32_type);
-        const data_type = mlir.Type.rankedTensorType(builder.ctx, &.{4, 12}, f32_type);
+        const data_type = mlir.Type.rankedTensorType(builder.ctx, &.{ 4, 12 }, f32_type);
         const loss_type = mlir.Type.rankedTensorType(builder.ctx, &.{}, f32_type);
-        
+
         // Create main function: func(params, inputs, targets) -> (new_params, loss)
         const main_input_types = [_]mlir.Type{ params_type, data_type, data_type };
         const main_result_types = [_]mlir.Type{ params_type, loss_type };
         const main_func_type = mlir.Type.functionType(builder.ctx, &main_input_types, &main_result_types);
-        
+
         const main_func_op = mlir.Operation.create(builder.ctx, "func.func", .{
             .operands = &.{},
             .results = &.{},
@@ -310,20 +327,20 @@ pub const DiLoCo = struct {
             },
             .location = builder.loc,
         });
-        
+
         // Create main function body
         const main_region = main_func_op.getRegion(0);
         const main_block = try builder.createBlock();
         main_region.appendOwnedBlock(main_block);
-        
+
         // Add main function arguments
         const initial_params = main_block.addArgument(params_type, builder.loc);
         const inputs = main_block.addArgument(data_type, builder.loc);
         const targets = main_block.addArgument(data_type, builder.loc);
-        
+
         // Call the forward function to get the loss
         const forward_call_op = mlir.Operation.create(builder.ctx, "func.call", .{
-            .operands = &.{initial_params, inputs, targets},
+            .operands = &.{ initial_params, inputs, targets },
             .results = &.{loss_type},
             .attributes = &.{
                 .{ "callee", mlir.Attribute.stringAttr(builder.ctx, "forward_and_loss_fn") },
@@ -331,153 +348,164 @@ pub const DiLoCo = struct {
             .location = builder.loc,
         });
         const loss_val = forward_call_op.getResult(0);
-        
+
         // Call the gradient function to get gradients
         const one = try ops.constant(&builder, 1.0, &.{}, f32_type); // Scalar 1.0 for loss gradient seed
         const grad_call_op = mlir.Operation.create(builder.ctx, "func.call", .{
-            .operands = &.{initial_params, inputs, targets, one.value},
-            .results = &.{params_type, data_type, data_type},
+            .operands = &.{ initial_params, inputs, targets, one.value },
+            .results = &.{ params_type, data_type, data_type },
             .attributes = &.{
                 .{ "callee", mlir.Attribute.stringAttr(builder.ctx, grad_fn_name) },
             },
             .location = builder.loc,
         });
         const param_grads = grad_call_op.getResult(0); // Gradients w.r.t. parameters
-        
+
         // Apply simple gradient descent update
         const learning_rate = try ops.constant(&builder, 0.01, &.{@intCast(param_count)}, f32_type);
         const grad_scaled = try ops.multiply(&builder, try builder.newTensor(param_grads), learning_rate);
         const updated_params = try ops.subtract(&builder, try builder.newTensor(initial_params), grad_scaled);
-        
+
         // Return both updated parameters and loss from main function
-        _ = try builder.createAndAttach("func.return", &.{updated_params.value, loss_val}, &.{});
-        
+        _ = try builder.createAndAttach("func.return", &.{ updated_params.value, loss_val }, &.{});
+
         // === Part 4: Debug and serialize the complete module ===
         std.log.info("Complete worker module with {} functions created successfully", .{3}); // forward_fn, grad_fn, main
-        
+
         // Dump the module for debugging
         builder.module.op().dump();
-        
+
         const serialized = try @import("../mlir_ctx.zig").serializeMLIRModule(self.allocator, builder.module);
-        
+
         std.log.info("✓ DiLoCo REAL autodiff worker training graph built and serialized ({} bytes).", .{serialized.len});
         return serialized;
     }
-    
-    /// Broadcast master parameters and training graph to all workers
+
+    /// Broadcasts the pre-built training graph to all workers for initialization
+    fn setupWorkers(self: *Self) !void {
+        std.log.info("Broadcasting training graph to workers for setup...", .{});
+
+        const json_payload = std.json.Value{ .string = self.serialized_worker_graph };
+
+        // Broadcast InitializeGraph message with the graph
+        try self.coordinator.broadcastToWorkers(MessageType.INITIALIZE_GRAPH, json_payload);
+
+        std.log.info("Training graph sent to {} workers for caching.", .{self.coordinator.getWorkerCount()});
+    }
+
+    /// Broadcast master parameters to all workers using binary protocol
     fn broadcastMasterParameters(self: *Self) !void {
         if (self.master_parameters == null) {
             return error.ParametersNotInitialized;
         }
-        
-        std.log.info("Materializing master parameters for broadcast...", .{});
-        
+
         // Materialize parameters to bytes
         const serialized_params = try self.executor.materialize(self.master_parameters.?);
         defer self.allocator.free(serialized_params);
-        
-        // Build the complete worker training graph
-        const worker_graph_str = try self.buildWorkerTrainingGraph();
-        defer self.allocator.free(worker_graph_str);
-        
-        // Create simple delimiter-based payload to avoid complex JSON parsing
-        var payload_list = std.ArrayList(u8).init(self.allocator);
-        defer payload_list.deinit();
-        try payload_list.appendSlice(worker_graph_str);
-        try payload_list.appendSlice("|||PARAMS|||"); // Delimiter
-        try payload_list.appendSlice(serialized_params);
-        const payload_bytes = try payload_list.toOwnedSlice();
+
+        // Create binary WorkerPayload
+        const worker_payload = binary_protocol.WorkerPayload{
+            .params = serialized_params,
+        };
+
+        // Serialize to binary format
+        const payload_bytes = try worker_payload.serialize(self.allocator);
         defer self.allocator.free(payload_bytes);
-        
-        const json_payload = std.json.Value{.string = payload_bytes};
-        
-        // Broadcast StartInnerLoop message with graph + parameters
+
+        // Create JSON payload with Base64-encoded binary data
+        const json_payload = std.json.Value{ .string = payload_bytes };
+
+        // Broadcast StartInnerLoop message with binary protocol
         try self.coordinator.broadcastToWorkers(MessageType.START_INNER_LOOP, json_payload);
-        
-        std.log.info("Training graph + parameters broadcasted to {} workers", .{self.coordinator.getWorkerCount()});
+
+        std.log.debug("Broadcasted binary-encoded parameters to {} workers", .{self.coordinator.getWorkerCount()});
     }
-    
-    /// Collect results from workers after inner loop
+
+    /// Collect results from workers after inner loop using binary protocol
     fn collectWorkerResults(self: *Self) !ArrayList(WorkerResult) {
         std.log.info("Collecting results from workers", .{});
-        
+
         // Collect InnerLoopComplete messages from all workers
         const responses = try self.coordinator.collectFromWorkers(MessageType.INNER_LOOP_COMPLETE);
         defer responses.deinit();
-        
+
         var results = ArrayList(WorkerResult).init(self.allocator);
-        
+
         for (responses.items) |response| {
-            // Parse worker result from message - new format with delimiter
-            const data_bytes = switch (response.data) {
+            // Parse worker result from message - binary format
+            const binary_data = switch (response.data) {
                 .string => |s| s,
                 else => return error.InvalidMessageFormat,
             };
-            
-            const delimiter = "|||LOSS|||";
-            const split_point = std.mem.indexOf(u8, data_bytes, delimiter) orelse return error.InvalidPayload;
 
-            const params = try self.allocator.dupe(u8, data_bytes[0..split_point]);
-            const loss = try self.allocator.dupe(u8, data_bytes[split_point + delimiter.len..]);
+            // Deserialize with binary protocol
+            const shepherd_payload = try binary_protocol.ShepherdPayload.deserialize(self.allocator, binary_data);
+            defer shepherd_payload.deinit(self.allocator);
+
+            // Convert loss f32 to bytes for compatibility with existing code
+            const loss_bytes = try self.allocator.alloc(u8, @sizeOf(f32));
+            std.mem.writeInt(u32, loss_bytes[0..4], @as(u32, @bitCast(shepherd_payload.loss)), .little);
+
+            // Duplicate parameter bytes for ownership
+            const params = try self.allocator.dupe(u8, shepherd_payload.updated_params);
 
             const result = WorkerResult{
                 .node_id = response.sender_node,
                 .parameter_bytes = params,
-                .loss_bytes = loss,
+                .loss_bytes = loss_bytes,
                 .steps_completed = self.config.tau,
             };
-            
+
             try results.append(result);
         }
-        
-        std.log.info("Collected results from {} workers", .{results.items.len});
+
+        std.log.info("Collected binary results from {} workers", .{results.items.len});
         return results;
     }
-    
-    
+
     /// Update master parameters using MLIR Nesterov optimizer
     fn updateMasterParametersMLIR(self: *Self, worker_results: ArrayList(WorkerResult)) !void {
         if (worker_results.items.len == 0) {
             return error.NoWorkerResults;
         }
-        
+
         std.log.info("Updating master parameters using MLIR Nesterov optimizer with {} worker results", .{worker_results.items.len});
-        
+
         // Average worker parameters
         const averaged_params_bytes = try self.averageWorkerParameterBytes(worker_results);
         defer self.allocator.free(averaged_params_bytes);
         const param_slice: []const f32 = @alignCast(std.mem.bytesAsSlice(f32, averaged_params_bytes));
         const averaged_tensor = try self.createTensorFromArray(param_slice);
         defer averaged_tensor.deinit();
-        
+
         // Compute gradients (difference between averaged and master parameters)
-        const gradient_tensor = try ops.subtract(self.mlir_builder, averaged_tensor, self.master_parameters.?);
+        const gradient_tensor = try ops.subtract(&self.mlir_builder, averaged_tensor, self.master_parameters.?);
         defer gradient_tensor.deinit();
-        
+
         // Apply Nesterov momentum update using MLIR optimizer
         const updated_params = try self.nesterov_optimizer.update(self.master_parameters.?, gradient_tensor);
-        
+
         // Replace master parameters with updated ones
         self.master_parameters.?.deinit();
         self.master_parameters = updated_params;
-        
+
         // Update metrics
         self.metrics.loss = self.calculateAverageLoss(worker_results);
-        
+
         std.log.info("Master parameters updated using MLIR Nesterov, average loss: {d:.4}", .{self.metrics.loss});
     }
-    
+
     /// Average parameters from all workers (new byte-based version)
     fn averageWorkerParameterBytes(self: *Self, worker_results: ArrayList(WorkerResult)) ![]u8 {
         const param_count = self.config.param_count;
         const averaged = try self.allocator.alloc(f32, param_count);
         defer self.allocator.free(averaged);
-        
+
         // Initialize to zero
         for (averaged) |*param| {
             param.* = 0.0;
         }
-        
+
         // Sum all worker parameters
         for (worker_results.items) |result| {
             const worker_params: []const f32 = @alignCast(std.mem.bytesAsSlice(f32, result.parameter_bytes));
@@ -487,26 +515,26 @@ pub const DiLoCo = struct {
                 }
             }
         }
-        
+
         // Divide by number of workers to get average
         const num_workers: f32 = @floatFromInt(worker_results.items.len);
         for (averaged) |*avg_param| {
             avg_param.* /= num_workers;
         }
-        
+
         // Convert back to bytes
         const result_bytes = try self.allocator.alloc(u8, averaged.len * @sizeOf(f32));
         const result_f32: []f32 = @alignCast(std.mem.bytesAsSlice(f32, result_bytes));
         @memcpy(result_f32, averaged);
-        
+
         return result_bytes;
     }
-    
+
     /// Calculate average loss across workers
     fn calculateAverageLoss(self: *Self, worker_results: ArrayList(WorkerResult)) f32 {
         _ = self;
         var total_loss: f32 = 0.0;
-        
+
         for (worker_results.items) |result| {
             // Parse loss from bytes - assume it's a single f32
             if (result.loss_bytes.len >= @sizeOf(f32)) {
@@ -514,71 +542,71 @@ pub const DiLoCo = struct {
                 total_loss += loss_value;
             }
         }
-        
+
         return total_loss / @as(f32, @floatFromInt(worker_results.items.len));
     }
-    
+
     /// Create MLIR tensor from parameter array
     fn createTensorFromArray(self: *Self, array: []const f32) !Tensor {
         const byte_data = std.mem.sliceAsBytes(array);
         const tensor_type = mlir.Type.rankedTensorType(self.mlir_builder.ctx, self.parameter_shape, self.element_type);
-        
+
         var shape = try tensor.Shape.init(self.allocator, self.parameter_shape, tensor.DType.f32);
         defer shape.deinit();
         const value = try self.mlir_builder.createConstant(byte_data, tensor_type, shape);
         return try self.mlir_builder.newTensor(value);
     }
-    
+
     /// Extract tensor values to array
     fn extractTensorToArray(self: *Self, _: Tensor) ![]f32 {
         // In a real implementation, this would extract values from the MLIR tensor
         // For now, simulate by creating array with current values
         const array = try self.allocator.alloc(f32, self.config.param_count);
-        
+
         // This is a placeholder - real implementation would extract from MLIR tensor
         var rng = std.Random.DefaultPrng.init(@intCast(self.current_epoch));
         for (array) |*param| {
             param.* = rng.random().floatNorm(f32) * 0.1;
         }
-        
+
         return array;
     }
-    
+
     /// Serialize parameters to string
     fn serializeParameters(self: *Self, params: []const f32) ![]u8 {
         var buffer = ArrayList(u8).init(self.allocator);
         defer buffer.deinit();
-        
+
         // Simple binary serialization
         try buffer.appendSlice(std.mem.asBytes(&params.len));
         for (params) |param| {
             try buffer.appendSlice(std.mem.asBytes(&param));
         }
-        
+
         return try self.allocator.dupe(u8, buffer.items);
     }
-    
+
     /// Deserialize parameters from string
     fn deserializeParameters(self: *Self, data: []const u8) ![]f32 {
         if (data.len < @sizeOf(usize)) {
             return error.InvalidData;
         }
-        
+
         const param_count = std.mem.readInt(usize, data[0..@sizeOf(usize)], .little);
         const params = try self.allocator.alloc(f32, param_count);
-        
+
         var offset: usize = @sizeOf(usize);
         for (params) |*param| {
             if (offset + @sizeOf(f32) > data.len) {
                 return error.InvalidData;
             }
-            param.* = @bitCast(std.mem.readInt(u32, data[offset..offset + @sizeOf(f32)][0..4], .little));
+            param.* = @bitCast(std.mem.readInt(u32, data[offset .. offset + @sizeOf(f32)][0..4], .little));
             offset += @sizeOf(f32);
         }
-        
+
         return params;
     }
-    
+
     /// Clean up worker results
     fn cleanupWorkerResults(self: *Self, worker_results: ArrayList(WorkerResult)) void {
         for (worker_results.items) |result| {
@@ -587,31 +615,31 @@ pub const DiLoCo = struct {
         }
         worker_results.deinit();
     }
-    
+
     /// Check if training should stop
     fn shouldStop(self: *Self) bool {
         if (self.current_epoch >= self.config.base_config.max_epochs) {
             return true;
         }
-        
+
         if (self.metrics.loss < 0.01) {
             return true;
         }
-        
+
         return false;
     }
-    
+
     /// Interface implementations
     fn deinitInterface(ptr: *anyopaque) void {
         const self: *Self = @ptrCast(@alignCast(ptr));
         self.deinit();
     }
-    
+
     fn getName(ptr: *anyopaque) []const u8 {
         _ = ptr;
         return "DiLoCo-MLIR";
     }
-    
+
     fn getStatus(ptr: *anyopaque) TrainingStatus {
         const self: *Self = @ptrCast(@alignCast(ptr));
         return self.status;
@@ -629,20 +657,20 @@ const WorkerResult = struct {
 /// Test function for DiLoCo algorithm
 pub fn testDiLoCo(allocator: Allocator) !void {
     std.log.info("Testing DiLoCo algorithm with MLIR optimizers...");
-    
+
     // Create a mock coordinator
     var mock_coordinator = shepherd.Shepherd.init(allocator);
     defer mock_coordinator.deinit();
-    
+
     // Create DiLoCo algorithm
     const config = DiLoCoConfig.default();
     var diloco = try DiLoCo.init(allocator, &mock_coordinator, config);
     defer diloco.deinit();
-    
+
     // Test initialization
     try std.testing.expectEqual(TrainingStatus.not_started, diloco.status);
     try std.testing.expectEqual(@as(usize, 0), diloco.current_epoch);
     try std.testing.expectEqual(@as(usize, 1000), diloco.config.param_count);
-    
+
     std.log.info("✓ DiLoCo MLIR algorithm test completed");
 }

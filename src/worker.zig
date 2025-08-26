@@ -6,6 +6,7 @@ const net = std.net;
 const Allocator = std.mem.Allocator;
 const tcp_stream = @import("network/tcp_stream.zig");
 const message = @import("network/message.zig");
+const binary_protocol = @import("network/binary_protocol.zig");
 const worker_backend = @import("backends/worker_backend.zig");
 const mlir = @import("mlir.zig");
 const mlir_ctx = @import("mlir_ctx.zig");
@@ -40,11 +41,14 @@ pub const Worker = struct {
     backend: WorkerBackend,
     
     // MLIR context for deserializing modules
-    mlir_context: ?*mlir_ctx.MLIRContext,
+    mlir_context: mlir_ctx.MLIRContext,
+    
+    // NEW: Cached MLIR module from graph initialization
+    cached_module: ?mlir.Module,
     
     const Self = @This();
     
-    pub fn init(allocator: Allocator, backend: WorkerBackend) Self {
+    pub fn init(allocator: Allocator, backend: WorkerBackend) !Self {
         return Self{
             .allocator = allocator,
             .client = TcpClient.init(allocator),
@@ -52,18 +56,21 @@ pub const Worker = struct {
             .state = .disconnected,
             .is_running = false,
             .backend = backend,
-            .mlir_context = null,
+            .mlir_context = try mlir_ctx.MLIRContext.init(allocator),
+            .cached_module = null,
         };
     }
     
     pub fn deinit(self: *Self) void {
+        // Cleanup cached module if it exists
+        if (self.cached_module) |mod| {
+            mod.deinit();
+        }
+        
         self.client.deinit();
         self.backend.deinit();
         
-        if (self.mlir_context) |ctx| {
-            ctx.deinit();
-            self.allocator.destroy(ctx);
-        }
+        self.mlir_context.deinit();
     }
     
     /// Connect to the Shepherd coordinator
@@ -123,7 +130,9 @@ pub const Worker = struct {
             };
             
             // Handle different message types
-            if (std.mem.eql(u8, msg.msg_type, MessageType.START_INNER_LOOP)) {
+            if (std.mem.eql(u8, msg.msg_type, MessageType.INITIALIZE_GRAPH)) {
+                try self.handleInitializeGraph(msg);
+            } else if (std.mem.eql(u8, msg.msg_type, MessageType.START_INNER_LOOP)) {
                 try self.handleStartInnerLoop(msg);
             } else if (std.mem.eql(u8, msg.msg_type, MessageType.SHUTDOWN)) {
                 self.handleShutdown(msg);
@@ -136,34 +145,54 @@ pub const Worker = struct {
         std.log.info("Worker {} exiting main loop", .{self.node_id.?});
     }
     
-    /// Handle StartInnerLoop command from Shepherd
-    fn handleStartInnerLoop(self: *Self, msg: MessageEnvelope) !void {
-        std.log.info("Worker {} received training graph.", .{self.node_id.?});
-        self.state = .training;
+    /// Handles the one-time setup message, deserializing and caching the MLIR module
+    fn handleInitializeGraph(self: *Self, msg: MessageEnvelope) !void {
+        std.log.info("Worker {} received training graph for initialization.", .{self.node_id.?});
 
-        // Initialize MLIR context if needed
-        if (self.mlir_context == null) {
-            self.mlir_context = try self.allocator.create(mlir_ctx.MLIRContext);
-            self.mlir_context.?.* = try mlir_ctx.MLIRContext.init(self.allocator);
+
+        // De-initialize any old module
+        if (self.cached_module) |mod| {
+            mod.deinit();
+            self.cached_module = null;
         }
 
-        // 1. Parse the delimiter-based payload (simpler than JSON)
-        const payload_bytes = switch (msg.data) {
+        // Payload is just the graph string
+        const graph_str = switch (msg.data) {
             .string => |s| s,
             else => return error.InvalidMessageFormat,
         };
-        
-        const delimiter = "|||PARAMS|||";
-        const split_point = std.mem.indexOf(u8, payload_bytes, delimiter) orelse return error.InvalidPayload;
 
-        const graph_str = payload_bytes[0..split_point];
-        const params_bytes = payload_bytes[split_point + delimiter.len ..];
+        // Deserialize and cache the module using the worker's own context
+        const module = try mlir_ctx.deserializeMLIRModule(self.allocator, self.mlir_context.getContext(), graph_str);
+        self.cached_module = module;
 
-        // 2. Parse the MLIR module from the graph string
-        const module = try mlir_ctx.deserializeMLIRModule(self.allocator, self.mlir_context.?.getContext(), graph_str);
-        defer module.deinit();
+        std.log.info("Worker {} successfully cached the training graph.", .{self.node_id.?});
+        // No response is needed. The worker is now ready for START_INNER_LOOP.
+    }
+    
+    /// Handle StartInnerLoop command from Shepherd using binary protocol
+    fn handleStartInnerLoop(self: *Self, msg: MessageEnvelope) !void {
+        self.state = .training;
 
-        // 3. Generate RANDOM data for this test run on the worker
+        // 1. Ensure the graph has been initialized and cached.
+        const module = self.cached_module orelse {
+            std.log.err("Received StartInnerLoop before graph was initialized.", .{});
+            return error.GraphNotInitialized;
+        };
+
+        // 2. The payload is binary-encoded data. Decode it.
+        const binary_data = switch (msg.data) {
+            .string => |s| s,
+            else => return error.InvalidMessageFormat,
+        };
+
+        // 3. Deserialize with binary protocol
+        const worker_payload = try binary_protocol.WorkerPayload.deserialize(self.allocator, binary_data);
+        defer worker_payload.deinit(self.allocator);
+
+        const params_bytes = worker_payload.params;
+
+        // 4. Generate RANDOM data for this test run on the worker
         // This simulates having a local dataset shard.
         const batch_size = 4;
         const seq_length = 12;
@@ -175,37 +204,32 @@ pub const Worker = struct {
         // For now, zeros are fine for testing the execution pipeline.
         @memset(random_data, 0);
 
-        // 4. Package inputs for the backend: [master_params, input_ids, targets]
-        // The order MUST match the function signature defined in the Shepherd!
-        const inputs_array = [_][]const u8{
-            params_bytes, // from shepherd
-            random_data,  // input_ids
-            random_data,  // targets (can be the same for this test)
-        };
-        const inputs: [][]const u8 = @constCast(&inputs_array);
+        // 5. Package inputs for the backend: [master_params, input_ids, targets]
+        const inputs_array = [_][]const u8{ params_bytes, random_data, random_data };
+        const inputs: [][]const u8 = &inputs_array;
 
-        // 5. Execute the training step on the backend
+        // 6. Execute using the CACHED module.
         const outputs = try self.backend.executeTrainingStep(module, inputs);
         defer {
             for (outputs) |o| self.allocator.free(o);
             self.allocator.free(outputs);
         }
 
-        // 6. Send BOTH outputs (updated_params, loss) back to the shepherd.
-        // We'll use a simple delimiter again.
-        var response_payload = std.ArrayList(u8).init(self.allocator);
-        defer response_payload.deinit();
-
-        if (outputs.len > 0) {
-            try response_payload.appendSlice(outputs[0]); // Updated params
-        }
-        try response_payload.appendSlice("|||LOSS|||");
-        if (outputs.len > 1) {
-            try response_payload.appendSlice(outputs[1]); // Loss
+        // 7. Extract loss from outputs (assume it's a single f32)
+        var loss: f32 = 0.0;
+        if (outputs.len > 1 and outputs[1].len >= @sizeOf(f32)) {
+            loss = @as(f32, @bitCast(std.mem.readInt(u32, outputs[1][0..4], .little)));
         }
 
-        const final_payload_bytes = try response_payload.toOwnedSlice();
-        defer self.allocator.free(final_payload_bytes);
+        // 8. Create binary ShepherdPayload
+        const shepherd_payload = binary_protocol.ShepherdPayload{
+            .updated_params = if (outputs.len > 0) outputs[0] else &[_]u8{},
+            .loss = loss,
+        };
+
+        // 9. Serialize to binary format
+        const payload_bytes = try shepherd_payload.serialize(self.allocator);
+        defer self.allocator.free(payload_bytes);
 
         const response = tcp_stream.createMessage(
             self.node_id.?, // our node_id
@@ -214,11 +238,11 @@ pub const Worker = struct {
             "shepherd", // shepherd service
             MessageType.INNER_LOOP_COMPLETE,
             msg.msg_id + 1,
-            std.json.Value{ .string = final_payload_bytes },
+            std.json.Value{ .string = payload_bytes },
         );
         
         try self.client.send(response);
-        std.log.info("Worker {} completed inner loop and sent results.", .{self.node_id.?});
+        std.log.info("Worker {} completed inner loop and sent binary results.", .{self.node_id.?});
         self.state = .connected;
     }
     
@@ -288,7 +312,7 @@ pub fn testWorker(allocator: Allocator) !void {
         },
     };
     
-    var worker = Worker.init(allocator, mock_backend);
+    var worker = try Worker.init(allocator, mock_backend);
     defer worker.deinit();
     
     // Test basic initialization

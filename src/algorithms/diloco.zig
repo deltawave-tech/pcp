@@ -162,16 +162,22 @@ pub const DiLoCo = struct {
     pub fn run(ptr: *anyopaque) !void {
         const self: *Self = @ptrCast(@alignCast(ptr));
 
+        std.log.info("🚀 DiLoCo.run() starting...", .{});
+
         self.status = .initializing;
         monitoring.setStatus(.initializing);
         monitoring.setModelInfo(self.config.param_count, self.config.base_config.learning_rate);
-        std.log.info("Starting DiLoCo training algorithm with MLIR optimizers", .{});
+        std.log.info("✓ DiLoCo status and monitoring initialized", .{});
 
         // Initialize master parameters
+        std.log.info("🔧 Initializing master parameters...", .{});
         try self.initializeMasterParameters();
+        std.log.info("✓ Master parameters initialized successfully", .{});
 
         // PHASE 0: SETUP WORKERS (ONE-TIME)
+        std.log.info("👥 Setting up workers...", .{});
         try self.setupWorkers();
+        std.log.info("✓ Workers setup completed", .{});
 
         self.status = .running;
         monitoring.setStatus(.running);
@@ -214,22 +220,29 @@ pub const DiLoCo = struct {
 
     /// Initialize master parameters using MLIR
     fn initializeMasterParameters(self: *Self) !void {
+        std.log.info("🎲 Allocating parameter data array ({} elements)...", .{self.config.param_count});
+        
         // Create initial parameter values
         const param_data = try self.allocator.alloc(f32, self.config.param_count);
         defer self.allocator.free(param_data);
+        std.log.info("✓ Parameter array allocated", .{});
 
         // Initialize with Xavier/Glorot initialization
+        std.log.info("🔢 Computing Xavier initialization...", .{});
         var rng = std.Random.DefaultPrng.init(12345);
         const scale = std.math.sqrt(2.0 / @as(f32, @floatFromInt(self.config.param_count)));
 
         for (param_data) |*param| {
             param.* = rng.random().floatNorm(f32) * scale;
         }
+        std.log.info("✓ Parameter values generated", .{});
 
         // Convert to MLIR tensor
+        std.log.info("🔧 Converting to MLIR tensor...", .{});
         self.master_parameters = try self.createTensorFromArray(param_data);
+        std.log.info("✓ MLIR tensor created successfully", .{});
 
-        std.log.info("Initialized master parameters with {} elements using Xavier initialization", .{self.config.param_count});
+        std.log.info("✅ Initialized master parameters with {} elements using Xavier initialization", .{self.config.param_count});
     }
 
     /// Create a dedicated forward+loss function that will be differentiated

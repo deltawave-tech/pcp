@@ -426,11 +426,19 @@ fn addMLIRSupport(b: *std.Build, target: *std.Build.Step.Compile, mlir_config: M
         "MLIRCAPIConversion",         // For conversion pass registration
         "MLIRConvertToLLVMPass",     // For general LLVM conversion infrastructure
         "MLIRFuncToLLVM",            // For createConvertFuncToLLVMPass
-        "MLIRGPUToLLVMSPV",          // For createGpuToLLVMConversionPass
+        "MLIRGPUToLLVMSPV",          // For GPU to SPIRV LLVM conversion
+        "MLIRGPUPipelines",          // For createGpuToLLVMConversionPass
+        "MLIRGPUToGPURuntimeTransforms", // Additional GPU to LLVM transforms
         "MLIRReconcileUnrealizedCasts", // For createReconcileUnrealizedCastsPass
         
         // Dependencies of the passes above
         "MLIRLinalgDialect",          // Target dialect for the legalization
+        "MLIRVectorDialect",          // Vector dialect for vector operations
+        "MLIRVectorTransforms",       // Vector dialect transforms
+        "MLIRVectorUtils",            // Vector dialect utilities
+        "MLIRVectorInterfaces",       // Vector interfaces
+        "MLIRMaskableOpInterface",    // Maskable operation interfaces
+        "MLIRMaskingOpInterface",     // Masking operation interfaces
         "StablehloOps",               // Source dialect for the legalization
         "StablehloLinalgTransforms",  // For StableHLO to Linalg conversion
         "VhloOps",                    // VHLO operations needed by StableHLO passes
@@ -462,15 +470,28 @@ fn addMLIRSupport(b: *std.Build, target: *std.Build.Step.Compile, mlir_config: M
         "StablehloTypeConversion",    // RemoveSignTypeConverter functions
         
         // Additional MLIR conversion libraries for LLVM conversion
-        "MLIRLLVMIR",                 // LLVM dialect for MLIR
-        "MLIRLLVMAVX512",            // LLVM AVX512 dialect
+        "MLIRLLVMDialect",           // LLVM dialect for MLIR
         "MLIRLLVMCommonConversion",  // Common LLVM conversion infrastructure 
+        "MLIRLLVMToLLVMIRTranslation", // LLVM to LLVM IR translation
+        "MLIRToLLVMIRTranslationRegistration", // LLVM IR translation registration  
+        "MLIRFromLLVMIRTranslationRegistration", // From LLVM IR translation registration
+        "MLIRBuiltinToLLVMIRTranslation", // Builtin to LLVM IR translation
+        "MLIRTargetLLVMIRExport",    // LLVM IR export and TypeToLLVMIRTranslator
+        "MLIRAsyncDialect",          // Async dialect for async operations
+        "MLIRAsyncTransforms",       // Async dialect transforms
+        "MLIRAsyncToLLVM",           // Async to LLVM conversion
         "MLIRVectorToLLVM",          // Vector to LLVM conversion
         "MLIRArithToLLVM",           // Arith to LLVM conversion
+        "MLIRArithAttrToLLVMConversion", // Arith attributes to LLVM conversion
         "MLIRControlFlowToLLVM",     // Control flow to LLVM conversion
         "MLIRIndexToLLVM",           // Index to LLVM conversion
         "MLIRMemRefToLLVM",          // MemRef to LLVM conversion
-        "MLIRSCFToLLVM",             // SCF to LLVM conversion
+        "MLIRMemRefUtils",           // MemRef utilities
+        "MLIRMathToLLVM",            // Math to LLVM conversion
+        "MLIRComplexToLLVM",         // Complex to LLVM conversion
+        "MLIRUBToLLVM",              // UB (undefined behavior) to LLVM conversion
+        "MLIROpenMPToLLVM",          // OpenMP to LLVM conversion
+        "MLIRConvertToLLVMInterface", // LLVM conversion interfaces
         
         // Complete LLVM libraries from llvm-config --libs
         "LLVMWindowsManifest", "LLVMXRay", "LLVMLibDriver", "LLVMDlltoolDriver", "LLVMTelemetry", "LLVMTextAPIBinaryReader",

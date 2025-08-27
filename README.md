@@ -123,21 +123,48 @@ zig build
 zig build test
 ```
 
+## Building and Running
+
+Build everything:
+```sh
+zig build
+```
+
+Run the distributed training system (requires Cap'n Proto):
+```sh
+zig build run-distributed
+```
+
+Run the demo (no external dependencies needed):
+```sh
+zig build run-demo
+```
+
+Run all tests:
+```sh
+zig build test
+```
+
+See all available commands:
+```sh
+zig build --help
+```
+
 ## Usage
 
 To run the distributed training demonstration, which starts one Shepherd and two Workers:
 
 ### Start the Shepherd Node:
 ```bash
-zig run src/main_distributed.zig -- --shepherd --workers 2
+./zig-out/bin/main_distributed --shepherd --workers 2
 ```
 
 ### Start the First Worker Node (new terminal):
 ```bash
-zig run src/main_distributed.zig -- --worker --connect 127.0.0.1:8080
+./zig-out/bin/main_distributed --worker --connect 127.0.0.1:8080
 ```
 
 ### Start the Second Worker Node (new terminal):
 ```bash
-zig run src/main_distributed.zig -- --worker --connect 127.0.0.1:8080
+./zig-out/bin/main_distributed --worker --connect 127.0.0.1:8080
 ```

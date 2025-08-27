@@ -18,6 +18,13 @@ const MLIRConfig = struct {
     include_dir: ?[]const u8 = null,
 };
 
+// Cap'n Proto configuration
+const CapnpConfig = struct {
+    enabled: bool = false,
+    include_dir: ?[]const u8 = null,
+    lib_dir: ?[]const u8 = null,
+};
+
 // Attempt to find LLVM/MLIR installation
 fn detectMLIR(b: *std.Build) MLIRConfig {
     var config = MLIRConfig{};
@@ -127,6 +134,79 @@ fn detectMLIR(b: *std.Build) MLIRConfig {
         std.debug.print("  macOS: brew install llvm\n", .{});
         std.debug.print("  Ubuntu: apt install llvm-dev libmlir-dev\n", .{});
         std.debug.print("  Or build from source with -DLLVM_ENABLE_PROJECTS=mlir\n", .{});
+    }
+    
+    return config;
+}
+
+// Attempt to find Cap'n Proto installation
+fn detectCapnp(b: *std.Build) CapnpConfig {
+    var config = CapnpConfig{};
+
+    // 1. Prioritize an environment variable for the Cap'n Proto directory
+    if (std.process.getEnvVarOwned(b.allocator, "CAPNP_DIR")) |capnp_dir| {
+        defer b.allocator.free(capnp_dir);
+        
+        const include_dir = std.fs.path.join(b.allocator, &[_][]const u8{ capnp_dir, "include" }) catch {
+            std.debug.print("Failed to construct include path from CAPNP_DIR\n", .{});
+            return config;
+        };
+        defer b.allocator.free(include_dir);
+        
+        const lib_dir = std.fs.path.join(b.allocator, &[_][]const u8{ capnp_dir, "lib" }) catch {
+            std.debug.print("Failed to construct lib path from CAPNP_DIR\n", .{});
+            return config;
+        };
+        defer b.allocator.free(lib_dir);
+        
+        // Test if directories exist
+        if (std.fs.cwd().access(include_dir, .{})) |_| {
+            if (std.fs.cwd().access(lib_dir, .{})) |_| {
+                config.enabled = true;
+                config.include_dir = b.dupe(include_dir);
+                config.lib_dir = b.dupe(lib_dir);
+                std.debug.print("Found Cap'n Proto via CAPNP_DIR at: {s}\n", .{capnp_dir});
+                return config;
+            } else |_| {
+                std.debug.print("CAPNP_DIR lib directory not accessible, continuing with auto-detection\n", .{});
+            }
+        } else |_| {
+            std.debug.print("CAPNP_DIR include directory not accessible, continuing with auto-detection\n", .{});
+        }
+    } else |_| {
+        // Environment variable not set, continue with auto-detection
+    }
+
+    // 2. If no environment variable, proceed with auto-detection of common paths
+    const capnp_candidates = [_]struct { include: []const u8, lib: []const u8 }{
+        // Homebrew paths (macOS)
+        .{ .include = "/opt/homebrew/opt/capnp/include", .lib = "/opt/homebrew/lib" },
+        .{ .include = "/opt/homebrew/include", .lib = "/opt/homebrew/lib" },
+        // Standard Linux/Unix paths
+        .{ .include = "/usr/local/include", .lib = "/usr/local/lib" },
+        .{ .include = "/usr/include", .lib = "/usr/lib" },
+        // Alternative system paths
+        .{ .include = "/usr/local/opt/capnp/include", .lib = "/usr/local/lib" },
+    };
+    
+    for (capnp_candidates) |candidate| {
+        // Check if capnp headers exist (look for common.h which should always be present)
+        const header_path = std.fs.path.join(b.allocator, &[_][]const u8{ candidate.include, "capnp", "common.h" }) catch continue;
+        defer b.allocator.free(header_path);
+        
+        if (std.fs.cwd().access(header_path, .{})) |_| {
+            config.enabled = true;
+            config.include_dir = b.dupe(candidate.include);
+            config.lib_dir = b.dupe(candidate.lib);
+            std.debug.print("Found Cap'n Proto at: include={s}, lib={s}\n", .{ candidate.include, candidate.lib });
+            break;
+        } else |_| {
+            // Continue checking other candidates
+        }
+    }
+    
+    if (!config.enabled) {
+        std.debug.print("Cap'n Proto not found in standard locations\n", .{});
     }
     
     return config;
@@ -431,6 +511,15 @@ pub fn build(b: *std.Build) void {
     std.debug.print("==> Detecting MLIR configuration\n", .{});
     const mlir_config = detectMLIR(b);
     std.debug.print("==> MLIR detected: enabled={}, path={s}\n", .{mlir_config.enabled, mlir_config.llvm_config_path orelse "null"});
+
+    // Detect Cap'n Proto availability
+    std.debug.print("==> Detecting Cap'n Proto configuration\n", .{});
+    const capnp_config = detectCapnp(b);
+    std.debug.print("==> Cap'n Proto detected: enabled={}, include={s}, lib={s}\n", .{
+        capnp_config.enabled, 
+        capnp_config.include_dir orelse "null", 
+        capnp_config.lib_dir orelse "null"
+    });
 
     // Create the Metal bridge object file if on macOS
     std.debug.print("==> Creating Metal bridge library\n", .{});
@@ -1312,42 +1401,58 @@ pub fn build(b: *std.Build) void {
     // Add MLIR support to distributed training
     addMLIRSupport(b, main_distributed, mlir_config);
 
-    // 1. Define a static C++ library for our Cap'n Proto bridge
-    const capnp_bridge_lib = b.addStaticLibrary(.{
-        .name = "capnp_bridge",
-        .target = target,
-        .optimize = optimize,
-    });
-    capnp_bridge_lib.addCSourceFiles(.{
-        .files = &.{
-            "src/network/protocol.capnp.c++",
-            "src/network/capnp_bridge.cpp",
-        },
-        .flags = &.{"-std=c++17"},
-    });
-    capnp_bridge_lib.linkLibCpp(); // IMPORTANT: Link against C++ standard library
+    // 1. Define a static C++ library for our Cap'n Proto bridge (if Cap'n Proto is available)
+    if (!capnp_config.enabled) {
+        std.debug.print("==> Cap'n Proto not found, skipping distributed training system\n", .{});
+    } else {
+        std.debug.print("==> Adding Cap'n Proto bridge library\n", .{});
+        
+        const capnp_bridge_lib = b.addStaticLibrary(.{
+            .name = "capnp_bridge",
+            .target = target,
+            .optimize = optimize,
+        });
+        capnp_bridge_lib.addCSourceFiles(.{
+            .files = &.{
+                "src/network/protocol.capnp.c++",
+                "src/network/capnp_bridge.cpp",
+            },
+            .flags = &.{"-std=c++17"},
+        });
+        capnp_bridge_lib.linkLibCpp(); // IMPORTANT: Link against C++ standard library
 
-    // NEW: Expose the public header directory to any executable that links this library.
-    capnp_bridge_lib.addIncludePath(b.path("src/network"));
+        // NEW: Expose the public header directory to any executable that links this library.
+        capnp_bridge_lib.addIncludePath(b.path("src/network"));
 
-    // This part is for the library's own dependencies (it needs to find <capnp/c++.h>)
-    capnp_bridge_lib.addIncludePath(.{ .cwd_relative = "/opt/homebrew/opt/capnp/include" });
-    capnp_bridge_lib.addLibraryPath(.{ .cwd_relative = "/opt/homebrew/lib" });
-    capnp_bridge_lib.linkSystemLibrary("capnp");
-    capnp_bridge_lib.linkSystemLibrary("kj");
-    
-    // Add include paths for the main executable
-    main_distributed.addIncludePath(b.path("src/network"));
-    main_distributed.addIncludePath(.{ .cwd_relative = "/opt/homebrew/opt/capnp/include" });
+        // This part is for the library's own dependencies (it needs to find <capnp/c++.h>)
+        if (capnp_config.include_dir) |include_dir| {
+            capnp_bridge_lib.addIncludePath(.{ .cwd_relative = include_dir });
+        }
+        if (capnp_config.lib_dir) |lib_dir| {
+            capnp_bridge_lib.addLibraryPath(.{ .cwd_relative = lib_dir });
+        }
+        capnp_bridge_lib.linkSystemLibrary("capnp");
+        capnp_bridge_lib.linkSystemLibrary("kj");
+        
+        // Add include paths for the main executable
+        main_distributed.addIncludePath(b.path("src/network"));
+        if (capnp_config.include_dir) |include_dir| {
+            main_distributed.addIncludePath(.{ .cwd_relative = include_dir });
+        }
 
-    // 2. Link the Zig executable against our bridge and the ARM64 Cap'n Proto libs
-    main_distributed.linkLibrary(capnp_bridge_lib);
-    // Ensure the bridge library is built before the main executable
-    main_distributed.step.dependOn(&capnp_bridge_lib.step);
-    // Explicitly use ARM64 Cap'n Proto libraries
-    main_distributed.addLibraryPath(.{ .cwd_relative = "/opt/homebrew/lib" });
-    main_distributed.linkSystemLibrary("capnp");
-    main_distributed.linkSystemLibrary("kj");
+        // 2. Link the Zig executable against our bridge and the Cap'n Proto libs
+        main_distributed.linkLibrary(capnp_bridge_lib);
+        // Ensure the bridge library is built before the main executable
+        main_distributed.step.dependOn(&capnp_bridge_lib.step);
+        // Use detected Cap'n Proto libraries
+        if (capnp_config.lib_dir) |lib_dir| {
+            main_distributed.addLibraryPath(.{ .cwd_relative = lib_dir });
+        }
+        main_distributed.linkSystemLibrary("capnp");
+        main_distributed.linkSystemLibrary("kj");
+        
+        std.debug.print("==> Cap'n Proto bridge library configured successfully\n", .{});
+    }
     
     if (spirv_bridge_lib != null) {
         main_distributed.linkLibrary(spirv_bridge_lib.?);

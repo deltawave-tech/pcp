@@ -71,28 +71,54 @@ This architecture is implemented through several key components:
 
 ## Building the Project
 
-### 1. Build LLVM+StableHLO
-This is a one-time step that takes about an hour.
+### Prerequisites
+
+Make sure you have the following tools installed:
+
+* **macOS:** `brew install git cmake ninja capnp`
+* **Ubuntu/Debian:** `sudo apt install build-essential git cmake ninja capnproto libcapnp-dev`
+
+### Step 1: Clone the Repository
+
+Clone the repository and all its submodules (`llvm-project`, `stablehlo`, etc.).
+
+```sh
+git clone --recursive <your-repo-url>
+cd <your-repo-name>
+```
+
+### Step 2: Build C++ Dependencies (One-Time, ~1 Hour)
+
+We provide a script that compiles LLVM, MLIR, and StableHLO. This is a long process that runs in the background.
+
 ```sh
 ./build_llvm_with_stablehlo.sh
 ```
 
-### 2. Set Environment Variables (Optional)
-For better control over LLVM detection, set the `LLVM_DIR` environment variable to point to your LLVM build directory:
+This script will create a local `llvm-build/` directory containing the libraries and headers our project needs.
+
+### Step 3: Set Environment Variables (Optional)
+
+For better control over dependency detection, you can set environment variables:
+
 ```sh
+# LLVM/MLIR location
 export LLVM_DIR=/path/to/your/llvm-build
+
+# Cap'n Proto location (if not in standard system paths)
+export CAPNP_DIR=/path/to/your/capnp-installation
 ```
 
-If not set, the build system will auto-detect LLVM in common locations including:
-- `llvm-build/bin/llvm-config` (project-local build)
-- System installations via Homebrew, package managers, etc.
+If not set, the build system will auto-detect dependencies in common locations:
+- **LLVM:** `llvm-build/bin/llvm-config` (project-local), system installations via Homebrew, package managers, etc.
+- **Cap'n Proto:** System installations via Homebrew (`/opt/homebrew`), package managers (`/usr`, `/usr/local`)
 
-### 3. Build the Project
+### Step 4: Build the Project
 ```sh
 zig build
 ```
 
-### 4. Run Tests
+### Step 5: Run Tests
 ```sh
 zig build test
 ```

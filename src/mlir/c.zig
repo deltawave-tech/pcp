@@ -135,6 +135,11 @@ pub const c = struct {
 
     // Function type operations
     extern fn mlirFunctionTypeGet(ctx: *MlirContext, numInputs: isize, inputs: [*]const *MlirType, numResults: isize, results: [*]const *MlirType) *MlirType;
+    extern fn mlirFunctionTypeGetNumInputs(type: *MlirType) isize;
+    extern fn mlirFunctionTypeGetNumResults(type: *MlirType) isize;
+    extern fn mlirFunctionTypeGetInput(type: *MlirType, pos: isize) *MlirType;
+    extern fn mlirFunctionTypeGetResult(type: *MlirType, pos: isize) *MlirType;
+    extern fn mlirTypeIsAFunction(type: *MlirType) bool;
     extern fn mlirTypeAttrGet(type: *MlirType) *MlirAttribute;
 
     // OpBuilder operations (TODO: Find correct MLIR C API functions)
@@ -201,6 +206,10 @@ pub const c = struct {
     extern fn mlirRegisterAllStablehloPasses() void; // StableHLO C-API only provides bulk registration
     extern fn mlirRegisterTransformsCanonicalizer() void;
     extern fn mlirRegisterTransformsCSE() void;
+    
+    // Bufferization pass registration (may not be available in all MLIR builds)
+    // extern fn mlirRegisterBufferizationPasses() void;
+    // extern fn mlirRegisterLinalgComprehensiveModuleBufferizePasses() void;
     
     // NEW: Single pass anchor function to force linker to load all required pass libraries
     extern fn mlirForceLoadAllRequiredPasses() void;
@@ -377,6 +386,15 @@ pub const c = struct {
     pub fn registerCSEPass() void {
         mlirRegisterTransformsCSE();
     }
+    
+    // Bufferization pass registration wrapper functions (commented out - not available)
+    // pub fn registerBufferizationPasses() void {
+    //     mlirRegisterBufferizationPasses();
+    // }
+    // 
+    // pub fn registerLinalgComprehensiveModuleBufferizePasses() void {
+    //     mlirRegisterLinalgComprehensiveModuleBufferizePasses();
+    // }
     
     // NEW: Zig wrapper for the consolidated pass anchor function
     pub fn forceLoadAllRequiredPasses() void {
@@ -633,6 +651,26 @@ pub const c = struct {
 
     pub fn functionTypeGet(ctx: *MlirContext, inputs: []const *MlirType, results: []const *MlirType) *MlirType {
         return mlirFunctionTypeGet(ctx, @intCast(inputs.len), inputs.ptr, @intCast(results.len), results.ptr);
+    }
+
+    pub fn functionTypeGetNumInputs(func_type: *MlirType) isize {
+        return mlirFunctionTypeGetNumInputs(func_type);
+    }
+
+    pub fn functionTypeGetNumResults(func_type: *MlirType) isize {
+        return mlirFunctionTypeGetNumResults(func_type);
+    }
+
+    pub fn functionTypeGetInput(func_type: *MlirType, pos: isize) *MlirType {
+        return mlirFunctionTypeGetInput(func_type, pos);
+    }
+
+    pub fn functionTypeGetResult(func_type: *MlirType, pos: isize) *MlirType {
+        return mlirFunctionTypeGetResult(func_type, pos);
+    }
+
+    pub fn typeIsAFunction(mlir_type: *MlirType) bool {
+        return mlirTypeIsAFunction(mlir_type);
     }
 
     pub fn typeAttr(type_val: *MlirType) *MlirAttribute {

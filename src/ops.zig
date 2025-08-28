@@ -11,24 +11,35 @@ pub const MLIRBuilder = struct {
     ctx: mlir.Context,
     loc: mlir.Location,
     module: mlir.Module,
+    /// The top-level block of the module, for inserting functions.
+    module_body: mlir.Block,
+    /// Default block for inserting new operations (inside the main function).
+    insertion_block: mlir.Block,
     allocator: std.mem.Allocator,
 
     const Self = @This();
 
     pub fn init(allocator: std.mem.Allocator) !Self {
         const ctx = try mlir.Context.init();
-        
-        // Register StableHLO dialect to enable stablehlo.multiply and other operations
         const c_api = @import("mlir/c.zig").c;
         c_api.contextSetAllowUnregisteredDialects(ctx.handle, true);
         
         const loc = mlir.Location.unknown(ctx);
+
+        // 1. Create the top-level `builtin.module`. The MLIR C API ensures this
+        //    operation contains one region with one block.
         const module = try mlir.Module.createEmpty(ctx);
+        const module_body_block = module.op().getRegion(0).getBlock(0);
+
+        // 2. The insertion point is now the module's top-level block, ready to accept function definitions.
+        // No automatic function creation - functions will be created explicitly by the caller.
 
         return Self{
             .ctx = ctx,
             .loc = loc,
             .module = module,
+            .module_body = module_body_block,
+            .insertion_block = module_body_block, // The insertion point is now the module's top-level block.
             .allocator = allocator,
         };
     }
@@ -37,6 +48,17 @@ pub const MLIRBuilder = struct {
         self.module.deinit();
         self.ctx.deinit();
     }
+
+    /// Temporarily sets the insertion point to a new block.
+    pub fn setInsertionBlock(self: *Self, block: mlir.Block) void {
+        self.insertion_block = block;
+    }
+
+    /// Gets the current insertion block (e.g., to save and restore it).
+    pub fn getInsertionBlock(self: *Self) mlir.Block {
+        return self.insertion_block;
+    }
+
 
     /// Helper to create a new tensor from an mlir.Value
     /// Create constant operation with data
@@ -54,9 +76,8 @@ pub const MLIRBuilder = struct {
     /// Helper to create operation, append to graph, and return result tensor
     /// This ensures all operations are properly attached to the MLIR graph
     pub fn createAndAppendOp(self: *Self, operation: mlir.Operation) !Tensor {
-        // CRITICAL FIX: Automatically append the new operation to the graph
-        const body_block = self.module.op().getRegion(0).getBlock(0);
-        body_block.appendOwnedOperation(operation);
+        // Use the designated insertion block instead of accessing module regions directly
+        self.insertion_block.appendOwnedOperation(operation);
         
         // Return result as new tensor
         return try self.newTensor(operation.getResult(0));
@@ -99,10 +120,9 @@ pub const MLIRBuilder = struct {
             .location = self.loc,
         });
 
-        // Attach the operation to the current block
-        const body_block = self.module.op().getRegion(0).getBlock(0);
-        body_block.appendOwnedOperation(constant_op);
-
+        // Attach the new constant operation to the builder's default insertion block.
+        self.insertion_block.appendOwnedOperation(constant_op);
+        
         // Return the result value
         return constant_op.getResult(0);
     }
@@ -131,20 +151,101 @@ pub const MLIRBuilder = struct {
             .location = self.loc,
         });
 
-        // Get the main block of the function being built.
-        // This assumes a single-block structure for now, which is fine.
-        const body_block = self.module.op().getRegion(0).getBlock(0);
-        body_block.appendOwnedOperation(op);
+        // Use the designated insertion block instead of accessing module regions directly
+        self.insertion_block.appendOwnedOperation(op);
         
         return op;
     }
     
-    /// Create a new block
-    pub fn createBlock(self: *Self) !mlir.Block {
-        _ = self;
+    /// Create a new block (static helper function)
+    pub fn createBlock() !mlir.Block {
         const c_api = @import("mlir/c.zig").c;
-        const block_handle = c_api.blockCreate(0, undefined, undefined);
+        // An empty block takes no arguments.
+        const block_handle = c_api.blockCreate(0, @constCast(@ptrCast(&[_]*c_api.MlirType{})), @constCast(@ptrCast(&[_]*c_api.MlirLocation{})));
         return mlir.Block{ .handle = block_handle };
+    }
+
+    /// Creates a complete, well-formed `func.func` operation with an empty body,
+    /// attaches it to the module, and returns the function's entry block for population.
+    /// This abstracts away the unsafe C API for function creation.
+    pub fn createFunction(
+        self: *Self,
+        name: []const u8,
+        func_type: mlir.Type,
+    ) !struct { func_op: mlir.Operation, entry_block: mlir.Block } {
+        std.log.info("MLIRBuilder.createFunction: Creating function '{s}'...", .{name});
+        const c_api = @import("mlir/c.zig").c;
+
+        // 1. Create the operation state for a `func.func`
+        std.log.info("MLIRBuilder.createFunction: Getting operation state...", .{});
+        var state = c_api.operationStateGet("func.func", self.loc.handle);
+
+        // 2. Add the function's attributes (type and name)
+        std.log.info("MLIRBuilder.createFunction: Creating attributes...", .{});
+        const func_type_attr = mlir.Attribute.typeAttr(func_type);
+        const sym_name_attr = mlir.Attribute.stringAttr(self.ctx, name);
+
+        const func_type_id = c_api.identifierGet(self.ctx.handle, "function_type");
+        const sym_name_id = c_api.identifierGet(self.ctx.handle, "sym_name");
+
+        var named_attrs = [_]c_api.MlirNamedAttribute{
+            .{ .name = func_type_id, .attribute = func_type_attr.handle },
+            .{ .name = sym_name_id, .attribute = sym_name_attr.handle },
+        };
+        c_api.mlirOperationStateAddAttributes(&state, named_attrs.len, @ptrCast(&named_attrs[0]));
+        std.log.info("MLIRBuilder.createFunction: Attributes added", .{});
+
+        // 3. Create and add a region for the function's body
+        std.log.info("MLIRBuilder.createFunction: Creating bootstrap region...", .{});
+        const bootstrap_region = c_api.regionCreate();
+        var regions = [_]*c_api.MlirRegion{bootstrap_region};
+        c_api.operationStateAddOwnedRegions(&state, 1, @ptrCast(&regions[0]));
+        std.log.info("MLIRBuilder.createFunction: Bootstrap region added", .{});
+
+        // 4. Create the final func.func operation
+        std.log.info("MLIRBuilder.createFunction: Creating operation...", .{});
+        const func_op_handle = c_api.operationCreate(&state);
+        const func_op = mlir.Operation{ .handle = func_op_handle };
+        std.log.info("MLIRBuilder.createFunction: Operation created", .{});
+
+        // --- START FIX ---
+        // The `bootstrap_region` handle is now stale. Get the canonical region handle
+        // directly from the newly created operation. This is the ONLY safe way.
+        std.log.info("MLIRBuilder.createFunction: Getting canonical region handle...", .{});
+        const canonical_region = c_api.operationGetRegion(func_op.handle, 0);
+        std.log.info("MLIRBuilder.createFunction: Canonical region handle retrieved", .{});
+        // --- END FIX ---
+
+        // 5. Get or create the entry block for the function body
+        std.log.info("MLIRBuilder.createFunction: Getting/creating entry block...", .{});
+        
+        // Check if the region already has a block (some MLIR operations auto-create blocks)
+        const region_wrapper = mlir.Region{ .handle = canonical_region };
+        const existing_block = region_wrapper.getBlock(0);
+        const block = if (@intFromPtr(existing_block.handle) != 0) blk: {
+            std.log.info("MLIRBuilder.createFunction: Using existing block from region", .{});
+            break :blk existing_block;
+        } else blk: {
+            std.log.info("MLIRBuilder.createFunction: Creating new block...", .{});
+            const new_block = try createBlock();
+            std.log.info("MLIRBuilder.createFunction: Appending new block to canonical region...", .{});
+            c_api.regionAppendOwnedBlock(canonical_region, new_block.handle);
+            std.log.info("MLIRBuilder.createFunction: New block appended successfully", .{});
+            break :blk new_block;
+        };
+
+        // 6. Add block arguments based on the function type
+        std.log.info("MLIRBuilder.createFunction: Adding block arguments...", .{});
+        const func_type_wrapper = func_type.as(mlir.FunctionType) orelse return error.NotAFunctionType;
+        const num_inputs = func_type_wrapper.getNumInputs();
+        for (0..num_inputs) |i| {
+            const input_type = func_type_wrapper.getInput(i);
+            _ = block.addArgument(input_type, self.loc);
+        }
+        std.log.info("MLIRBuilder.createFunction: Block arguments added ({})", .{num_inputs});
+
+        std.log.info("MLIRBuilder.createFunction: Function '{s}' created successfully", .{name});
+        return .{ .func_op = func_op, .entry_block = block };
     }
 };
 

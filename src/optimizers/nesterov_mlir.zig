@@ -1,6 +1,5 @@
 /// MLIR-based implementation of the Nesterov Accelerated Gradient optimizer
 /// Implements the Nesterov momentum optimizer using MLIR/StableHLO operations for compilation and optimization
-
 const std = @import("std");
 const mlir = @import("../mlir.zig");
 const ops = @import("../ops.zig");
@@ -24,66 +23,9 @@ pub fn NesterovMLIRConfiguration(comptime DataType: type) type {
     };
 }
 
-/// Builds a self-contained `func.func @apply_nesterov(...)` that encapsulates the optimizer logic.
-/// The function signature will be:
-/// func(%params, %grads, %velocity) -> (%new_params, %new_velocity)
-fn buildNesterovUpdateFunction(
-    builder: *MLIRBuilder,
-    conf: anytype,
-    tensor_type: mlir.Type,
-    element_type: mlir.Type,
-) ![]const u8 {
-    // 1. Define the function signature
-    const input_types = [_]mlir.Type{ tensor_type, tensor_type, tensor_type }; // params, grads, velocity
-    const result_types = [_]mlir.Type{ tensor_type, tensor_type }; // new_params, new_velocity
-    const func_type = mlir.Type.functionType(builder.ctx, &input_types, &result_types);
-
-    const func_name = "apply_nesterov_update";
-
-    // 2. Create the func.func operation
-    const func_op = mlir.Operation.create(builder.ctx, "func.func", .{
-        .attributes = &.{
-            .{ "function_type", mlir.Attribute.typeAttr(func_type) },
-            .{ "sym_name", mlir.Attribute.stringAttr(builder.ctx, func_name) },
-        },
-        .location = builder.loc,
-    });
-    // Add the function to the main module's body
-    builder.module.op().getRegion(0).getBlock(0).appendOwnedOperation(func_op);
-
-    // 3. Create the function body
-    const region = func_op.getRegion(0);
-    const block = try builder.createBlock();
-    region.appendOwnedBlock(block);
-
-    // 4. Get handles to the function arguments
-    const params_arg = block.addArgument(tensor_type, builder.loc);
-    const grads_arg = block.addArgument(tensor_type, builder.loc);
-    const velocity_arg = block.addArgument(tensor_type, builder.loc);
-
-    const params = try builder.newTensor(params_arg);
-    const grads = try builder.newTensor(grads_arg);
-    const velocity = try builder.newTensor(velocity_arg);
-
-    // 5. Build the optimizer logic inside this function
-    const params_dims = try params.shape.getDims(builder.allocator);
-    defer builder.allocator.free(params_dims);
-    const momentum_tensor = try ops.constant(builder, @as(f64, @floatCast(conf.momentum)), params_dims, element_type);
-    const lr_tensor = try ops.constant(builder, @as(f64, @floatCast(conf.learning_rate)), params_dims, element_type);
-
-    // velocity = momentum * velocity + learning_rate * grads
-    const momentum_velocity_update = try ops.multiply(builder, momentum_tensor, velocity);
-    const lr_grads = try ops.multiply(builder, lr_tensor, grads);
-    const new_velocity = try ops.add(builder, momentum_velocity_update, lr_grads);
-
-    // params = params - new_velocity
-    const new_params = try ops.subtract(builder, params, new_velocity);
-
-    // 6. Add the return operation
-    _ = try builder.createAndAttach("func.return", &.{ new_params.value, new_velocity.value }, &.{});
-
-    return func_name;
-}
+// NOTE: buildNesterovUpdateFunction has been removed.
+// We now use inline operations in the update() method to avoid complex function building
+// that was causing segmentation faults with the MLIR C API.
 
 pub fn NesterovMLIR(comptime T: type) type {
     const ConfT = NesterovMLIRConfiguration(T);
@@ -94,21 +36,18 @@ pub fn NesterovMLIR(comptime T: type) type {
         conf: ConfT,
         element_type: mlir.Type,
         velocity: ?Tensor,
-        
+
         // NEW FIELD: Store the name of our pre-built optimizer function
         update_fn_name: []const u8,
 
         const Self = @This();
 
         pub fn init(allocator: std.mem.Allocator, builder: *MLIRBuilder, conf: ConfT, element_type: mlir.Type) !Self {
-            // To build the function, we need a representative tensor type.
-            // The optimizer logic is shape-agnostic, but MLIR needs a concrete type.
-            // We'll use a placeholder shape [1] which works because the logic is element-wise.
-            const placeholder_shape = &[_]i64{1};
-            const tensor_type = mlir.Type.rankedTensorType(builder.ctx, placeholder_shape, element_type);
-
-            // Build the reusable update function and get its name
-            const fn_name = try buildNesterovUpdateFunction(builder, conf, tensor_type, element_type);
+            std.log.info("NesterovMLIR.init: Starting initialization...", .{});
+            
+            // SIMPLIFIED: Don't build the function during initialization to avoid crashes
+            // Instead, we'll build operations inline during the update() call
+            std.log.info("NesterovMLIR.init: Creating simple optimizer instance", .{});
 
             return Self{
                 .allocator = allocator,
@@ -116,7 +55,7 @@ pub fn NesterovMLIR(comptime T: type) type {
                 .conf = conf,
                 .element_type = element_type,
                 .velocity = null,
-                .update_fn_name = fn_name, // Store the name
+                .update_fn_name = "nesterov_inline", // Dummy name for now
             };
         }
 
@@ -142,39 +81,24 @@ pub fn NesterovMLIR(comptime T: type) type {
                 try self.initializeVelocity(params);
             }
 
-            // The logic is now encapsulated in the pre-built function.
-            // We just need to call it.
-            
-            // 1. Prepare operands for the call
-            const operands = [_]mlir.Value{
-                params.value,
-                grads.value,
-                self.velocity.?.value,
-            };
+            // SIMPLIFIED: Build operations inline instead of calling a pre-built function
+            // This avoids the complex MLIR function building that was causing the crash
 
-            // 2. Define the result types based on the function's signature
-            const tensor_type = params.value.getType();
-            const result_types = [_]mlir.Type{
-                tensor_type, // new_params
-                tensor_type, // new_velocity
-            };
+            // Create scalar constants
+            const params_dims = try params.shape.getDims(self.builder.allocator);
+            defer self.builder.allocator.free(params_dims);
+            const momentum_tensor = try ops.constant(self.builder, @as(f64, @floatCast(self.conf.momentum)), params_dims, self.element_type);
+            const lr_tensor = try ops.constant(self.builder, @as(f64, @floatCast(self.conf.learning_rate)), params_dims, self.element_type);
 
-            // 3. Create the func.call operation
-            const call_op = self.builder.createAndAttach("func.call", &operands, &result_types) catch |err| {
-                std.log.err("Failed to create func.call for optimizer: {}", .{err});
-                // Dump the module to see what functions are available
-                self.builder.module.op().dump();
-                return err;
-            };
-            
-            // 4. Extract results from the call
-            const new_params_val = call_op.getResult(0);
-            const new_velocity_val = call_op.getResult(1);
+            // velocity = momentum * velocity + learning_rate * grads
+            const momentum_velocity_update = try ops.multiply(self.builder, momentum_tensor, self.velocity.?);
+            const lr_grads = try ops.multiply(self.builder, lr_tensor, grads);
+            const new_velocity = try ops.add(self.builder, momentum_velocity_update, lr_grads);
 
-            const new_params = try self.builder.newTensor(new_params_val);
-            const new_velocity = try self.builder.newTensor(new_velocity_val);
+            // params = params - new_velocity
+            const new_params = try ops.subtract(self.builder, params, new_velocity);
 
-            // 5. Update internal state
+            // Update internal state
             if (self.velocity) |v| v.deinit();
             self.velocity = new_velocity;
 
@@ -182,7 +106,7 @@ pub fn NesterovMLIR(comptime T: type) type {
         }
 
         /// Alternative implementation that more clearly separates the lookahead computation
-        pub fn updateWithLookahead(self: *Self, params: Tensor, grads_fn: fn(Tensor) anyerror!Tensor) !Tensor {
+        pub fn updateWithLookahead(self: *Self, params: Tensor, grads_fn: fn (Tensor) anyerror!Tensor) !Tensor {
             // Initialize velocity if first call
             if (self.velocity == null) {
                 try self.initializeVelocity(params);
@@ -280,7 +204,7 @@ pub fn NesterovMLIRMap(comptime K: type, comptime DataType: type) type {
             return try optimizer.update(params, grads);
         }
 
-        pub fn updateWithLookahead(self: *Self, key: K, params: Tensor, grads_fn: fn(Tensor) anyerror!Tensor) !Tensor {
+        pub fn updateWithLookahead(self: *Self, key: K, params: Tensor, grads_fn: fn (Tensor) anyerror!Tensor) !Tensor {
             const optimizer = self.map.getPtr(key) orelse return error.OptimizerNotFound;
             return try optimizer.updateWithLookahead(params, grads_fn);
         }
@@ -296,7 +220,7 @@ pub fn testNesterovMLIR(allocator: std.mem.Allocator) !void {
 
     const element_type = mlir.Type.f32Type(builder.ctx);
     const conf = NesterovMLIRConfiguration(f32).default_configuration();
-    
+
     var nesterov = try NesterovMLIR(f32).init(allocator, &builder, conf, element_type);
     defer nesterov.deinit();
 

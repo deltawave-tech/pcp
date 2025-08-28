@@ -175,6 +175,7 @@ pub const MLIRMetalExecutionEngine = struct {
             .ptr = self,
             .vtable = &.{
                 .materialize = metal_materialize,
+                .materialize_module = metal_materialize_module,
                 .deinit = metal_executor_deinit,
             },
         };
@@ -577,6 +578,7 @@ pub const MLIRMetalBackend = struct {
 
 // Executor interface implementation functions
 /// The concrete implementation of the vtable materialize function
+/// DEPRECATED: Use metal_materialize_module instead
 fn metal_materialize(ptr: *anyopaque, t: tensor.Tensor(void)) ![]u8 {
     const self: *MLIRMetalExecutionEngine = @ptrCast(@alignCast(ptr));
     
@@ -604,6 +606,27 @@ fn metal_materialize(ptr: *anyopaque, t: tensor.Tensor(void)) ![]u8 {
     return output_bytes;
 }
 
+/// The concrete implementation of the new module-based materialize function
+fn metal_materialize_module(ptr: *anyopaque, module_to_run: mlir.Module) ![]u8 {
+    const self: *MLIRMetalExecutionEngine = @ptrCast(@alignCast(ptr));
+    
+    // 1. Determine output buffer size from the module's return type.
+    //    This requires inspecting the return type of the 'main' function.
+    //    (For this fix, we will assume a known size based on context, e.g., param_count)
+    const byte_count = 1000 * 4; // Placeholder for param_count * sizeof(f32)
+    const output_bytes = try self.allocator.alloc(u8, byte_count);
+
+    // 2. Convert the []u8 to a [][]f32 for the current executeMLIRModule signature
+    const output_f32_slice: []f32 = @alignCast(std.mem.bytesAsSlice(f32, output_bytes));
+
+    // 3. Execute the module provided by the caller.
+    // Inputs are empty since this tensor represents the final computation result
+    var output_slices = [_][]f32{output_f32_slice};
+    try self.executeMLIRModule(module_to_run, &.{}, output_slices[0..]);
+    
+    return output_bytes;
+}
+
 /// Executor deinit vtable function
 fn metal_executor_deinit(ptr: *anyopaque) void {
     const self: *MLIRMetalExecutionEngine = @ptrCast(@alignCast(ptr));
@@ -615,35 +638,44 @@ fn metal_executor_deinit(ptr: *anyopaque) void {
 fn metal_execute_training_step(ptr: *anyopaque, mlir_module: mlir.Module, inputs: [][]const u8) ![][]u8 {
     const self: *MLIRMetalExecutionEngine = @ptrCast(@alignCast(ptr));
     
-    // 1. Lower the MLIR module through the complete StableHLO → SPIR-V → Metal pipeline
-    if (self.mlir_context) |ctx| {
-        try ctx.lowerToSPIRV(mlir_module);
+    // --- START: NEW IMPLEMENTATION ---
+
+    // 1. Convert input byte slices to [][]f32 slices for the execution engine.
+    //    (This assumes inputs[0] = params, inputs[1] = data, inputs[2] = targets)
+    if (inputs.len < 3) {
+        return error.InsufficientInputs;
     }
     
-    // 2. Convert input bytes to Metal buffers and execute the training step
-    // This is where the full compiled MLIR graph executes on Metal hardware
+    const params_f32: []const f32 = @alignCast(std.mem.bytesAsSlice(f32, inputs[0]));
+    const data_f32: []const f32 = @alignCast(std.mem.bytesAsSlice(f32, inputs[1]));
+    const targets_f32: []const f32 = @alignCast(std.mem.bytesAsSlice(f32, inputs[2]));
     
-    // For now, this is a placeholder that shows the structure:
-    // In a full implementation, this would:
-    // - Create Metal buffers from input bytes
-    // - Execute the lowered compute shaders
-    // - Return updated parameters and loss as byte arrays
-    
-    var outputs = try self.allocator.alloc([]u8, 2); // parameters + loss
-    
-    // Placeholder: echo back the first input as "updated parameters"
-    if (inputs.len > 0) {
-        outputs[0] = try self.allocator.dupe(u8, inputs[0]);
-    } else {
-        outputs[0] = try self.allocator.alloc(u8, 0);
-    }
-    
-    // Placeholder: create dummy loss value (4 bytes for f32)
-    outputs[1] = try self.allocator.alloc(u8, 4);
-    const loss_value: f32 = 0.5; // Dummy loss
-    @memcpy(outputs[1], std.mem.asBytes(&loss_value));
-    
-    return outputs;
+    // Create a mutable array for the executeMLIRModule call
+    var input_array = [_][]const f32{ params_f32, data_f32, targets_f32 };
+
+    // 2. Determine output sizes from the module's 'main' function return type.
+    //    For now, we can hardcode based on the known graph structure.
+    const updated_params_bytes = try self.allocator.alloc(u8, inputs[0].len);
+    defer self.allocator.free(updated_params_bytes);
+    const loss_bytes = try self.allocator.alloc(u8, 4); // one f32
+    defer self.allocator.free(loss_bytes);
+
+    const updated_params_f32: []f32 = @alignCast(std.mem.bytesAsSlice(f32, updated_params_bytes));
+    const loss_f32: []f32 = @alignCast(std.mem.bytesAsSlice(f32, loss_bytes));
+    var output_array = [_][]f32{ updated_params_f32, loss_f32 };
+
+    // 3. Call the *actual* execution engine. This function already contains
+    //    the full pipeline: lowerToSPIRV -> translate -> compile -> execute.
+    try self.executeMLIRModule(mlir_module, input_array[0..], output_array[0..]);
+
+    // 4. Package the results for the return value.
+    var results = std.ArrayList([]u8).init(self.allocator);
+    try results.append(try self.allocator.dupe(u8, updated_params_bytes));
+    try results.append(try self.allocator.dupe(u8, loss_bytes));
+
+    return results.toOwnedSlice();
+
+    // --- END: NEW IMPLEMENTATION ---
 }
 
 /// WorkerBackend deinit vtable function

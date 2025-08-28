@@ -56,7 +56,7 @@ pub const DiLoCo = struct {
     current_epoch: usize,
 
     // MLIR infrastructure
-    mlir_builder: MLIRBuilder,
+    mlir_builder: *MLIRBuilder, // Now a pointer, as it's owned externally
     nesterov_optimizer: *NesterovMLIR,
     element_type: mlir.Type,
 
@@ -73,26 +73,33 @@ pub const DiLoCo = struct {
     const Self = @This();
 
     // Change the init signature to accept the generic executor
-    pub fn init(allocator: Allocator, coordinator: *Shepherd, config: DiLoCoConfig, executor: Executor) !Self {
-        // Initialize MLIR infrastructure directly
-        var mlir_builder = try MLIRBuilder.init(allocator);
-
+    pub fn init(allocator: Allocator, coordinator: *Shepherd, config: DiLoCoConfig, executor: Executor, mlir_builder: *MLIRBuilder) !Self {
+        std.log.info("DiLoCo.init: Starting initialization...", .{});
+        
+        // The MLIRBuilder is now passed in, ensuring a single context.
+        std.log.info("DiLoCo.init: Creating element type...", .{});
         const element_type = mlir.Type.f32Type(mlir_builder.ctx);
 
         // Configure and create Nesterov optimizer
+        std.log.info("DiLoCo.init: Configuring Nesterov optimizer...", .{});
         const nesterov_config = nesterov_mlir.NesterovMLIRConfiguration(f32){
             .learning_rate = config.base_config.learning_rate,
             .momentum = config.nesterov_momentum,
         };
 
+        std.log.info("DiLoCo.init: Allocating Nesterov optimizer memory...", .{});
         const nesterov_optimizer = try allocator.create(NesterovMLIR);
-        nesterov_optimizer.* = try NesterovMLIR.init(allocator, &mlir_builder, nesterov_config, element_type);
+        std.log.info("DiLoCo.init: Memory allocated, calling NesterovMLIR.init...", .{});
+        nesterov_optimizer.* = try NesterovMLIR.init(allocator, mlir_builder, nesterov_config, element_type);
+        std.log.info("DiLoCo.init: Nesterov optimizer created successfully", .{});
 
         // Set up parameter shape
+        std.log.info("DiLoCo.init: Setting up parameter shape...", .{});
         const parameter_shape = try allocator.alloc(i64, 1);
         parameter_shape[0] = @intCast(config.param_count);
 
         // Create a partial instance to build the worker graph
+        std.log.info("DiLoCo.init: Creating partial instance...", .{});
         var partial_self = Self{
             .allocator = allocator,
             .coordinator = undefined, // Not used during graph building
@@ -109,8 +116,11 @@ pub const DiLoCo = struct {
             .serialized_worker_graph = undefined, // Will be set below
         };
 
-        // Build the worker graph ONCE during initialization
-        const graph = try partial_self.buildWorkerTrainingGraph();
+        // Build the worker graph ONCE during initialization using the safe function builder
+        std.log.info("DiLoCo.init: Building worker training graph...", .{});
+        const graph = try partial_self.buildWorkerTrainingGraph(mlir_builder);
+        mlir_builder.module.op().dump(); // Debug print the state of the shared builder's module
+        std.log.info("DiLoCo.init: Worker training graph built successfully", .{});
 
         return Self{
             .allocator = allocator,
@@ -137,7 +147,7 @@ pub const DiLoCo = struct {
         self.nesterov_optimizer.deinit();
         self.allocator.destroy(self.nesterov_optimizer);
 
-        self.mlir_builder.deinit();
+        // We no longer deinit the builder, as we don't own it.
 
         // Free the stored serialized graph
         self.allocator.free(self.serialized_worker_graph);
@@ -221,7 +231,7 @@ pub const DiLoCo = struct {
     /// Initialize master parameters using MLIR
     fn initializeMasterParameters(self: *Self) !void {
         std.log.info("🎲 Allocating parameter data array ({} elements)...", .{self.config.param_count});
-        
+
         // Create initial parameter values
         const param_data = try self.allocator.alloc(f32, self.config.param_count);
         defer self.allocator.free(param_data);
@@ -248,41 +258,44 @@ pub const DiLoCo = struct {
     /// Create a dedicated forward+loss function that will be differentiated
     /// This is a well-formed func.func operation that autodiff can process
     fn buildForwardAndLossFunction(self: *Self, builder: *ops.MLIRBuilder) !mlir.Operation {
+        std.log.info("buildForwardAndLossFunction: Starting...", .{});
         const f32_type = mlir.Type.f32Type(builder.ctx);
         const param_count = self.config.param_count;
 
         // Define types
+        std.log.info("buildForwardAndLossFunction: Creating tensor types...", .{});
         const params_type = mlir.Type.rankedTensorType(builder.ctx, &.{@intCast(param_count)}, f32_type);
         const data_type = mlir.Type.rankedTensorType(builder.ctx, &.{ 4, 12 }, f32_type);
         const loss_type = mlir.Type.rankedTensorType(builder.ctx, &.{}, f32_type); // Scalar loss
 
         // Define the function type: func(params, inputs, targets) -> (loss)
+        std.log.info("buildForwardAndLossFunction: Creating function type...", .{});
         const input_types = [_]mlir.Type{ params_type, data_type, data_type };
         const result_types = [_]mlir.Type{loss_type};
         const func_type = mlir.Type.functionType(builder.ctx, &input_types, &result_types);
+        std.log.info("buildForwardAndLossFunction: Function type created", .{});
 
-        // Create the func.func operation with attributes
-        const func_op = mlir.Operation.create(builder.ctx, "func.func", .{
-            .operands = &.{},
-            .results = &.{},
-            .attributes = &.{
-                .{ "function_type", mlir.Attribute.typeAttr(func_type) },
-                .{ "sym_name", mlir.Attribute.stringAttr(builder.ctx, "forward_and_loss_fn") },
-            },
-            .location = builder.loc,
-        });
+        // --- REFACTORED CODE ---
+        // Use the new safe helper to create the function and get its entry block
+        std.log.info("buildForwardAndLossFunction: Using safe createFunction helper...", .{});
+        const result = try builder.createFunction("forward_and_loss_fn", func_type);
+        const func_op = result.func_op;
+        const block = result.entry_block;
 
-        // Create a block for the function body
-        const region = func_op.getRegion(0);
-        const block = try builder.createBlock();
-        region.appendOwnedBlock(block);
+        // Get block arguments (which are now created for us)
+        const params_arg = block.getArgument(0);
+        const inputs_arg = block.getArgument(1);
+        // const targets_arg = block.getArgument(2); // (unused)
+        std.log.info("buildForwardAndLossFunction: Function created with safe helper", .{});
+        // --- END REFACTORED CODE ---
 
-        // Add block arguments
-        const params_arg = block.addArgument(params_type, builder.loc);
-        const inputs_arg = block.addArgument(data_type, builder.loc);
-        _ = block.addArgument(data_type, builder.loc); // targets_arg (unused in simple example)
+        // CRITICAL: Save the original insertion block and set the new one.
+        const original_insertion_block = builder.getInsertionBlock();
+        builder.setInsertionBlock(block);
+        defer builder.setInsertionBlock(original_insertion_block); // Restore on exit
 
         // Build the forward/loss computation inside this function
+        std.log.info("buildForwardAndLossFunction: Building forward computation in function body...", .{});
         const param_tensor = try builder.newTensor(params_arg);
         const input_flat = try ops.reshape(builder, try builder.newTensor(inputs_arg), &.{@intCast(param_count)});
 
@@ -292,25 +305,108 @@ pub const DiLoCo = struct {
         const loss = try ops.reduceSum(builder, squared, &.{0});
 
         // Return the loss
+        std.log.info("buildForwardAndLossFunction: Adding func.return terminator...", .{});
         _ = try builder.createAndAttach("func.return", &.{loss.value}, &.{});
+        std.log.info("buildForwardAndLossFunction: func.return terminator added", .{});
 
         return func_op;
     }
 
+    /// Extract raw byte data from a tensor defined by a stablehlo.constant operation.
+    fn extractTensorData(self: *Self, t: Tensor) ![]u8 {
+        const c = @import("../mlir/c.zig").c;
+
+        // 1. Get the MLIR Value from the Tensor
+        if (!c.mlirValueIsAOpResult(t.value.handle)) {
+            std.log.err("Cannot extract data: Tensor value is not an operation result.", .{});
+            return error.NotAnOperationResult;
+        }
+        const defining_op_handle = c.mlirOpResultGetOwner(t.value.handle);
+        const defining_op = mlir.Operation{ .handle = defining_op_handle };
+
+        // 2. Verify the operation is a constant
+        const op_identifier = c.mlirOperationGetName(defining_op.handle);
+        const op_name_ref = c.mlirIdentifierStr(op_identifier);
+        const op_name = c.fromStringRef(op_name_ref);
+
+        if (!std.mem.eql(u8, op_name, "stablehlo.constant")) {
+            std.log.err("Cannot extract data: Tensor is not defined by a stablehlo.constant op. It is a {s}", .{op_name});
+            return error.NotAConstantOp;
+        }
+
+        // 3. Get the 'value' attribute, which must be a DenseElementsAttr
+        const value_attr = c.operationGetAttributeByName(defining_op.handle, "value");
+        if (@intFromPtr(value_attr) == 0 or !c.mlirAttributeIsADenseElements(value_attr)) {
+            return error.InvalidConstantAttribute;
+        }
+
+        // 4. Extract the raw data pointer and size
+        const raw_data_ptr = c.mlirDenseElementsAttrGetRawData(value_attr);
+        const num_bytes = t.shape.elemCount() * t.shape.dtype.sizeInBytes();
+        const data_slice: [*]const u8 = @ptrCast(raw_data_ptr);
+
+        // 5. Return a duplicate of the data for the caller to own
+        return self.allocator.dupe(u8, data_slice[0..num_bytes]);
+    }
+
     /// Build the complete worker training graph as MLIR module using Function-as-a-Unit pattern
     /// This creates: forward_fn -> autodiff -> main_fn that orchestrates the full training step
-    fn buildWorkerTrainingGraph(self: *Self) ![]u8 {
+    fn buildWorkerTrainingGraph(self: *Self, builder: *MLIRBuilder) ![]u8 {
         std.log.info("DiLoCo: Building REAL autodiff-enabled worker training graph with Function-as-a-Unit pattern...", .{});
-        var builder = try ops.MLIRBuilder.init(self.allocator);
-        defer builder.deinit();
 
         // === Part 1: Create the forward+loss function to be differentiated ===
         std.log.info("Creating forward+loss function...", .{});
-        const forward_fn = try self.buildForwardAndLossFunction(&builder);
+        const forward_fn_op = try self.buildForwardAndLossFunction(builder);
+        std.log.info("Forward+loss function created successfully", .{});
+        // CRITICAL: Attach the newly created function to the module's body.
+        std.log.info("Attaching function to module body...", .{});
+        builder.module_body.appendOwnedOperation(forward_fn_op);
+        std.log.info("Function attached successfully", .{});
 
         // === Part 2: Differentiate the forward function ===
         std.log.info("Differentiating forward function with autodiff.buildGradientGraph...", .{});
-        _ = try autodiff.buildGradientGraph(self.allocator, &builder, forward_fn);
+        
+        // DEBUG: Verify function structure before calling autodiff
+        std.log.info("DEBUG: Verifying forward function structure...", .{});
+        const func_region = forward_fn_op.getRegion(0);
+        const func_block = func_region.getBlock(0);
+        
+        // Debug: Check all operations in the block
+        std.log.info("DEBUG: Walking through all operations in function block...", .{});
+        var maybe_op = func_block.getFirstOp();
+        var op_count: usize = 0;
+        while (maybe_op) |op| {
+            const op_name = op.getName();
+            std.log.info("DEBUG: Operation {}: {s}", .{ op_count, op_name });
+            if (std.mem.eql(u8, op_name, "func.return")) {
+                std.log.info("DEBUG: Found func.return operation!", .{});
+            }
+            maybe_op = op.getNext();
+            op_count += 1;
+        }
+        std.log.info("DEBUG: Total operations in function block: {}", .{op_count});
+        
+        const maybe_terminator = func_block.getLastOp();
+        const maybe_last_op = func_block.getLastOpGeneric();
+        if (maybe_terminator) |terminator| {
+            std.log.info("DEBUG: Found terminator operation in forward function", .{});
+            terminator.dump();
+        } else {
+            std.log.info("DEBUG: ERROR - No terminator found via getLastOp()!", .{});
+        }
+        
+        if (maybe_last_op) |last_op| {
+            const last_op_name = last_op.getName();
+            std.log.info("DEBUG: Last operation via getLastOpGeneric(): {s}", .{last_op_name});
+            if (std.mem.eql(u8, last_op_name, "func.return")) {
+                std.log.info("DEBUG: Last operation IS func.return!", .{});
+            }
+        } else {
+            std.log.info("DEBUG: ERROR - No last operation found via getLastOpGeneric()!", .{});
+        }
+        
+        // The autodiff function will add its own generated function to the module.
+        _ = try autodiff.buildGradientGraph(self.allocator, builder, forward_fn_op);
 
         // The autodiff system will name the gradient function predictably
         // For now, we'll use the convention that it names it "forward_and_loss_fn_grad"
@@ -331,25 +427,27 @@ pub const DiLoCo = struct {
         const main_result_types = [_]mlir.Type{ params_type, loss_type };
         const main_func_type = mlir.Type.functionType(builder.ctx, &main_input_types, &main_result_types);
 
-        const main_func_op = mlir.Operation.create(builder.ctx, "func.func", .{
-            .operands = &.{},
-            .results = &.{},
-            .attributes = &.{
-                .{ "function_type", mlir.Attribute.typeAttr(main_func_type) },
-                .{ "sym_name", mlir.Attribute.stringAttr(builder.ctx, "main") },
-            },
-            .location = builder.loc,
-        });
+        // --- REFACTORED MAIN FUNCTION CREATION ---
+        // Use the safe helper to create the main function
+        std.log.info("Creating main orchestration function with safe helper...", .{});
+        const main_result = try builder.createFunction("main", main_func_type);
+        const main_func_op = main_result.func_op;
+        const main_block = main_result.entry_block;
 
-        // Create main function body
-        const main_region = main_func_op.getRegion(0);
-        const main_block = try builder.createBlock();
-        main_region.appendOwnedBlock(main_block);
+        // CRITICAL: Attach the main function to the module's body.
+        builder.module_body.appendOwnedOperation(main_func_op);
 
-        // Add main function arguments
-        const initial_params = main_block.addArgument(params_type, builder.loc);
-        const inputs = main_block.addArgument(data_type, builder.loc);
-        const targets = main_block.addArgument(data_type, builder.loc);
+        // CRITICAL: Set the insertion point to the main function's body.
+        const original_insertion_block = builder.getInsertionBlock();
+        builder.setInsertionBlock(main_block);
+        defer builder.setInsertionBlock(original_insertion_block);
+
+        // Get main function arguments (created by the safe helper)
+        const initial_params = main_block.getArgument(0);
+        const inputs = main_block.getArgument(1);
+        const targets = main_block.getArgument(2);
+        std.log.info("Main function created with safe helper", .{});
+        // --- END REFACTORED MAIN FUNCTION CREATION ---
 
         // Call the forward function to get the loss
         const forward_call_op = mlir.Operation.create(builder.ctx, "func.call", .{
@@ -360,10 +458,11 @@ pub const DiLoCo = struct {
             },
             .location = builder.loc,
         });
+        builder.insertion_block.appendOwnedOperation(forward_call_op);
         const loss_val = forward_call_op.getResult(0);
 
         // Call the gradient function to get gradients
-        const one = try ops.constant(&builder, 1.0, &.{}, f32_type); // Scalar 1.0 for loss gradient seed
+        const one = try ops.constant(builder, 1.0, &.{}, f32_type); // Scalar 1.0 for loss gradient seed
         const grad_call_op = mlir.Operation.create(builder.ctx, "func.call", .{
             .operands = &.{ initial_params, inputs, targets, one.value },
             .results = &.{ params_type, data_type, data_type },
@@ -372,12 +471,13 @@ pub const DiLoCo = struct {
             },
             .location = builder.loc,
         });
+        builder.insertion_block.appendOwnedOperation(grad_call_op);
         const param_grads = grad_call_op.getResult(0); // Gradients w.r.t. parameters
 
         // Apply simple gradient descent update
-        const learning_rate = try ops.constant(&builder, 0.01, &.{@intCast(param_count)}, f32_type);
-        const grad_scaled = try ops.multiply(&builder, try builder.newTensor(param_grads), learning_rate);
-        const updated_params = try ops.subtract(&builder, try builder.newTensor(initial_params), grad_scaled);
+        const learning_rate = try ops.constant(builder, 0.01, &.{@intCast(param_count)}, f32_type);
+        const grad_scaled = try ops.multiply(builder, try builder.newTensor(param_grads), learning_rate);
+        const updated_params = try ops.subtract(builder, try builder.newTensor(initial_params), grad_scaled);
 
         // Return both updated parameters and loss from main function
         _ = try builder.createAndAttach("func.return", &.{ updated_params.value, loss_val }, &.{});
@@ -412,8 +512,9 @@ pub const DiLoCo = struct {
             return error.ParametersNotInitialized;
         }
 
-        // Materialize parameters to bytes
-        const serialized_params = try self.executor.materialize(self.master_parameters.?);
+        // CORRECT APPROACH: Extract the raw data directly from the constant tensor.
+        // This avoids misusing the executor and creating invalid IR.
+        const serialized_params = try self.extractTensorData(self.master_parameters.?);
         defer self.allocator.free(serialized_params);
 
         // Create WorkerPayload and serialize with Cap'n Proto
@@ -427,7 +528,7 @@ pub const DiLoCo = struct {
         const b64_len = std.base64.standard.Encoder.calcSize(capnp_bytes.len);
         const b64_encoded_payload = try self.allocator.alloc(u8, b64_len);
         defer self.allocator.free(b64_encoded_payload);
-        
+
         const encoded_len = std.base64.standard.Encoder.encode(b64_encoded_payload, capnp_bytes).len;
 
         // Create JSON payload with Base64-encoded binary data
@@ -499,7 +600,7 @@ pub const DiLoCo = struct {
         defer averaged_tensor.deinit();
 
         // Compute gradients (difference between averaged and master parameters)
-        const gradient_tensor = try ops.subtract(&self.mlir_builder, averaged_tensor, self.master_parameters.?);
+        const gradient_tensor = try ops.subtract(self.mlir_builder, averaged_tensor, self.master_parameters.?);
         defer gradient_tensor.deinit();
 
         // Apply Nesterov momentum update using MLIR optimizer

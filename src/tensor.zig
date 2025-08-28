@@ -230,7 +230,7 @@ pub fn Tensor(comptime T: type) type {
                 return error.UnsupportedDTypeForFromSlice;
             }
             const dtype = DType.f32;
-            const shape = try Shape.init(builder.allocator, dims, dtype);
+            const shape = try Shape.initWithDims(builder.ctx, dims, dtype);
 
             const host_bytes = std.mem.sliceAsBytes(host_slice);
             return Self.newConstant(builder, host_bytes, shape);

@@ -76,8 +76,13 @@ pub fn buildGradientGraph(
 
     // 2. Create and append the entry block to the gradient function
     const grad_fn_region = gradient_fn.getRegion(0);
-    const grad_fn_block = try builder.createBlock();
+    const grad_fn_block = try ops.MLIRBuilder.createBlock();
     c.regionAppendOwnedBlock(grad_fn_region.handle, grad_fn_block.handle);
+    
+    // CRITICAL FIX: Set the insertion point to the new gradient function's block.
+    const original_insertion_block = builder.getInsertionBlock();
+    builder.setInsertionBlock(grad_fn_block);
+    defer builder.setInsertionBlock(original_insertion_block); // Restore on exit
     
     std.debug.print("Created gradient function block and appended to region\n", .{});
     
@@ -362,8 +367,8 @@ fn transposeVJP(
             c.mlirOperationStateAddAttributes(&state, 1, @ptrCast(@constCast(&named_attr)));
             
             const transpose_op = c.operationCreate(&state);
-            const body_block = builder.module.op().getRegion(0).getBlock(0);
-            body_block.appendOwnedOperation(mlir.Operation{ .handle = transpose_op });
+            // CRITICAL FIX: Use the builder's pre-established insertion block instead of accessing module regions directly
+            builder.insertion_block.appendOwnedOperation(mlir.Operation{ .handle = transpose_op });
             
             try result.append(mlir.Value{ .handle = c.operationGetResult(transpose_op, 0) });
         } else {
@@ -544,8 +549,8 @@ fn reduceSumVJP(
                 c.mlirOperationStateAddAttributes(&state, 1, @ptrCast(@constCast(&named_attr)));
                 
                 const broadcast_op = c.operationCreate(&state);
-                const body_block = builder.module.op().getRegion(0).getBlock(0);
-                body_block.appendOwnedOperation(mlir.Operation{ .handle = broadcast_op });
+                // CRITICAL FIX: Use the builder's pre-established insertion block instead of accessing module regions directly
+                builder.insertion_block.appendOwnedOperation(mlir.Operation{ .handle = broadcast_op });
                 
                 try result.append(mlir.Value{ .handle = c.operationGetResult(broadcast_op, 0) });
             }
@@ -697,29 +702,25 @@ fn getOperationsInReverseOrder(allocator: Allocator, fn_op: mlir.Operation) ![]m
     var visited = std.AutoHashMap(mlir.Operation, void).init(allocator);
     defer visited.deinit();
 
-    // The fn_op is a module operation. We need to find the actual function body block.
-    // Walk through all operations in the module to find the terminator
-    const region = fn_op.getRegion(0);
-    const block = region.getBlock(0);
+    // CRITICAL FIX: The fn_op is the func.func operation itself. We must start
+    // the reverse traversal from ITS terminator (the func.return op).
+    const func_body_region = fn_op.getRegion(0);
+    const func_body_block = func_body_region.getBlock(0);
     
-    // Walk through the block to find the terminator (func.return)
-    var maybe_op = block.getFirstOp();
-    var terminator: ?mlir.Operation = null;
-    
-    while (maybe_op) |op| {
-        const op_name = op.getName();
-        
-        if (std.mem.eql(u8, op_name, "func.return")) {
-            terminator = op;
-            break;
-        }
-        maybe_op = op.getNext();
-    }
+    // FIXED: Use getLastOpGeneric instead of getLastOp (which relies on blockGetTerminator)
+    const terminator = func_body_block.getLastOpGeneric();
     
     if (terminator) |term_op| {
-        try worklist.append(term_op);
+        // Verify it's actually a func.return
+        const op_name = term_op.getName();
+        if (std.mem.eql(u8, op_name, "func.return")) {
+            try worklist.append(term_op);
+        } else {
+            std.debug.print("  ERROR: Last operation is not func.return, it's: {s}\\n", .{op_name});
+            return error.InvalidTerminator;
+        }
     } else {
-        std.debug.print("  ERROR: No terminator found!\\n", .{});
+        std.debug.print("  ERROR: No last operation found in the forward function!\\n", .{});
         return error.NoTerminatorFound;
     }
 
@@ -751,23 +752,35 @@ fn getOperationsInReverseOrder(allocator: Allocator, fn_op: mlir.Operation) ![]m
 }
 
 fn getReturnValue(fn_op: mlir.Operation) ?mlir.Value {
-    // Get the return value of the function (typically the loss)
-    // Walk the operations in the function's first block to find func.return
     const region = fn_op.getRegion(0);
     const block = region.getBlock(0);
-    
-    // Iterate through operations to find func.return
+
+    // --- RECOMMENDED FIX ---
+
+    // 1. First, try the more direct `getLastOpGeneric()`, which we've confirmed works.
+    if (block.getLastOpGeneric()) |last_op| {
+        // 2. Verify that the last operation is, in fact, a `func.return`.
+        if (std.mem.eql(u8, last_op.getName(), "func.return")) {
+            // This is the expected, successful path.
+            if (last_op.getNumOperands() > 0) {
+                return last_op.getOperand(0);
+            }
+        }
+    }
+
+    // 3. Fallback to the existing iteration method for full robustness, just in case.
+    std.debug.print("getReturnValue: Falling back to full iteration to find terminator.\n", .{});
     var maybe_op = block.getFirstOp();
     while (maybe_op) |op| {
-        const op_name = op.getName();
-        if (std.mem.eql(u8, op_name, "func.return")) {
-            // Return the first operand of the return operation
-            return op.getOperand(0);
+        if (std.mem.eql(u8, op.getName(), "func.return")) {
+            if (op.getNumOperands() > 0) {
+                return op.getOperand(0);
+            }
         }
         maybe_op = op.getNext();
     }
     
-    // If no return found, return null
+    // If no return value is found by either method.
     return null;
 }
 

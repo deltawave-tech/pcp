@@ -1,6 +1,5 @@
 /// MLIR-based implementation of the Adam optimizer
 /// Implements the Adam optimizer using MLIR/StableHLO operations for compilation and optimization
-
 const std = @import("std");
 const mlir = @import("../mlir.zig");
 const ops = @import("../ops.zig");
@@ -45,21 +44,40 @@ fn buildAdamUpdateFunction(
 
     const func_name = "apply_adam_update";
 
-    // 2. Create the func.func operation
-    const func_op = mlir.Operation.create(builder.ctx, "func.func", .{
-        .attributes = &.{
-            .{ "function_type", mlir.Attribute.typeAttr(func_type) },
-            .{ "sym_name", mlir.Attribute.stringAttr(builder.ctx, func_name) },
-        },
-        .location = builder.loc,
-    });
-    // Add the function to the main module's body
-    builder.module.op().getRegion(0).getBlock(0).appendOwnedOperation(func_op);
+    // 2. Create the func.func operation with regions
+    const c_api = @import("../mlir/c.zig").c;
+
+    // Create operation state
+    var state = c_api.operationStateGet("func.func", builder.loc.handle);
+
+    // Add attributes
+    const function_type_attr = mlir.Attribute.typeAttr(func_type);
+    const sym_name_attr = mlir.Attribute.stringAttr(builder.ctx, func_name);
+
+    const function_type_id = c_api.identifierGet(builder.ctx.handle, "function_type");
+    const sym_name_id = c_api.identifierGet(builder.ctx.handle, "sym_name");
+
+    var named_attrs = [_]c_api.MlirNamedAttribute{
+        c_api.MlirNamedAttribute{ .name = function_type_id, .attribute = function_type_attr.handle },
+        c_api.MlirNamedAttribute{ .name = sym_name_id, .attribute = sym_name_attr.handle },
+    };
+    c_api.mlirOperationStateAddAttributes(&state, named_attrs.len, @ptrCast(&named_attrs[0]));
+
+    // Create and add region for function body
+    const region = c_api.regionCreate();
+    var regions = [_]*c_api.MlirRegion{region};
+    c_api.operationStateAddOwnedRegions(&state, 1, @ptrCast(&regions[0]));
+
+    // Create the operation
+    const func_op = mlir.Operation{ .handle = c_api.operationCreate(&state) };
+
+    // CRITICAL FIX: A `func.func` must be inserted into the module's top-level block,
+    // not inside another function.
+    builder.module_body.appendOwnedOperation(func_op);
 
     // 3. Create the function body
-    const region = func_op.getRegion(0);
-    const block = try builder.createBlock();
-    region.appendOwnedBlock(block);
+    const block = try ops.MLIRBuilder.createBlock();
+    c_api.regionAppendOwnedBlock(region, block.handle);
 
     // 4. Get handles to the function arguments
     const params_arg = block.addArgument(tensor_type, builder.loc);
@@ -67,6 +85,11 @@ fn buildAdamUpdateFunction(
     const m_state_arg = block.addArgument(tensor_type, builder.loc);
     const v_state_arg = block.addArgument(tensor_type, builder.loc);
     const timestep_arg = block.addArgument(scalar_type, builder.loc);
+
+    // CRITICAL FIX: Set the insertion point to this function's block.
+    const original_insertion_block = builder.getInsertionBlock();
+    builder.setInsertionBlock(block);
+    defer builder.setInsertionBlock(original_insertion_block);
 
     const params = try builder.newTensor(params_arg);
     const grads = try builder.newTensor(grads_arg);
@@ -100,11 +123,11 @@ fn buildAdamUpdateFunction(
 
     // Broadcast timestep to tensor shape for power computation
     const t_tensor = try ops.broadcast(builder, timestep, params_dims);
-    
+
     // Calculate beta1^t and beta2^t using exponential operation
     const beta1_power_t = try ops.exp(builder, try ops.multiply(builder, try ops.log(builder, beta1_tensor), t_tensor));
     const beta2_power_t = try ops.exp(builder, try ops.multiply(builder, try ops.log(builder, beta2_tensor), t_tensor));
-    
+
     // Calculate bias correction: 1 - beta^t
     const one_minus_beta1_t = try ops.subtract(builder, one_tensor, beta1_power_t);
     const one_minus_beta2_t = try ops.subtract(builder, one_tensor, beta2_power_t);
@@ -140,7 +163,7 @@ pub fn AdamMLIR(comptime T: type) type {
         element_type: mlir.Type,
         m_state: ?Tensor,
         v_state: ?Tensor,
-        
+
         // NEW FIELD: Store the name of our pre-built optimizer function
         update_fn_name: []const u8,
 
@@ -182,13 +205,13 @@ pub fn AdamMLIR(comptime T: type) type {
             // Initialize m and v to zeros with same shape as params
             const params_dims = try params.shape.getDims(self.builder.allocator);
             defer self.builder.allocator.free(params_dims);
-            
+
             const zero_op = hlo.zeroConstant(self.builder.ctx, params_dims, self.element_type);
-            
+
             // Create m state (first moment)
             const m_op = hlo.zeroConstant(self.builder.ctx, params_dims, self.element_type);
             self.m_state = try self.builder.newTensor(m_op.getResult(0));
-            
+
             // Create v state (second moment)
             const v_op = hlo.zeroConstant(self.builder.ctx, params_dims, self.element_type);
             self.v_state = try self.builder.newTensor(v_op.getResult(0));
@@ -206,12 +229,12 @@ pub fn AdamMLIR(comptime T: type) type {
 
             // The logic is now encapsulated in the pre-built function.
             // We just need to call it.
-            
+
             // Create scalar timestep tensor
             const scalar_shape = &[_]i64{}; // scalar shape
             const scalar_type = mlir.Type.rankedTensorType(self.builder.ctx, scalar_shape, self.element_type);
             const timestep_tensor = try ops.constant(self.builder, @as(f64, @floatCast(t_val)), scalar_shape, self.element_type);
-            
+
             // 1. Prepare operands for the call
             const operands = [_]mlir.Value{
                 params.value,
@@ -240,7 +263,7 @@ pub fn AdamMLIR(comptime T: type) type {
                 self.builder.module.op().dump();
                 return err;
             };
-            
+
             // 4. Extract results from the call
             const new_params_val = call_op.getResult(0);
             const new_m_val = call_op.getResult(1);
@@ -342,7 +365,7 @@ pub fn testAdamMLIR(allocator: std.mem.Allocator) !void {
 
     const element_type = mlir.Type.f32Type(builder.ctx);
     const conf = AdamMLIRConfiguration(f32).default_configuration();
-    
+
     var adam = try AdamMLIR(f32).init(allocator, &builder, conf, element_type);
     defer adam.deinit();
 

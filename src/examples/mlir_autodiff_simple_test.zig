@@ -48,7 +48,8 @@ pub fn testSimpleAutodiff(allocator: Allocator) !void {
     });
     
     // Add the return operation to the module body
-    const body_block = builder.module.op().getRegion(0).getBlock(0);
+    // CRITICAL FIX: Use the builder's pre-established insertion block instead of accessing module regions directly
+    const body_block = builder.insertion_block;
     body_block.appendOwnedOperation(return_op);
 
     std.debug.print("Added func.return to forward graph\n", .{});

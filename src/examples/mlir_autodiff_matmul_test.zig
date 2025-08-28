@@ -41,7 +41,8 @@ pub fn testMatmulAutodiff(allocator: Allocator) !void {
     std.debug.print("Built forward pass: A @ B\n", .{});
 
     // 3. CRITICAL FIX: Add the matmul operation to the module's block first
-    const body_block = builder.module.op().getRegion(0).getBlock(0);
+    // CRITICAL FIX: Use the builder's pre-established insertion block instead of accessing module regions directly
+    const body_block = builder.insertion_block;
     body_block.appendOwnedOperation(matmul_op);
 
     // 4. Create a func.return to make the function well-formed

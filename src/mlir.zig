@@ -264,6 +264,10 @@ pub const Context = struct {
         pub fn addArgument(self: Self, arg_type: Type, loc: Location) Value {
             return Value{ .handle = c.c.mlirBlockAddArgument(self.handle, arg_type.handle, loc.handle) };
         }
+
+        pub fn getArgument(self: Self, pos: usize) Value {
+            return Value{ .handle = c.c.blockGetArgument(self.handle, @intCast(pos)) };
+        }
         
         pub fn getLastOp(self: Self) ?Operation {
             const terminator = c.c.blockGetTerminator(self.handle);
@@ -271,8 +275,16 @@ pub const Context = struct {
             return Operation{ .handle = terminator };
         }
         
-        pub fn getArgument(self: Self, index: usize) Value {
-            return Value{ .handle = c.c.blockGetArgument(self.handle, @intCast(index)) };
+        /// Get the actual last operation in the block (not necessarily a terminator)
+        pub fn getLastOpGeneric(self: Self) ?Operation {
+            // Walk through all operations to find the last one
+            var maybe_op = self.getFirstOp();
+            var last_op: ?Operation = null;
+            while (maybe_op) |op| {
+                last_op = op;
+                maybe_op = op.getNext();
+            }
+            return last_op;
         }
         
         pub fn getNumArguments(self: Self) usize {
@@ -358,6 +370,10 @@ pub const Context = struct {
             if (T == RankedTensorType) {
                 if (c.c.typeIsARankedTensor(self.handle)) {
                     return RankedTensorType{ .handle = self.handle };
+                }
+            } else if (T == FunctionType) {
+                if (c.c.typeIsAFunction(self.handle)) {
+                    return FunctionType{ .handle = self.handle };
                 }
             }
             return null;
@@ -520,6 +536,33 @@ pub const Context = struct {
                 shape[i] = self.getDimension(i);
             }
             return shape;
+        }
+    };
+
+    /// MLIR FunctionType - for function type introspection
+    pub const FunctionType = struct {
+        handle: *c.c.MlirType,
+        
+        const Self = @This();
+        
+        /// Get the number of input types
+        pub fn getNumInputs(self: Self) usize {
+            return @intCast(c.c.functionTypeGetNumInputs(self.handle));
+        }
+        
+        /// Get the number of result types
+        pub fn getNumResults(self: Self) usize {
+            return @intCast(c.c.functionTypeGetNumResults(self.handle));
+        }
+        
+        /// Get a specific input type
+        pub fn getInput(self: Self, pos: usize) Type {
+            return Type{ .handle = c.c.functionTypeGetInput(self.handle, @intCast(pos)) };
+        }
+        
+        /// Get a specific result type
+        pub fn getResult(self: Self, pos: usize) Type {
+            return Type{ .handle = c.c.functionTypeGetResult(self.handle, @intCast(pos)) };
         }
     };
     

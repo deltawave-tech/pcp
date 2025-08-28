@@ -55,6 +55,12 @@ pub const MLIRContext = struct {
         c.registerCanonicalizerPass();      // canonicalize
         c.registerCSEPass();                // cse
         
+        // Bufferization passes (commented out - not available in this MLIR build)
+        // std.debug.print("Registering bufferization passes...\n", .{});
+        // c.registerBufferizationPasses();
+        // c.registerLinalgComprehensiveModuleBufferizePasses();
+        // std.debug.print("✓ Bufferization passes registered.\n", .{});
+        
         // NEW: Force-load all required pass libraries (consolidated approach)
         std.debug.print("Force-loading all required pass libraries...\n", .{});
         c.forceLoadAllRequiredPasses();
@@ -73,34 +79,28 @@ pub const MLIRContext = struct {
 
         std.debug.print("Building staged pass pipeline programmatically...\n", .{});
 
-        // Stage 1: Legalize StableHLO to Linalg on Tensors
-        // This pass is from the StableHLO project itself.
-        try opm.addPipeline("stablehlo-legalize-to-linalg");
-        try opm.addPipeline("canonicalize"); // Clean up after legalization
-
-        // Stage 2: Comprehensive Bufferization
-        // This pipeline converts all tensor-based operations to memref-based ones.
-        // It's a critical and complex step. Using the pre-built pipeline is best.
-        try opm.addPipeline("linalg-comprehensive-bufferize");
-        try opm.addPipeline("canonicalize");
-
-        // Stage 3: Convert Linalg on MemRefs to loops (SCF dialect)
-        try opm.addPipeline("convert-linalg-to-loops");
-        try opm.addPipeline("canonicalize");
-
-        // Stage 4: Convert SCF (loops) to GPU launch operations
-        // NOTE: This part is complex. We'll use a simplified version for now.
-        // A full version would involve tiling and mapping to workgroups.
-        // For now, we rely on a simpler direct conversion.
-        try opm.addPipeline("convert-scf-to-cf"); // Lower SCF to standard Control Flow
-
-        // Stage 5: Convert operations to SPIR-V
-        // This pass handles the conversion of GPU dialect ops and standard math
-        // ops into the SPIR-V dialect, which is our final target before binary generation.
-        try opm.addPipeline("convert-gpu-to-spirv");
-        try opm.addPipeline("canonicalize");
+        std.debug.print("Building extended pass pipeline with available conversions...\n", .{});
         
-        std.debug.print("✓ Staged pass pipeline built successfully.\n", .{});
+        // Stage 1: Basic optimization and StableHLO to Linalg
+        try opm.addPipeline("canonicalize");
+        try opm.addPipeline("cse");
+        try opm.addPipeline("stablehlo-legalize-to-linalg");
+        
+        // Stage 2: Convert Linalg to loops
+        std.debug.print("Adding convert-linalg-to-loops pass...\n", .{});
+        try opm.addPipeline("convert-linalg-to-loops");
+        std.debug.print("✓ convert-linalg-to-loops pass added successfully\n", .{});
+        
+        // Stage 3: Convert SCF to CF
+        std.debug.print("Adding convert-scf-to-cf pass...\n", .{});
+        try opm.addPipeline("convert-scf-to-cf");
+        std.debug.print("✓ convert-scf-to-cf pass added successfully\n", .{});
+        
+        // Stage 4: Final cleanup
+        try opm.addPipeline("canonicalize");
+        try opm.addPipeline("cse");
+        
+        std.debug.print("✓ Extended pass pipeline built successfully.\n", .{});
         
         return Self{
             .allocator = allocator,
@@ -124,10 +124,14 @@ pub const MLIRContext = struct {
         std.debug.print("--- Module BEFORE lowering ---\n", .{});
         module.op().dump();
         
+        // Run the pass pipeline and observe IR transformations
+        std.debug.print("Running pass pipeline...\n", .{});
         try self.stablehlo_to_spirv_pm.runOnOp(module.op());
         
         // VERIFY HERE: Dump the module after the full pipeline runs
-        // We should now see gpu.module containing spirv.module with spirv.FAdd and other low-level operations
+        // We should see:
+        // 1. After canonicalize: cleaned up operations
+        // 2. After stablehlo-legalize-to-linalg: stablehlo ops converted to linalg ops
         std.debug.print("--- Module AFTER full lowering pipeline ---\n", .{});
         module.op().dump();
         

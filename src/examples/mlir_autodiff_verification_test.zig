@@ -83,7 +83,8 @@ pub fn testMultiplyVJP(allocator: Allocator) !void {
         .location = test_framework.builder.loc,
     });
     
-    const body_block = test_framework.builder.module.op().getRegion(0).getBlock(0);
+    // CRITICAL FIX: Use the builder's pre-established insertion block instead of accessing module regions directly
+    const body_block = test_framework.builder.insertion_block;
     body_block.appendOwnedOperation(return_op);
     
     const forward_fn = test_framework.builder.module.op();
@@ -156,7 +157,8 @@ pub fn testMatmulVJP(allocator: Allocator) !void {
         .location = test_framework.builder.loc,
     });
     
-    const body_block = test_framework.builder.module.op().getRegion(0).getBlock(0);
+    // CRITICAL FIX: Use the builder's pre-established insertion block instead of accessing module regions directly
+    const body_block = test_framework.builder.insertion_block;
     body_block.appendOwnedOperation(return_op);
     
     const forward_fn = test_framework.builder.module.op();
@@ -208,7 +210,8 @@ pub fn testDivideVJP(allocator: Allocator) !void {
         .location = test_framework.builder.loc,
     });
     
-    const body_block = test_framework.builder.module.op().getRegion(0).getBlock(0);
+    // CRITICAL FIX: Use the builder's pre-established insertion block instead of accessing module regions directly
+    const body_block = test_framework.builder.insertion_block;
     body_block.appendOwnedOperation(return_op);
     
     const forward_fn = test_framework.builder.module.op();

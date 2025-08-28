@@ -137,14 +137,20 @@ fn runShepherd(allocator: Allocator, args: Args) !void {
     );
     defer system.deinit();
 
+    // Create a single, authoritative MLIRBuilder for this training run.
+    var mlir_builder = try MLIRBuilder.init(allocator);
+    defer mlir_builder.deinit();
+
     // Now use system.shepherd instead of a local variable
     const shepherd_controller = &system.shepherd;
     
     const diloco_config = DiLoCoConfig.default();
     
-    // The `createDiLoCoAlgorithm` helper is perfect here.
-    var diloco_algo = try system.createDiLoCoAlgorithm(diloco_config);
+    // Pass the single MLIRBuilder instance to the algorithm.
+    print("🔧 Initializing DiLoCo algorithm...\n", .{});
+    var diloco_algo = try DiLoCo.init(allocator, shepherd_controller, diloco_config, system.executor, &mlir_builder);
     defer diloco_algo.deinit();
+    print("✅ DiLoCo algorithm initialized successfully\n", .{});
     
     var training_algo = diloco_algo.asTrainingAlgorithm();
     shepherd_controller.setAlgorithm(&training_algo);

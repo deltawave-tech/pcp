@@ -142,8 +142,11 @@ pub const DistributedTrainingSystem = struct {
     }
     
     /// Create and configure a DiLoCo algorithm instance
+    /// NOTE: This method is now deprecated. Use DiLoCo.init directly with a shared MLIRBuilder.
     pub fn createDiLoCoAlgorithm(self: *Self, config: diloco.DiLoCoConfig) !DiLoCo {
-        return DiLoCo.init(self.allocator, &self.shepherd, config, self.executor);
+        _ = self;
+        _ = config;
+        @panic("createDiLoCoAlgorithm is deprecated - use DiLoCo.init directly with shared MLIRBuilder");
     }
     
     /// Create a worker with the appropriate backend
@@ -207,6 +210,7 @@ fn createMockExecutor() Executor {
         .ptr = undefined,
         .vtable = &.{
             .materialize = mockMaterialize,
+            .materialize_module = mockMaterializeModule,
             .deinit = mockExecutorDeinit,
         },
     };
@@ -225,6 +229,12 @@ fn createMockWorkerBackend() WorkerBackend {
 fn mockMaterialize(ptr: *anyopaque, t: @import("tensor.zig").Tensor(void)) ![]u8 {
     _ = ptr;
     _ = t;
+    return &[_]u8{};
+}
+
+fn mockMaterializeModule(ptr: *anyopaque, module: @import("mlir.zig").Module) ![]u8 {
+    _ = ptr;
+    _ = module;
     return &[_]u8{};
 }
 

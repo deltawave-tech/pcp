@@ -41,7 +41,8 @@ pub fn testAutodiffGradients(allocator: Allocator) !void {
         .location = builder.loc,
     });
     
-    const body_block = builder.module.op().getRegion(0).getBlock(0);
+    // CRITICAL FIX: Use the builder's pre-established insertion block instead of accessing module regions directly
+    const body_block = builder.insertion_block;
     body_block.appendOwnedOperation(return_op);
     
     const forward_fn = builder.module.op();
@@ -138,7 +139,8 @@ pub fn testAutodiffGradients(allocator: Allocator) !void {
         .location = matrix_builder.loc,
     });
     
-    const matrix_body = matrix_builder.module.op().getRegion(0).getBlock(0);
+    // CRITICAL FIX: Use the builder's pre-established insertion block instead of accessing module regions directly
+    const matrix_body = matrix_builder.insertion_block;
     matrix_body.appendOwnedOperation(matrix_return);
     
     const matrix_forward = matrix_builder.module.op();
@@ -194,7 +196,8 @@ pub fn testComplexAutodiff(allocator: Allocator) !void {
         .location = builder.loc,
     });
     
-    const body_block = builder.module.op().getRegion(0).getBlock(0);
+    // CRITICAL FIX: Use the builder's pre-established insertion block instead of accessing module regions directly
+    const body_block = builder.insertion_block;
     body_block.appendOwnedOperation(return_op);
     
     const forward_fn = builder.module.op();

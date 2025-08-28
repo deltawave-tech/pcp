@@ -17,7 +17,7 @@
 // Add interface registration headers
 #include "mlir/Dialect/Tensor/Transforms/BufferizableOpInterfaceImpl.h"
 #include "mlir/Dialect/Linalg/Transforms/BufferizableOpInterfaceImpl.h"
-#include "mlir/Dialect/Func/Extensions/AllExtensions.h"
+#include "mlir/Dialect/Bufferization/Transforms/FuncBufferizableOpInterfaceImpl.h"
 #include "mlir/IR/DialectRegistry.h"
 
 // NEW: Include headers for canonical GPU pipeline builder  
@@ -117,9 +117,9 @@ void mlirRegisterBufferizationInterfaces(MlirDialectRegistry registryHandle) {
   // Convert C API registry handle to C++ DialectRegistry
   mlir::DialectRegistry &registry = *unwrap(registryHandle);
   
-  // Register the interface implementations
-  std::printf("  - Func dialect all extensions (includes BufferizableOpInterface)\n");
-  mlir::func::registerAllExtensions(registry);
+  // Register SPECIFIC BufferizableOpInterface implementations
+  std::printf("  - Func dialect BufferizableOpInterface (specific registration)\n");
+  mlir::bufferization::func_ext::registerBufferizableOpInterfaceExternalModels(registry);
   
   std::printf("  - Tensor dialect BufferizableOpInterface\n");
   mlir::tensor::registerBufferizableOpInterfaceExternalModels(registry);

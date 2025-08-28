@@ -80,8 +80,9 @@
             rev = "v${version}";
             hash = "sha256-OH6Nz4b5sR8sPII59p6AaHXY7VlUS3pJM5ejdrri4iw=";
           };
+          outputs = [ "out" "dev" ];
           nativeBuildInputs = [ mlirPkg mlirPkg.dev libllvm tblgen ]
-            ++ (with pkgs; [ cmake gtest libffi libxml2 ninja ]);
+            ++ (with pkgs; [ cmake gtest libffi libxml2 ninja pkg-config ]);
           cmakeFlags = [
             (lib.cmakeBool "LLVM_ENABLE_LDD" true)
             (lib.cmakeFeature "CMAKE_BUILD_TYPE" "Release")
@@ -107,18 +108,31 @@
             ln -s ${tblgen}/bin/mlir-tblgen stablehlo/transforms/optimization/
             cmake --build . --verbose
           '';
+          # See https://github.com/openxla/stablehlo/issues/2811 -- StableHLO does not install
+          # header files.  The header files need a couple of '*.h.inc' files.
+          postInstall = ''
+            mkdir -p $dev/include/
+            cd /build/source/
+            find stablehlo/ -name '*.h' -exec cp -v --parents {} $dev/include/ \;
+            cd /build
+            find stablehlo/ -name '*.h.inc' -exec cp -v --parents {} $dev/include/ \;
+          '';
         };
         packages.pcp = pkgs.stdenvNoCC.mkDerivation {
           name = "pcp";
           version = "main";
           src = ./.;
           nativeBuildInputs = [
+            pkgs.capnproto
             llvmPkg.libllvm.dev
             llvmPkg.libllvm
             mlirPkg
+            mlirPkg.dev
             pkgs.spirv-cross
             zig
             packages.stablehlo
+            packages.stablehlo.dev
+            pkgs.pkg-config
           ];
           dontConfigure = true;
           dontInstall = true;
@@ -150,6 +164,7 @@
             echo "Zig development environment loaded"
             echo "Zig version: $(zig version)"
             echo "ZLS version: $(zls --version)"
+            echo "${packages.stablehlo.dev}"
           '';
         };
         checks.pcp = packages.pcp;

@@ -381,9 +381,14 @@ fn addMLIRSupport(b: *std.Build, target: *std.Build.Step.Compile, mlir_config: M
         "MLIRDialectUtils",
         "MLIRArithUtils",
         "MLIRLinalgUtils",
+        "MLIRAffineUtils",        // For affine utility functions
+        "MLIRAffineAnalysis",     // For affine analysis (MemRefRegion, FlatAffineValueConstraints)
+        "MLIRSCFUtils",          // For SCF utility functions
+        "MLIRTensorUtils",       // For tensor utility functions
+        "MLIRTensorTilingInterfaceImpl", // For bubbleUpPadSlice  
         "MLIRLinalgTransforms",
         "MLIRBufferizationTransforms",
-        "MLIRTensorTransforms",
+        "MLIRTensorTransforms",  // Already included - may contain bubbleUpPadSlice
         "MLIRMemRefTransforms",
         
         // Interface libraries for missing vtable symbols

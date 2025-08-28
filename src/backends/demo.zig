@@ -4,15 +4,19 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const worker_backend = @import("worker_backend.zig");
+const execution = @import("../execution.zig");
 const mlir = @import("../mlir.zig");
+const tensor = @import("../tensor.zig");
 
 const WorkerBackend = worker_backend.WorkerBackend;
+const Executor = execution.Executor;
 
 /// Demo backend that simulates MLIR training execution
 pub const DemoBackend = struct {
     allocator: Allocator,
     worker_id: u32,
     execution_count: u32,
+    real_executor: ?Executor,
     
     const Self = @This();
     
@@ -22,12 +26,29 @@ pub const DemoBackend = struct {
             .allocator = allocator,
             .worker_id = @intCast(@mod(std.time.timestamp(), 1000)),
             .execution_count = 0,
+            .real_executor = null,
         };
         return backend;
     }
     
     pub fn deinit(self: *Self) void {
         self.allocator.destroy(self);
+    }
+    
+    pub fn setRealExecutor(self: *Self, executor: Executor) void {
+        self.real_executor = executor;
+    }
+    
+    pub fn asExecutor(self: *Self) Executor {
+        return Executor{
+            .ptr = self,
+            .vtable = &.{
+                .materialize = demoMaterialize,
+                .materialize_module = demoMaterializeModule,
+                .getContext = demoGetContext,
+                .deinit = demoExecutorDeinit,
+            },
+        };
     }
     
     pub fn asWorkerBackend(self: *Self) WorkerBackend {
@@ -122,6 +143,40 @@ pub const DemoBackend = struct {
     }
     
     fn deinitInterface(ptr: *anyopaque) void {
+        const self: *Self = @ptrCast(@alignCast(ptr));
+        self.deinit();
+    }
+    
+    // Executor interface implementations that delegate to the real executor
+    fn demoMaterialize(ptr: *anyopaque, t: tensor.Tensor(void)) ![]u8 {
+        const self: *Self = @ptrCast(@alignCast(ptr));
+        if (self.real_executor) |real| {
+            return real.materialize(t);
+        } else {
+            return error.NoRealExecutor;
+        }
+    }
+
+    fn demoMaterializeModule(ptr: *anyopaque, module: mlir.Module) ![]u8 {
+        const self: *Self = @ptrCast(@alignCast(ptr));
+        if (self.real_executor) |real| {
+            return real.materializeModule(module);
+        } else {
+            // Fallback to simulation for demo
+            return simulateModuleSerialization(self.allocator, "demo execution");
+        }
+    }
+
+    fn demoGetContext(ptr: *anyopaque) mlir.Context {
+        const self: *Self = @ptrCast(@alignCast(ptr));
+        if (self.real_executor) |real| {
+            return real.getContext();
+        } else {
+            @panic("Demo backend requires real executor for MLIR context");
+        }
+    }
+
+    fn demoExecutorDeinit(ptr: *anyopaque) void {
         const self: *Self = @ptrCast(@alignCast(ptr));
         self.deinit();
     }

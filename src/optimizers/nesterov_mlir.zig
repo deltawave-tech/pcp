@@ -215,7 +215,13 @@ pub fn NesterovMLIRMap(comptime K: type, comptime DataType: type) type {
 pub fn testNesterovMLIR(allocator: std.mem.Allocator) !void {
     std.debug.print("\n=== Testing MLIR Nesterov Optimizer ===\n", .{});
 
-    var builder = try MLIRBuilder.init(allocator);
+    // Create MLIR context for this test
+    var ctx = try mlir.Context.init();
+    defer ctx.deinit();
+    const c_api = @import("../mlir/c.zig").c;
+    c_api.mlirContextSetAllowUnregisteredDialects(ctx.handle, true);
+
+    var builder = try MLIRBuilder.init(allocator, ctx);
     defer builder.deinit();
 
     const element_type = mlir.Type.f32Type(builder.ctx);

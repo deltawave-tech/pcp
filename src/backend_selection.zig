@@ -52,20 +52,25 @@ pub fn createExecutor(allocator: Allocator, backend: Backend) !Executor {
             const engine = try metal_backend.getExecutionEngine();
             break :blk engine.asExecutor();
         },
-        .demo => {
-            // Demo backend for demonstration purposes
-            std.log.info("Using demo backend for simulated execution", .{});
-            return createMockExecutor();
+        .demo => blk: {
+            // Demo backend uses the real Metal MLIR context but simulated execution
+            try metal_backend.init(allocator);
+            const engine = try metal_backend.getExecutionEngine();
+            
+            // Wrap the real executor with demo behavior
+            const demo = try demo_backend.DemoBackend.init(allocator);
+            demo.setRealExecutor(engine.asExecutor());
+            break :blk demo.asExecutor();
         },
         .cuda => {
             // TODO: Implement CUDA backend
-            std.log.warn("CUDA backend not implemented yet, using mock", .{});
-            return createMockExecutor();
+            std.log.err("CUDA backend not implemented yet", .{});
+            return error.BackendNotImplemented;
         },
         .cpu => {
             // TODO: Implement CPU backend  
-            std.log.warn("CPU backend not implemented yet, using mock", .{});
-            return createMockExecutor();
+            std.log.err("CPU backend not implemented yet", .{});
+            return error.BackendNotImplemented;
         },
     };
 }
@@ -87,13 +92,13 @@ pub fn createWorkerBackend(allocator: Allocator, backend: Backend) !WorkerBacken
         },
         .cuda => {
             // TODO: Implement CUDA backend
-            std.log.warn("CUDA WorkerBackend not implemented yet, using mock", .{});
-            return createMockWorkerBackend();
+            std.log.err("CUDA WorkerBackend not implemented yet", .{});
+            return error.BackendNotImplemented;
         },
         .cpu => {
             // TODO: Implement CPU backend
-            std.log.warn("CPU WorkerBackend not implemented yet, using mock", .{});
-            return createMockWorkerBackend();
+            std.log.err("CPU WorkerBackend not implemented yet", .{});
+            return error.BackendNotImplemented;
         },
     };
 }
@@ -204,70 +209,6 @@ pub fn exampleUsage(allocator: Allocator) !void {
     std.log.info("✓ Example completed successfully");
 }
 
-// Mock implementations for testing and future backends
-fn createMockExecutor() Executor {
-    return Executor{
-        .ptr = undefined,
-        .vtable = &.{
-            .materialize = mockMaterialize,
-            .materialize_module = mockMaterializeModule,
-            .getContext = mockGetContext,
-            .deinit = mockExecutorDeinit,
-        },
-    };
-}
-
-fn createMockWorkerBackend() WorkerBackend {
-    return WorkerBackend{
-        .ptr = undefined,
-        .vtable = &.{
-            .executeTrainingStep = mockExecuteTrainingStep,
-            .deinit = mockWorkerBackendDeinit,
-        },
-    };
-}
-
-fn mockMaterialize(ptr: *anyopaque, t: @import("tensor.zig").Tensor(void)) ![]u8 {
-    _ = ptr;
-    _ = t;
-    return &[_]u8{};
-}
-
-fn mockMaterializeModule(ptr: *anyopaque, module: @import("mlir.zig").Module) ![]u8 {
-    _ = ptr;
-    _ = module;
-    return &[_]u8{};
-}
-
-fn mockGetContext(ptr: *anyopaque) @import("mlir.zig").Context {
-    _ = ptr;
-    // Return a basic MLIR context for mock purposes with func dialect registered
-    const mlir = @import("mlir.zig");
-    const c = @import("mlir/c.zig").c;
-    var ctx = mlir.Context.init() catch @panic("Mock context creation failed");
-    
-    // Register essential dialects that MLIRBuilder needs
-    c.mlirDialectHandleRegisterDialect(c.mlirGetDialectHandle__func__(), ctx.handle);
-    c.mlirDialectHandleRegisterDialect(c.mlirGetDialectHandle__builtin__(), ctx.handle);
-    c.mlirContextSetAllowUnregisteredDialects(ctx.handle, true);
-    
-    return ctx;
-}
-
-fn mockExecutorDeinit(ptr: *anyopaque) void {
-    _ = ptr;
-}
-
-fn mockExecuteTrainingStep(ptr: *anyopaque, mlir_module: @import("mlir.zig").Module, inputs: [][]const u8) ![][]u8 {
-    _ = ptr;
-    _ = mlir_module;
-    _ = inputs;
-    return &[_][]u8{};
-}
-
-fn mockWorkerBackendDeinit(ptr: *anyopaque) void {
-    _ = ptr;
-}
 
 /// Test the backend selection system
 pub fn testBackendSelection(allocator: Allocator) !void {
@@ -277,8 +218,8 @@ pub fn testBackendSelection(allocator: Allocator) !void {
     const default_backend = Backend.selectDefault();
     std.log.info("Default backend for this platform: {}", .{default_backend});
     
-    // Test system initialization with mock backend (to avoid Metal dependency in tests)
-    var system = try DistributedTrainingSystem.init(allocator, .cpu);
+    // Test system initialization with demo backend 
+    var system = try DistributedTrainingSystem.init(allocator, .demo);
     defer system.deinit();
     
     std.log.info("✓ Backend selection test completed");

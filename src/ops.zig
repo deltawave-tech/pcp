@@ -573,8 +573,14 @@ pub fn gather(
 pub fn testMLIROpGeneration(allocator: std.mem.Allocator) !void {
     std.debug.print("\n=== Testing MLIR Operation Generation with Dialect Wrappers ===\n", .{});
 
+    // Create MLIR context for this test
+    var ctx = try mlir.Context.init();
+    defer ctx.deinit();
+    const c_api = @import("mlir/c.zig").c;
+    c_api.mlirContextSetAllowUnregisteredDialects(ctx.handle, true);
+    
     // Create MLIR builder
-    var builder = try MLIRBuilder.init(allocator);
+    var builder = try MLIRBuilder.init(allocator, ctx);
     defer builder.deinit();
 
     std.debug.print("✓ MLIRBuilder initialized\n", .{});

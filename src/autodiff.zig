@@ -920,8 +920,13 @@ pub const AutoDiff = struct {
 pub fn testMLIRAutoDiff(allocator: Allocator) !void {
     std.debug.print("\n=== Testing MLIR Automatic Differentiation ===\n", .{});
     
+    // Create MLIR context for this test
+    var ctx = try mlir.Context.init();
+    defer ctx.deinit();
+    c.mlirContextSetAllowUnregisteredDialects(ctx.handle, true);
+    
     // Create MLIR builder
-    var builder = try MLIRBuilder.init(allocator);
+    var builder = try MLIRBuilder.init(allocator, ctx);
     defer builder.deinit();
     
     // Create autodiff system

@@ -184,6 +184,9 @@ pub const c = struct {
     
     // NEW: Canonical GPU pipeline builder from C++ bridge
     extern fn mlirBuildAndAppendGpuAndSpirvConversionPipeline(pm: *MlirOpPassManager) void;
+    
+    // Register BufferizableOpInterface implementations with dialect registry
+    extern fn mlirRegisterBufferizationInterfaces(registry: *MlirDialectRegistry) void;
 
     // Pass and dialect registration - dialect handle pattern
     pub const MlirDialectHandle = extern struct {
@@ -420,6 +423,11 @@ pub const c = struct {
     // NEW: Zig wrapper for canonical GPU pipeline builder
     pub fn buildAndAppendGpuAndSpirvConversionPipeline(pm: *MlirOpPassManager) void {
         mlirBuildAndAppendGpuAndSpirvConversionPipeline(pm);
+    }
+    
+    // Register BufferizableOpInterface implementations with dialect registry
+    pub fn registerBufferizationInterfaces(registry: *MlirDialectRegistry) void {
+        mlirRegisterBufferizationInterfaces(registry);
     }
 
     // Module wrapper functions

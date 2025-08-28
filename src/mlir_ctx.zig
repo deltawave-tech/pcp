@@ -34,6 +34,10 @@ pub const MLIRContext = struct {
         // StableHLO dialect registration - NOW ENABLED!
         c.dialectHandleInsertDialect(c.getDialectHandleStableHLO(), registry);
         c.dialectHandleInsertDialect(c.getDialectHandleCHLO(), registry);
+        
+        // Register BufferizableOpInterface implementations before appending registry to context
+        std.debug.print("Registering BufferizableOpInterface implementations...\n", .{});
+        c.registerBufferizationInterfaces(registry);
 
         // Append registry to context
         c.contextAppendDialectRegistry(context, registry);

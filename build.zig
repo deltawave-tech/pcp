@@ -1158,6 +1158,88 @@ pub fn build(b: *std.Build) void {
     const run_metal_benchmark_step = b.step("run-metal-benchmark", "Run the Metal backend benchmarks");
     run_metal_benchmark_step.dependOn(&run_metal_benchmark_cmd.step);
 
+    // M3 Pipeline Test - tests complete MLIR → SPIR-V → MSL → Metal pipeline
+    const m3_pipeline_test = b.addExecutable(.{
+        .name = "m3_pipeline_test",
+        .root_source_file = b.path("src/examples/m3_pipeline_test.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    // Add module dependencies
+    m3_pipeline_test.root_module.addImport("pcp", pcp_module);
+    
+    // Add MLIR support
+    addMLIRSupport(b, m3_pipeline_test, mlir_config);
+    
+    // Add the same GPU libraries as pass_registration_test
+    if (mlir_config.enabled) {
+        // Core dialects
+        m3_pipeline_test.linkSystemLibrary("MLIRLinalgDialect");
+        m3_pipeline_test.linkSystemLibrary("MLIRSCFDialect");
+        m3_pipeline_test.linkSystemLibrary("MLIRGPUDialect");
+        
+        // FIX: Add the missing dialect extension libraries for BufferizableOpInterface
+        m3_pipeline_test.linkSystemLibrary("MLIRFuncAllExtensions");
+        m3_pipeline_test.linkSystemLibrary("MLIRTensorAllExtensions");
+        
+        // Add dependencies of MLIRFuncAllExtensions
+        m3_pipeline_test.linkSystemLibrary("MLIRFuncInlinerExtension");
+        m3_pipeline_test.linkSystemLibrary("MLIRShardingInterface");
+        m3_pipeline_test.linkSystemLibrary("MLIRFuncMeshShardingExtensions");
+        
+        // Add mesh dialect libraries for mesh sharding symbols
+        m3_pipeline_test.linkSystemLibrary("MLIRMeshDialect");
+        
+        // GPU-related passes and transforms
+        m3_pipeline_test.linkSystemLibrary("MLIRGPUTransforms");
+        m3_pipeline_test.linkSystemLibrary("MLIRGPUPipelines");
+        m3_pipeline_test.linkSystemLibrary("MLIRGPUToGPURuntimeTransforms");
+        
+        // Linalg transforms and conversions
+        m3_pipeline_test.linkSystemLibrary("MLIRLinalgTransforms");
+        m3_pipeline_test.linkSystemLibrary("MLIRLinalgToStandard");
+        
+        // SCF transforms  
+        m3_pipeline_test.linkSystemLibrary("MLIRSCFTransforms");
+        
+        // GPU to SPIR-V conversion
+        m3_pipeline_test.linkSystemLibrary("MLIRGPUToSPIRV");
+        
+        // Conversion libraries needed for SPIR-V pipeline
+        m3_pipeline_test.linkSystemLibrary("MLIRSCFToSPIRV");
+        m3_pipeline_test.linkSystemLibrary("MLIRSCFToControlFlow");
+        m3_pipeline_test.linkSystemLibrary("MLIRFuncToSPIRV");
+        m3_pipeline_test.linkSystemLibrary("MLIRMemRefToSPIRV");
+        m3_pipeline_test.linkSystemLibrary("MLIRVectorToSPIRV");
+        m3_pipeline_test.linkSystemLibrary("MLIRArithToSPIRV");
+        
+        // Additional interfaces and utilities
+        m3_pipeline_test.linkSystemLibrary("MLIRParallelCombiningOpInterface");
+        m3_pipeline_test.linkSystemLibrary("MLIRSPIRVConversion");
+        m3_pipeline_test.linkSystemLibrary("MLIRCAPIConversion");
+        
+        // GPU utils and interfaces
+        m3_pipeline_test.linkSystemLibrary("MLIRGPUUtils");
+    }
+    
+    if (spirv_bridge_lib != null) {
+        m3_pipeline_test.linkLibrary(spirv_bridge_lib.?);
+    }
+
+    // Link Metal bridge on macOS
+    if (builtin.os.tag == .macos and metal_bridge_lib != null) {
+        m3_pipeline_test.linkFramework("Foundation");
+        m3_pipeline_test.linkFramework("Metal");
+        m3_pipeline_test.linkLibrary(metal_bridge_lib.?);
+    }
+
+    const run_m3_pipeline_test_cmd = b.addRunArtifact(m3_pipeline_test);
+    run_m3_pipeline_test_cmd.step.dependOn(&m3_pipeline_test.step);
+
+    const run_m3_pipeline_test_step = b.step("run-m3-pipeline-test", "Test complete MLIR → SPIR-V → MSL → Metal pipeline on M3");
+    run_m3_pipeline_test_step.dependOn(&run_m3_pipeline_test_cmd.step);
+
     // Create a new Zig file for our Plan-based test
     const plan_test_src =
         \\const std = @import("std");

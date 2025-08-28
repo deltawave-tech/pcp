@@ -14,9 +14,16 @@
 #include "mlir/Transforms/Passes.h"
 #include "stablehlo/transforms/Passes.h"
 
+// Add interface registration headers
+#include "mlir/Dialect/Tensor/Transforms/BufferizableOpInterfaceImpl.h"
+#include "mlir/Dialect/Linalg/Transforms/BufferizableOpInterfaceImpl.h"
+#include "mlir/Dialect/Func/Extensions/AllExtensions.h"
+#include "mlir/IR/DialectRegistry.h"
+
 // NEW: Include headers for canonical GPU pipeline builder  
 #include "mlir-c/Pass.h"
 #include "mlir/CAPI/Pass.h"  // For unwrap functionality
+#include "mlir/CAPI/IR.h"    // For MlirDialectRegistry unwrap
 #include "mlir/Conversion/SCFToControlFlow/SCFToControlFlow.h"
 
 // We use extern "C" to make these functions callable from Zig.
@@ -40,6 +47,8 @@ void mlirRegisterSPIRVPasses() {
 // This forces the linker to include all required pass libraries and
 // ensures their C++ static initializers run to register the passes.
 void mlirForceLoadAllRequiredPasses() {
+  // Create a dialect registry for interface registration
+  mlir::DialectRegistry registry;
   // === MINIMAL REGISTRATION APPROACH ===
   // Register only the specific passes required for StableHLO → SPIR-V pipeline
   
@@ -99,6 +108,26 @@ void mlirBuildAndAppendGpuAndSpirvConversionPipeline(MlirOpPassManager passManag
   } catch (...) {
     std::printf("C++: ❌ Unknown error building GPU pipeline\n");
   }
+}
+
+// Register BufferizableOpInterface implementations with a dialect registry
+void mlirRegisterBufferizationInterfaces(MlirDialectRegistry registryHandle) {
+  std::printf("C++: Registering BufferizableOpInterface implementations...\n");
+  
+  // Convert C API registry handle to C++ DialectRegistry
+  mlir::DialectRegistry &registry = *unwrap(registryHandle);
+  
+  // Register the interface implementations
+  std::printf("  - Func dialect all extensions (includes BufferizableOpInterface)\n");
+  mlir::func::registerAllExtensions(registry);
+  
+  std::printf("  - Tensor dialect BufferizableOpInterface\n");
+  mlir::tensor::registerBufferizableOpInterfaceExternalModels(registry);
+  
+  std::printf("  - Linalg dialect BufferizableOpInterface\n");
+  mlir::linalg::registerBufferizableOpInterfaceExternalModels(registry);
+  
+  std::printf("C++: ✅ BufferizableOpInterface implementations registered\n");
 }
 
 } // extern "C"

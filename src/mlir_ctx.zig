@@ -80,27 +80,36 @@ pub const MLIRContext = struct {
         // COMPLETE StableHLO → SPIR-V Pipeline Implementation
         std.debug.print("Building COMPLETE StableHLO → SPIR-V pass pipeline...\n", .{});
 
-        // Stage 1: High-level optimizations and legalization to Linalg (on Tensors)
+        // Stage 1: Legalize input ops to Linalg on Tensors
         try opm.addPipeline("canonicalize,cse,stablehlo-legalize-to-linalg");
-        std.debug.print("✓ Stage 1: StableHLO → Linalg legalization completed\n", .{});
+        std.debug.print("✓ Stage 1: StableHLO → Linalg on Tensors completed\n", .{});
 
-        // --- START REPLACEMENT ---
-        // Remove the old, multi-line pipeline construction.
-        // try opm.addPipeline("one-shot-bufferize");
-        // try opm.addPipeline("func.func(convert-linalg-to-parallel-loops)");
-        // try opm.addPipeline("gpu-map-parallel-loops");
-        // try opm.addPipeline("gpu-kernel-outlining");
-        // try opm.addPipeline("convert-gpu-to-spirv");
+        // Stage 1.5: Fusion on tensors (use available pass)
+        try opm.addPipeline("linalg-fuse-elementwise-ops");
+        std.debug.print("✓ Stage 1.5: Fusion on tensors completed\n", .{});
 
-        // NEW: Use the single, robust C++ bridge function to build the rest of the pipeline
+        // Stage 2: One-Shot Bufferization (Tensor -> MemRef) at the module level.
+        // Add options for safety/flexibility using proper boolean flag syntax
+        try opm.addPipeline("one-shot-bufferize{allow-unknown-ops dialect-filter=linalg,func,arith}");
+        std.debug.print("✓ Stage 2: Bufferization completed\n", .{});
+
+        // Stage 3: Convert Linalg-on-MemRefs to Parallel Loops
+        // KEY FIX: Generalize named ops first to ensure lowering works on matmul/etc.
+        // This converts linalg.matmul to linalg.generic which convert-linalg-to-parallel-loops can handle
+        try opm.addPipeline("func.func(linalg-generalize-named-ops,convert-linalg-to-parallel-loops)");
+        std.debug.print("✓ Stage 3: Linalg generalization and conversion to parallel loops completed\n", .{});
+
+        // Stage 4: Map parallel loops to GPU kernels and convert to SPIR-V.
+        // This C++ bridge function should now receive the `scf.parallel` operations it expects.
         std.debug.print("Adding canonical GPU and SPIR-V conversion pipeline...\n", .{});
         c.buildAndAppendGpuAndSpirvConversionPipeline(opm.handle);
-        std.debug.print("✓ Canonical GPU pipeline appended successfully\n", .{});
-        // --- END REPLACEMENT ---
+        std.debug.print("✓ Stage 4: GPU mapping and SPIR-V conversion pipeline appended\n", .{});
 
-        // Stage 5: Final cleanup (still good practice)
+        // Stage 5: Final cleanup
         try opm.addPipeline("canonicalize,cse");
         std.debug.print("✓ Stage 5: Final cleanup completed\n", .{});
+
+        std.debug.print("🚀 COMPLETE StableHLO → GPU → SPIR-V pipeline built successfully!\n", .{});
 
         std.debug.print("🚀 COMPLETE StableHLO → SPIR-V pipeline built successfully!\n", .{});
         
@@ -337,12 +346,13 @@ pub fn testMLIRGPUPipeline(allocator: std.mem.Allocator) !void {
     var mlir_ctx = try MLIRContext.init(allocator);
     defer mlir_ctx.deinit();
     
-    // 2. Create a simple StableHLO module (would normally come from your tensor ops)
+    // 2. Create a StableHLO module that will go through the complete pipeline
+    // Using stablehlo.dot_general will test StableHLO -> Linalg -> tiling -> parallel loops -> GPU pipeline.
     const stablehlo_module_str =
         \\module {
-        \\  func.func @main(%arg0: tensor<4xf32>, %arg1: tensor<4xf32>) -> tensor<4xf32> {
-        \\    %0 = stablehlo.add %arg0, %arg1 : tensor<4xf32>
-        \\    func.return %0 : tensor<4xf32>
+        \\  func.func @main(%arg0: tensor<128x256xf32>, %arg1: tensor<256x512xf32>) -> tensor<128x512xf32> {
+        \\    %0 = stablehlo.dot_general %arg0, %arg1, contracting_dims = [1] x [0] : (tensor<128x256xf32>, tensor<256x512xf32>) -> tensor<128x512xf32>
+        \\    return %0 : tensor<128x512xf32>
         \\  }
         \\}
     ;

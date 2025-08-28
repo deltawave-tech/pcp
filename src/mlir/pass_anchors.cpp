@@ -11,6 +11,7 @@
 // LinalgToLoops is actually in Linalg dialect passes
 #include "mlir/Dialect/GPU/Transforms/Passes.h"
 #include "mlir/Dialect/Linalg/Passes.h"
+#include "mlir/Conversion/LinalgToStandard/LinalgToStandard.h"
 #include "mlir/Transforms/Passes.h"
 #include "stablehlo/transforms/Passes.h"
 
@@ -18,6 +19,7 @@
 #include "mlir/Dialect/Tensor/Transforms/BufferizableOpInterfaceImpl.h"
 #include "mlir/Dialect/Linalg/Transforms/BufferizableOpInterfaceImpl.h"
 #include "mlir/Dialect/Bufferization/Transforms/FuncBufferizableOpInterfaceImpl.h"
+#include "mlir/Dialect/Arith/Transforms/BufferizableOpInterfaceImpl.h"
 #include "mlir/IR/DialectRegistry.h"
 
 // NEW: Include headers for canonical GPU pipeline builder  
@@ -85,19 +87,25 @@ void mlirBuildAndAppendGpuAndSpirvConversionPipeline(MlirOpPassManager passManag
     // Convert C API handle to C++ PassManager using correct unwrap from CAPI
     mlir::OpPassManager *opm = unwrap(passManager);
     
-    // Add bufferization (tensor → memref transformation)
-    std::printf("  - Adding one-shot bufferization pass\n");
-    opm->addPass(mlir::bufferization::createOneShotBufferizePass());
+    // NOTE: Bufferization, tiling, and linalg-to-parallel-loops are now handled in Zig code
+    // This function handles: parallel loops → GPU mapping → SPIR-V conversion
     
-    // Add Linalg to loops conversion (replaces convert-linalg-to-parallel-loops)
-    std::printf("  - Adding Linalg to loops conversion\n");
-    opm->addPass(mlir::createConvertLinalgToLoopsPass());
+    std::printf("  - Parallel loops should now be present from Zig pipeline\n");
+    auto &funcPM = opm->nest<mlir::func::FuncOp>();
     
-    // Add SCF to ControlFlow lowering 
-    std::printf("  - Adding SCF to ControlFlow conversion\n");
-    opm->addPass(mlir::createSCFToControlFlowPass());
+    // Add GPU mapping passes - function level passes
+    std::printf("  - Adding GPU map parallel loops pass (func level)\n");
+    funcPM.addPass(mlir::createGpuMapParallelLoopsPass());
     
-    // Add GPU to SPIR-V conversion
+    // GPU kernel outlining - module level pass (creates gpu.module ops)
+    std::printf("  - Adding GPU kernel outlining pass\n");
+    opm->addPass(mlir::createGpuKernelOutliningPass());
+    
+    // SCF to ControlFlow lowering - function level pass
+    std::printf("  - Adding SCF to ControlFlow conversion (func level)\n");
+    funcPM.addPass(mlir::createSCFToControlFlowPass());
+    
+    // GPU to SPIR-V conversion - module level pass (operates on gpu.module)
     std::printf("  - Adding GPU to SPIR-V conversion\n");
     opm->addPass(mlir::createConvertGPUToSPIRVPass());
     
@@ -126,6 +134,9 @@ void mlirRegisterBufferizationInterfaces(MlirDialectRegistry registryHandle) {
   
   std::printf("  - Linalg dialect BufferizableOpInterface\n");
   mlir::linalg::registerBufferizableOpInterfaceExternalModels(registry);
+  
+  std::printf("  - Arith dialect BufferizableOpInterface\n");
+  mlir::arith::registerBufferizableOpInterfaceExternalModels(registry);
   
   std::printf("C++: ✅ BufferizableOpInterface implementations registered\n");
 }

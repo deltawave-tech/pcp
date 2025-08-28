@@ -181,6 +181,9 @@ pub const c = struct {
     extern fn mlirPassManagerGetAsOpPassManager(pm: *MlirPassManager) *MlirOpPassManager;
     extern fn mlirPassManagerRunOnOp(pm: *MlirPassManager, op: *MlirOperation) MlirLogicalResult;
     extern fn mlirOpPassManagerAddPipeline(opm: *MlirOpPassManager, pipelineElements: MlirStringRef, callback: ?*const fn (MlirLogicalResult, ?*anyopaque) callconv(.C) void, userData: ?*anyopaque) MlirLogicalResult;
+    
+    // NEW: Canonical GPU pipeline builder from C++ bridge
+    extern fn mlirBuildAndAppendGpuAndSpirvConversionPipeline(pm: *MlirOpPassManager) void;
 
     // Pass and dialect registration - dialect handle pattern
     pub const MlirDialectHandle = extern struct {
@@ -412,6 +415,11 @@ pub const c = struct {
 
     pub fn opPassManagerAddPipeline(opm: *MlirOpPassManager, pipeline: []const u8) MlirLogicalResult {
         return mlirOpPassManagerAddPipeline(opm, stringRefFromString(pipeline), null, null);
+    }
+
+    // NEW: Zig wrapper for canonical GPU pipeline builder
+    pub fn buildAndAppendGpuAndSpirvConversionPipeline(pm: *MlirOpPassManager) void {
+        mlirBuildAndAppendGpuAndSpirvConversionPipeline(pm);
     }
 
     // Module wrapper functions

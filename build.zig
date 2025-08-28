@@ -1053,6 +1053,67 @@ pub fn build(b: *std.Build) void {
     const run_metal_test_step = b.step("run-metal-test", "Run the Metal backend tests");
     run_metal_test_step.dependOn(&run_metal_test_cmd.step);
 
+    // Pass registration test executable - minimal test to isolate GPU pass linking issues
+    const pass_test = b.addExecutable(.{
+        .name = "pass_registration_test",
+        .root_source_file = b.path("src/examples/pass_registration_test.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    // Add module dependencies
+    pass_test.root_module.addImport("pcp", pcp_module);
+
+    // Add MLIR support with additional GPU libraries for testing
+    addMLIRSupport(b, pass_test, mlir_config);
+
+    // Add the suspected missing libraries for GPU passes
+    if (mlir_config.enabled) {
+        // Core dialects
+        pass_test.linkSystemLibrary("MLIRLinalgDialect");
+        pass_test.linkSystemLibrary("MLIRSCFDialect");
+        pass_test.linkSystemLibrary("MLIRGPUDialect");
+        
+        // GPU-related passes and transforms
+        pass_test.linkSystemLibrary("MLIRGPUTransforms");
+        pass_test.linkSystemLibrary("MLIRGPUPipelines");
+        pass_test.linkSystemLibrary("MLIRGPUToGPURuntimeTransforms");
+        
+        // Linalg transforms and conversions
+        pass_test.linkSystemLibrary("MLIRLinalgTransforms");
+        pass_test.linkSystemLibrary("MLIRLinalgToStandard");
+        
+        // SCF transforms  
+        pass_test.linkSystemLibrary("MLIRSCFTransforms");
+        
+        // GPU to SPIR-V conversion
+        pass_test.linkSystemLibrary("MLIRGPUToSPIRV");
+        
+        // Additional interfaces and utilities
+        pass_test.linkSystemLibrary("MLIRParallelCombiningOpInterface");
+        pass_test.linkSystemLibrary("MLIRSPIRVConversion");
+        pass_test.linkSystemLibrary("MLIRCAPIConversion");
+        
+        // GPU utils and interfaces
+        pass_test.linkSystemLibrary("MLIRGPUUtils");
+    }
+
+    if (spirv_bridge_lib != null) {
+        pass_test.linkLibrary(spirv_bridge_lib.?);
+    }
+
+    if (builtin.os.tag == .macos and metal_bridge_lib != null) {
+        pass_test.linkFramework("Foundation");
+        pass_test.linkFramework("Metal");
+        pass_test.linkLibrary(metal_bridge_lib.?);
+    }
+
+    const run_pass_test_cmd = b.addRunArtifact(pass_test);
+    run_pass_test_cmd.step.dependOn(&pass_test.step);
+
+    const run_pass_test_step = b.step("run-pass-test", "Run the minimal pass registration test");
+    run_pass_test_step.dependOn(&run_pass_test_cmd.step);
+
     // Metal benchmark executable
     const metal_benchmark = b.addExecutable(.{
         .name = "metal_benchmark",

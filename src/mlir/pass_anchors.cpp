@@ -8,10 +8,16 @@
 #include "mlir/Dialect/Bufferization/Transforms/Passes.h"
 #include "mlir/Conversion/SCFToControlFlow/SCFToControlFlow.h"
 #include "mlir/Conversion/GPUToSPIRV/GPUToSPIRVPass.h"
-// #include "mlir/Conversion/LinalgToLoops/LinalgToLoops.h" // Header not found, will add specific passes later
+// LinalgToLoops is actually in Linalg dialect passes
 #include "mlir/Dialect/GPU/Transforms/Passes.h"
+#include "mlir/Dialect/Linalg/Passes.h"
 #include "mlir/Transforms/Passes.h"
 #include "stablehlo/transforms/Passes.h"
+
+// NEW: Include headers for canonical GPU pipeline builder  
+#include "mlir-c/Pass.h"
+#include "mlir/CAPI/Pass.h"  // For unwrap functionality
+#include "mlir/Conversion/SCFToControlFlow/SCFToControlFlow.h"
 
 // We use extern "C" to make these functions callable from Zig.
 extern "C" {
@@ -59,6 +65,40 @@ void mlirForceLoadAllRequiredPasses() {
   
   std::printf("C++: ✅ Minimal pass registration completed successfully!\n");
   std::printf("     (Avoided problematic bulk GPU/SCF registrations)\n");
+}
+
+// NEW FUNCTION: Build canonical GPU and SPIR-V conversion pipeline
+// This replaces the fragile string-based pipeline with a robust C++ function
+void mlirBuildAndAppendGpuAndSpirvConversionPipeline(MlirOpPassManager passManager) {
+  std::printf("C++: Building canonical GPU → SPIR-V conversion pipeline...\n");
+  
+  try {
+    // Convert C API handle to C++ PassManager using correct unwrap from CAPI
+    mlir::OpPassManager *opm = unwrap(passManager);
+    
+    // Add bufferization (tensor → memref transformation)
+    std::printf("  - Adding one-shot bufferization pass\n");
+    opm->addPass(mlir::bufferization::createOneShotBufferizePass());
+    
+    // Add Linalg to loops conversion (replaces convert-linalg-to-parallel-loops)
+    std::printf("  - Adding Linalg to loops conversion\n");
+    opm->addPass(mlir::createConvertLinalgToLoopsPass());
+    
+    // Add SCF to ControlFlow lowering 
+    std::printf("  - Adding SCF to ControlFlow conversion\n");
+    opm->addPass(mlir::createSCFToControlFlowPass());
+    
+    // Add GPU to SPIR-V conversion
+    std::printf("  - Adding GPU to SPIR-V conversion\n");
+    opm->addPass(mlir::createConvertGPUToSPIRVPass());
+    
+    std::printf("C++: ✅ Canonical GPU → SPIR-V pipeline built successfully!\n");
+    
+  } catch (const std::exception& e) {
+    std::printf("C++: ❌ Error building GPU pipeline: %s\n", e.what());
+  } catch (...) {
+    std::printf("C++: ❌ Unknown error building GPU pipeline\n");
+  }
 }
 
 } // extern "C"

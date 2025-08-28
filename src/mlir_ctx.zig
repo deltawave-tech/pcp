@@ -80,24 +80,21 @@ pub const MLIRContext = struct {
         try opm.addPipeline("canonicalize,cse,stablehlo-legalize-to-linalg");
         std.debug.print("✓ Stage 1: StableHLO → Linalg legalization completed\n", .{});
 
-        // Stage 2: Bufferization (Tensor → MemRef) - Critical transition
-        std.debug.print("Adding bufferization stage (Tensor → MemRef)...\n", .{});
-        try opm.addPipeline("one-shot-bufferize");
-        std.debug.print("✓ Stage 2: Bufferization completed\n", .{});
+        // --- START REPLACEMENT ---
+        // Remove the old, multi-line pipeline construction.
+        // try opm.addPipeline("one-shot-bufferize");
+        // try opm.addPipeline("func.func(convert-linalg-to-parallel-loops)");
+        // try opm.addPipeline("gpu-map-parallel-loops");
+        // try opm.addPipeline("gpu-kernel-outlining");
+        // try opm.addPipeline("convert-gpu-to-spirv");
 
-        // Stage 3: Lower Linalg on MemRefs to loops, then map to GPU constructs
-        std.debug.print("Adding Linalg → GPU conversion...\n", .{});
-        try opm.addPipeline("func.func(convert-linalg-to-parallel-loops)");
-        try opm.addPipeline("gpu-map-parallel-loops");
-        try opm.addPipeline("gpu-kernel-outlining");
-        std.debug.print("✓ Stage 3: Linalg → GPU conversion completed\n", .{});
+        // NEW: Use the single, robust C++ bridge function to build the rest of the pipeline
+        std.debug.print("Adding canonical GPU and SPIR-V conversion pipeline...\n", .{});
+        c.buildAndAppendGpuAndSpirvConversionPipeline(opm.handle);
+        std.debug.print("✓ Canonical GPU pipeline appended successfully\n", .{});
+        // --- END REPLACEMENT ---
 
-        // Stage 4: Lower from high-level GPU dialect to low-level SPIR-V
-        std.debug.print("Adding GPU → SPIR-V conversion...\n", .{});
-        try opm.addPipeline("convert-gpu-to-spirv");
-        std.debug.print("✓ Stage 4: GPU → SPIR-V conversion completed\n", .{});
-
-        // Stage 5: Final cleanup
+        // Stage 5: Final cleanup (still good practice)
         try opm.addPipeline("canonicalize,cse");
         std.debug.print("✓ Stage 5: Final cleanup completed\n", .{});
 

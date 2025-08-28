@@ -207,9 +207,8 @@ pub const c = struct {
     extern fn mlirRegisterTransformsCanonicalizer() void;
     extern fn mlirRegisterTransformsCSE() void;
     
-    // Bufferization pass registration (may not be available in all MLIR builds)
-    // extern fn mlirRegisterBufferizationPasses() void;
-    // extern fn mlirRegisterLinalgComprehensiveModuleBufferizePasses() void;
+    // Pass registration via C++ anchor function
+    // Individual MLIR C API registration functions are not available
     
     // NEW: Single pass anchor function to force linker to load all required pass libraries
     extern fn mlirForceLoadAllRequiredPasses() void;
@@ -374,7 +373,7 @@ pub const c = struct {
         mlirContextLoadAllAvailableDialects(ctx);
     }
 
-    // Pass registration wrapper functions - HYBRID
+    // Pass registration wrapper functions - COMPLETE
     pub fn registerAllStablehloPasses() void {
         mlirRegisterAllStablehloPasses();
     }
@@ -387,14 +386,7 @@ pub const c = struct {
         mlirRegisterTransformsCSE();
     }
     
-    // Bufferization pass registration wrapper functions (commented out - not available)
-    // pub fn registerBufferizationPasses() void {
-    //     mlirRegisterBufferizationPasses();
-    // }
-    // 
-    // pub fn registerLinalgComprehensiveModuleBufferizePasses() void {
-    //     mlirRegisterLinalgComprehensiveModuleBufferizePasses();
-    // }
+    // Pass registration uses single comprehensive anchor function
     
     // NEW: Zig wrapper for the consolidated pass anchor function
     pub fn forceLoadAllRequiredPasses() void {

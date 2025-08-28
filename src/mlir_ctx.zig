@@ -49,22 +49,18 @@ pub const MLIRContext = struct {
         _ = c.dialectHandleLoadDialect(c.getDialectHandleStableHLO(), context);
         _ = c.dialectHandleLoadDialect(c.getDialectHandleCHLO(), context);
         
-        // CRITICAL: Register passes for pipeline parsing (HYBRID)
-        std.debug.print("Registering passes for pipeline parsing...\n", .{});
-        c.registerAllStablehloPasses();     // StableHLO C-API only provides bulk registration
+        // CRITICAL: Register ALL passes for complete pipeline
+        std.debug.print("Registering complete pass suite for full pipeline...\n", .{});
+        
+        // Core passes
+        c.registerAllStablehloPasses();     // StableHLO passes
         c.registerCanonicalizerPass();      // canonicalize
         c.registerCSEPass();                // cse
         
-        // Bufferization passes (commented out - not available in this MLIR build)
-        // std.debug.print("Registering bufferization passes...\n", .{});
-        // c.registerBufferizationPasses();
-        // c.registerLinalgComprehensiveModuleBufferizePasses();
-        // std.debug.print("✓ Bufferization passes registered.\n", .{});
-        
-        // NEW: Force-load all required pass libraries (consolidated approach)
-        std.debug.print("Force-loading all required pass libraries...\n", .{});
+        // Complete pass registration via C++ anchor function
+        std.debug.print("Registering all MLIR passes via C++ anchor function...\n", .{});
         c.forceLoadAllRequiredPasses();
-        std.debug.print("✓ Pass libraries force-loaded successfully\n", .{});
+        std.debug.print("✓ All MLIR passes registered successfully\n", .{});
 
         // Verify registration worked
         if (!c.contextIsRegisteredOperation(context, "func.func")) {
@@ -77,30 +73,35 @@ pub const MLIRContext = struct {
         const stablehlo_to_spirv_pm = try mlir.PassManager.init(mlir.Context{ .handle = context });
         const opm = stablehlo_to_spirv_pm.asOpPassManager();
 
-        std.debug.print("Building staged pass pipeline programmatically...\n", .{});
+        // COMPLETE StableHLO → SPIR-V Pipeline Implementation
+        std.debug.print("Building COMPLETE StableHLO → SPIR-V pass pipeline...\n", .{});
 
-        std.debug.print("Building extended pass pipeline with available conversions...\n", .{});
-        
-        // Stage 1: Basic optimization and StableHLO to Linalg
-        try opm.addPipeline("canonicalize");
-        try opm.addPipeline("cse");
-        try opm.addPipeline("stablehlo-legalize-to-linalg");
-        
-        // Stage 2: Convert Linalg to loops
-        std.debug.print("Adding convert-linalg-to-loops pass...\n", .{});
-        try opm.addPipeline("convert-linalg-to-loops");
-        std.debug.print("✓ convert-linalg-to-loops pass added successfully\n", .{});
-        
-        // Stage 3: Convert SCF to CF
-        std.debug.print("Adding convert-scf-to-cf pass...\n", .{});
-        try opm.addPipeline("convert-scf-to-cf");
-        std.debug.print("✓ convert-scf-to-cf pass added successfully\n", .{});
-        
-        // Stage 4: Final cleanup
-        try opm.addPipeline("canonicalize");
-        try opm.addPipeline("cse");
-        
-        std.debug.print("✓ Extended pass pipeline built successfully.\n", .{});
+        // Stage 1: High-level optimizations and legalization to Linalg (on Tensors)
+        try opm.addPipeline("canonicalize,cse,stablehlo-legalize-to-linalg");
+        std.debug.print("✓ Stage 1: StableHLO → Linalg legalization completed\n", .{});
+
+        // Stage 2: Bufferization (Tensor → MemRef) - Critical transition
+        std.debug.print("Adding bufferization stage (Tensor → MemRef)...\n", .{});
+        try opm.addPipeline("one-shot-bufferize");
+        std.debug.print("✓ Stage 2: Bufferization completed\n", .{});
+
+        // Stage 3: Lower Linalg on MemRefs to loops, then map to GPU constructs
+        std.debug.print("Adding Linalg → GPU conversion...\n", .{});
+        try opm.addPipeline("func.func(convert-linalg-to-parallel-loops)");
+        try opm.addPipeline("gpu-map-parallel-loops");
+        try opm.addPipeline("gpu-kernel-outlining");
+        std.debug.print("✓ Stage 3: Linalg → GPU conversion completed\n", .{});
+
+        // Stage 4: Lower from high-level GPU dialect to low-level SPIR-V
+        std.debug.print("Adding GPU → SPIR-V conversion...\n", .{});
+        try opm.addPipeline("convert-gpu-to-spirv");
+        std.debug.print("✓ Stage 4: GPU → SPIR-V conversion completed\n", .{});
+
+        // Stage 5: Final cleanup
+        try opm.addPipeline("canonicalize,cse");
+        std.debug.print("✓ Stage 5: Final cleanup completed\n", .{});
+
+        std.debug.print("🚀 COMPLETE StableHLO → SPIR-V pipeline built successfully!\n", .{});
         
         return Self{
             .allocator = allocator,

@@ -78,7 +78,11 @@ pub const DiLoCo = struct {
         
         // The MLIRBuilder is now passed in, ensuring a single context.
         std.log.info("DiLoCo.init: Creating element type...", .{});
+        std.log.info("DiLoCo.init: mlir_builder pointer = {}", .{@intFromPtr(mlir_builder)});
+        std.log.info("DiLoCo.init: mlir_builder.ctx handle = {}", .{@intFromPtr(mlir_builder.ctx.handle)});
+        std.log.info("DiLoCo.init: About to call f32Type...", .{});
         const element_type = mlir.Type.f32Type(mlir_builder.ctx);
+        std.log.info("DiLoCo.init: f32Type call succeeded", .{});
 
         // Configure and create Nesterov optimizer
         std.log.info("DiLoCo.init: Configuring Nesterov optimizer...", .{});
@@ -259,7 +263,11 @@ pub const DiLoCo = struct {
     /// This is a well-formed func.func operation that autodiff can process
     fn buildForwardAndLossFunction(self: *Self, builder: *ops.MLIRBuilder) !mlir.Operation {
         std.log.info("buildForwardAndLossFunction: Starting...", .{});
+        std.log.info("buildForwardAndLossFunction: builder pointer = {}", .{@intFromPtr(builder)});
+        std.log.info("buildForwardAndLossFunction: builder.ctx handle = {}", .{@intFromPtr(builder.ctx.handle)});
+        std.log.info("buildForwardAndLossFunction: About to call f32Type...", .{});
         const f32_type = mlir.Type.f32Type(builder.ctx);
+        std.log.info("buildForwardAndLossFunction: f32Type call succeeded", .{});
         const param_count = self.config.param_count;
 
         // Define types
@@ -356,6 +364,8 @@ pub const DiLoCo = struct {
 
         // === Part 1: Create the forward+loss function to be differentiated ===
         std.log.info("Creating forward+loss function...", .{});
+        std.log.info("buildWorkerTrainingGraph: builder pointer = {}", .{@intFromPtr(builder)});
+        std.log.info("buildWorkerTrainingGraph: About to call buildForwardAndLossFunction...", .{});
         const forward_fn_op = try self.buildForwardAndLossFunction(builder);
         std.log.info("Forward+loss function created successfully", .{});
         // CRITICAL: Attach the newly created function to the module's body.

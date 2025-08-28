@@ -176,6 +176,7 @@ pub const MLIRMetalExecutionEngine = struct {
             .vtable = &.{
                 .materialize = metal_materialize,
                 .materialize_module = metal_materialize_module,
+                .getContext = metal_get_context,
                 .deinit = metal_executor_deinit,
             },
         };
@@ -583,7 +584,8 @@ fn metal_materialize(ptr: *anyopaque, t: tensor.Tensor(void)) ![]u8 {
     const self: *MLIRMetalExecutionEngine = @ptrCast(@alignCast(ptr));
     
     // 1. Create a temporary module with just a return operation for this tensor
-    var temp_builder = try ops.MLIRBuilder.init(self.allocator);
+    const shared_context = self.mlir_context.?.getContext();
+    var temp_builder = try ops.MLIRBuilder.init(self.allocator, shared_context);
     defer temp_builder.deinit();
     
     // Create a simple function that returns the tensor value
@@ -625,6 +627,12 @@ fn metal_materialize_module(ptr: *anyopaque, module_to_run: mlir.Module) ![]u8 {
     try self.executeMLIRModule(module_to_run, &.{}, output_slices[0..]);
     
     return output_bytes;
+}
+
+/// Get the shared MLIR context for this executor
+fn metal_get_context(ptr: *anyopaque) mlir.Context {
+    const self: *MLIRMetalExecutionEngine = @ptrCast(@alignCast(ptr));
+    return self.mlir_context.?.getContext();
 }
 
 /// Executor deinit vtable function

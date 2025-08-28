@@ -211,6 +211,7 @@ fn createMockExecutor() Executor {
         .vtable = &.{
             .materialize = mockMaterialize,
             .materialize_module = mockMaterializeModule,
+            .getContext = mockGetContext,
             .deinit = mockExecutorDeinit,
         },
     };
@@ -236,6 +237,21 @@ fn mockMaterializeModule(ptr: *anyopaque, module: @import("mlir.zig").Module) ![
     _ = ptr;
     _ = module;
     return &[_]u8{};
+}
+
+fn mockGetContext(ptr: *anyopaque) @import("mlir.zig").Context {
+    _ = ptr;
+    // Return a basic MLIR context for mock purposes with func dialect registered
+    const mlir = @import("mlir.zig");
+    const c = @import("mlir/c.zig").c;
+    var ctx = mlir.Context.init() catch @panic("Mock context creation failed");
+    
+    // Register essential dialects that MLIRBuilder needs
+    c.mlirDialectHandleRegisterDialect(c.mlirGetDialectHandle__func__(), ctx.handle);
+    c.mlirDialectHandleRegisterDialect(c.mlirGetDialectHandle__builtin__(), ctx.handle);
+    c.mlirContextSetAllowUnregisteredDialects(ctx.handle, true);
+    
+    return ctx;
 }
 
 fn mockExecutorDeinit(ptr: *anyopaque) void {

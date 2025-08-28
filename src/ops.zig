@@ -1,5 +1,6 @@
 const std = @import("std");
 const mlir = @import("mlir.zig");
+const mlir_ctx = @import("mlir_ctx.zig"); // Import complete MLIR context
 const tensor = @import("tensor.zig");
 const hlo = @import("mlir/dialects/stablehlo.zig");
 
@@ -8,7 +9,7 @@ const Tensor = tensor.Tensor(void); // DataType is encoded in mlir.Type
 /// MLIRBuilder is a stateful object that constructs the MLIR graph
 /// MLIR operation creation
 pub const MLIRBuilder = struct {
-    ctx: mlir.Context,
+    ctx: mlir.Context,                   // Handle to the shared context
     loc: mlir.Location,
     module: mlir.Module,
     /// The top-level block of the module, for inserting functions.
@@ -19,11 +20,7 @@ pub const MLIRBuilder = struct {
 
     const Self = @This();
 
-    pub fn init(allocator: std.mem.Allocator) !Self {
-        const ctx = try mlir.Context.init();
-        const c_api = @import("mlir/c.zig").c;
-        c_api.contextSetAllowUnregisteredDialects(ctx.handle, true);
-        
+    pub fn init(allocator: std.mem.Allocator, ctx: mlir.Context) !Self {
         const loc = mlir.Location.unknown(ctx);
 
         // 1. Create the top-level `builtin.module`. The MLIR C API ensures this
@@ -44,9 +41,9 @@ pub const MLIRBuilder = struct {
         };
     }
 
-    pub fn deinit(self: Self) void {
+    pub fn deinit(self: *Self) void {
         self.module.deinit();
-        self.ctx.deinit();
+        // Do NOT deinit the context here, as we don't own it
     }
 
     /// Temporarily sets the insertion point to a new block.

@@ -22,6 +22,9 @@ pub const Executor = struct {
         /// NEW SIGNATURE: Takes the entire module to be executed.
         materialize_module: *const fn(ptr: *anyopaque, module: mlir.Module) anyerror![]u8,
         
+        /// Get the shared MLIR context for this executor
+        getContext: *const fn(ptr: *anyopaque) mlir.Context,
+        
         /// Optional: Clean up resources when the executor is done
         deinit: *const fn(ptr: *anyopaque) void,
     };
@@ -35,6 +38,11 @@ pub const Executor = struct {
     /// Materialize a symbolic module into concrete bytes
     pub fn materializeModule(self: Executor, module: mlir.Module) ![]u8 {
         return self.vtable.materialize_module(self.ptr, module);
+    }
+    
+    /// Get the shared MLIR context
+    pub fn getContext(self: Executor) mlir.Context {
+        return self.vtable.getContext(self.ptr);
     }
     
     /// Clean up executor resources

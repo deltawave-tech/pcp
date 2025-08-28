@@ -137,8 +137,11 @@ fn runShepherd(allocator: Allocator, args: Args) !void {
     );
     defer system.deinit();
 
-    // Create a single, authoritative MLIRBuilder for this training run.
-    var mlir_builder = try MLIRBuilder.init(allocator);
+    // Get the shared MLIR context from the executor
+    const shared_mlir_context = system.executor.getContext();
+    
+    // Create MLIRBuilder with the shared context
+    var mlir_builder = try MLIRBuilder.init(allocator, shared_mlir_context);
     defer mlir_builder.deinit();
 
     // Now use system.shepherd instead of a local variable

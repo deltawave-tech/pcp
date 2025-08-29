@@ -138,68 +138,60 @@ pub const MLIRContext = struct {
         c.contextDestroy(self.context);
     }
     
-    /// Lowers the module's GPU-targeted functions to SPIR-V dialect using dynamic pipeline construction
+    /// Lowers the module's GPU-targeted functions to SPIR-V dialect using a robust, multi-stage pipeline.
     pub fn lowerToSPIRV(self: *Self, allocator: Allocator, module: mlir.Module) !void {
         _ = allocator;
-        std.debug.print("Lowering module with isolated transform pipeline...\n", .{});
+        std.debug.print("Lowering module with robust, isolated transform pipeline...\n", .{});
 
-        // === STEP A: INJECT the transform script into the module ===
+        // === STAGE 1: INJECT the transform script into the main module ===
         const transform_module = mlir.Module.parse(self.getContext(), TILING_TRANSFORM_SCRIPT) catch |err| {
             std.debug.print("FATAL: Failed to parse transform script: {}\n", .{err});
             return err;
         };
-        defer transform_module.deinit(); 
+        defer transform_module.deinit();
 
         std.debug.print("Injecting tiling transform script...\n", .{});
         const main_module_body = module.op().getRegion(0).getBlock(0);
         const transform_module_body = transform_module.op().getRegion(0).getBlock(0);
 
+        // Clone the transform.named_sequence operation into the main module.
         var op_to_clone = transform_module_body.getFirstOp();
         while (op_to_clone) |op| {
             const cloned_op = mlir.Operation{ .handle = c.operationClone(op.handle) };
             main_module_body.appendOwnedOperation(cloned_op);
             op_to_clone = op.getNext();
         }
-        std.debug.print("✓ Script injected.\n", .{});
 
-        // --- THE FINAL, CRITICAL FIX ---
-        // Add the required attribute to the main module operation.
-        std.debug.print("Adding 'transform.with_named_sequence' attribute to the module...\n", .{});
+        // CRITICAL FIX: Add the required 'transform.with_named_sequence' attribute to the main module.
+        // The interpreter will not run without this.
         const unit_attr = c.unitAttrGet(self.context);
         c.operationSetAttributeByName(module.op().handle, "transform.with_named_sequence", unit_attr);
-        std.debug.print("✓ Module attribute set successfully.\n", .{});
-        // --- END OF FIX ---
+        std.debug.print("✓ Script injected and module attribute set.\n", .{});
 
-        // --- START: THE FINAL, ROBUST FIX ---
-
-        // === STEP B: Run the Tiling Transformation in an ISOLATED Pass Manager ===
+        // === STAGE 2: Run Tiling and GPU Mapping in an ISOLATED Pass Manager ===
         {
-            std.debug.print("--- Creating isolated pass manager for tiling ---\n", .{});
             var tiling_pm = try mlir.PassManager.init(self.getContext());
             defer tiling_pm.deinit(); // This pass manager is temporary and self-contained.
 
             const opm = tiling_pm.asOpPassManager();
 
-            // Stage 1: Legalize StableHLO to Linalg.
+            // Add the exact sequence of passes needed to prepare for and run the transform.
             try opm.addPipeline("stablehlo-legalize-to-linalg");
-            
-            // Stage 2: Run function-level Linalg prep.
             try opm.addPipeline("func.func(linalg-generalize-named-ops,canonicalize,cse)");
-            
-            // Stage 3: Run the transform interpreter at the TOP LEVEL.
             try opm.addPipeline("transform-interpreter");
-            
-            std.debug.print("Running transform and GPU mapping passes...\n", .{});
-            try tiling_pm.runOnOp(module.op());
-            std.debug.print("✓ Tiling and GPU mapping complete.\n", .{});
-        } // `tiling_pm` is destroyed here.
 
-        // --- THE FINAL FIX: CLEAN UP THE MODULE ---
+            std.debug.print("--- Running Transform Interpreter Pipeline ---\n", .{});
+            try tiling_pm.runOnOp(module.op());
+            std.debug.print("✓ Tiling and GPU mapping via transform interpreter is complete.\n", .{});
+        } // The isolated pass manager `tiling_pm` is destroyed here.
+
+        // === STAGE 3: CLEAN UP the transform script operations from the module ===
+        // These ops have served their purpose and must be removed before the next stage.
         std.debug.print("--- Cleaning up transform script from module IR ---\n", .{});
         const module_body = module.op().getRegion(0).getBlock(0);
         var maybe_op = module_body.getFirstOp();
         while (maybe_op) |op| {
-            const next_op = op.getNext(); // Get next op BEFORE potentially destroying current one
+            const next_op = op.getNext(); // Get next op BEFORE potentially destroying the current one.
             const op_name_id = c.operationGetName(op.handle);
             const op_name_ref = c.identifierStr(op_name_id);
             const op_name = c.fromStringRef(op_name_ref);
@@ -209,49 +201,37 @@ pub const MLIRContext = struct {
             }
             maybe_op = next_op;
         }
-        std.debug.print("✓ Transform script removed.\n", .{});
 
-        // Optional but recommended: Verify the module is still valid after our manual changes.
+        // Sanity Check: Verify the module is still valid after our manual modifications.
         if (c.operationVerify(module.op().handle).isFailure()) {
             std.debug.print("ERROR: Module verification failed after transform script removal!\n", .{});
             module.op().dump();
             return error.ModuleVerificationFailed;
         }
+        std.debug.print("✓ Transform script removed and module verified.\n", .{});
 
-        std.debug.print("--- Module AFTER Tiling & Cleanup ---\n", .{});
+        std.debug.print("\n--- IR after Transform and Cleanup ---\n", .{});
         module.op().dump();
-        // --- END OF FIX ---
 
-        // === STEP D: Run the FINAL Lowering Pipeline ===
-        std.debug.print("--- Building final lowering pipeline for bufferization -> SPIR-V ---\n", .{});
-        
-        var main_pm = try mlir.PassManager.init(self.getContext());
-        defer main_pm.deinit();
-        
-        const main_opm = main_pm.asOpPassManager();
+        // === STAGE 4: Run the FINAL Lowering Pipeline in a NEW, ISOLATED Pass Manager ===
+        {
+            var final_pm = try mlir.PassManager.init(self.getContext());
+            defer final_pm.deinit();
+            const opm = final_pm.asOpPassManager();
 
-        // --- THE NEW, SIMPLIFIED PIPELINE ---
+            // The IR now contains gpu.launch ops with linalg.generic on tensors.
+            // This pipeline handles the rest of the lowering.
+            try opm.addPipeline("one-shot-bufferize{bufferize-function-boundaries}");
+            try opm.addPipeline("buffer-deallocation-pipeline");
+            try opm.addPipeline("gpu.module(func.func(convert-linalg-to-loops))");
+            c.buildAndAppendGpuAndSpirvConversionPipeline(opm.handle);
 
-        // STAGE 1: Bufferization. The IR now contains gpu.launch with linalg.generic on tensors.
-        try main_opm.addPipeline("one-shot-bufferize{bufferize-function-boundaries}");
-        try main_opm.addPipeline("buffer-deallocation-pipeline");
-        std.debug.print("✓ Stage 1: Bufferization Pipeline\n", .{});
+            std.debug.print("\n--- Running Final Lowering Pipeline (Bufferization -> SPIR-V) ---\n", .{});
+            try final_pm.runOnOp(module.op());
+            std.debug.print("✓ Final lowering pipeline executed.\n", .{});
+        }
 
-        // STAGE 2: Convert Linalg ops inside the GPU kernel to standard loops.
-        // We must run this inside the gpu.launch op's body.
-        try main_opm.addPipeline("gpu.module(func.func(convert-linalg-to-loops))");
-        std.debug.print("✓ Stage 2: Linalg -> SCF Loops (inside GPU kernel)\n", .{});
-
-        // STAGE 3: Lower the GPU module to the final SPIR-V binary representation.
-        c.buildAndAppendGpuAndSpirvConversionPipeline(main_opm.handle);
-        std.debug.print("✓ Stage 3: GPU Dialect -> SPIR-V Conversion\n", .{});
-
-        // --- END OF PIPELINE ---
-        
-        std.debug.print("Running final lowering passes...\n", .{});
-        try main_pm.runOnOp(module.op());
-        
-        std.debug.print("--- Module AFTER Final Lowering ---\n", .{});
+        std.debug.print("\n--- Final Module IR (Lowered to SPIR-V) ---\n", .{});
         module.op().dump();
         std.debug.print("✅ Full pipeline executed successfully!\n", .{});
     }

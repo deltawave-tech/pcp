@@ -7,6 +7,8 @@ const worker_backend = @import("worker_backend.zig");
 const execution = @import("../execution.zig");
 const mlir = @import("../mlir.zig");
 const tensor = @import("../tensor.zig");
+const mlir_ctx = @import("../mlir_ctx.zig");
+const ops = @import("../ops.zig");
 
 const WorkerBackend = worker_backend.WorkerBackend;
 const Executor = execution.Executor;
@@ -182,35 +184,85 @@ pub const DemoBackend = struct {
     }
 };
 
-/// Module serialization simulation for demo
+/// Create a realistic demo MLIR module using actual MLIR infrastructure
 pub fn simulateModuleSerialization(allocator: Allocator, description: []const u8) ![]u8 {
-    // Create a realistic "serialized" MLIR module for demo
-    const module_data = try std.fmt.allocPrint(allocator, 
-        \\// Demo MLIR Module: {s}
-        \\module {{
-        \\  func.func @forward_and_loss_fn(%params: tensor<1000xf32>, %inputs: tensor<4x12xf32>, %targets: tensor<4x12xf32>) -> tensor<f32> {{
-        \\    // Simulated forward pass
-        \\    %loss = "demo.compute_loss"(%params, %inputs, %targets) : (tensor<1000xf32>, tensor<4x12xf32>, tensor<4x12xf32>) -> tensor<f32>
-        \\    return %loss : tensor<f32>
-        \\  }}
-        \\  
-        \\  func.func @forward_and_loss_fn_grad(%params: tensor<1000xf32>, %inputs: tensor<4x12xf32>, %targets: tensor<4x12xf32>, %seed: tensor<f32>) -> (tensor<1000xf32>, tensor<4x12xf32>, tensor<4x12xf32>) {{
-        \\    // Simulated gradient computation  
-        \\    %grad_params, %grad_inputs, %grad_targets = "demo.compute_gradients"(%params, %inputs, %targets, %seed) : (tensor<1000xf32>, tensor<4x12xf32>, tensor<4x12xf32>, tensor<f32>) -> (tensor<1000xf32>, tensor<4x12xf32>, tensor<4x12xf32>)
-        \\    return %grad_params, %grad_inputs, %grad_targets : tensor<1000xf32>, tensor<4x12xf32>, tensor<4x12xf32>
-        \\  }}
-        \\  
-        \\  func.func @main(%initial_params: tensor<1000xf32>, %inputs: tensor<4x12xf32>, %targets: tensor<4x12xf32>) -> (tensor<1000xf32>, tensor<f32>) {{
-        \\    // Simulated main training function
-        \\    %loss = call @forward_and_loss_fn(%initial_params, %inputs, %targets) : (tensor<1000xf32>, tensor<4x12xf32>, tensor<4x12xf32>) -> tensor<f32>
-        \\    %one = arith.constant 1.0 : tensor<f32>
-        \\    %grad_params, %grad_inputs, %grad_targets = call @forward_and_loss_fn_grad(%initial_params, %inputs, %targets, %one) : (tensor<1000xf32>, tensor<4x12xf32>, tensor<4x12xf32>, tensor<f32>) -> (tensor<1000xf32>, tensor<4x12xf32>, tensor<4x12xf32>)
-        \\    %updated_params = "demo.apply_gradients"(%initial_params, %grad_params) : (tensor<1000xf32>, tensor<1000xf32>) -> tensor<1000xf32>
-        \\    return %updated_params, %loss : tensor<1000xf32>, tensor<f32>
-        \\  }}
-        \\}}
-        \\// Demo module size: {} bytes
-    , .{ description, 1000 }); // Fixed size since module_data is not yet defined
+    // Create a real MLIR context and builder to generate an actual module
+    var ctx = mlir.Context.init() catch {
+        // Fallback to simple string if MLIR initialization fails
+        return try std.fmt.allocPrint(allocator, "// Demo fallback: {s} (MLIR unavailable)", .{description});
+    };
+    defer ctx.deinit();
     
-    return module_data;
+    // Allow unregistered dialects for flexibility in demo
+    const c_api = @import("../mlir/c.zig").c;
+    c_api.contextSetAllowUnregisteredDialects(ctx.handle, true);
+    
+    var builder = ops.MLIRBuilder.init(allocator, ctx) catch {
+        // Fallback if builder creation fails
+        return try std.fmt.allocPrint(allocator, "// Demo fallback: {s} (Builder unavailable)", .{description});
+    };
+    defer builder.deinit();
+    
+    // Build a realistic demo training module with actual MLIR operations
+    try buildDemoTrainingModule(&builder, description);
+    
+    // Use the real serialization function from mlir_ctx
+    return mlir_ctx.serializeMLIRModule(allocator, builder.module);
+}
+
+/// Build a realistic demo training module with actual MLIR operations
+fn buildDemoTrainingModule(builder: *ops.MLIRBuilder, description: []const u8) !void {
+    const f32_type = mlir.Type.f32Type(builder.ctx);
+    const param_count = 1000;
+    
+    // Define tensor types
+    const params_type = mlir.Type.rankedTensorType(builder.ctx, &.{param_count}, f32_type);
+    const data_type = mlir.Type.rankedTensorType(builder.ctx, &.{4, 12}, f32_type);
+    const loss_type = mlir.Type.rankedTensorType(builder.ctx, &.{}, f32_type); // Scalar loss
+    
+    // Create forward+loss function
+    const forward_input_types = [_]mlir.Type{ params_type, data_type, data_type };
+    const forward_result_types = [_]mlir.Type{loss_type};
+    const forward_func_type = mlir.Type.functionType(builder.ctx, &forward_input_types, &forward_result_types);
+    
+    const forward_result = try builder.createFunction("forward_and_loss_fn", forward_func_type);
+    const forward_func = forward_result.func_op;
+    const forward_block = forward_result.entry_block;
+    
+    // Build forward function body
+    const original_block = builder.getInsertionBlock();
+    builder.setInsertionBlock(forward_block);
+    
+    // Get function arguments
+    const params_arg = forward_block.getArgument(0);
+    const inputs_arg = forward_block.getArgument(1);
+    const targets_arg = forward_block.getArgument(2);
+    
+    // Create simple loss computation: MSE between prediction and targets
+    const param_tensor = try builder.newTensor(params_arg);
+    const input_tensor = try builder.newTensor(inputs_arg);
+    const target_tensor = try builder.newTensor(targets_arg);
+    
+    // Flatten inputs to match param dimensions for demo
+    const input_flat = try ops.reshape(builder, input_tensor, &.{param_count});
+    const target_flat = try ops.reshape(builder, target_tensor, &.{param_count});
+    
+    // Simple prediction: params + inputs (demo computation)
+    const prediction = try ops.add(builder, param_tensor, input_flat);
+    
+    // MSE loss: (prediction - target)^2
+    const diff = try ops.subtract(builder, prediction, target_flat);
+    const squared = try ops.multiply(builder, diff, diff);
+    const loss = try ops.reduceSum(builder, squared, &.{0});
+    
+    // Return loss
+    _ = try builder.createAndAttach("func.return", &.{loss.value}, &.{});
+    
+    // Restore insertion block and attach function to module
+    builder.setInsertionBlock(original_block);
+    builder.module_body.appendOwnedOperation(forward_func);
+    
+    // Add a comment attribute to identify this as a demo module
+    const comment_attr = mlir.Attribute.stringAttr(builder.ctx, description);
+    _ = @import("../mlir/c.zig").c.operationSetAttributeByName(builder.module.op().handle, "demo.comment", comment_attr.handle);
 }

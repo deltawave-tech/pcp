@@ -188,6 +188,9 @@ pub const c = struct {
     
     // Register BufferizableOpInterface implementations with dialect registry
     extern fn mlirRegisterBufferizationInterfaces(registry: *MlirDialectRegistry) void;
+    
+    // Register Transform dialect extensions with dialect registry
+    extern fn mlirRegisterTransformExtensions(registry: *MlirDialectRegistry) void;
 
     // Pass and dialect registration - dialect handle pattern
     pub const MlirDialectHandle = extern struct {
@@ -446,6 +449,11 @@ pub const c = struct {
     // Register BufferizableOpInterface implementations with dialect registry
     pub fn registerBufferizationInterfaces(registry: *MlirDialectRegistry) void {
         mlirRegisterBufferizationInterfaces(registry);
+    }
+    
+    // Register Transform dialect extensions with dialect registry
+    pub fn registerTransformExtensions(registry: *MlirDialectRegistry) void {
+        mlirRegisterTransformExtensions(registry);
     }
 
     // Module wrapper functions

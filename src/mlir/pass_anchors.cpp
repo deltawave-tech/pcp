@@ -32,6 +32,12 @@
 // Test pass registration headers  
 #include "mlir/Dialect/Linalg/Passes.h"
 
+// Transform dialect headers
+#include "mlir/Dialect/Transform/IR/TransformDialect.h"
+#include "mlir/Dialect/Transform/Transforms/Passes.h"
+#include "mlir/Dialect/Linalg/TransformOps/LinalgTransformOps.h"
+#include "mlir/Dialect/Linalg/TransformOps/DialectExtension.h"
+
 // Production tiling should be included in standard Linalg passes
 
 // Forward declarations for test passes
@@ -96,6 +102,14 @@ void mlirForceLoadAllRequiredPasses() {
   // Register specific passes for our pipeline instead of bulk GPU/SCF registration
   std::printf("  - Specific conversion passes for our pipeline\n");
   // These individual pass registrations avoid the bulk registration issues
+  
+  // CRITICAL: Register Transform dialect passes and extensions
+  std::printf("  - Transform dialect passes and extensions\n");
+  mlir::transform::registerTransformPasses();
+  
+  // Register Linalg Transform dialect extensions (for transform.structured.* ops)
+  std::printf("  - Linalg Transform dialect extensions\n");
+  mlir::linalg::registerTransformDialectExtension(registry);
   
   std::printf("C++: ✅ Minimal pass registration completed successfully!\n");
   std::printf("     (Including Transform dialect and production tiling)\n");
@@ -162,6 +176,20 @@ void mlirRegisterBufferizationInterfaces(MlirDialectRegistry registryHandle) {
   mlir::arith::registerBufferizableOpInterfaceExternalModels(registry);
   
   std::printf("C++: ✅ BufferizableOpInterface implementations registered\n");
+}
+
+// Register Transform dialect extensions with a dialect registry
+void mlirRegisterTransformExtensions(MlirDialectRegistry registryHandle) {
+  std::printf("C++: Registering Transform dialect extensions...\n");
+  
+  // Convert C API registry handle to C++ DialectRegistry
+  mlir::DialectRegistry &registry = *unwrap(registryHandle);
+  
+  // Register Linalg Transform dialect extensions (for transform.structured.* ops)
+  std::printf("  - Linalg Transform dialect extensions\n");
+  mlir::linalg::registerTransformDialectExtension(registry);
+  
+  std::printf("C++: ✅ Transform dialect extensions registered\n");
 }
 
 } // extern "C"

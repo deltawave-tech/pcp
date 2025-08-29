@@ -6,14 +6,13 @@ const Allocator = std.mem.Allocator;
 
 const TILING_TRANSFORM_SCRIPT =
     \\module attributes { transform.with_named_sequence } {
-    \\  transform.named_sequence @__transform_main(%arg0: !pdl.operation) {
+    \\  transform.named_sequence @__transform_main(%arg0: !transform.any_op) {
     \\    // Step 1: Find all linalg.matmul operations.
-    \\    %matmul = transform.structured.match ops{["linalg.matmul"]} in %arg0 
+    \\    %matmul = transform.structured.match ops{["linalg.matmul"]} in %arg0 : (!transform.any_op) -> !transform.any_op
     \\
     \\    // Step 2: Tile the matched matmul operation.
-    \\    // The empty `forall` tells it to tile to scf.forall loops.
-    \\    %forall_loops, %tiled_op = transform.structured.tile %matmul [32, 32, 32]
-    \\      interchange = [0, 1, 2]
+    \\    %forall_loops, %tiled_op = transform.structured.tile_using_forall %matmul tile_sizes [32, 32, 32]
+    \\      : (!transform.any_op) -> (!transform.any_op, !transform.any_op)
     \\
     \\    // Return the result of the transformation.
     \\    transform.yield
@@ -26,7 +25,7 @@ pub const MLIRContext = struct {
     allocator: Allocator,
     context: *c.MlirContext,
     registry: *c.MlirDialectRegistry,
-    stablehlo_to_spirv_pm: mlir.PassManager,
+    pass_manager: mlir.PassManager,
     
     const Self = @This();
     
@@ -59,6 +58,10 @@ pub const MLIRContext = struct {
         // Register BufferizableOpInterface implementations before appending registry to context
         std.debug.print("Registering BufferizableOpInterface implementations...\n", .{});
         c.registerBufferizationInterfaces(registry);
+        
+        // CRITICAL: Register Transform dialect extensions (for transform.structured.* ops)
+        std.debug.print("Registering Transform dialect extensions...\n", .{});
+        c.registerTransformExtensions(registry);
 
         // Append registry to context
         c.contextAppendDialectRegistry(context, registry);
@@ -101,153 +104,97 @@ pub const MLIRContext = struct {
         }
         std.debug.print("✓ Dialects registered successfully.\n", .{});
         
-        // 2. BUILD THE PASS PIPELINE PROGRAMMATICALLY (MORE ROBUST)
-        const stablehlo_to_spirv_pm = try mlir.PassManager.init(mlir.Context{ .handle = context });
-        const opm = stablehlo_to_spirv_pm.asOpPassManager();
-
-std.debug.print("Building CANONICAL StableHLO → SPIR-V pass pipeline...\n", .{});
-
-// === Stage 1: Legalize StableHLO to Linalg on Tensors ===
-try opm.addPipeline("stablehlo-legalize-to-linalg");
-std.debug.print("✓ Stage 1: StableHLO → Linalg on Tensors completed\n", .{});
-
-// === Stage 2: Tensor-level Linalg transformations (Tiling, Fusion, Padding) ===
-// This nested pipeline correctly applies tiling and fusion before bufferization.
-try opm.addPipeline(
-    "func.func("
-    // Generalize named linalg ops to generic ops. This is a good preparatory step.
-    ++ "linalg-generalize-named-ops,"
-    // Fuse elementwise operations into their producers.
-    ++ "linalg-fuse-elementwise-ops,"
-    // Cleanup the IR after the above transformations.
-    ++ "canonicalize"
-    ++ ")"
-);
-std.debug.print("✓ Stage 2a: Linalg preparation completed\n", .{});
-
-// === Stage 2b: Apply Tiling via Transform Dialect ===
-// THIS IS THE KEY FIX: We run the transform dialect interpreter, which will
-// execute our TILING_TRANSFORM_SCRIPT on the module.
-try opm.addPipeline("transform-interpreter");
-std.debug.print("✓ Stage 2b: Tiling via Transform Dialect Interpreter completed\n", .{});
-
-// === Stage 3: Bufferization (Tensor → MemRef) ===
-// THIS IS THE KEY FIX: Use the curated '-linalg-bufferize' pipeline.
-// It correctly includes --func-bufferize, --finalizing-bufferize, and other
-// necessary passes in the right order with the right dependencies.
-try opm.addPipeline("linalg-bufferize");
-std.debug.print("✓ Stage 3: Bufferization (Tensor → MemRef) via -linalg-bufferize completed\n", .{});
-
-// === Stage 4: Lowering to Loops and GPU Dialect ===
-// Now that we have memrefs, we can lower to loops and then map to GPU constructs.
-// This combines two previous stages into one logical block.
-try opm.addPipeline("func.func(convert-linalg-to-parallel-loops)");
-std.debug.print("✓ Stage 4a: Linalg → scf.parallel completed\n", .{});
-
-// This C++ helper function handles the rest: scf.parallel -> gpu -> spirv
-c.buildAndAppendGpuAndSpirvConversionPipeline(opm.handle);
-std.debug.print("✓ Stage 4b: GPU mapping and SPIR-V conversion appended\n", .{});
-
-// === Stage 5: Final Cleanup ===
-try opm.addPipeline("canonicalize,cse");
-std.debug.print("✓ Stage 5: Final cleanup completed\n", .{});
-
-std.debug.print("🚀 COMPLETE StableHLO → GPU → SPIR-V pipeline built successfully!\n", .{});
-
-        std.debug.print("🚀 COMPLETE StableHLO → SPIR-V pipeline built successfully!\n", .{});
+        // 2. INITIALIZE EMPTY PASS MANAGER (Dynamic pipeline construction)
+        // The pipeline will be built just-in-time in lowerToSPIRV()
+        std.debug.print("Initializing empty pass manager for dynamic pipeline construction...\n", .{});
+        const pass_manager = try mlir.PassManager.init(mlir.Context{ .handle = context });
+        std.debug.print("✓ Empty pass manager initialized successfully\n", .{});
         
         return Self{
             .allocator = allocator,
             .context = context,
             .registry = registry,
-            .stablehlo_to_spirv_pm = stablehlo_to_spirv_pm,
+            .pass_manager = pass_manager,
         };
     }
     
     pub fn deinit(self: *Self) void {
-        self.stablehlo_to_spirv_pm.deinit();
+        self.pass_manager.deinit();
         c.dialectRegistryDestroy(self.registry);
         c.contextDestroy(self.context);
     }
     
-    /// Lowers the module's GPU-targeted functions to SPIR-V dialect
+    /// Lowers the module's GPU-targeted functions to SPIR-V dialect using dynamic pipeline construction
     pub fn lowerToSPIRV(self: *Self, allocator: Allocator, module: mlir.Module) !void {
         _ = allocator; // Suppress unused parameter warning
-        std.debug.print("Lowering MLIR module through StableHLO → GPU → SPIR-V pipeline...\n", .{});
+        std.debug.print("Lowering module with dynamic pipeline construction...\n", .{});
 
-        // =====================================================================
-        // === START: NEW TRANSFORM SCRIPT INJECTION LOGIC =====================
-        // =====================================================================
-        std.debug.print("Injecting tiling transform script into the main module...\n", .{});
-
-        // 1. Parse the TILING_TRANSFORM_SCRIPT string into its own temporary module.
-        //    We use the same context to ensure compatibility.
-        std.debug.print("Parsing TILING_TRANSFORM_SCRIPT...\n", .{});
+        // === STEP A: INJECT the transform script into the module FIRST ===
+        std.debug.print("Injecting tiling transform script...\n", .{});
         const transform_module = mlir.Module.parse(self.getContext(), TILING_TRANSFORM_SCRIPT) catch |err| {
-            std.debug.print("FATAL: Failed to parse the hardcoded TILING_TRANSFORM_SCRIPT: {}\n", .{err});
+            std.debug.print("FATAL: Failed to parse transform script: {}\n", .{err});
             return err;
         };
         defer transform_module.deinit();
-        std.debug.print("✓ Transform script parsed successfully\n", .{});
 
-        // 2. Get the body of the main module where we will insert the script.
-        std.debug.print("Getting main module body...\n", .{});
         const main_module_body = module.op().getRegion(0).getBlock(0);
-        std.debug.print("✓ Got main module body\n", .{});
-
-        // 3. Get the body of the transform script module.
-        std.debug.print("Getting transform script module body...\n", .{});
         const transform_module_body = transform_module.op().getRegion(0).getBlock(0);
-        std.debug.print("✓ Got transform script module body\n", .{});
 
-        // 4. Iterate over all operations in the transform script (e.g., the `transform.named_sequence`)
-        std.debug.print("Getting first operation from transform script...\n", .{});
         var op_to_clone = transform_module_body.getFirstOp();
-        std.debug.print("First op result: {}\n", .{op_to_clone != null});
-        var op_count: u32 = 0;
         while (op_to_clone) |op| {
-            std.debug.print("Processing operation #{}\n", .{op_count + 1});
-            // 5. Clone the operation. This creates a new, parent-less copy.
-            std.debug.print("Cloning operation...\n", .{});
-            const cloned_op_handle = c.operationClone(op.handle);
-            const cloned_op = mlir.Operation{ .handle = cloned_op_handle };
-            std.debug.print("✓ Operation cloned successfully\n", .{});
-
-            // 6. Append the cloned transform operation to the main module's body.
-            std.debug.print("Appending cloned operation to main module...\n", .{});
+            const cloned_op = mlir.Operation{ .handle = c.operationClone(op.handle) };
             main_module_body.appendOwnedOperation(cloned_op);
-            std.debug.print("✓ Operation appended successfully\n", .{});
-
-            op_count += 1;
-            std.debug.print("Getting next operation...\n", .{});
             op_to_clone = op.getNext();
-            std.debug.print("Next op result: {}\n", .{op_to_clone != null});
         }
-        std.debug.print("Processed {} operations from transform script\n", .{op_count});
-        std.debug.print("✓ Tiling transform script injected successfully.\n", .{});
-        // =====================================================================
-        // === END: NEW TRANSFORM SCRIPT INJECTION LOGIC =======================
-        // =====================================================================
+        std.debug.print("✓ Script injected. Module is ready for the interpreter.\n", .{});
         
-        // Debug: Dump module before lowering to see the injected script
-        std.debug.print("--- Module BEFORE lowering (with injected script) ---\n", .{});
+        // === STEP B: BUILD the full pipeline just-in-time ===
+        std.debug.print("Building dynamic pass pipeline...\n", .{});
+        const opm = self.pass_manager.asOpPassManager();
+        
+        // Stage 1: HLO -> Linalg
+        try opm.addPipeline("stablehlo-legalize-to-linalg");
+        std.debug.print("✓ Stage 1: StableHLO → Linalg added to pipeline\n", .{});
+        
+        // Stage 2a: Linalg Prep
+        try opm.addPipeline("func.func(linalg-generalize-named-ops,linalg-fuse-elementwise-ops,canonicalize)");
+        std.debug.print("✓ Stage 2a: Linalg preparation added to pipeline\n", .{});
+        
+        // Stage 2b: THE CRITICAL FIX - Add the interpreter now that the script exists
+        try opm.addPipeline("transform-interpreter");
+        std.debug.print("✓ Stage 2b: Transform interpreter added to pipeline\n", .{});
+        
+        // Stage 3: Bufferization
+        try opm.addPipeline("linalg-bufferize");
+        std.debug.print("✓ Stage 3: Bufferization added to pipeline\n", .{});
+        
+        // Stage 4 & 5: Lowering to GPU/SPIR-V and cleanup
+        try opm.addPipeline("func.func(convert-linalg-to-parallel-loops)");
+        std.debug.print("✓ Stage 4a: Linalg → scf.parallel added to pipeline\n", .{});
+        
+        c.buildAndAppendGpuAndSpirvConversionPipeline(opm.handle);
+        std.debug.print("✓ Stage 4b: GPU/SPIR-V conversion added to pipeline\n", .{});
+        
+        try opm.addPipeline("canonicalize,cse");
+        std.debug.print("✓ Stage 5: Final cleanup added to pipeline\n", .{});
+
+        std.debug.print("✓ Dynamic pipeline constructed successfully.\n", .{});
+
+        // === STEP C: RUN the pipeline on the prepared module ===
+        std.debug.print("--- Module BEFORE pipeline execution (with injected script) ---\n", .{});
         module.op().dump();
         
-        // Run the pass pipeline and observe IR transformations
-        std.debug.print("Running pass pipeline...\n", .{});
-        self.stablehlo_to_spirv_pm.runOnOp(module.op()) catch |err| {
+        std.debug.print("Running pass manager on prepared module...\n", .{});
+        self.pass_manager.runOnOp(module.op()) catch |err| {
             std.debug.print("ERROR during pass pipeline execution: {}\n", .{err});
+            std.debug.print("--- Module state on failure ---\n", .{});
+            module.op().dump();
             return err;
         };
         
-        // VERIFY HERE: Dump the module after the full pipeline runs
-        // We should see:
-        // 1. After canonicalize: cleaned up operations
-        // 2. After stablehlo-legalize-to-linalg: stablehlo ops converted to linalg ops
-        std.debug.print("--- Module AFTER full lowering pipeline ---\n", .{});
+        std.debug.print("--- Module AFTER pipeline execution ---\n", .{});
         module.op().dump();
-        
-        std.debug.print("✓ Successfully ran full lowering pipeline\n", .{});
+        std.debug.print("✓ Dynamic pipeline execution completed successfully.\n", .{});
     }
     
     /// Translates a module containing SPIR-V dialect ops into a SPIR-V binary blob

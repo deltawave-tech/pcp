@@ -11,10 +11,11 @@ const TILING_TRANSFORM_SCRIPT =
     \\    %generic = transform.structured.match ops{["linalg.generic"]} in %arg0
     \\        : (!transform.any_op) -> !transform.any_op
     \\
-    \\    // Step 1: Just tile the tensor-based operation into scf.forall loops.
-    \\    // DO NOT add mapping attributes here. We are only concerned with the loop structure.
+    \\    // STEP 1: Tile the tensor-based operation AND apply GPU mapping attributes simultaneously.
+    \\    // This is the key that provides the necessary hints for the GPU conversion pass.
     \\    %tiled, %loops = transform.structured.tile_using_forall %generic
-    \\        tile_sizes [32, 32, 32]
+    \\        tile_sizes [32, 32]
+    \\        (mapping = [#gpu.block<x>, #gpu.block<y>])
     \\        : (!transform.any_op) -> (!transform.any_op, !transform.any_op)
     \\
     \\    transform.yield
@@ -125,31 +126,24 @@ pub const MLIRContext = struct {
         c.contextDestroy(self.context);
     }
     
-    /// Lowers the module using the canonical, decoupled pipeline, now with manual transform op cleanup.
+    /// Lowers the module using the definitive, canonically-ordered GPU pipeline with kernel outlining.
     pub fn lowerToSPIRV(self: *Self, allocator: Allocator, module: mlir.Module) !void {
         _ = allocator;
-        std.debug.print("=== Executing Decoupled GPU Lowering Pipeline ===\n", .{});
+        std.debug.print("=== Executing Definitive GPU Lowering Pipeline with Kernel Outlining ===\n", .{});
 
-        // === STAGE 1: HLO to Linalg on Tensors ===
+        // === STAGE 1 & 2: HLO -> Linalg -> Tiled+Mapped scf.forall (on Tensors) ===
         {
+            // This initial block correctly prepares the tensor-based IR.
             var pm = try mlir.PassManager.init(self.getContext());
             defer pm.deinit();
             const opm = pm.asOpPassManager();
-
             try opm.addPipeline("stablehlo-legalize-to-linalg");
             try opm.addPipeline("func.func(linalg-generalize-named-ops,canonicalize,cse)");
-
-            std.debug.print("--- Running Stage 1: HLO -> Linalg (Tensors) ---\n", .{});
             try pm.runOnOp(module.op());
-        }
-        std.debug.print("\n--- IR after Stage 1 ---\n", .{});
-        module.op().dump();
 
-        // === STAGE 2: Logical Tiling on Tensors using Transform Dialect ===
-        {
+            // This block correctly tiles the linalg op into an attributed scf.forall.
             const transform_module = try mlir.Module.parse(self.getContext(), TILING_TRANSFORM_SCRIPT);
             defer transform_module.deinit();
-
             const main_module_body = module.op().getRegion(0).getBlock(0);
             const transform_body = transform_module.op().getRegion(0).getBlock(0);
             var op_to_clone = transform_body.getFirstOp();
@@ -158,62 +152,58 @@ pub const MLIRContext = struct {
                 op_to_clone = op.getNext();
             }
             c.operationSetAttributeByName(module.op().handle, "transform.with_named_sequence", c.unitAttrGet(self.context));
-
-            var pm = try mlir.PassManager.init(self.getContext());
-            defer pm.deinit();
-            try pm.asOpPassManager().addPipeline("transform-interpreter");
-
-            std.debug.print("\n--- Running Stage 2: Transform Interpreter (Tiling Only) ---\n", .{});
-            try pm.runOnOp(module.op());
+            var transform_pm = try mlir.PassManager.init(self.getContext());
+            defer transform_pm.deinit();
+            try transform_pm.asOpPassManager().addPipeline("transform-interpreter");
+            try transform_pm.runOnOp(module.op());
         }
-        std.debug.print("\n--- IR after Stage 2 (Tiled scf.forall on Tensors) ---\n", .{});
+        std.debug.print("\n--- IR after Stage 2 (Attributed scf.forall on Tensors) ---\n", .{});
         module.op().dump();
 
-        // === STAGE 3: Cleanup and Final Lowering Pipeline ===
-        
-        // 3.1: DEFINITIVE FIX - Manually clean up the transform script operations.
-        // This replaces the crashing `transform-dialect-erase-schedule` pass.
-        std.debug.print("\n--- Stage 3.1: Manually Cleaning Up Transform Script ---\n", .{});
-        const module_body = module.op().getRegion(0).getBlock(0);
-        var maybe_op = module_body.getFirstOp();
-        while (maybe_op) |op| {
-            const next_op = op.getNext(); // Get next op BEFORE potentially destroying the current one.
-            const op_name_id = c.operationGetName(op.handle);
-            const op_name_ref = c.identifierStr(op_name_id);
-            const op_name = c.fromStringRef(op_name_ref);
-            if (std.mem.startsWith(u8, op_name, "transform.")) {
-                std.debug.print("  - Erasing op: {s}\n", .{op_name});
-                c.operationDestroy(op.handle);
-            }
-            maybe_op = next_op;
-        }
-        
-        // Sanity check that the module is still valid after our manual changes.
-        if (c.operationVerify(module.op().handle).isFailure()) {
-            std.debug.print("ERROR: Module verification failed after manual transform cleanup!\n", .{});
-            module.op().dump();
-            return error.ModuleVerificationFailed;
-        }
-        std.debug.print("✓ Transform script erased and module verified.\n", .{});
-        
-        // 3.2: Run the rest of the lowering in a single, final pass manager.
+        // === STAGE 3: GPU Dialect Conversion and Final Lowering ===
         {
             var pm = try mlir.PassManager.init(self.getContext());
             defer pm.deinit();
             const opm = pm.asOpPassManager();
 
-            // Bufferize the tiled computation.
+            // 3.1: Manually clean up the transform script operations.
+            std.debug.print("\n--- Stage 3.1: Manually Cleaning Up Transform Script ---\n", .{});
+            const module_body = module.op().getRegion(0).getBlock(0);
+            var maybe_op = module_body.getFirstOp();
+            while (maybe_op) |op| {
+                const next_op = op.getNext();
+                const op_name_id = c.operationGetName(op.handle);
+                const op_name_ref = c.identifierStr(op_name_id);
+                const op_name = c.fromStringRef(op_name_ref);
+                if (std.mem.startsWith(u8, op_name, "transform.")) {
+                    c.operationDestroy(op.handle);
+                }
+                maybe_op = next_op;
+            }
+            if (c.operationVerify(module.op().handle).isFailure()) {
+                return error.ModuleVerificationFailed;
+            }
+
+            // 3.2: THE DEFINITIVE FIX: Perform GPU Kernel Outlining.
+            // This is the missing link. It consumes the attributed `scf.forall` and creates
+            // the `gpu.module` and `gpu.launch_func` operations.
+            std.debug.print("\n--- Stage 3.2: GPU Kernel Outlining ---\n", .{});
+            try opm.addPipeline("gpu-kernel-outlining");
+
+            // 3.3: Bufferize the entire module.
+            std.debug.print("\n--- Stage 3.3: Bufferization ---\n", .{});
             try opm.addPipeline("one-shot-bufferize{bufferize-function-boundaries}");
             try opm.addPipeline("buffer-deallocation-pipeline");
-            
-            // Map the scf.forall loops to GPU constructs.
-            try opm.addPipeline("convert-parallel-loops-to-gpu");
 
-            // Lower the remaining ops inside the GPU kernel.
+            // 3.4: Lower the Linalg on memrefs within the GPU kernel to loops.
+            std.debug.print("\n--- Stage 3.4: Linalg -> Loops ---\n", .{});
             try opm.addPipeline("gpu.module(func.func(convert-linalg-to-loops))");
+
+            // 3.5: Final conversion to SPIR-V binary representation.
+            std.debug.print("\n--- Stage 3.5: GPU -> SPIR-V ---\n", .{});
             c.buildAndAppendGpuAndSpirvConversionPipeline(opm.handle);
 
-            std.debug.print("\n--- Running Stage 3.2: Final Lowering (Bufferize -> Map -> SPIR-V) ---\n", .{});
+            std.debug.print("\n--- Running Final Lowering Pass Manager ---\n", .{});
             try pm.runOnOp(module.op());
         }
 

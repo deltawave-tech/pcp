@@ -135,6 +135,10 @@ void mlirForceLoadAllRequiredPasses() {
   std::printf("  - SCF to GPU conversion passes\n");
   mlir::registerConvertParallelLoopToGpuPass();
   
+  // Register GPU passes (for gpu-kernel-outlining and other GPU transformations)
+  std::printf("  - GPU passes (for kernel outlining and transformations)\n");
+  mlir::registerGPUPasses();
+  
   std::printf("C++: ✅ Minimal pass registration completed successfully!\n");
   std::printf("     (Including Transform dialect and production tiling)\n");
 }

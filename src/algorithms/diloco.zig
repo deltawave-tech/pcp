@@ -99,8 +99,11 @@ pub const DiLoCo = struct {
 
         // Set up parameter shape
         std.log.info("DiLoCo.init: Setting up parameter shape...", .{});
-        const parameter_shape = try allocator.alloc(i64, 1);
-        parameter_shape[0] = @intCast(config.param_count);
+        // TEMPORARY: Hardcode shape to 4x4 for the matmul test.
+        const parameter_shape = try allocator.alloc(i64, 2);
+        parameter_shape[0] = 4;
+        parameter_shape[1] = 4;
+        // NOTE: config.param_count is now ignored for this test.
 
         // Create a partial instance to build the worker graph
         std.log.info("DiLoCo.init: Creating partial instance...", .{});
@@ -234,17 +237,19 @@ pub const DiLoCo = struct {
 
     /// Initialize master parameters using MLIR
     fn initializeMasterParameters(self: *Self) !void {
-        std.log.info("🎲 Allocating parameter data array ({} elements)...", .{self.config.param_count});
+        // TEMPORARY: The parameter count for our 4x4 test is 16.
+        const param_element_count = 16;
+        std.log.info("🎲 Allocating parameter data array ({} elements for 4x4 test)...", .{param_element_count});
 
         // Create initial parameter values
-        const param_data = try self.allocator.alloc(f32, self.config.param_count);
+        const param_data = try self.allocator.alloc(f32, param_element_count);
         defer self.allocator.free(param_data);
         std.log.info("✓ Parameter array allocated", .{});
 
         // Initialize with Xavier/Glorot initialization
         std.log.info("🔢 Computing Xavier initialization...", .{});
         var rng = std.Random.DefaultPrng.init(12345);
-        const scale = std.math.sqrt(2.0 / @as(f32, @floatFromInt(self.config.param_count)));
+        const scale = std.math.sqrt(2.0 / @as(f32, @floatFromInt(param_element_count)));
 
         for (param_data) |*param| {
             param.* = rng.random().floatNorm(f32) * scale;
@@ -256,67 +261,51 @@ pub const DiLoCo = struct {
         self.master_parameters = try self.createTensorFromArray(param_data);
         std.log.info("✓ MLIR tensor created successfully", .{});
 
-        std.log.info("✅ Initialized master parameters with {} elements using Xavier initialization", .{self.config.param_count});
+        std.log.info("✅ Initialized master parameters with {} elements using Xavier initialization", .{param_element_count});
     }
 
     /// Create a dedicated forward+loss function that will be differentiated
     /// This is a well-formed func.func operation that autodiff can process
+    /// Now builds a 2D matmul test graph: Y = A @ A, loss = reduce_sum(Y)
     fn buildForwardAndLossFunction(self: *Self, builder: *ops.MLIRBuilder) !mlir.Operation {
-        std.log.info("buildForwardAndLossFunction: Starting...", .{});
-        std.log.info("buildForwardAndLossFunction: builder pointer = {}", .{@intFromPtr(builder)});
-        std.log.info("buildForwardAndLossFunction: builder.ctx handle = {}", .{@intFromPtr(builder.ctx.handle)});
-        std.log.info("buildForwardAndLossFunction: About to call f32Type...", .{});
+        std.log.info("buildForwardAndLossFunction: Building 2D MATMUL test graph...", .{});
         const f32_type = mlir.Type.f32Type(builder.ctx);
-        std.log.info("buildForwardAndLossFunction: f32Type call succeeded", .{});
-        const param_count = self.config.param_count;
 
-        // Define types
-        std.log.info("buildForwardAndLossFunction: Creating tensor types...", .{});
-        const params_type = mlir.Type.rankedTensorType(builder.ctx, &.{@intCast(param_count)}, f32_type);
-        const data_type = mlir.Type.rankedTensorType(builder.ctx, &.{ 4, 12 }, f32_type);
-        const loss_type = mlir.Type.rankedTensorType(builder.ctx, &.{}, f32_type); // Scalar loss
+        // 1. Define types for a 4x4 matrix and a scalar loss.
+        const matrix_type = mlir.Type.rankedTensorType(builder.ctx, &.{4, 4}, f32_type);
+        const loss_type = mlir.Type.rankedTensorType(builder.ctx, &.{}, f32_type); // Scalar is rank 0
 
-        // Define the function type: func(params, inputs, targets) -> (loss)
-        std.log.info("buildForwardAndLossFunction: Creating function type...", .{});
-        const input_types = [_]mlir.Type{ params_type, data_type, data_type };
+        // 2. Define the function type: func(params: tensor<4x4xf32>) -> tensor<f32>
+        //    (We will ignore the dummy data/target inputs from the main graph for this test)
+        const input_types = [_]mlir.Type{ matrix_type, matrix_type, matrix_type }; // Keep signature for now
         const result_types = [_]mlir.Type{loss_type};
         const func_type = mlir.Type.functionType(builder.ctx, &input_types, &result_types);
-        std.log.info("buildForwardAndLossFunction: Function type created", .{});
 
-        // --- REFACTORED CODE ---
-        // Use the new safe helper to create the function and get its entry block
-        std.log.info("buildForwardAndLossFunction: Using safe createFunction helper...", .{});
+        // 3. Create the function and get its entry block.
         const result = try builder.createFunction("forward_and_loss_fn", func_type);
         const func_op = result.func_op;
         const block = result.entry_block;
 
-        // Get block arguments (which are now created for us)
-        const params_arg = block.getArgument(0);
-        const inputs_arg = block.getArgument(1);
-        // const targets_arg = block.getArgument(2); // (unused)
-        std.log.info("buildForwardAndLossFunction: Function created with safe helper", .{});
-        // --- END REFACTORED CODE ---
+        // 4. Get the parameter argument from the block.
+        const params_arg = block.getArgument(0); // This will be our matrix 'A'
 
-        // CRITICAL: Save the original insertion block and set the new one.
+        // 5. Set the insertion point to inside our new function.
         const original_insertion_block = builder.getInsertionBlock();
         builder.setInsertionBlock(block);
         defer builder.setInsertionBlock(original_insertion_block); // Restore on exit
 
-        // Build the forward/loss computation inside this function
-        std.log.info("buildForwardAndLossFunction: Building forward computation in function body...", .{});
-        const param_tensor = try builder.newTensor(params_arg);
-        const input_flat = try ops.reshape(builder, try builder.newTensor(inputs_arg), &.{@intCast(param_count)});
+        // 6. Build the computation: Y = A @ A
+        const params_tensor = try builder.newTensor(params_arg);
+        const matmul_result = try ops.matmul(builder, params_tensor, params_tensor);
 
-        // Simple MSE loss computation
-        const diff = try ops.subtract(builder, param_tensor, input_flat);
-        const squared = try ops.multiply(builder, diff, diff);
-        const loss = try ops.reduceSum(builder, squared, &.{0});
+        // 7. Compute a scalar "loss": reduce_sum(Y)
+        //    The dimension to reduce is {0, 1} for a 2D tensor to get a scalar.
+        const loss = try ops.reduceSum(builder, matmul_result, &.{0, 1});
 
-        // Return the loss
-        std.log.info("buildForwardAndLossFunction: Adding func.return terminator...", .{});
+        // 8. Return the scalar loss.
         _ = try builder.createAndAttach("func.return", &.{loss.value}, &.{});
-        std.log.info("buildForwardAndLossFunction: func.return terminator added", .{});
 
+        std.log.info("buildForwardAndLossFunction: 2D MATMUL test graph built successfully.", .{});
         return func_op;
     }
 

@@ -104,7 +104,7 @@ pub const MLIRContext = struct {
             // Step 2d: Run a canonicalizer pass to clean up the IR after padding.
             ++ "canonicalize,"
             // Step 2e: The actual tiling pass, now operating on padded, canonical IR.
-            ++ "linalg-tile{tile-sizes=32,32,32}" // Note: Matmul needs 3 tile sizes (M, N, K)
+            ++ "linalg-tile{tile-sizes=32}" // Tile only the outermost loop. This is robust for 1D/2D/3D ops.
             ++ ")"
         );
         std.debug.print("✓ Stage 2: Tiling on Tensors (with padding) completed\n", .{});

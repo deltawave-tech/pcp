@@ -25,7 +25,9 @@ pub const MLIRContext = struct {
     allocator: Allocator,
     context: *c.MlirContext,
     registry: *c.MlirDialectRegistry,
-    pass_manager: mlir.PassManager,
+    
+    // --- REMOVED ---
+    // pass_manager: mlir.PassManager, // <-- This field is the source of the state bug. Remove it.
     
     const Self = @This();
     
@@ -104,22 +106,19 @@ pub const MLIRContext = struct {
         }
         std.debug.print("✓ Dialects registered successfully.\n", .{});
         
-        // 2. INITIALIZE EMPTY PASS MANAGER (Dynamic pipeline construction)
-        // The pipeline will be built just-in-time in lowerToSPIRV()
-        std.debug.print("Initializing empty pass manager for dynamic pipeline construction...\n", .{});
-        const pass_manager = try mlir.PassManager.init(mlir.Context{ .handle = context });
-        std.debug.print("✓ Empty pass manager initialized successfully\n", .{});
+        // --- REMOVED ---
+        // const pass_manager = try mlir.PassManager.init(...); // <-- Remove this.
         
         return Self{
             .allocator = allocator,
             .context = context,
             .registry = registry,
-            .pass_manager = pass_manager,
+            // pass_manager = pass_manager, // <-- Remove this.
         };
     }
     
     pub fn deinit(self: *Self) void {
-        self.pass_manager.deinit();
+        // self.pass_manager.deinit(); // <-- Remove this.
         c.dialectRegistryDestroy(self.registry);
         c.contextDestroy(self.context);
     }
@@ -178,16 +177,45 @@ pub const MLIRContext = struct {
             std.debug.print("Running tiling and legalization passes...\n", .{});
             try tiling_pm.runOnOp(module.op());
             std.debug.print("✓ Tiling and legalization complete.\n", .{});
-            
-            std.debug.print("--- Module AFTER Tiling ---\n", .{});
+        } // `tiling_pm` is destroyed here.
+
+        // --- THE FINAL FIX: CLEAN UP THE MODULE ---
+        std.debug.print("--- Cleaning up transform script from module IR ---\n", .{});
+        const module_body = module.op().getRegion(0).getBlock(0);
+        var maybe_op = module_body.getFirstOp();
+        while (maybe_op) |op| {
+            const next_op = op.getNext(); // Get next op BEFORE potentially destroying current one
+            const op_name_id = c.operationGetName(op.handle);
+            const op_name_ref = c.identifierStr(op_name_id);
+            const op_name = c.fromStringRef(op_name_ref);
+            if (std.mem.startsWith(u8, op_name, "transform.")) {
+                std.debug.print("Destroying op: {s}\n", .{op_name});
+                c.operationDestroy(op.handle);
+            }
+            maybe_op = next_op;
+        }
+        std.debug.print("✓ Transform script removed.\n", .{});
+
+        // Optional but recommended: Verify the module is still valid after our manual changes.
+        if (c.operationVerify(module.op().handle).isFailure()) {
+            std.debug.print("ERROR: Module verification failed after transform script removal!\n", .{});
             module.op().dump();
-        } // `tiling_pm` is destroyed here, ensuring clean state.
+            return error.ModuleVerificationFailed;
+        }
 
-        // === STEP C: Run the REST of the pipeline in the main Pass Manager ===
-        std.debug.print("--- Building main lowering pipeline for bufferization and GPU conversion ---\n", .{});
-        const main_opm = self.pass_manager.asOpPassManager();
+        std.debug.print("--- Module AFTER Tiling & Cleanup ---\n", .{});
+        module.op().dump();
+        // --- END OF FIX ---
 
-        // The IR is already tiled, so we start with bufferization.
+        // === STEP C: Run the REST of the pipeline in a NEW, FRESH Pass Manager ===
+        std.debug.print("--- Creating FRESH pass manager for bufferization and GPU conversion ---\n", .{});
+        
+        // --- THE FINAL FIX ---
+        var main_pm = try mlir.PassManager.init(self.getContext());
+        defer main_pm.deinit(); // Ensure this new pass manager is cleaned up.
+        
+        const main_opm = main_pm.asOpPassManager();
+
         try main_opm.addPipeline("linalg-bufferize");
         std.debug.print("✓ Stage 3: linalg-bufferize\n", .{});
 
@@ -201,8 +229,9 @@ pub const MLIRContext = struct {
         std.debug.print("✓ Stage 6: Final Cleanup\n", .{});
 
         std.debug.print("Running main lowering passes...\n", .{});
-        try self.pass_manager.runOnOp(module.op());
-
+        try main_pm.runOnOp(module.op());
+        // --- END OF FIX ---
+        
         std.debug.print("--- Module AFTER Final Lowering ---\n", .{});
         module.op().dump();
         std.debug.print("✅ Full pipeline executed successfully!\n", .{});

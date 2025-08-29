@@ -76,11 +76,14 @@ pub const c = struct {
     // Operation operations
     pub const MlirIdentifier = opaque {};
     extern fn mlirOperationCreate(state: *MlirOperationState) *MlirOperation;
-    extern fn mlirOperationDestroy(op: *MlirOperation) void;
+    // ENSURE THIS EXTERN IS PRESENT AND PUBLIC
+    pub extern fn mlirOperationDestroy(op: *MlirOperation) void;
     extern fn mlirOperationClone(op: *MlirOperation) *MlirOperation;
     pub extern fn mlirOperationPrint(op: *MlirOperation, callback: *const fn ([*]const u8, usize, ?*anyopaque) callconv(.C) void, userData: ?*anyopaque) void;
     extern fn mlirOperationDump(op: *MlirOperation) void;
     extern fn mlirOperationGetResult(op: *MlirOperation, pos: isize) *MlirValue;
+    // ADD THIS NEW EXTERN
+    pub extern fn mlirOperationVerify(op: *MlirOperation) MlirLogicalResult;
     pub extern fn mlirOperationGetOperand(op: *MlirOperation, pos: isize) *MlirValue;
     pub extern fn mlirOperationGetName(op: *MlirOperation) *MlirIdentifier;
     pub extern fn mlirIdentifierStr(identifier: *MlirIdentifier) MlirStringRef;
@@ -499,8 +502,14 @@ pub const c = struct {
         return mlirOperationGetResult(op, pos);
     }
 
+    // ENSURE THIS WRAPPER IS PRESENT
     pub fn operationDestroy(op: *MlirOperation) void {
         mlirOperationDestroy(op);
+    }
+    
+    // ADD THIS NEW WRAPPER
+    pub fn operationVerify(op: *MlirOperation) MlirLogicalResult {
+        return mlirOperationVerify(op);
     }
 
     pub fn operationClone(op: *MlirOperation) *MlirOperation {

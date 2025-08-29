@@ -7,19 +7,22 @@ const Allocator = std.mem.Allocator;
 const TILING_TRANSFORM_SCRIPT =
     \\module attributes { transform.with_named_sequence } {
     \\  transform.named_sequence @__transform_main(%arg0: !transform.any_op) {
-    \\    // Step 1: Find all linalg.generic ops.
+    \\    // Step 1: Find all linalg.generic ops. (This is correct)
     \\    %matmul = transform.structured.match ops{["linalg.generic"]} in %arg0 : (!transform.any_op) -> !transform.any_op
     \\
-    \\    // Step 2: Tile the matmul into scf.forall loops.
+    \\    // Step 2: Tile the matmul and get a handle to the new forall loops.
     \\    %tiled_op, %forall_loops = transform.structured.tile_using_forall %matmul tile_sizes [32, 32, 32]
     \\        : (!transform.any_op) -> (!transform.any_op, !transform.any_op)
     \\
-    \\    // Step 3: Map the forall loops to GPU blocks using chained handles.
+    \\    // --- THE FINAL FIX ---
+    \\    // Step 3: Map the forall loops to GPU blocks USING THE CHAINED HANDLE.
+    \\    // Do NOT re-match. Use the `%forall_loops` handle directly from the previous step.
     \\    %gpu_launch = transform.gpu.map_forall_to_blocks %forall_loops generate_gpu_launch grid_dims = [4, 8, 1]
     \\        : (!transform.any_op) -> !transform.any_op
     \\
-    \\    // Step 4: Map nested forall loops to GPU threads.
-    \\    %final_launch = transform.gpu.map_nested_forall_to_threads %gpu_launch block_dims = [32, 32, 1]
+    \\    // Step 4: Map the nested loops within the new launch op to GPU threads.
+    \\    // The handle `%gpu_launch` is correctly chained here.
+    \\    transform.gpu.map_nested_forall_to_threads %gpu_launch block_dims = [32, 32, 1]
     \\        : (!transform.any_op) -> !transform.any_op
     \\
     \\    transform.yield

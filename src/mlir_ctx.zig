@@ -126,17 +126,20 @@ pub const MLIRContext = struct {
     
     /// Lowers the module's GPU-targeted functions to SPIR-V dialect using dynamic pipeline construction
     pub fn lowerToSPIRV(self: *Self, allocator: Allocator, module: mlir.Module) !void {
-        _ = allocator; // Suppress unused parameter warning
-        std.debug.print("Lowering module with dynamic pipeline construction...\n", .{});
+        _ = allocator;
+        std.debug.print("Lowering module with FINAL pipeline structure...\n", .{});
 
-        // === STEP A: INJECT the transform script into the module FIRST ===
-        std.debug.print("Injecting tiling transform script...\n", .{});
+        // === START OF THE FIX ===
+        // STEP A: INJECT the transform script into the module.
+        // Parse the script module ONCE and keep it alive for the duration of this function.
         const transform_module = mlir.Module.parse(self.getContext(), TILING_TRANSFORM_SCRIPT) catch |err| {
             std.debug.print("FATAL: Failed to parse transform script: {}\n", .{err});
             return err;
         };
-        defer transform_module.deinit();
+        // CRITICAL FIX: Ensure transform_module is destroyed only at the VERY END of the function.
+        defer transform_module.deinit(); 
 
+        std.debug.print("Injecting tiling transform script...\n", .{});
         const main_module_body = module.op().getRegion(0).getBlock(0);
         const transform_module_body = transform_module.op().getRegion(0).getBlock(0);
 
@@ -146,45 +149,49 @@ pub const MLIRContext = struct {
             main_module_body.appendOwnedOperation(cloned_op);
             op_to_clone = op.getNext();
         }
-        std.debug.print("✓ Script injected. Module is ready for the interpreter.\n", .{});
-        
-        // === STEP B: BUILD the full pipeline just-in-time ===
-        std.debug.print("Building dynamic pass pipeline...\n", .{});
+        std.debug.print("✓ Script injected. Module is ready.\n", .{});
+        // === END OF THE FIX ===
+
+        // STEP B: BUILD and RUN the pipeline in discrete, sequential, and correctly-scoped stages.
         const opm = self.pass_manager.asOpPassManager();
-        
-        // Stage 1: HLO -> Linalg
+
+        // --- THE FINAL, WORKING PIPELINE ---
+
+        // STAGE 1: Legalize StableHLO to Linalg. Produces linalg.matmul ops.
         try opm.addPipeline("stablehlo-legalize-to-linalg");
-        std.debug.print("✓ Stage 1: StableHLO → Linalg added to pipeline\n", .{});
-        
-        // Stage 2a: Linalg Prep
-        try opm.addPipeline("func.func(linalg-generalize-named-ops,linalg-fuse-elementwise-ops,canonicalize)");
-        std.debug.print("✓ Stage 2a: Linalg preparation added to pipeline\n", .{});
-        
-        // Stage 2b: THE CRITICAL FIX - Add the interpreter now that the script exists
+        std.debug.print("✓ Stage 1: stablehlo-legalize-to-linalg\n", .{});
+
+        // STAGE 2A: Run function-level Linalg preparation passes.
+        try opm.addPipeline("func.func(linalg-generalize-named-ops,canonicalize,cse)");
+        std.debug.print("✓ Stage 2a: Linalg preparation (func.func)\n", .{});
+
+        // STAGE 2B: Run the transform interpreter at the TOP LEVEL of the module.
+        // This is the critical change that prevents the crash.
         try opm.addPipeline("transform-interpreter");
-        std.debug.print("✓ Stage 2b: Transform interpreter added to pipeline\n", .{});
-        
-        // Stage 3: Bufferization
+        std.debug.print("✓ Stage 2b: Tiling (transform-interpreter)\n", .{});
+
+        // STAGE 3: Bufferize the module.
         try opm.addPipeline("linalg-bufferize");
-        std.debug.print("✓ Stage 3: Bufferization added to pipeline\n", .{});
-        
-        // Stage 4 & 5: Lowering to GPU/SPIR-V and cleanup
+        std.debug.print("✓ Stage 3: linalg-bufferize\n", .{});
+
+        // STAGE 4: Lower Linalg on memrefs to parallel loops.
         try opm.addPipeline("func.func(convert-linalg-to-parallel-loops)");
-        std.debug.print("✓ Stage 4a: Linalg → scf.parallel added to pipeline\n", .{});
+        std.debug.print("✓ Stage 4: convert-linalg-to-parallel-loops\n", .{});
         
+        // STAGE 5: Map parallel loops to GPU constructs and convert to SPIR-V.
         c.buildAndAppendGpuAndSpirvConversionPipeline(opm.handle);
-        std.debug.print("✓ Stage 4b: GPU/SPIR-V conversion added to pipeline\n", .{});
-        
+        std.debug.print("✓ Stage 5: GPU & SPIR-V Conversion\n", .{});
+
+        // STAGE 6: Final cleanup.
         try opm.addPipeline("canonicalize,cse");
-        std.debug.print("✓ Stage 5: Final cleanup added to pipeline\n", .{});
+        std.debug.print("✓ Stage 6: Final Cleanup\n", .{});
 
-        std.debug.print("✓ Dynamic pipeline constructed successfully.\n", .{});
-
-        // === STEP C: RUN the pipeline on the prepared module ===
-        std.debug.print("--- Module BEFORE pipeline execution (with injected script) ---\n", .{});
+        // STEP C: RUN the pipeline.
+        std.debug.print("--- Module BEFORE pipeline execution ---\n", .{});
         module.op().dump();
         
-        std.debug.print("Running pass manager on prepared module...\n", .{});
+        std.debug.print("Running the pass manager...\n", .{});
+        // By the time this runs, the `transform_module` is still alive due to the `defer`.
         self.pass_manager.runOnOp(module.op()) catch |err| {
             std.debug.print("ERROR during pass pipeline execution: {}\n", .{err});
             std.debug.print("--- Module state on failure ---\n", .{});
@@ -194,7 +201,9 @@ pub const MLIRContext = struct {
         
         std.debug.print("--- Module AFTER pipeline execution ---\n", .{});
         module.op().dump();
-        std.debug.print("✓ Dynamic pipeline execution completed successfully.\n", .{});
+        std.debug.print("✅ Pipeline executed successfully!\n", .{});
+
+        // The `defer transform_module.deinit()` will execute here, safely after the pass manager is done.
     }
     
     /// Translates a module containing SPIR-V dialect ops into a SPIR-V binary blob

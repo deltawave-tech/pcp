@@ -198,6 +198,8 @@ pub const c = struct {
     extern fn mlirGetDialectHandle__gpu__() MlirDialectHandle;
     extern fn mlirGetDialectHandle__spirv__() MlirDialectHandle;
     extern fn mlirGetDialectHandle__scf__() MlirDialectHandle;
+    // ADD THIS LINE for the Async dialect
+    extern fn mlirGetDialectHandle__async__() MlirDialectHandle;
     // StableHLO dialect registration - NOW ENABLED!
     extern fn mlirGetDialectHandle__stablehlo__() MlirDialectHandle;
     extern fn mlirGetDialectHandle__chlo__() MlirDialectHandle;
@@ -353,6 +355,11 @@ pub const c = struct {
 
     pub fn getDialectHandleSCF() MlirDialectHandle {
         return mlirGetDialectHandle__scf__();
+    }
+
+    // ADD THIS WRAPPER for the Async dialect
+    pub fn getDialectHandleAsync() MlirDialectHandle {
+        return mlirGetDialectHandle__async__();
     }
 
     pub fn getDialectHandleStableHLO() MlirDialectHandle {

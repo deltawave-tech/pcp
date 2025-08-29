@@ -31,6 +31,8 @@ pub const MLIRContext = struct {
         c.dialectHandleInsertDialect(c.getDialectHandleGPU(), registry);
         c.dialectHandleInsertDialect(c.getDialectHandleSPIRV(), registry);
         c.dialectHandleInsertDialect(c.getDialectHandleSCF(), registry);
+        // ADD THE ASYNC DIALECT HANDLE
+        c.dialectHandleInsertDialect(c.getDialectHandleAsync(), registry);
         // StableHLO dialect registration - NOW ENABLED!
         c.dialectHandleInsertDialect(c.getDialectHandleStableHLO(), registry);
         c.dialectHandleInsertDialect(c.getDialectHandleCHLO(), registry);
@@ -50,6 +52,8 @@ pub const MLIRContext = struct {
         _ = c.dialectHandleLoadDialect(c.getDialectHandleGPU(), context);
         _ = c.dialectHandleLoadDialect(c.getDialectHandleSPIRV(), context);
         _ = c.dialectHandleLoadDialect(c.getDialectHandleSCF(), context);
+        // LOAD THE ASYNC DIALECT
+        _ = c.dialectHandleLoadDialect(c.getDialectHandleAsync(), context);
         _ = c.dialectHandleLoadDialect(c.getDialectHandleStableHLO(), context);
         _ = c.dialectHandleLoadDialect(c.getDialectHandleCHLO(), context);
         
@@ -78,43 +82,55 @@ pub const MLIRContext = struct {
         const opm = stablehlo_to_spirv_pm.asOpPassManager();
 
         // COMPLETE StableHLO → SPIR-V Pipeline Implementation
-        std.debug.print("Building COMPLETE StableHLO → SPIR-V pass pipeline...\n", .{});
+        std.debug.print("Building MODERN StableHLO → SPIR-V pass pipeline...\n", .{});
 
-        // Stage 1: Legalize input ops to Linalg on Tensors
+        // Stage 1: Legalize input ops to Linalg on Tensors (Correct)
         try opm.addPipeline("canonicalize,cse,stablehlo-legalize-to-linalg");
         std.debug.print("✓ Stage 1: StableHLO → Linalg on Tensors completed\n", .{});
 
-        // Stage 1.5: Optional but recommended fusion on tensors
-        try opm.addPipeline("linalg-fuse-elementwise-ops");
-        std.debug.print("✓ Stage 1.5: Fusion on tensors completed\n", .{});
+        // --- START: FINAL, ROBUST PIPELINE ---
 
-        // Stage 2: One-Shot Bufferization (Tensor -> MemRef) at the module level.
-        try opm.addPipeline("one-shot-bufferize{allow-unknown-ops dialect-filter=linalg,func,arith}");
-        std.debug.print("✓ Stage 2: Bufferization completed\n", .{});
-
-        // --- START: FINAL CORRECTED STAGE 3 ---
-        // The key is to run tiling *after* generalization but *before* parallel loop conversion.
-        // This new pipeline does the following in sequence for each function:
-        // 1. linalg-generalize-named-ops: Converts linalg.matmul -> linalg.generic.
-        // 2. test-linalg-transform-patterns: Takes the linalg.generic and creates tiled loops around it.
-        // 3. convert-linalg-to-parallel-loops: Now sees the loops and converts them to `scf.parallel`.
+        // Stage 2: Prepare for and execute Tiling on Tensors.
         try opm.addPipeline(
-            "func.func(linalg-generalize-named-ops,"
-            ++ "test-linalg-transform-patterns,"
-            ++ "convert-linalg-to-parallel-loops)"
+            "func.func("
+            // Step 2a: Generalize named ops (e.g., linalg.matmul) to linalg.generic.
+            ++ "linalg-generalize-named-ops,"
+            // Step 2b: Fuse elementwise ops into their producers for better tiling.
+            ++ "linalg-fuse-elementwise-ops,"
+            // Step 2c: **CRITICAL FIX**: Introduce padding. This pass finds Linalg ops
+            // that will be tiled and pads their tensor operands so the dimensions are
+            // divisible by the tile sizes. This prevents the `linalg-tile` crash.
+            ++ "linalg-generalize-pad-tensor,"
+            // Step 2d: Run a canonicalizer pass to clean up the IR after padding.
+            ++ "canonicalize,"
+            // Step 2e: The actual tiling pass, now operating on padded, canonical IR.
+            ++ "linalg-tile{tile-sizes=32,32,32}" // Note: Matmul needs 3 tile sizes (M, N, K)
+            ++ ")"
         );
-        std.debug.print("✓ Stage 3: Linalg tiling and conversion to parallel loops completed\n", .{});
-        // --- END: FINAL CORRECTED STAGE 3 ---
+        std.debug.print("✓ Stage 2: Tiling on Tensors (with padding) completed\n", .{});
 
-        // Stage 4: Map parallel loops to GPU kernels and convert to SPIR-V.
-        // This C++ bridge function should now receive the `scf.parallel` operations it expects.
+        // Stage 3: Comprehensive Bufferization (Correct)
+        try opm.addPipeline(
+            "func-bufferize,"
+            ++ "arith-bufferize,"
+            ++ "linalg-comprehensive-module-bufferize"
+        );
+        std.debug.print("✓ Stage 3: Comprehensive Bufferization completed\n", .{});
+
+        // Stage 4: Convert to parallel loops (Correct)
+        try opm.addPipeline("func.func(convert-linalg-to-parallel-loops)");
+        std.debug.print("✓ Stage 4: Conversion to scf.parallel completed\n", .{});
+
+        // --- END: FINAL, ROBUST PIPELINE ---
+
+        // Stage 5: GPU Mapping and SPIR-V Conversion (Correct)
         std.debug.print("Adding canonical GPU and SPIR-V conversion pipeline...\n", .{});
         c.buildAndAppendGpuAndSpirvConversionPipeline(opm.handle);
-        std.debug.print("✓ Stage 4: GPU mapping and SPIR-V conversion pipeline appended\n", .{});
+        std.debug.print("✓ Stage 5: GPU mapping and SPIR-V conversion pipeline appended\n", .{});
 
-        // Stage 5: Final cleanup
+        // Stage 6: Final cleanup (Correct)
         try opm.addPipeline("canonicalize,cse");
-        std.debug.print("✓ Stage 5: Final cleanup completed\n", .{});
+        std.debug.print("✓ Stage 6: Final cleanup completed\n", .{});
 
         std.debug.print("🚀 COMPLETE StableHLO → GPU → SPIR-V pipeline built successfully!\n", .{});
 

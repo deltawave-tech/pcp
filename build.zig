@@ -1178,6 +1178,8 @@ pub fn build(b: *std.Build) void {
         m3_pipeline_test.linkSystemLibrary("MLIRLinalgDialect");
         m3_pipeline_test.linkSystemLibrary("MLIRSCFDialect");
         m3_pipeline_test.linkSystemLibrary("MLIRGPUDialect");
+        m3_pipeline_test.linkSystemLibrary("MLIRAsyncDialect");
+        m3_pipeline_test.linkSystemLibrary("MLIRCAPIAsync");
         
         // FIX: Add the missing dialect extension libraries for BufferizableOpInterface
         m3_pipeline_test.linkSystemLibrary("MLIRFuncAllExtensions");

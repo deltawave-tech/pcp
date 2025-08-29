@@ -6,6 +6,7 @@
 // Minimal registration approach - include only specific passes we need
 #include "mlir/Dialect/Linalg/Passes.h"
 #include "mlir/Dialect/Bufferization/Transforms/Passes.h"
+#include "mlir/Dialect/Async/Passes.h"
 #include "mlir/Conversion/SCFToControlFlow/SCFToControlFlow.h"
 #include "mlir/Conversion/GPUToSPIRV/GPUToSPIRVPass.h"
 // LinalgToLoops is actually in Linalg dialect passes
@@ -87,6 +88,10 @@ void mlirForceLoadAllRequiredPasses() {
   mlir::test::registerTestLinalgTransforms();
   
   // Production linalg-tile should be included in registerLinalgPasses()
+  
+  // Register Async passes (needed for linalg-tile runtime infrastructure)
+  std::printf("  - Async passes (for tiling runtime infrastructure)\n");
+  mlir::registerAsyncPasses();
   
   // Register specific passes for our pipeline instead of bulk GPU/SCF registration
   std::printf("  - Specific conversion passes for our pipeline\n");

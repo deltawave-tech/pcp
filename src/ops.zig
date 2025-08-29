@@ -310,8 +310,8 @@ pub fn add(builder: *MLIRBuilder, a: Tensor, b: Tensor) !Tensor {
     // Use StableHLO dialect wrapper for clean operation creation
     const operation = hlo.add(builder.ctx, b_tensors[0].value, b_tensors[1].value, builder.loc);
 
-    // Return result as new tensor
-    return try builder.newTensor(operation.getResult(0));
+    // MUST use the helper that appends the operation
+    return try builder.createAndAppendOp(operation);
 }
 
 /// Subtract two tensors element-wise using stablehlo.subtract with broadcasting support
@@ -321,8 +321,8 @@ pub fn subtract(builder: *MLIRBuilder, a: Tensor, b: Tensor) !Tensor {
     // Use StableHLO dialect wrapper for clean operation creation
     const operation = hlo.subtract(builder.ctx, b_tensors[0].value, b_tensors[1].value, builder.loc);
 
-    // Return result as new tensor
-    return try builder.newTensor(operation.getResult(0));
+    // MUST use the helper that appends the operation
+    return try builder.createAndAppendOp(operation);
 }
 
 /// Multiply two tensors element-wise using stablehlo.multiply with broadcasting support
@@ -452,7 +452,8 @@ pub fn transpose(builder: *MLIRBuilder, a: Tensor, permutation: []const i64) !Te
     // Use StableHLO dialect wrapper
     const operation = hlo.transpose(builder.ctx, a.value, permutation, builder.loc);
 
-    return try builder.newTensor(operation.getResult(0));
+    // MUST use the helper that appends the operation
+    return try builder.createAndAppendOp(operation);
 }
 
 /// Reshape a tensor using stablehlo.reshape
@@ -460,7 +461,8 @@ pub fn reshape(builder: *MLIRBuilder, a: Tensor, new_shape: []const i64) !Tensor
     // Use StableHLO dialect wrapper
     const operation = hlo.reshape(builder.ctx, a.value, new_shape, builder.loc);
 
-    return try builder.newTensor(operation.getResult(0));
+    // MUST use the helper that appends the operation
+    return try builder.createAndAppendOp(operation);
 }
 
 /// Element-wise maximum operation
@@ -470,7 +472,8 @@ pub fn maximum(builder: *MLIRBuilder, a: Tensor, b: Tensor) !Tensor {
     // Use StableHLO dialect wrapper
     const operation = hlo.maximum(builder.ctx, b_tensors[0].value, b_tensors[1].value, builder.loc);
 
-    return try builder.newTensor(operation.getResult(0));
+    // MUST use the helper that appends the operation
+    return try builder.createAndAppendOp(operation);
 }
 
 /// Element-wise minimum operation
@@ -480,7 +483,8 @@ pub fn minimum(builder: *MLIRBuilder, a: Tensor, b: Tensor) !Tensor {
     // Use StableHLO dialect wrapper
     const operation = hlo.minimum(builder.ctx, b_tensors[0].value, b_tensors[1].value, builder.loc);
 
-    return try builder.newTensor(operation.getResult(0));
+    // MUST use the helper that appends the operation
+    return try builder.createAndAppendOp(operation);
 }
 
 /// Element-wise negation
@@ -488,7 +492,8 @@ pub fn negate(builder: *MLIRBuilder, a: Tensor) !Tensor {
     // Use StableHLO dialect wrapper
     const operation = hlo.negate(builder.ctx, a.value, builder.loc);
 
-    return try builder.newTensor(operation.getResult(0));
+    // MUST use the helper that appends the operation
+    return try builder.createAndAppendOp(operation);
 }
 
 /// Softmax operation

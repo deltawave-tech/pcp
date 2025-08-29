@@ -162,6 +162,10 @@ pub const c = struct {
     pub extern fn mlirDenseI64ArrayGet(ctx: *MlirContext, size: isize, values: [*]const i64) *MlirAttribute;
     extern fn mlirAttributeIsAString(attr: *MlirAttribute) bool;
     extern fn mlirStringAttrGet(ctx: *MlirContext, str: MlirStringRef) *MlirAttribute;
+    
+    // --- ADD THESE TWO NEW EXTERNS ---
+    pub extern fn mlirUnitAttrGet(ctx: *MlirContext) *MlirAttribute;
+    pub extern fn mlirOperationSetAttributeByName(op: *MlirOperation, name: MlirStringRef, attr: *MlirAttribute) void;
     // Functions to extract data from dense elements attributes
     pub extern fn mlirDenseElementsAttrGetRawData(attr: *MlirAttribute) *const anyopaque;
     // pub extern fn mlirDenseElementsAttrGetNumElements(attr: *MlirAttribute) isize; // Not available in current MLIR build
@@ -742,5 +746,14 @@ pub const c = struct {
 
     pub fn stringAttrGet(ctx: *MlirContext, str: []const u8) *MlirAttribute {
         return mlirStringAttrGet(ctx, stringRefFromString(str));
+    }
+
+    // --- ADD THESE TWO NEW WRAPPERS ---
+    pub fn unitAttrGet(ctx: *MlirContext) *MlirAttribute {
+        return mlirUnitAttrGet(ctx);
+    }
+    
+    pub fn operationSetAttributeByName(op: *MlirOperation, name: []const u8, attr: *MlirAttribute) void {
+        mlirOperationSetAttributeByName(op, stringRefFromString(name), attr);
     }
 };

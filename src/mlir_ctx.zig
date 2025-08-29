@@ -7,14 +7,14 @@ const Allocator = std.mem.Allocator;
 const TILING_TRANSFORM_SCRIPT =
     \\module attributes { transform.with_named_sequence } {
     \\  transform.named_sequence @__transform_main(%arg0: !transform.any_op) {
-    \\    // Step 1: Find all linalg.matmul operations.
-    \\    %matmul = transform.structured.match ops{["linalg.matmul"]} in %arg0 : (!transform.any_op) -> !transform.any_op
+    \\    // Step 1: Find all linalg.generic operations with matrix multiplication semantics
+    \\    %matmul = transform.structured.match ops{["linalg.generic"]} in %arg0 : (!transform.any_op) -> !transform.any_op
     \\
-    \\    // Step 2: Tile the matched matmul operation.
+    \\    // Step 2: Tile the matched generic operations using forall loops
     \\    %tiled_op, %forall_loops = transform.structured.tile_using_forall %matmul tile_sizes [32, 32, 32]
     \\        : (!transform.any_op) -> (!transform.any_op, !transform.any_op)
     \\
-    \\    // Return the result of the transformation.
+    \\    // Return the result of the transformation
     \\    transform.yield
     \\  }
     \\}
@@ -207,34 +207,42 @@ pub const MLIRContext = struct {
         module.op().dump();
         // --- END OF FIX ---
 
-        // === STEP D: Run the REST of the pipeline in a NEW, FRESH Pass Manager ===
-        std.debug.print("--- Creating FRESH pass manager for bufferization and GPU conversion ---\n", .{});
+        // === STEP D: Run the REST of the pipeline with the FINAL, CORRECTED sequence ===
+        std.debug.print("--- Building final, canonical lowering pipeline ---\n", .{});
         
-        // --- THE FINAL ARCHITECTURAL FIX ---
         var main_pm = try mlir.PassManager.init(self.getContext());
-        defer main_pm.deinit(); // Ensure this new pass manager is also cleaned up locally.
+        defer main_pm.deinit();
         
         const main_opm = main_pm.asOpPassManager();
 
-        // Use the correct bufferization pass names discovered by the team.
-        try main_opm.addPipeline("one-shot-bufferize");
+        // --- THE FINAL, CANONICAL PIPELINE ---
+
+        // STAGE 3: Bufferization (Tensor -> MemRef). This is correct.
+        try main_opm.addPipeline("one-shot-bufferize{bufferize-function-boundaries}");
         try main_opm.addPipeline("buffer-deallocation-pipeline");
-        std.debug.print("✓ Stage 3: Bufferization passes added\n", .{});
+        std.debug.print("✓ Stage 3: Bufferization Pipeline\n", .{});
 
-        // NOTE: `convert-bufferization-to-memref` is often part of bufferization pipelines
-        // but can sometimes cause issues. We'll proceed to Linalg on loops.
-        // The `one-shot-bufferize` should have already produced memrefs.
-        
-        try main_opm.addPipeline("func.func(convert-linalg-to-parallel-loops)");
-        std.debug.print("✓ Stage 4: convert-linalg-to-parallel-loops added\n", .{});
-        
+        // STAGE 4: Convert Linalg on MemRefs to standard SCF loops.
+        // This will handle the tiled linalg.generic ops inside the scf.forall.
+        try main_opm.addPipeline("func.func(convert-linalg-to-loops)");
+        std.debug.print("✓ Stage 4: Linalg -> SCF Loops\n", .{});
+
+        // STAGE 5: Convert the parallel `scf.forall` loops directly to GPU kernels.
+        // This is the key pass that creates the gpu.launch_func operations.
+        try main_opm.addPipeline("convert-parallel-loops-to-gpu");
+        std.debug.print("✓ Stage 5: Parallel Loops -> GPU Kernels\n", .{});
+
+        // STAGE 6: Lower the newly created GPU modules to SPIR-V.
         c.buildAndAppendGpuAndSpirvConversionPipeline(main_opm.handle);
-        std.debug.print("✓ Stage 5: GPU & SPIR-V Conversion added\n", .{});
+        std.debug.print("✓ Stage 6: GPU Dialect -> SPIR-V Conversion\n", .{});
 
+        // STAGE 7: Final cleanup.
         try main_opm.addPipeline("canonicalize,cse");
-        std.debug.print("✓ Stage 6: Final Cleanup added\n", .{});
+        std.debug.print("✓ Stage 7: Final Cleanup\n", .{});
 
-        std.debug.print("Running main lowering passes...\n", .{});
+        // --- END OF PIPELINE ---
+        
+        std.debug.print("Running final lowering passes...\n", .{});
         try main_pm.runOnOp(module.op());
         // --- END OF FIX ---
         

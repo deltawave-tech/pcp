@@ -21,7 +21,12 @@
 #include "mlir/Dialect/Linalg/Transforms/BufferizableOpInterfaceImpl.h"
 #include "mlir/Dialect/Bufferization/Transforms/FuncBufferizableOpInterfaceImpl.h"
 #include "mlir/Dialect/Arith/Transforms/BufferizableOpInterfaceImpl.h"
+#include "mlir/Dialect/SCF/Transforms/BufferizableOpInterfaceImpl.h"
+#include "mlir/Dialect/SCF/Transforms/BufferDeallocationOpInterfaceImpl.h"
 #include "mlir/IR/DialectRegistry.h"
+
+// Add TilingInterface registration
+#include "mlir/Dialect/Linalg/Transforms/TilingInterfaceImpl.h"
 
 // Add bufferization pipelines header
 #include "mlir/Dialect/Bufferization/Pipelines/Passes.h"
@@ -40,6 +45,10 @@
 #include "mlir/Dialect/Transform/Transforms/Passes.h"
 #include "mlir/Dialect/Linalg/TransformOps/LinalgTransformOps.h"
 #include "mlir/Dialect/Linalg/TransformOps/DialectExtension.h"
+
+// Add SCF to GPU conversion headers
+#include "mlir/Conversion/SCFToGPU/SCFToGPUPass.h"
+#include "mlir/Conversion/Passes.h"
 
 // Production tiling should be included in standard Linalg passes
 
@@ -117,6 +126,14 @@ void mlirForceLoadAllRequiredPasses() {
   std::printf("  - Linalg Transform dialect extensions\n");
   mlir::linalg::registerTransformDialectExtension(registry);
   
+  // Register TilingInterface implementations for Linalg operations
+  std::printf("  - Linalg TilingInterface implementations\n");
+  mlir::linalg::registerTilingInterfaceExternalModels(registry);
+  
+  // Register SCF to GPU conversion passes
+  std::printf("  - SCF to GPU conversion passes\n");
+  mlir::registerConvertParallelLoopToGpuPass();
+  
   std::printf("C++: ✅ Minimal pass registration completed successfully!\n");
   std::printf("     (Including Transform dialect and production tiling)\n");
 }
@@ -130,15 +147,13 @@ void mlirBuildAndAppendGpuAndSpirvConversionPipeline(MlirOpPassManager passManag
     // Convert C API handle to C++ PassManager using correct unwrap from CAPI
     mlir::OpPassManager *opm = unwrap(passManager);
     
-    // NOTE: Bufferization, tiling, and linalg-to-parallel-loops are now handled in Zig code
-    // This function handles: parallel loops → GPU mapping → SPIR-V conversion
+    // NOTE: Bufferization, tiling, and parallel-to-GPU conversion are now handled in Zig code
+    // This function handles: GPU dialect → SPIR-V conversion
     
-    std::printf("  - Parallel loops should now be present from Zig pipeline\n");
+    std::printf("  - GPU kernels should now be present from Zig pipeline\n");
+    
+    // Create function PM for function-level passes
     auto &funcPM = opm->nest<mlir::func::FuncOp>();
-    
-    // Add GPU mapping passes - function level passes
-    std::printf("  - Adding GPU map parallel loops pass (func level)\n");
-    funcPM.addPass(mlir::createGpuMapParallelLoopsPass());
     
     // GPU kernel outlining - module level pass (creates gpu.module ops)
     std::printf("  - Adding GPU kernel outlining pass\n");
@@ -181,6 +196,12 @@ void mlirRegisterBufferizationInterfaces(MlirDialectRegistry registryHandle) {
   std::printf("  - Arith dialect BufferizableOpInterface\n");
   mlir::arith::registerBufferizableOpInterfaceExternalModels(registry);
   
+  std::printf("  - SCF dialect BufferizableOpInterface\n");
+  mlir::scf::registerBufferizableOpInterfaceExternalModels(registry);
+  
+  std::printf("  - SCF dialect BufferDeallocationOpInterface\n");
+  mlir::scf::registerBufferDeallocationOpInterfaceExternalModels(registry);
+  
   std::printf("C++: ✅ BufferizableOpInterface implementations registered\n");
 }
 
@@ -194,6 +215,10 @@ void mlirRegisterTransformExtensions(MlirDialectRegistry registryHandle) {
   // Register Linalg Transform dialect extensions (for transform.structured.* ops)
   std::printf("  - Linalg Transform dialect extensions\n");
   mlir::linalg::registerTransformDialectExtension(registry);
+  
+  // CRITICAL: Register TilingInterface implementations for Linalg operations
+  std::printf("  - Linalg TilingInterface implementations\n");
+  mlir::linalg::registerTilingInterfaceExternalModels(registry);
   
   std::printf("C++: ✅ Transform dialect extensions registered\n");
 }

@@ -284,7 +284,7 @@ fn addMLIRSupport(target: *std.Build.Step.Compile, mlir_config: MLIRConfig) void
 
         // Core Transforms & Conversion
         "MLIRFuncTransforms", "MLIRLinalgTransforms", "MLIRSCFTransforms", "MLIRGPUTransforms", "MLIRSPIRVConversion", "MLIRBufferizationTransforms", "MLIRBufferizationPipelines", "MLIRMemRefTransforms", "MLIRVectorTransforms", "MLIRArithTransforms", "MLIRAsyncTransforms", "MLIRAffineTransforms", "MLIRAsyncToLLVM", "MLIRTensorTransforms", "MLIRTensorTransformOps", "MLIRReconcileUnrealizedCasts",
-        "MLIRSCFToSPIRV", "MLIRSCFToControlFlow", "MLIRFuncToSPIRV", "MLIRMemRefToSPIRV", "MLIRVectorToSPIRV", "MLIRArithToSPIRV",
+        "MLIRSCFToSPIRV", "MLIRSCFToGPU", "MLIRSCFToControlFlow", "MLIRFuncToSPIRV", "MLIRMemRefToSPIRV", "MLIRVectorToSPIRV", "MLIRArithToSPIRV",
         "MLIRLinalgToStandard", "MLIRConvertToLLVMPass", "MLIRFuncToLLVM", "MLIRGPUToLLVMSPV", "MLIRLLVMCommonConversion", "MLIRArithToLLVM", "MLIRComplexToLLVM", "MLIRControlFlowToLLVM", "MLIRIndexToLLVM", "MLIRMathToLLVM", "MLIRMemRefToLLVM", "MLIRUBToLLVM", "MLIRVectorToLLVM", "MLIRAffineToStandard",
 
         // GPU Pipeline Passes & Utilities

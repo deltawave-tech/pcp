@@ -7,14 +7,24 @@ const Allocator = std.mem.Allocator;
 const TILING_TRANSFORM_SCRIPT =
     \\module attributes { transform.with_named_sequence } {
     \\  transform.named_sequence @__transform_main(%arg0: !transform.any_op) {
-    \\    // Step 1: Find all linalg.generic operations with matrix multiplication semantics
+    \\    // Step 1: Find all linalg.generic ops that are our matmul target.
     \\    %matmul = transform.structured.match ops{["linalg.generic"]} in %arg0 : (!transform.any_op) -> !transform.any_op
     \\
-    \\    // Step 2: Tile the matched generic operations using forall loops
+    \\    // Step 2: Tile the matmul into scf.forall loops.
     \\    %tiled_op, %forall_loops = transform.structured.tile_using_forall %matmul tile_sizes [32, 32, 32]
     \\        : (!transform.any_op) -> (!transform.any_op, !transform.any_op)
     \\
-    \\    // Return the result of the transformation
+    \\    // --- THIS IS THE NEW, CRITICAL PART ---
+    \\    // Step 3: Find all scf.forall ops and map the outer ones to GPU blocks.
+    \\    %forall_ops = transform.structured.match ops{["scf.forall"]} in %arg0 : (!transform.any_op) -> !transform.any_op
+    \\    %gpu_launch = transform.gpu.map_forall_to_blocks %forall_ops generate_gpu_launch grid_dims = [4, 8, 1]
+    \\        : (!transform.any_op) -> !transform.any_op
+    \\
+    \\    // Step 4: Map the remaining nested scf.forall loops inside the gpu.launch to GPU threads.
+    \\    transform.gpu.map_nested_forall_to_threads %gpu_launch block_dims = [32, 32, 1]
+    \\        : (!transform.any_op) -> !transform.any_op
+    \\
+    \\    // The transformation is complete.
     \\    transform.yield
     \\  }
     \\}
@@ -174,9 +184,9 @@ pub const MLIRContext = struct {
             // Stage 3: Run the transform interpreter at the TOP LEVEL.
             try opm.addPipeline("transform-interpreter");
             
-            std.debug.print("Running tiling and legalization passes...\n", .{});
+            std.debug.print("Running transform and GPU mapping passes...\n", .{});
             try tiling_pm.runOnOp(module.op());
-            std.debug.print("✓ Tiling and legalization complete.\n", .{});
+            std.debug.print("✓ Tiling and GPU mapping complete.\n", .{});
         } // `tiling_pm` is destroyed here.
 
         // --- THE FINAL FIX: CLEAN UP THE MODULE ---
@@ -207,49 +217,38 @@ pub const MLIRContext = struct {
         module.op().dump();
         // --- END OF FIX ---
 
-        // === STEP D: Run the REST of the pipeline with the FINAL, CORRECTED sequence ===
-        std.debug.print("--- Building final, canonical lowering pipeline ---\n", .{});
+        // === STEP D: Run the FINAL Lowering Pipeline ===
+        std.debug.print("--- Building final lowering pipeline for bufferization -> SPIR-V ---\n", .{});
         
         var main_pm = try mlir.PassManager.init(self.getContext());
         defer main_pm.deinit();
         
         const main_opm = main_pm.asOpPassManager();
 
-        // --- THE FINAL, CANONICAL PIPELINE ---
+        // --- THE NEW, SIMPLIFIED PIPELINE ---
 
-        // STAGE 3: Bufferization (Tensor -> MemRef). This is correct.
+        // STAGE 1: Bufferization. The IR now contains gpu.launch with linalg.generic on tensors.
         try main_opm.addPipeline("one-shot-bufferize{bufferize-function-boundaries}");
         try main_opm.addPipeline("buffer-deallocation-pipeline");
-        std.debug.print("✓ Stage 3: Bufferization Pipeline\n", .{});
+        std.debug.print("✓ Stage 1: Bufferization Pipeline\n", .{});
 
-        // STAGE 4: Convert Linalg on MemRefs to standard SCF loops.
-        // This will handle the tiled linalg.generic ops inside the scf.forall.
-        try main_opm.addPipeline("func.func(convert-linalg-to-loops)");
-        std.debug.print("✓ Stage 4: Linalg -> SCF Loops\n", .{});
+        // STAGE 2: Convert Linalg ops inside the GPU kernel to standard loops.
+        // We must run this inside the gpu.launch op's body.
+        try main_opm.addPipeline("gpu.module(func.func(convert-linalg-to-loops))");
+        std.debug.print("✓ Stage 2: Linalg -> SCF Loops (inside GPU kernel)\n", .{});
 
-        // STAGE 5: Convert the parallel `scf.forall` loops directly to GPU kernels.
-        // This is the key pass that creates the gpu.launch_func operations.
-        try main_opm.addPipeline("convert-parallel-loops-to-gpu");
-        std.debug.print("✓ Stage 5: Parallel Loops -> GPU Kernels\n", .{});
-
-        // STAGE 6: Lower the newly created GPU modules to SPIR-V.
+        // STAGE 3: Lower the GPU module to the final SPIR-V binary representation.
         c.buildAndAppendGpuAndSpirvConversionPipeline(main_opm.handle);
-        std.debug.print("✓ Stage 6: GPU Dialect -> SPIR-V Conversion\n", .{});
-
-        // STAGE 7: Final cleanup.
-        try main_opm.addPipeline("canonicalize,cse");
-        std.debug.print("✓ Stage 7: Final Cleanup\n", .{});
+        std.debug.print("✓ Stage 3: GPU Dialect -> SPIR-V Conversion\n", .{});
 
         // --- END OF PIPELINE ---
         
         std.debug.print("Running final lowering passes...\n", .{});
         try main_pm.runOnOp(module.op());
-        // --- END OF FIX ---
         
         std.debug.print("--- Module AFTER Final Lowering ---\n", .{});
         module.op().dump();
         std.debug.print("✅ Full pipeline executed successfully!\n", .{});
-        // --- END OF FINAL FIX ---
     }
     
     /// Translates a module containing SPIR-V dialect ops into a SPIR-V binary blob

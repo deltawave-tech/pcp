@@ -45,6 +45,7 @@
 #include "mlir/Dialect/Transform/Transforms/Passes.h"
 #include "mlir/Dialect/Linalg/TransformOps/LinalgTransformOps.h"
 #include "mlir/Dialect/Linalg/TransformOps/DialectExtension.h"
+#include "mlir/Dialect/GPU/TransformOps/GPUTransformOps.h"
 
 // Add SCF to GPU conversion headers
 #include "mlir/Conversion/SCFToGPU/SCFToGPUPass.h"
@@ -215,6 +216,10 @@ void mlirRegisterTransformExtensions(MlirDialectRegistry registryHandle) {
   // Register Linalg Transform dialect extensions (for transform.structured.* ops)
   std::printf("  - Linalg Transform dialect extensions\n");
   mlir::linalg::registerTransformDialectExtension(registry);
+  
+  // Register GPU Transform dialect extensions (for transform.gpu.* ops)
+  std::printf("  - GPU Transform dialect extensions\n");
+  mlir::gpu::registerTransformDialectExtension(registry);
   
   // CRITICAL: Register TilingInterface implementations for Linalg operations
   std::printf("  - Linalg TilingInterface implementations\n");

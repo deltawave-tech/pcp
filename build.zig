@@ -285,13 +285,16 @@ fn addMLIRSupport(target: *std.Build.Step.Compile, mlir_config: MLIRConfig) void
         // Core Transforms & Conversion
         "MLIRFuncTransforms", "MLIRLinalgTransforms", "MLIRSCFTransforms", "MLIRGPUTransforms", "MLIRSPIRVConversion", "MLIRBufferizationTransforms", "MLIRBufferizationPipelines", "MLIRMemRefTransforms", "MLIRVectorTransforms", "MLIRArithTransforms", "MLIRAsyncTransforms", "MLIRAffineTransforms", "MLIRAsyncToLLVM", "MLIRTensorTransforms", "MLIRTensorTransformOps", "MLIRReconcileUnrealizedCasts",
         "MLIRSCFToSPIRV", "MLIRSCFToGPU", "MLIRSCFToControlFlow", "MLIRFuncToSPIRV", "MLIRMemRefToSPIRV", "MLIRVectorToSPIRV", "MLIRArithToSPIRV",
-        "MLIRLinalgToStandard", "MLIRConvertToLLVMPass", "MLIRFuncToLLVM", "MLIRGPUToLLVMSPV", "MLIRLLVMCommonConversion", "MLIRArithToLLVM", "MLIRComplexToLLVM", "MLIRControlFlowToLLVM", "MLIRIndexToLLVM", "MLIRMathToLLVM", "MLIRMemRefToLLVM", "MLIRUBToLLVM", "MLIRVectorToLLVM", "MLIRAffineToStandard",
+        "MLIRLinalgToStandard", "MLIRConvertToLLVMPass", "MLIRConvertToLLVMInterface", "MLIRFuncToLLVM", "MLIRGPUToLLVMSPV", "MLIRLLVMCommonConversion", "MLIRArithToLLVM", "MLIRComplexToLLVM", "MLIRControlFlowToLLVM", "MLIRIndexToLLVM", "MLIRMathToLLVM", "MLIRMemRefToLLVM", "MLIRUBToLLVM", "MLIRVectorToLLVM", "MLIRAffineToStandard",
 
-        // GPU Pipeline Passes & Utilities
-        "MLIRGPUPipelines", "MLIRGPUToGPURuntimeTransforms", "MLIRGPUToSPIRV", "MLIRGPUUtils",
+        // GPU Pipeline Passes & Utilities  
+        "MLIRGPUPipelines", "MLIRGPUToGPURuntimeTransforms", "MLIRGPUToSPIRV", "MLIRGPUUtils", "MLIRGPUToNVVMTransforms", "MLIRGPUToROCDLTransforms",
+        
+        // GPU Target Dialects & Translation
+        "MLIRNVVMDialect", "MLIRROCDLDialect", "MLIRAMDGPUDialect", "MLIRAMDGPUUtils", "MLIRTargetLLVMIRExport", "MLIRTargetLLVMIRImport",
 
         // Transform Dialect for Production Tiling
-        "MLIRTransformDialect", "MLIRTransformDialectTransforms", "MLIRTransformDialectUtils", "MLIRTransformDialectInterfaces", "MLIRTransformUtils", "MLIRLinalgTransformOps",
+        "MLIRTransformDialect", "MLIRTransformDialectTransforms", "MLIRTransformDialectUtils", "MLIRTransformDialectInterfaces", "MLIRTransformUtils", "MLIRLinalgTransformOps", "MLIRGPUTransformOps",
 
         // Interfaces (for vtables and dynamic dispatch) - Only actual existing libraries
         "MLIRSideEffectInterfaces", "MLIRLoopLikeInterface", "MLIRControlFlowInterfaces", "MLIRFunctionInterfaces", "MLIRShapedOpInterfaces", "MLIRViewLikeInterface", "MLIRTilingInterface", "MLIRParallelCombiningOpInterface", "MLIRDestinationStyleOpInterface", "MLIRCallInterfaces", "MLIRShardingInterface", "MLIRInferTypeOpInterface", "MLIRDataLayoutInterfaces", "MLIRCastInterfaces", "MLIRValueBoundsOpInterface", "MLIRMemorySlotInterfaces", "MLIRVectorInterfaces", "MLIRMaskableOpInterface", "MLIRMaskingOpInterface", "MLIRRuntimeVerifiableOpInterface", "MLIRSubsetOpInterface", "MLIRBytecodeOpInterface", "MLIRDerivedAttributeOpInterface", "MLIRCopyOpInterface", "MLIRInferIntRangeInterface",

@@ -203,6 +203,7 @@ pub const c = struct {
     // StableHLO dialect registration - NOW ENABLED!
     extern fn mlirGetDialectHandle__stablehlo__() MlirDialectHandle;
     extern fn mlirGetDialectHandle__chlo__() MlirDialectHandle;
+    extern fn mlirGetDialectHandle__tensor__() MlirDialectHandle;
 
     extern fn mlirDialectHandleInsertDialect(handle: MlirDialectHandle, registry: *MlirDialectRegistry) void;
     extern fn mlirContextAppendDialectRegistry(ctx: *MlirContext, registry: *MlirDialectRegistry) void;
@@ -368,6 +369,10 @@ pub const c = struct {
 
     pub fn getDialectHandleCHLO() MlirDialectHandle {
         return mlirGetDialectHandle__chlo__();
+    }
+
+    pub fn getDialectHandleTensor() MlirDialectHandle {
+        return mlirGetDialectHandle__tensor__();
     }
 
     pub fn dialectHandleInsertDialect(handle: MlirDialectHandle, registry: *MlirDialectRegistry) void {

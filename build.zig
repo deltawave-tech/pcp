@@ -260,7 +260,7 @@ fn addMLIRSupport(target: *std.Build.Step.Compile, mlir_config: MLIRConfig) void
     const all_mlir_libs = [_][]const u8{
         // Core MLIR & C-API
         "MLIRIR", "MLIRSupport", "MLIRAnalysis", "MLIRDialect", "MLIRParser", "MLIRAsmParser", "MLIRPass", "MLIRTransforms", "MLIRRewrite", "MLIRTransformUtils",
-        "MLIRBytecodeReader", "MLIRBytecodeWriter", "MLIRCAPIIR", "MLIRCAPIFunc", "MLIRCAPIArith", "MLIRCAPILinalg", "MLIRCAPIGPU", "MLIRCAPISPIRV", "MLIRCAPISCF", "MLIRCAPIConversion", "MLIRCAPITransforms", "MLIRCAPIAsync",
+        "MLIRBytecodeReader", "MLIRBytecodeWriter", "MLIRCAPIIR", "MLIRCAPIFunc", "MLIRCAPIArith", "MLIRCAPILinalg", "MLIRCAPIGPU", "MLIRCAPISPIRV", "MLIRCAPISCF", "MLIRCAPIConversion", "MLIRCAPITransforms", "MLIRCAPIAsync", "MLIRCAPITensor",
         // Test/Debug libraries for MLIR
         "MLIRLinalgTestPasses",
 

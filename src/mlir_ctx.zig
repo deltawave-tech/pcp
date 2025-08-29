@@ -28,6 +28,7 @@ pub const MLIRContext = struct {
         c.dialectHandleInsertDialect(c.getDialectHandleFunc(), registry);
         c.dialectHandleInsertDialect(c.getDialectHandleArith(), registry);
         c.dialectHandleInsertDialect(c.getDialectHandleLinalg(), registry);
+        c.dialectHandleInsertDialect(c.getDialectHandleTensor(), registry);
         c.dialectHandleInsertDialect(c.getDialectHandleGPU(), registry);
         c.dialectHandleInsertDialect(c.getDialectHandleSPIRV(), registry);
         c.dialectHandleInsertDialect(c.getDialectHandleSCF(), registry);
@@ -49,6 +50,9 @@ pub const MLIRContext = struct {
         _ = c.dialectHandleLoadDialect(c.getDialectHandleFunc(), context);
         _ = c.dialectHandleLoadDialect(c.getDialectHandleArith(), context);
         _ = c.dialectHandleLoadDialect(c.getDialectHandleLinalg(), context);
+        std.debug.print("Loading tensor dialect into context...\n", .{});
+        _ = c.dialectHandleLoadDialect(c.getDialectHandleTensor(), context);
+        std.debug.print("✓ Tensor dialect loaded successfully\n", .{});
         _ = c.dialectHandleLoadDialect(c.getDialectHandleGPU(), context);
         _ = c.dialectHandleLoadDialect(c.getDialectHandleSPIRV(), context);
         _ = c.dialectHandleLoadDialect(c.getDialectHandleSCF(), context);

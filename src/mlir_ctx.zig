@@ -125,7 +125,7 @@ pub const MLIRContext = struct {
         c.contextDestroy(self.context);
     }
     
-    /// Lowers the module using the canonical, decoupled pipeline to bypass the transform dialect bug.
+    /// Lowers the module using the canonical, decoupled pipeline, now with manual transform op cleanup.
     pub fn lowerToSPIRV(self: *Self, allocator: Allocator, module: mlir.Module) !void {
         _ = allocator;
         std.debug.print("=== Executing Decoupled GPU Lowering Pipeline ===\n", .{});
@@ -147,7 +147,6 @@ pub const MLIRContext = struct {
 
         // === STAGE 2: Logical Tiling on Tensors using Transform Dialect ===
         {
-            // Inject and run the new, simpler TILING_ONLY script.
             const transform_module = try mlir.Module.parse(self.getContext(), TILING_TRANSFORM_SCRIPT);
             defer transform_module.deinit();
 
@@ -170,57 +169,57 @@ pub const MLIRContext = struct {
         std.debug.print("\n--- IR after Stage 2 (Tiled scf.forall on Tensors) ---\n", .{});
         module.op().dump();
 
-        // === STAGE 3: Final Lowering Pipeline ===
+        // === STAGE 3: Cleanup and Final Lowering Pipeline ===
+        
+        // 3.1: DEFINITIVE FIX - Manually clean up the transform script operations.
+        // This replaces the crashing `transform-dialect-erase-schedule` pass.
+        std.debug.print("\n--- Stage 3.1: Manually Cleaning Up Transform Script ---\n", .{});
+        const module_body = module.op().getRegion(0).getBlock(0);
+        var maybe_op = module_body.getFirstOp();
+        while (maybe_op) |op| {
+            const next_op = op.getNext(); // Get next op BEFORE potentially destroying the current one.
+            const op_name_id = c.operationGetName(op.handle);
+            const op_name_ref = c.identifierStr(op_name_id);
+            const op_name = c.fromStringRef(op_name_ref);
+            if (std.mem.startsWith(u8, op_name, "transform.")) {
+                std.debug.print("  - Erasing op: {s}\n", .{op_name});
+                c.operationDestroy(op.handle);
+            }
+            maybe_op = next_op;
+        }
+        
+        // Sanity check that the module is still valid after our manual changes.
+        if (c.operationVerify(module.op().handle).isFailure()) {
+            std.debug.print("ERROR: Module verification failed after manual transform cleanup!\n", .{});
+            module.op().dump();
+            return error.ModuleVerificationFailed;
+        }
+        std.debug.print("✓ Transform script erased and module verified.\n", .{});
+        
+        // 3.2: Run the rest of the lowering in a single, final pass manager.
         {
             var pm = try mlir.PassManager.init(self.getContext());
             defer pm.deinit();
             const opm = pm.asOpPassManager();
 
-            std.debug.print("\n--- Running Stage 3: Final Lowering (Bufferize -> Map -> SPIR-V) ---\n", .{});
+            // Bufferize the tiled computation.
+            try opm.addPipeline("one-shot-bufferize{bufferize-function-boundaries}");
+            try opm.addPipeline("buffer-deallocation-pipeline");
             
-            // 3.1: Clean up the transform script operations.
-            std.debug.print("  3.1: Cleaning up transform script operations...\n", .{});
-            try opm.addPipeline("transform-dialect-erase-schedule");
-            try pm.runOnOp(module.op());
-            std.debug.print("  ✓ Transform script cleanup complete\n", .{});
-            
-            // 3.2: Bufferize the entire tiled computation. This converts the IR to be memref-based.
-            std.debug.print("  3.2: Bufferizing tiled computation...\n", .{});
-            var buf_pm = try mlir.PassManager.init(self.getContext());
-            defer buf_pm.deinit();
-            try buf_pm.asOpPassManager().addPipeline("one-shot-bufferize{bufferize-function-boundaries}");
-            try buf_pm.asOpPassManager().addPipeline("buffer-deallocation-pipeline");
-            try buf_pm.runOnOp(module.op());
-            std.debug.print("  ✓ Bufferization complete\n", .{});
-            
-            std.debug.print("\n--- IR after Bufferization ---\n", .{});
-            module.op().dump();
-            
-            // 3.3: CRITICAL WORKAROUND: Map the scf.forall loops (now on memrefs) to GPU constructs
-            // using the standard, robust conversion pass, bypassing the buggy transform op.
-            std.debug.print("  3.3: Converting parallel loops to GPU...\n", .{});
-            var gpu_pm = try mlir.PassManager.init(self.getContext());
-            defer gpu_pm.deinit();
-            try gpu_pm.asOpPassManager().addPipeline("convert-parallel-loops-to-gpu");
-            try gpu_pm.runOnOp(module.op());
-            std.debug.print("  ✓ GPU conversion complete\n", .{});
-            
-            std.debug.print("\n--- IR after GPU Conversion ---\n", .{});
-            module.op().dump();
+            // Map the scf.forall loops to GPU constructs.
+            try opm.addPipeline("convert-parallel-loops-to-gpu");
 
-            // 3.4: Lower the remaining ops inside the GPU kernel.
-            std.debug.print("  3.4: Final GPU → SPIR-V lowering...\n", .{});
-            var final_pm = try mlir.PassManager.init(self.getContext());
-            defer final_pm.deinit();
-            try final_pm.asOpPassManager().addPipeline("gpu.module(func.func(convert-linalg-to-loops))");
-            c.buildAndAppendGpuAndSpirvConversionPipeline(final_pm.asOpPassManager().handle);
-            try final_pm.runOnOp(module.op());
-            std.debug.print("  ✓ Final lowering complete\n", .{});
+            // Lower the remaining ops inside the GPU kernel.
+            try opm.addPipeline("gpu.module(func.func(convert-linalg-to-loops))");
+            c.buildAndAppendGpuAndSpirvConversionPipeline(opm.handle);
+
+            std.debug.print("\n--- Running Stage 3.2: Final Lowering (Bufferize -> Map -> SPIR-V) ---\n", .{});
+            try pm.runOnOp(module.op());
         }
 
         std.debug.print("\n--- Final Module IR (Lowered to SPIR-V) ---\n", .{});
         module.op().dump();
-        std.debug.print("✅ Decoupled GPU Pipeline executed successfully!\n", .{});
+        std.debug.print("✅ Full GPU Pipeline executed successfully!\n", .{});
     }
     
     /// Translates a module containing SPIR-V dialect ops into a SPIR-V binary blob

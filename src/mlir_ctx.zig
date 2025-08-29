@@ -10,19 +10,20 @@ const TILING_TRANSFORM_SCRIPT =
     \\    // Step 1: Find all linalg.generic ops. (This is correct)
     \\    %matmul = transform.structured.match ops{["linalg.generic"]} in %arg0 : (!transform.any_op) -> !transform.any_op
     \\
-    \\    // Step 2: Tile the matmul and get a handle to the new forall loops.
-    \\    %tiled_op, %forall_loops = transform.structured.tile_using_forall %matmul tile_sizes [32, 32, 32]
+    \\    // --- THE FINAL FIX ---
+    \\    // Step 2: Tile the matmul into scf.forall loops AND SIMULTANEOUSLY
+    \\    //         attribute the loops with the desired GPU block mapping.
+    \\    %tiled_op, %forall_loops = transform.structured.tile_using_forall %matmul tile_sizes [32, 32, 32] (mapping = [#gpu.block<x>, #gpu.block<y>, #gpu.thread<x>])
     \\        : (!transform.any_op) -> (!transform.any_op, !transform.any_op)
     \\
-    \\    // --- THE FINAL FIX ---
-    \\    // Step 3: Map the forall loops to GPU blocks USING THE CHAINED HANDLE.
-    \\    // Do NOT re-match. Use the `%forall_loops` handle directly from the previous step.
+    \\    // Step 3: Now that the loops are attributed, map them to a GPU launch operation.
+    \\    // This will consume the outer two loops mapped to #gpu.block<x> and #gpu.block<y>.
     \\    %gpu_launch = transform.gpu.map_forall_to_blocks %forall_loops generate_gpu_launch grid_dims = [4, 8, 1]
     \\        : (!transform.any_op) -> !transform.any_op
     \\
-    \\    // Step 4: Map the nested loops within the new launch op to GPU threads.
-    \\    // The handle `%gpu_launch` is correctly chained here.
-    \\    transform.gpu.map_nested_forall_to_threads %gpu_launch block_dims = [32, 32, 1]
+    \\    // Step 4: Map the remaining inner loop (originally #gpu.thread<x>) to GPU threads.
+    \\    // This must now operate on the contents of the gpu.launch op.
+    \\    transform.gpu.map_nested_forall_to_threads %gpu_launch block_dims = [32, 1, 1]
     \\        : (!transform.any_op) -> !transform.any_op
     \\
     \\    transform.yield

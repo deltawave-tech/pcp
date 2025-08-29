@@ -7,25 +7,15 @@ const Allocator = std.mem.Allocator;
 const TILING_TRANSFORM_SCRIPT =
     \\module attributes { transform.with_named_sequence } {
     \\  transform.named_sequence @__transform_main(%arg0: !transform.any_op) {
-    \\    // Find the target linalg.generic operation.
-    \\    %matmul = transform.structured.match ops{["linalg.generic"]} in %arg0
+    \\    // Find the linalg.generic operation.
+    \\    %generic = transform.structured.match ops{["linalg.generic"]} in %arg0
     \\        : (!transform.any_op) -> !transform.any_op
     \\
-    \\    // STEP 1: Tile the tensor-based operation AND apply GPU mapping attributes simultaneously.
-    \\    %tiled_op, %forall_loops = transform.structured.tile_using_forall %matmul
+    \\    // Step 1: Just tile the tensor-based operation into scf.forall loops.
+    \\    // DO NOT add mapping attributes here. We are only concerned with the loop structure.
+    \\    %tiled, %loops = transform.structured.tile_using_forall %generic
     \\        tile_sizes [32, 32, 32]
-    \\        (mapping = [#gpu.block<x>, #gpu.block<y>, #gpu.thread<x>])
     \\        : (!transform.any_op) -> (!transform.any_op, !transform.any_op)
-    \\
-    \\    // STEP 2: Consume the loop handle to map the block-attributed loops to a gpu.launch op.
-    \\    %gpu_launch = transform.gpu.map_forall_to_blocks %forall_loops
-    \\        generate_gpu_launch grid_dims = [4, 8, 1]
-    \\        : (!transform.any_op) -> !transform.any_op
-    \\
-    \\    // STEP 3: Consume the gpu.launch handle to map the thread-attributed loops inside it.
-    \\    transform.gpu.map_nested_forall_to_threads %gpu_launch
-    \\        block_dims = [32, 1, 1]
-    \\        : (!transform.any_op) -> !transform.any_op
     \\
     \\    transform.yield
     \\  }
@@ -135,88 +125,102 @@ pub const MLIRContext = struct {
         c.contextDestroy(self.context);
     }
     
-    /// Lowers the module using the canonical, two-stage GPU pipeline.
+    /// Lowers the module using the canonical, decoupled pipeline to bypass the transform dialect bug.
     pub fn lowerToSPIRV(self: *Self, allocator: Allocator, module: mlir.Module) !void {
         _ = allocator;
-        std.debug.print("=== Executing Canonical GPU Lowering Pipeline ===\n", .{});
+        std.debug.print("=== Executing Decoupled GPU Lowering Pipeline ===\n", .{});
 
-        // === STAGE 1: High-Level Optimization (HLO -> Tiled+Mapped GPU Ops on Tensors) ===
+        // === STAGE 1: HLO to Linalg on Tensors ===
         {
             var pm = try mlir.PassManager.init(self.getContext());
             defer pm.deinit();
             const opm = pm.asOpPassManager();
 
-            // Step 1.1: Convert StableHLO to Linalg on Tensors.
             try opm.addPipeline("stablehlo-legalize-to-linalg");
             try opm.addPipeline("func.func(linalg-generalize-named-ops,canonicalize,cse)");
 
-            // Step 1.2: Inject and run the full transform script.
-            // This is done via a pass that injects the script from a string.
-            // For our setup, we will manually inject and run the interpreter pass.
-
-            std.debug.print("--- Running High-Level Optimization Passes ---\n", .{});
+            std.debug.print("--- Running Stage 1: HLO -> Linalg (Tensors) ---\n", .{});
             try pm.runOnOp(module.op());
-            std.debug.print("✓ HLO -> Linalg on Tensors complete.\n", .{});
         }
-
-        std.debug.print("\n--- IR after Linalg Conversion ---\n", .{});
+        std.debug.print("\n--- IR after Stage 1 ---\n", .{});
         module.op().dump();
 
-        // Now, inject and run the transform interpreter.
-        const transform_module = try mlir.Module.parse(self.getContext(), TILING_TRANSFORM_SCRIPT);
-        defer transform_module.deinit();
-
-        const main_module_body = module.op().getRegion(0).getBlock(0);
-        const transform_module_body = transform_module.op().getRegion(0).getBlock(0);
-        var op_to_clone = transform_module_body.getFirstOp();
-        while (op_to_clone) |op| {
-            main_module_body.appendOwnedOperation(mlir.Operation{ .handle = c.operationClone(op.handle) });
-            op_to_clone = op.getNext();
-        }
-        const unit_attr = c.unitAttrGet(self.context);
-        c.operationSetAttributeByName(module.op().handle, "transform.with_named_sequence", unit_attr);
-
+        // === STAGE 2: Logical Tiling on Tensors using Transform Dialect ===
         {
-            var transform_pm = try mlir.PassManager.init(self.getContext());
-            defer transform_pm.deinit();
-            try transform_pm.asOpPassManager().addPipeline("transform-interpreter");
+            // Inject and run the new, simpler TILING_ONLY script.
+            const transform_module = try mlir.Module.parse(self.getContext(), TILING_TRANSFORM_SCRIPT);
+            defer transform_module.deinit();
 
-            std.debug.print("\n--- Running Transform Interpreter (Tiling & GPU Mapping on Tensors) ---\n", .{});
-            try transform_pm.runOnOp(module.op());
-            std.debug.print("✓ Transform Interpreter complete.\n", .{});
+            const main_module_body = module.op().getRegion(0).getBlock(0);
+            const transform_body = transform_module.op().getRegion(0).getBlock(0);
+            var op_to_clone = transform_body.getFirstOp();
+            while (op_to_clone) |op| {
+                main_module_body.appendOwnedOperation(mlir.Operation{ .handle = c.operationClone(op.handle) });
+                op_to_clone = op.getNext();
+            }
+            c.operationSetAttributeByName(module.op().handle, "transform.with_named_sequence", c.unitAttrGet(self.context));
+
+            var pm = try mlir.PassManager.init(self.getContext());
+            defer pm.deinit();
+            try pm.asOpPassManager().addPipeline("transform-interpreter");
+
+            std.debug.print("\n--- Running Stage 2: Transform Interpreter (Tiling Only) ---\n", .{});
+            try pm.runOnOp(module.op());
         }
-
-        std.debug.print("\n--- IR after Transform Interpreter ---\n", .{});
+        std.debug.print("\n--- IR after Stage 2 (Tiled scf.forall on Tensors) ---\n", .{});
         module.op().dump();
 
-        // === STAGE 2: Lowering to Executable Form (Bufferization -> Loops -> SPIR-V) ===
+        // === STAGE 3: Final Lowering Pipeline ===
         {
-            var lower_pm = try mlir.PassManager.init(self.getContext());
-            defer lower_pm.deinit();
-            const opm = lower_pm.asOpPassManager();
+            var pm = try mlir.PassManager.init(self.getContext());
+            defer pm.deinit();
+            const opm = pm.asOpPassManager();
 
-            // Step 2.1: Clean up the transform script ops now that they've run.
-            // A dedicated pass for this is cleaner than manual iteration.
+            std.debug.print("\n--- Running Stage 3: Final Lowering (Bufferize -> Map -> SPIR-V) ---\n", .{});
+            
+            // 3.1: Clean up the transform script operations.
+            std.debug.print("  3.1: Cleaning up transform script operations...\n", .{});
             try opm.addPipeline("transform-dialect-erase-schedule");
+            try pm.runOnOp(module.op());
+            std.debug.print("  ✓ Transform script cleanup complete\n", .{});
+            
+            // 3.2: Bufferize the entire tiled computation. This converts the IR to be memref-based.
+            std.debug.print("  3.2: Bufferizing tiled computation...\n", .{});
+            var buf_pm = try mlir.PassManager.init(self.getContext());
+            defer buf_pm.deinit();
+            try buf_pm.asOpPassManager().addPipeline("one-shot-bufferize{bufferize-function-boundaries}");
+            try buf_pm.asOpPassManager().addPipeline("buffer-deallocation-pipeline");
+            try buf_pm.runOnOp(module.op());
+            std.debug.print("  ✓ Bufferization complete\n", .{});
+            
+            std.debug.print("\n--- IR after Bufferization ---\n", .{});
+            module.op().dump();
+            
+            // 3.3: CRITICAL WORKAROUND: Map the scf.forall loops (now on memrefs) to GPU constructs
+            // using the standard, robust conversion pass, bypassing the buggy transform op.
+            std.debug.print("  3.3: Converting parallel loops to GPU...\n", .{});
+            var gpu_pm = try mlir.PassManager.init(self.getContext());
+            defer gpu_pm.deinit();
+            try gpu_pm.asOpPassManager().addPipeline("convert-parallel-loops-to-gpu");
+            try gpu_pm.runOnOp(module.op());
+            std.debug.print("  ✓ GPU conversion complete\n", .{});
+            
+            std.debug.print("\n--- IR after GPU Conversion ---\n", .{});
+            module.op().dump();
 
-            // Step 2.2: Bufferize everything, including the ops inside the gpu.launch.
-            try opm.addPipeline("one-shot-bufferize{bufferize-function-boundaries}");
-            try opm.addPipeline("buffer-deallocation-pipeline");
-
-            // Step 2.3: Lower Linalg on memrefs within the GPU kernel to loops.
-            try opm.addPipeline("gpu.module(func.func(convert-linalg-to-loops))");
-
-            // Step 2.4: Final conversion to SPIR-V binary representation.
-            c.buildAndAppendGpuAndSpirvConversionPipeline(opm.handle);
-
-            std.debug.print("\n--- Running Final Lowering Passes ---\n", .{});
-            try lower_pm.runOnOp(module.op());
-            std.debug.print("✓ Final Lowering complete.\n", .{});
+            // 3.4: Lower the remaining ops inside the GPU kernel.
+            std.debug.print("  3.4: Final GPU → SPIR-V lowering...\n", .{});
+            var final_pm = try mlir.PassManager.init(self.getContext());
+            defer final_pm.deinit();
+            try final_pm.asOpPassManager().addPipeline("gpu.module(func.func(convert-linalg-to-loops))");
+            c.buildAndAppendGpuAndSpirvConversionPipeline(final_pm.asOpPassManager().handle);
+            try final_pm.runOnOp(module.op());
+            std.debug.print("  ✓ Final lowering complete\n", .{});
         }
 
         std.debug.print("\n--- Final Module IR (Lowered to SPIR-V) ---\n", .{});
         module.op().dump();
-        std.debug.print("✅ Canonical GPU Pipeline executed successfully!\n", .{});
+        std.debug.print("✅ Decoupled GPU Pipeline executed successfully!\n", .{});
     }
     
     /// Translates a module containing SPIR-V dialect ops into a SPIR-V binary blob

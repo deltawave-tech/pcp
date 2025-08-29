@@ -684,20 +684,6 @@ pub const DiLoCo = struct {
         return try self.mlir_builder.newTensor(value);
     }
 
-    /// Extract tensor values to array
-    fn extractTensorToArray(self: *Self, _: Tensor) ![]f32 {
-        // In a real implementation, this would extract values from the MLIR tensor
-        // For now, simulate by creating array with current values
-        const array = try self.allocator.alloc(f32, self.config.param_count);
-
-        // This is a placeholder - real implementation would extract from MLIR tensor
-        var rng = std.Random.DefaultPrng.init(@intCast(self.current_epoch));
-        for (array) |*param| {
-            param.* = rng.random().floatNorm(f32) * 0.1;
-        }
-
-        return array;
-    }
 
     /// Serialize parameters to string
     fn serializeParameters(self: *Self, params: []const f32) ![]u8 {

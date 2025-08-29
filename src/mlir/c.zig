@@ -77,6 +77,7 @@ pub const c = struct {
     pub const MlirIdentifier = opaque {};
     extern fn mlirOperationCreate(state: *MlirOperationState) *MlirOperation;
     extern fn mlirOperationDestroy(op: *MlirOperation) void;
+    extern fn mlirOperationClone(op: *MlirOperation) *MlirOperation;
     pub extern fn mlirOperationPrint(op: *MlirOperation, callback: *const fn ([*]const u8, usize, ?*anyopaque) callconv(.C) void, userData: ?*anyopaque) void;
     extern fn mlirOperationDump(op: *MlirOperation) void;
     extern fn mlirOperationGetResult(op: *MlirOperation, pos: isize) *MlirValue;
@@ -204,6 +205,7 @@ pub const c = struct {
     extern fn mlirGetDialectHandle__stablehlo__() MlirDialectHandle;
     extern fn mlirGetDialectHandle__chlo__() MlirDialectHandle;
     extern fn mlirGetDialectHandle__tensor__() MlirDialectHandle;
+    extern fn mlirGetDialectHandle__transform__() MlirDialectHandle;
 
     extern fn mlirDialectHandleInsertDialect(handle: MlirDialectHandle, registry: *MlirDialectRegistry) void;
     extern fn mlirContextAppendDialectRegistry(ctx: *MlirContext, registry: *MlirDialectRegistry) void;
@@ -375,6 +377,10 @@ pub const c = struct {
         return mlirGetDialectHandle__tensor__();
     }
 
+    pub fn getDialectHandleTransform() MlirDialectHandle {
+        return mlirGetDialectHandle__transform__();
+    }
+
     pub fn dialectHandleInsertDialect(handle: MlirDialectHandle, registry: *MlirDialectRegistry) void {
         mlirDialectHandleInsertDialect(handle, registry);
     }
@@ -483,6 +489,10 @@ pub const c = struct {
 
     pub fn operationDestroy(op: *MlirOperation) void {
         mlirOperationDestroy(op);
+    }
+
+    pub fn operationClone(op: *MlirOperation) *MlirOperation {
+        return mlirOperationClone(op);
     }
 
     pub fn operationDump(op: *MlirOperation) void {

@@ -207,26 +207,32 @@ pub const MLIRContext = struct {
         module.op().dump();
         // --- END OF FIX ---
 
-        // === STEP C: Run the REST of the pipeline in a NEW, FRESH Pass Manager ===
+        // === STEP D: Run the REST of the pipeline in a NEW, FRESH Pass Manager ===
         std.debug.print("--- Creating FRESH pass manager for bufferization and GPU conversion ---\n", .{});
         
-        // --- THE FINAL FIX ---
+        // --- THE FINAL ARCHITECTURAL FIX ---
         var main_pm = try mlir.PassManager.init(self.getContext());
-        defer main_pm.deinit(); // Ensure this new pass manager is cleaned up.
+        defer main_pm.deinit(); // Ensure this new pass manager is also cleaned up locally.
         
         const main_opm = main_pm.asOpPassManager();
 
-        try main_opm.addPipeline("linalg-bufferize");
-        std.debug.print("✓ Stage 3: linalg-bufferize\n", .{});
+        // Use the correct bufferization pass names discovered by the team.
+        try main_opm.addPipeline("one-shot-bufferize");
+        try main_opm.addPipeline("buffer-deallocation-pipeline");
+        std.debug.print("✓ Stage 3: Bufferization passes added\n", .{});
 
+        // NOTE: `convert-bufferization-to-memref` is often part of bufferization pipelines
+        // but can sometimes cause issues. We'll proceed to Linalg on loops.
+        // The `one-shot-bufferize` should have already produced memrefs.
+        
         try main_opm.addPipeline("func.func(convert-linalg-to-parallel-loops)");
-        std.debug.print("✓ Stage 4: convert-linalg-to-parallel-loops\n", .{});
+        std.debug.print("✓ Stage 4: convert-linalg-to-parallel-loops added\n", .{});
         
         c.buildAndAppendGpuAndSpirvConversionPipeline(main_opm.handle);
-        std.debug.print("✓ Stage 5: GPU & SPIR-V Conversion\n", .{});
+        std.debug.print("✓ Stage 5: GPU & SPIR-V Conversion added\n", .{});
 
         try main_opm.addPipeline("canonicalize,cse");
-        std.debug.print("✓ Stage 6: Final Cleanup\n", .{});
+        std.debug.print("✓ Stage 6: Final Cleanup added\n", .{});
 
         std.debug.print("Running main lowering passes...\n", .{});
         try main_pm.runOnOp(module.op());

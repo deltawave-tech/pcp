@@ -260,7 +260,7 @@ fn addMLIRSupport(target: *std.Build.Step.Compile, mlir_config: MLIRConfig) void
     const all_mlir_libs = [_][]const u8{
         // Core MLIR & C-API
         "MLIRIR", "MLIRSupport", "MLIRAnalysis", "MLIRDialect", "MLIRParser", "MLIRAsmParser", "MLIRPass", "MLIRTransforms", "MLIRRewrite", "MLIRTransformUtils",
-        "MLIRBytecodeReader", "MLIRBytecodeWriter", "MLIRCAPIIR", "MLIRCAPIFunc", "MLIRCAPIArith", "MLIRCAPILinalg", "MLIRCAPIGPU", "MLIRCAPISPIRV", "MLIRCAPISCF", "MLIRCAPIConversion", "MLIRCAPITransforms", "MLIRCAPIAsync", "MLIRCAPITensor",
+        "MLIRBytecodeReader", "MLIRBytecodeWriter", "MLIRCAPIIR", "MLIRCAPIFunc", "MLIRCAPIArith", "MLIRCAPILinalg", "MLIRCAPIGPU", "MLIRCAPISPIRV", "MLIRCAPISCF", "MLIRCAPIConversion", "MLIRCAPITransforms", "MLIRCAPIAsync", "MLIRCAPITensor", "MLIRCAPITransformDialect", "MLIRCAPITransformDialectTransforms",
         // Test/Debug libraries for MLIR
         "MLIRLinalgTestPasses",
 
@@ -283,7 +283,7 @@ fn addMLIRSupport(target: *std.Build.Step.Compile, mlir_config: MLIRConfig) void
         "MLIRFuncAllExtensions", "MLIRTensorAllExtensions", "MLIRFuncInlinerExtension", "MLIRFuncMeshShardingExtensions",
 
         // Core Transforms & Conversion
-        "MLIRFuncTransforms", "MLIRLinalgTransforms", "MLIRSCFTransforms", "MLIRGPUTransforms", "MLIRSPIRVConversion", "MLIRBufferizationTransforms", "MLIRMemRefTransforms", "MLIRVectorTransforms", "MLIRArithTransforms", "MLIRAsyncTransforms", "MLIRAffineTransforms", "MLIRAsyncToLLVM", "MLIRTensorTransforms", "MLIRTensorTransformOps", "MLIRReconcileUnrealizedCasts",
+        "MLIRFuncTransforms", "MLIRLinalgTransforms", "MLIRSCFTransforms", "MLIRGPUTransforms", "MLIRSPIRVConversion", "MLIRBufferizationTransforms", "MLIRBufferizationPipelines", "MLIRMemRefTransforms", "MLIRVectorTransforms", "MLIRArithTransforms", "MLIRAsyncTransforms", "MLIRAffineTransforms", "MLIRAsyncToLLVM", "MLIRTensorTransforms", "MLIRTensorTransformOps", "MLIRReconcileUnrealizedCasts",
         "MLIRSCFToSPIRV", "MLIRSCFToControlFlow", "MLIRFuncToSPIRV", "MLIRMemRefToSPIRV", "MLIRVectorToSPIRV", "MLIRArithToSPIRV",
         "MLIRLinalgToStandard", "MLIRConvertToLLVMPass", "MLIRFuncToLLVM", "MLIRGPUToLLVMSPV", "MLIRLLVMCommonConversion", "MLIRArithToLLVM", "MLIRComplexToLLVM", "MLIRControlFlowToLLVM", "MLIRIndexToLLVM", "MLIRMathToLLVM", "MLIRMemRefToLLVM", "MLIRUBToLLVM", "MLIRVectorToLLVM", "MLIRAffineToStandard",
 
@@ -291,7 +291,7 @@ fn addMLIRSupport(target: *std.Build.Step.Compile, mlir_config: MLIRConfig) void
         "MLIRGPUPipelines", "MLIRGPUToGPURuntimeTransforms", "MLIRGPUToSPIRV", "MLIRGPUUtils",
 
         // Transform Dialect for Production Tiling
-        "MLIRTransformDialect", "MLIRTransformDialectTransforms", "MLIRTransformDialectUtils", "MLIRLinalgTransformOps",
+        "MLIRTransformDialect", "MLIRTransformDialectTransforms", "MLIRTransformDialectUtils", "MLIRTransformDialectInterfaces", "MLIRTransformUtils", "MLIRLinalgTransformOps",
 
         // Interfaces (for vtables and dynamic dispatch) - Only actual existing libraries
         "MLIRSideEffectInterfaces", "MLIRLoopLikeInterface", "MLIRControlFlowInterfaces", "MLIRFunctionInterfaces", "MLIRShapedOpInterfaces", "MLIRViewLikeInterface", "MLIRTilingInterface", "MLIRParallelCombiningOpInterface", "MLIRDestinationStyleOpInterface", "MLIRCallInterfaces", "MLIRShardingInterface", "MLIRInferTypeOpInterface", "MLIRDataLayoutInterfaces", "MLIRCastInterfaces", "MLIRValueBoundsOpInterface", "MLIRMemorySlotInterfaces", "MLIRVectorInterfaces", "MLIRMaskableOpInterface", "MLIRMaskingOpInterface", "MLIRRuntimeVerifiableOpInterface", "MLIRSubsetOpInterface", "MLIRBytecodeOpInterface", "MLIRDerivedAttributeOpInterface", "MLIRCopyOpInterface", "MLIRInferIntRangeInterface",

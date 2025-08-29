@@ -23,6 +23,9 @@
 #include "mlir/Dialect/Arith/Transforms/BufferizableOpInterfaceImpl.h"
 #include "mlir/IR/DialectRegistry.h"
 
+// Add bufferization pipelines header
+#include "mlir/Dialect/Bufferization/Pipelines/Passes.h"
+
 // NEW: Include headers for canonical GPU pipeline builder  
 #include "mlir-c/Pass.h"
 #include "mlir/CAPI/Pass.h"  // For unwrap functionality
@@ -81,6 +84,9 @@ void mlirForceLoadAllRequiredPasses() {
   
   std::printf("  - Bufferization passes (tensor → memref)\n");
   mlir::bufferization::registerBufferizationPasses();
+  
+  std::printf("  - Bufferization pipelines (buffer-deallocation-pipeline)\n");
+  mlir::bufferization::registerBufferizationPipelines();
   
   std::printf("  - StableHLO passes (HLO legalization)\n");
   mlir::stablehlo::registerPassPipelines();

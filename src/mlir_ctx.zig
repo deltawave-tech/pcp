@@ -84,20 +84,27 @@ pub const MLIRContext = struct {
         try opm.addPipeline("canonicalize,cse,stablehlo-legalize-to-linalg");
         std.debug.print("✓ Stage 1: StableHLO → Linalg on Tensors completed\n", .{});
 
-        // Stage 1.5: Fusion on tensors (use available pass)
+        // Stage 1.5: Optional but recommended fusion on tensors
         try opm.addPipeline("linalg-fuse-elementwise-ops");
         std.debug.print("✓ Stage 1.5: Fusion on tensors completed\n", .{});
 
         // Stage 2: One-Shot Bufferization (Tensor -> MemRef) at the module level.
-        // Add options for safety/flexibility using proper boolean flag syntax
         try opm.addPipeline("one-shot-bufferize{allow-unknown-ops dialect-filter=linalg,func,arith}");
         std.debug.print("✓ Stage 2: Bufferization completed\n", .{});
 
-        // Stage 3: Convert Linalg-on-MemRefs to Parallel Loops
-        // KEY FIX: Generalize named ops first to ensure lowering works on matmul/etc.
-        // This converts linalg.matmul to linalg.generic which convert-linalg-to-parallel-loops can handle
-        try opm.addPipeline("func.func(linalg-generalize-named-ops,convert-linalg-to-parallel-loops)");
-        std.debug.print("✓ Stage 3: Linalg generalization and conversion to parallel loops completed\n", .{});
+        // --- START: FINAL CORRECTED STAGE 3 ---
+        // The key is to run tiling *after* generalization but *before* parallel loop conversion.
+        // This new pipeline does the following in sequence for each function:
+        // 1. linalg-generalize-named-ops: Converts linalg.matmul -> linalg.generic.
+        // 2. test-linalg-transform-patterns: Takes the linalg.generic and creates tiled loops around it.
+        // 3. convert-linalg-to-parallel-loops: Now sees the loops and converts them to `scf.parallel`.
+        try opm.addPipeline(
+            "func.func(linalg-generalize-named-ops,"
+            ++ "test-linalg-transform-patterns,"
+            ++ "convert-linalg-to-parallel-loops)"
+        );
+        std.debug.print("✓ Stage 3: Linalg tiling and conversion to parallel loops completed\n", .{});
+        // --- END: FINAL CORRECTED STAGE 3 ---
 
         // Stage 4: Map parallel loops to GPU kernels and convert to SPIR-V.
         // This C++ bridge function should now receive the `scf.parallel` operations it expects.

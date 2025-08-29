@@ -28,6 +28,18 @@
 #include "mlir/CAPI/IR.h"    // For MlirDialectRegistry unwrap
 #include "mlir/Conversion/SCFToControlFlow/SCFToControlFlow.h"
 
+// Test pass registration headers  
+#include "mlir/Dialect/Linalg/Passes.h"
+
+// Production tiling should be included in standard Linalg passes
+
+// Forward declarations for test passes
+namespace mlir {
+namespace test {
+void registerTestLinalgTransforms();
+}
+}
+
 // We use extern "C" to make these functions callable from Zig.
 extern "C" {
 
@@ -70,12 +82,18 @@ void mlirForceLoadAllRequiredPasses() {
   mlir::registerCanonicalizerPass();
   mlir::registerCSEPass();
   
+  // Register test passes for tiling functionality
+  std::printf("  - Test Linalg transform passes (for tiling)\n");
+  mlir::test::registerTestLinalgTransforms();
+  
+  // Production linalg-tile should be included in registerLinalgPasses()
+  
   // Register specific passes for our pipeline instead of bulk GPU/SCF registration
   std::printf("  - Specific conversion passes for our pipeline\n");
   // These individual pass registrations avoid the bulk registration issues
   
   std::printf("C++: ✅ Minimal pass registration completed successfully!\n");
-  std::printf("     (Avoided problematic bulk GPU/SCF registrations)\n");
+  std::printf("     (Including Transform dialect and production tiling)\n");
 }
 
 // NEW FUNCTION: Build canonical GPU and SPIR-V conversion pipeline

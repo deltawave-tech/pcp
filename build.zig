@@ -1198,7 +1198,14 @@ pub fn build(b: *std.Build) void {
         
         // Linalg transforms and conversions
         m3_pipeline_test.linkSystemLibrary("MLIRLinalgTransforms");
+        m3_pipeline_test.linkSystemLibrary("MLIRLinalgTransformOps");  // Production tiling ops (linalg-tile)
+        m3_pipeline_test.linkSystemLibrary("MLIRLinalgTestPasses");  // Add test passes for tiling
         m3_pipeline_test.linkSystemLibrary("MLIRLinalgToStandard");
+        
+        // Transform Dialect (needed for production tiling)
+        m3_pipeline_test.linkSystemLibrary("MLIRTransformDialect");
+        m3_pipeline_test.linkSystemLibrary("MLIRTransformDialectTransforms");
+        m3_pipeline_test.linkSystemLibrary("MLIRTransformDialectUtils");
         
         // SCF transforms  
         m3_pipeline_test.linkSystemLibrary("MLIRSCFTransforms");
@@ -1213,6 +1220,7 @@ pub fn build(b: *std.Build) void {
         m3_pipeline_test.linkSystemLibrary("MLIRMemRefToSPIRV");
         m3_pipeline_test.linkSystemLibrary("MLIRVectorToSPIRV");
         m3_pipeline_test.linkSystemLibrary("MLIRArithToSPIRV");
+        m3_pipeline_test.linkSystemLibrary("MLIRArithTransforms");
         
         // Additional interfaces and utilities
         m3_pipeline_test.linkSystemLibrary("MLIRParallelCombiningOpInterface");

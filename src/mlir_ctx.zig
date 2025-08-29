@@ -7,23 +7,27 @@ const Allocator = std.mem.Allocator;
 const TILING_TRANSFORM_SCRIPT =
     \\module attributes { transform.with_named_sequence } {
     \\  transform.named_sequence @__transform_main(%arg0: !transform.any_op) {
-    \\    // Step 1: Find all linalg.generic ops. (This is correct)
-    \\    %matmul = transform.structured.match ops{["linalg.generic"]} in %arg0 : (!transform.any_op) -> !transform.any_op
-    \\
-    \\    // --- THE FINAL FIX ---
-    \\    // Step 2: Tile the matmul into scf.forall loops AND SIMULTANEOUSLY
-    \\    //         attribute the loops with the desired GPU block mapping.
-    \\    %tiled_op, %forall_loops = transform.structured.tile_using_forall %matmul tile_sizes [32, 32, 32] (mapping = [#gpu.block<x>, #gpu.block<y>, #gpu.thread<x>])
-    \\        : (!transform.any_op) -> (!transform.any_op, !transform.any_op)
-    \\
-    \\    // Step 3: Now that the loops are attributed, map them to a GPU launch operation.
-    \\    // This will consume the outer two loops mapped to #gpu.block<x> and #gpu.block<y>.
-    \\    %gpu_launch = transform.gpu.map_forall_to_blocks %forall_loops generate_gpu_launch grid_dims = [4, 8, 1]
+    \\    // Find the target operation.
+    \\    %matmul = transform.structured.match ops{["linalg.generic"]} in %arg0
     \\        : (!transform.any_op) -> !transform.any_op
     \\
-    \\    // Step 4: Map the remaining inner loop (originally #gpu.thread<x>) to GPU threads.
-    \\    // This must now operate on the contents of the gpu.launch op.
-    \\    transform.gpu.map_nested_forall_to_threads %gpu_launch block_dims = [32, 1, 1]
+    \\    // STEP 1: Tile and assign GPU mapping attributes simultaneously.
+    \\    // This is the key step. It produces a handle to the newly created loops.
+    \\    %tiled_op, %forall_loops = transform.structured.tile_using_forall %matmul
+    \\        tile_sizes [32, 32, 32]
+    \\        (mapping = [#gpu.block<x>, #gpu.block<y>, #gpu.thread<x>])
+    \\        : (!transform.any_op) -> (!transform.any_op, !transform.any_op)
+    \\
+    \\    // STEP 2: Map the attributed loops to GPU blocks.
+    \\    // This consumes the '%forall_loops' handle and produces a new '%gpu_launch' handle.
+    \\    %gpu_launch = transform.gpu.map_forall_to_blocks %forall_loops
+    \\        generate_gpu_launch grid_dims = [4, 8, 1]
+    \\        : (!transform.any_op) -> !transform.any_op
+    \\
+    \\    // STEP 3: Map the remaining nested loops to GPU threads.
+    \\    // This targets the loops *inside* the operation associated with the '%gpu_launch' handle.
+    \\    transform.gpu.map_nested_forall_to_threads %gpu_launch
+    \\        block_dims = [32, 1, 1]
     \\        : (!transform.any_op) -> !transform.any_op
     \\
     \\    transform.yield

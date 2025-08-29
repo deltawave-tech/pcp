@@ -11,8 +11,8 @@ const TILING_TRANSFORM_SCRIPT =
     \\    %matmul = transform.structured.match ops{["linalg.matmul"]} in %arg0 : (!transform.any_op) -> !transform.any_op
     \\
     \\    // Step 2: Tile the matched matmul operation.
-    \\    %forall_loops, %tiled_op = transform.structured.tile_using_forall %matmul tile_sizes [32, 32, 32]
-    \\      : (!transform.any_op) -> (!transform.any_op, !transform.any_op)
+    \\    %tiled_op, %forall_loops = transform.structured.tile_using_forall %matmul tile_sizes [32, 32, 32]
+    \\        : (!transform.any_op) -> (!transform.any_op, !transform.any_op)
     \\
     \\    // Return the result of the transformation.
     \\    transform.yield

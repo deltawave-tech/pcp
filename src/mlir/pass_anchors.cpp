@@ -52,6 +52,21 @@
 #include "mlir/Conversion/SCFToGPU/SCFToGPUPass.h"
 #include "mlir/Conversion/Passes.h"
 
+// Add SCF dialect passes
+#include "mlir/Dialect/SCF/Transforms/Passes.h"
+
+// SPIR-V conversion patterns for supporting dialects
+#include "mlir/Conversion/ArithToSPIRV/ArithToSPIRV.h"
+#include "mlir/Conversion/MemRefToSPIRV/MemRefToSPIRV.h"
+#include "mlir/Conversion/MemRefToSPIRV/MemRefToSPIRVPass.h"
+#include "mlir/Conversion/SCFToSPIRV/SCFToSPIRV.h"
+#include "mlir/Conversion/SCFToSPIRV/SCFToSPIRVPass.h"
+#include "mlir/Conversion/FuncToSPIRV/FuncToSPIRV.h"
+#include "mlir/Conversion/VectorToSPIRV/VectorToSPIRV.h"
+#include "mlir/Conversion/ControlFlowToSPIRV/ControlFlowToSPIRV.h"
+#include "mlir/Dialect/SPIRV/Transforms/SPIRVConversion.h"
+#include "mlir/Transforms/DialectConversion.h"
+
 // Production tiling should be included in standard Linalg passes
 
 // Forward declarations for test passes
@@ -139,6 +154,17 @@ void mlirForceLoadAllRequiredPasses() {
   // Register GPU passes (for gpu-kernel-outlining and other GPU transformations)
   std::printf("  - GPU passes (for kernel outlining and transformations)\n");
   mlir::registerGPUPasses();
+  
+  // Register SCF passes (including forall to parallel)
+  std::printf("  - SCF passes (including forall to parallel)\n");
+  mlir::registerSCFPasses();
+  
+  // SPIR-V conversion patterns (force linking by registering conversion passes)
+  std::printf("  - SPIRV conversion passes (arith, memref, scf, func)\n");
+  mlir::registerConvertArithToSPIRVPass();
+  mlir::registerConvertFuncToSPIRVPass();
+  mlir::registerConvertMemRefToSPIRVPass();
+  mlir::registerSCFToSPIRVPass();
   
   std::printf("C++: ✅ Minimal pass registration completed successfully!\n");
   std::printf("     (Including Transform dialect and production tiling)\n");

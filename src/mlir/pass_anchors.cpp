@@ -23,6 +23,7 @@
 #include "mlir/Dialect/Arith/Transforms/BufferizableOpInterfaceImpl.h"
 #include "mlir/Dialect/SCF/Transforms/BufferizableOpInterfaceImpl.h"
 #include "mlir/Dialect/SCF/Transforms/BufferDeallocationOpInterfaceImpl.h"
+#include "mlir/Dialect/MemRef/Transforms/AllocationOpInterfaceImpl.h"
 #include "mlir/IR/DialectRegistry.h"
 
 // Add TilingInterface registration
@@ -206,6 +207,9 @@ void mlirRegisterBufferizationInterfaces(MlirDialectRegistry registryHandle) {
   
   std::printf("  - SCF dialect BufferDeallocationOpInterface\n");
   mlir::scf::registerBufferDeallocationOpInterfaceExternalModels(registry);
+  
+  std::printf("  - MemRef dialect AllocationOpInterface\n");
+  mlir::memref::registerAllocationOpInterfaceExternalModels(registry);
   
   std::printf("C++: ✅ BufferizableOpInterface implementations registered\n");
 }

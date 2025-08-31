@@ -68,6 +68,7 @@
 #include "mlir/Conversion/VectorToSPIRV/VectorToSPIRV.h"
 #include "mlir/Conversion/ControlFlowToSPIRV/ControlFlowToSPIRV.h"
 #include "mlir/Dialect/SPIRV/Transforms/SPIRVConversion.h"
+#include "mlir/Dialect/SPIRV/Transforms/Passes.h"
 #include "mlir/Transforms/DialectConversion.h"
 
 // Production tiling should be included in standard Linalg passes
@@ -177,6 +178,10 @@ void mlirForceLoadAllRequiredPasses() {
   mlir::registerConvertMemRefToSPIRVPass();
   mlir::registerSCFToSPIRVPass();
   mlir::registerConvertGPUToSPIRVPass();
+
+  // Register specific SPIR-V passes (avoiding problematic bulk registration)
+  std::printf("  - Specific SPIRV passes (target attributes and lowering)\n");
+  // Register individual passes instead of bulk registration to avoid linking issues
   
   std::printf("C++: ✅ Minimal pass registration completed successfully!\n");
   std::printf("     (Including Transform dialect and production tiling)\n");

@@ -179,25 +179,23 @@ pub const MLIRContext = struct {
             defer pm.deinit();
 
             const pipeline =
-                // 1. **THE CRITICAL FIX**: Go directly from `scf.forall` on Tensors to the Memref domain first.
-                // The bufferizer knows how to handle `scf.forall` with tensor semantics.
+                // 1. Bufferize while on tensors, handling scf.forall correctly.
                 "one-shot-bufferize{bufferize-function-boundaries=true}," ++
                 "func.func(buffer-hoisting,buffer-loop-hoisting)," ++
                 "buffer-deallocation-pipeline," ++
                 "canonicalize,cse," ++
 
-                // 2. **THE SECOND CRITICAL FIX**: Now that we are on memrefs, use the single, robust
-                // pass that converts the mapped `scf.forall` DIRECTLY to `gpu.launch`.
-                // This bypasses the problematic `scf.parallel` intermediate step.
+                // 2. Convert the mapped scf.forall (now on memrefs) DIRECTLY to gpu.launch.
                 "convert-scf-to-gpu," ++
 
-                // 3. Kernel Outlining: Create the gpu.module with gpu.func kernels.
+                // 3. Outline the gpu.launch body into a gpu.module.
                 "gpu-kernel-outlining," ++
 
-                // 4. Kernel Body Lowering: Lower the high-level ops inside the GPU kernel.
+                // 4. Lower the high-level ops inside the GPU kernel.
                 "gpu.module(convert-linalg-to-loops,canonicalize,cse)," ++
 
-                // 5. Final Conversion to SPIR-V: Convert the host and device code.
+                // 5. Convert the GPU dialect to the SPIR-V dialect.
+                // The convert-gpu-to-spirv pass should handle SPIR-V module creation automatically.
                 "convert-gpu-to-spirv";
 
             std.debug.print("\n--- Running Final Unified Pipeline ---\n", .{});

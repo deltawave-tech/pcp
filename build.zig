@@ -277,7 +277,7 @@ fn addMLIRSupport(target: *std.Build.Step.Compile, mlir_config: MLIRConfig) void
         "MLIRPresburger", "MLIRAffineAnalysis", "MLIRAffineUtils", "MLIRDialectUtils", "MLIRArithUtils", "MLIRLinalgUtils", "MLIRSCFUtils", "MLIRTensorUtils", "MLIRTensorTilingInterfaceImpl", "MLIRMemRefUtils", "MLIRVectorUtils", "MLIRInferIntRangeCommon",
 
         // GPU & SPIR-V Pipeline Dialects
-        "MLIRGPUDialect", "MLIRSPIRVDialect", "MLIRSPIRVSerialization", "MLIRSPIRVTarget", "MLIRSPIRVImageInterfaces", "MLIRLLVMDialect", "MLIRMeshDialect",
+        "MLIRGPUDialect", "MLIRSPIRVDialect", "MLIRSPIRVSerialization", "MLIRSPIRVTarget", "MLIRSPIRVImageInterfaces", "MLIRSPIRVTransforms", "MLIRSPIRVUtils", "MLIRLLVMDialect", "MLIRMeshDialect",
 
         // Dialect Extensions (Critical for BufferizableOpInterface)
         "MLIRFuncAllExtensions", "MLIRTensorAllExtensions", "MLIRFuncInlinerExtension", "MLIRFuncMeshShardingExtensions",
@@ -450,6 +450,8 @@ pub fn build(b: *std.Build) void {
             "MLIRSPIRVDialect",
             "MLIRSPIRVSerialization",
             "MLIRSPIRVBinaryUtils",
+            "MLIRSPIRVTransforms",
+            "MLIRSPIRVUtils",
             "MLIRSupport",
             "LLVMSupport",
             "LLVMCore",

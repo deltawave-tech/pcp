@@ -150,10 +150,10 @@ fn runShepherd(allocator: Allocator, args: Args) !void {
     const diloco_config = DiLoCoConfig.default();
     
     // Pass the single MLIRBuilder instance to the algorithm.
-    print("🔧 Initializing DiLoCo algorithm...\n", .{});
+    print("Initializing DiLoCo algorithm...\n", .{});
     var diloco_algo = try DiLoCo.init(allocator, shepherd_controller, diloco_config, system.executor, &mlir_builder);
     defer diloco_algo.deinit();
-    print("✅ DiLoCo algorithm initialized successfully\n", .{});
+    print("🌙 DiLoCo algorithm initialized successfully\n", .{});
     
     var training_algo = diloco_algo.asTrainingAlgorithm();
     shepherd_controller.setAlgorithm(&training_algo);
@@ -167,9 +167,9 @@ fn runShepherd(allocator: Allocator, args: Args) !void {
     defer dashboard_thread.join();
     
     // Wait for workers and start training
-    print("🔄 Waiting for workers to connect...\n", .{});
+    print("Waiting for workers to connect...\n", .{});
     shepherd_controller.startTraining(args.workers) catch |err| {
-        print("❌ Training failed with error: {}\n", .{err});
+        print("💣 Training failed with error: {}\n", .{err});
         return err;
     };
     

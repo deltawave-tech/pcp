@@ -32,7 +32,7 @@ pub fn main() !void {
     // Test 5: MLIR Integration
     try testMLIRIntegration(allocator);
     
-    std.debug.print("\n✅ All MLIR verification tests passed successfully!\n", .{});
+    std.debug.print("\n🌙 All MLIR verification tests passed successfully!\n", .{});
 }
 
 /// Test 1: Basic MLIR Operations (multiply, add, etc.)

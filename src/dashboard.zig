@@ -68,7 +68,7 @@ pub const Dashboard = struct {
         std.debug.print("\x1b[1;36m🪐 Planetary Compute Protocol - Dashboard\x1b[0m\n\n", .{});
         
         // Status Section
-        drawBox("📊 Status", 40);
+        drawBox("Status", 40);
         std.debug.print("  \x1b[37mWorkers Connected:\x1b[0m \x1b[32m{}\x1b[0m\n", .{metrics.workers_connected});
         std.debug.print("  \x1b[37mTraining Status:\x1b[0m  \x1b[32m{s}\x1b[0m\n", .{metrics.training_status.toString()});
         
@@ -78,7 +78,7 @@ pub const Dashboard = struct {
         std.debug.print("\n", .{});
         
         // Metrics Section  
-        drawBox("📈 Metrics", 40);
+        drawBox("Metrics", 40);
         std.debug.print("  \x1b[37mOuter Loop Step:\x1b[0m  \x1b[32m{}\x1b[0m\n", .{metrics.outer_loop_step});
         
         const loss_str = try std.fmt.bufPrint(&buf, "{d:.6}", .{metrics.average_loss});
@@ -104,7 +104,7 @@ pub const Dashboard = struct {
         std.debug.print("\n", .{});
         
         // Loss History Graph
-        drawBox("📉 Loss History", 70);
+        drawBox("Loss History", 70);
         try drawLossGraph(metrics);
         std.debug.print("\n", .{});
         

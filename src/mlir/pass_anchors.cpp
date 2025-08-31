@@ -183,7 +183,7 @@ void mlirForceLoadAllRequiredPasses() {
   std::printf("  - Specific SPIRV passes (target attributes and lowering)\n");
   // Register individual passes instead of bulk registration to avoid linking issues
   
-  std::printf("C++: ✅ Minimal pass registration completed successfully!\n");
+  std::printf("C++: 🌙 Minimal pass registration completed successfully!\n");
   std::printf("     (Including Transform dialect and production tiling)\n");
 }
 
@@ -216,12 +216,12 @@ void mlirBuildAndAppendGpuAndSpirvConversionPipeline(MlirOpPassManager passManag
     std::printf("  - Adding GPU to SPIR-V conversion\n");
     opm->addPass(mlir::createConvertGPUToSPIRVPass());
     
-    std::printf("C++: ✅ Canonical GPU → SPIR-V pipeline built successfully!\n");
+    std::printf("C++: 🌙 Canonical GPU → SPIR-V pipeline built successfully!\n");
     
   } catch (const std::exception& e) {
-    std::printf("C++: ❌ Error building GPU pipeline: %s\n", e.what());
+    std::printf("C++: 💣 Error building GPU pipeline: %s\n", e.what());
   } catch (...) {
-    std::printf("C++: ❌ Unknown error building GPU pipeline\n");
+    std::printf("C++: 💣 Unknown error building GPU pipeline\n");
   }
 }
 
@@ -254,7 +254,7 @@ void mlirRegisterBufferizationInterfaces(MlirDialectRegistry registryHandle) {
   std::printf("  - MemRef dialect AllocationOpInterface\n");
   mlir::memref::registerAllocationOpInterfaceExternalModels(registry);
   
-  std::printf("C++: ✅ BufferizableOpInterface implementations registered\n");
+  std::printf("C++: 🌙 BufferizableOpInterface implementations registered\n");
 }
 
 // Register Transform dialect extensions with a dialect registry
@@ -276,7 +276,7 @@ void mlirRegisterTransformExtensions(MlirDialectRegistry registryHandle) {
   std::printf("  - Linalg TilingInterface implementations\n");
   mlir::linalg::registerTilingInterfaceExternalModels(registry);
   
-  std::printf("C++: ✅ Transform dialect extensions registered\n");
+  std::printf("C++: 🌙 Transform dialect extensions registered\n");
 }
 
 } // extern "C"

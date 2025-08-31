@@ -509,17 +509,17 @@ pub fn testMLIRGPUPipeline(allocator: std.mem.Allocator) !void {
                                 std.mem.indexOf(u8, msl_source, "main_dispatch") != null;
     
     if (msl_contains_kernel) {
-        std.debug.print("✅ MSL contains GPU kernel function\n", .{});
+        std.debug.print("🌙 MSL contains GPU kernel function\n", .{});
     } else {
         std.debug.print("⚠ MSL may not contain expected kernel function\n", .{});
     }
 
     // 8. Verify kernel name extraction worked
     if (kernel_info.len > 0) {
-        std.debug.print("✅ Successfully extracted kernel: {s}\n", .{kernel_info[0].name});
+        std.debug.print("🌙 Successfully extracted kernel: {s}\n", .{kernel_info[0].name});
         
         // 9. Verify the mathematical correctness (CPU verification)
-        std.debug.print("🔍 Verifying mathematical correctness (CPU calculation)...\n", .{});
+        std.debug.print("Verifying mathematical correctness (CPU calculation)...\n", .{});
         std.debug.print("   Input A: {any}\n", .{input_a_data});
         std.debug.print("   Input B: {any}\n", .{input_b_data});
         std.debug.print("   Expected Result: {any}\n", .{expected_output_data});
@@ -537,12 +537,12 @@ pub fn testMLIRGPUPipeline(allocator: std.mem.Allocator) !void {
         const tolerance = 1e-6;
         for (cpu_result, expected_output_data) |cpu_val, expected_val| {
             if (@abs(cpu_val - expected_val) > tolerance) {
-                std.debug.print("❌ CPU verification failed! Computed: {}, Expected: {}\n", .{ cpu_val, expected_val });
+                std.debug.print("💣 CPU verification failed! Computed: {}, Expected: {}\n", .{ cpu_val, expected_val });
                 return error.CPUVerificationFailed;
             }
         }
         
-        std.debug.print("✅ CPU verification successful! Math is correct.\n", .{});
+        std.debug.print("🌙 CPU verification successful! Math is correct.\n", .{});
     }
 
     // --- START: NEW EXECUTION AND VERIFICATION SECTION ---
@@ -564,23 +564,23 @@ pub fn testMLIRGPUPipeline(allocator: std.mem.Allocator) !void {
     // 3. Execute the pre-compiled MSL on the GPU
     // This is the step that actually runs code on the M3.
     // Now you should see a spike in `mactop`!
-    std.debug.print("🚀 Dispatching kernel to M3 GPU for execution...\n", .{});
+    std.debug.print("👻 Dispatching kernel to M3 GPU for execution...\n", .{});
     try engine.executeMSL(msl_source, kernel_info, input_array[0..], output_array[0..]);
-    std.debug.print("✅ GPU execution finished.\n", .{});
+    std.debug.print("🌙 GPU execution finished.\n", .{});
 
     // 4. Verify the result read back from the GPU
-    std.debug.print("🔍 Verifying GPU output against expected result...\n", .{});
+    std.debug.print("Verifying GPU output against expected result...\n", .{});
     std.debug.print("   GPU Result: {any}\n", .{actual_gpu_output});
     std.debug.print("   Expected:   {any}\n", .{expected_output_data});
 
     const tolerance = 1e-6;
     for (actual_gpu_output, expected_output_data) |gpu_val, expected_val| {
         if (@abs(gpu_val - expected_val) > tolerance) {
-            std.debug.print("❌ GPU verification failed! Computed: {}, Expected: {}\n", .{ gpu_val, expected_val });
+            std.debug.print("💣 GPU verification failed! Computed: {}, Expected: {}\n", .{ gpu_val, expected_val });
             return error.GPUVerificationFailed;
         }
     }
-    std.debug.print("✅ Verification successful! The result from the GPU is correct.\n", .{});
+    std.debug.print("🌙 Verification successful! The result from the GPU is correct.\n", .{});
 
     // --- END: NEW EXECUTION AND VERIFICATION SECTION ---
 

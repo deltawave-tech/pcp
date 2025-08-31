@@ -179,7 +179,7 @@ pub const DiLoCo = struct {
     pub fn run(ptr: *anyopaque) !void {
         const self: *Self = @ptrCast(@alignCast(ptr));
 
-        std.log.info("🚀 DiLoCo.run() starting...", .{});
+        std.log.info("👻 DiLoCo.run() starting...", .{});
 
         self.status = .initializing;
         monitoring.setStatus(.initializing);
@@ -187,12 +187,12 @@ pub const DiLoCo = struct {
         std.log.info("✓ DiLoCo status and monitoring initialized", .{});
 
         // Initialize master parameters
-        std.log.info("🔧 Initializing master parameters...", .{});
+        std.log.info("Initializing master parameters...", .{});
         try self.initializeMasterParameters();
         std.log.info("✓ Master parameters initialized successfully", .{});
 
         // PHASE 0: SETUP WORKERS (ONE-TIME)
-        std.log.info("👥 Setting up workers...", .{});
+        std.log.info("Setting up workers...", .{});
         try self.setupWorkers();
         std.log.info("✓ Workers setup completed", .{});
 
@@ -247,7 +247,7 @@ pub const DiLoCo = struct {
         std.log.info("✓ Parameter array allocated", .{});
 
         // Initialize with Xavier/Glorot initialization
-        std.log.info("🔢 Computing Xavier initialization...", .{});
+        std.log.info("Computing Xavier initialization...", .{});
         var rng = std.Random.DefaultPrng.init(12345);
         const scale = std.math.sqrt(2.0 / @as(f32, @floatFromInt(param_element_count)));
 
@@ -257,11 +257,11 @@ pub const DiLoCo = struct {
         std.log.info("✓ Parameter values generated", .{});
 
         // Convert to MLIR tensor
-        std.log.info("🔧 Converting to MLIR tensor...", .{});
+        std.log.info("Converting to MLIR tensor...", .{});
         self.master_parameters = try self.createTensorFromArray(param_data);
         std.log.info("✓ MLIR tensor created successfully", .{});
 
-        std.log.info("✅ Initialized master parameters with {} elements using Xavier initialization", .{param_element_count});
+        std.log.info("🌙 Initialized master parameters with {} elements using Xavier initialization", .{param_element_count});
     }
 
     /// Create a dedicated forward+loss function that will be differentiated

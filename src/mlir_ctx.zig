@@ -9,10 +9,9 @@ const TILING_TRANSFORM_SCRIPT =
     \\  transform.named_sequence @__transform_main(%arg0: !transform.any_op) {
     \\    transform.sequence %arg0 : !transform.any_op failures(propagate) {
     \\      ^bb1(%arg1: !transform.any_op):
-    \\        %matmul = transform.structured.match ops{["linalg.generic"]} attributes {iterator_types = ["parallel", "parallel", "parallel", "reduction"]} in %arg1 : (!transform.any_op) -> !transform.any_op
-    \\        %split_matmul, %init_or_alloc_op, %more_parallel_fill_op, %split_identities = transform.structured.split_reduction %matmul {split_factor = 8, insert_split_dimension = 3} : (!transform.any_op) -> (!transform.any_op, !transform.any_op, !transform.any_op, !transform.any_op)
-    \\        %tiled_matmul, %forall_matmul = transform.structured.tile_using_forall %split_matmul tile_sizes [4, 32, 32, 8, 0]
-    \\          (mapping = [#gpu.block<x>, #gpu.block<y>, #gpu.thread<x>, #gpu.thread<y>]) : (!transform.any_op) -> (!transform.any_op, !transform.any_op)
+    \\        %fill = transform.structured.match ops{["linalg.generic"]} attributes {iterator_types = ["parallel", "parallel", "parallel"]} in %arg1 : (!transform.any_op) -> !transform.any_op
+    \\        %tiled_fill, %forall_fill = transform.structured.tile_using_forall %fill tile_sizes [4, 32, 32] 
+    \\          {interchange = []} : (!transform.any_op) -> (!transform.any_op, !transform.any_op)
     \\    }
     \\    transform.yield
     \\  }

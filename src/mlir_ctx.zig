@@ -132,13 +132,11 @@ pub const MLIRContext = struct {
 
         // === STAGE 1 & 2: HLO -> Linalg -> Tiled+Mapped scf.forall (on Tensors) ===
         {
-            // Prepare the IR by lowering to Linalg on tensors.
             var pm = try mlir.PassManager.init(self.getContext());
             defer pm.deinit();
             try pm.asOpPassManager().addPipeline("stablehlo-legalize-to-linalg,func.func(linalg-generalize-named-ops,canonicalize,cse)");
             try pm.runOnOp(module.op());
 
-            // Inject and run the new 3D TILING_TRANSFORM_SCRIPT.
             const transform_module = try mlir.Module.parse(self.getContext(), TILING_TRANSFORM_SCRIPT);
             defer transform_module.deinit();
             const main_module_body = module.op().getRegion(0).getBlock(0);
@@ -149,7 +147,7 @@ pub const MLIRContext = struct {
                 op_to_clone = op.getNext();
             }
             c.operationSetAttributeByName(module.op().handle, "transform.with_named_sequence", c.unitAttrGet(self.context));
-            
+
             var transform_pm = try mlir.PassManager.init(self.getContext());
             defer transform_pm.deinit();
             try transform_pm.asOpPassManager().addPipeline("transform-interpreter");
@@ -159,14 +157,10 @@ pub const MLIRContext = struct {
         std.debug.print("\n--- IR after 3D Tiling (Attributed scf.forall) ---\n", .{});
         module.op().dump();
 
-        // === STAGE 3: Canonical Lowering Pipeline ===
+        // === STAGE 3: Unified Lowering Pipeline (Working Order) ===
         {
-            var pm = try mlir.PassManager.init(self.getContext());
-            defer pm.deinit();
-            const opm = pm.asOpPassManager();
-
-            // 3.1: Clean up the transform script operations.
-            std.debug.print("\n--- Stage 3.1: Cleaning Up Transform Script ---\n", .{});
+            // First, manually clean the transform script ops from the module.
+            std.debug.print("\n--- Cleaning Up Transform Script ---\n", .{});
             const module_body = module.op().getRegion(0).getBlock(0);
             var maybe_op = module_body.getFirstOp();
             while (maybe_op) |op| {
@@ -178,56 +172,29 @@ pub const MLIRContext = struct {
                 maybe_op = next_op;
             }
             _ = c.operationRemoveAttributeByName(module.op().handle, "transform.with_named_sequence");
-            
-            std.debug.print("\n--- IR after transform cleanup ---\n", .{});
-            module.op().dump();
 
-            // 3.2: Bufferization - Move early to convert tensors to memrefs before forall lowering
-            std.debug.print("\n--- Stage 3.2: Bufferization ---\n", .{});
-            try opm.addPipeline("one-shot-bufferize{bufferize-function-boundaries=true}");
-            try opm.addPipeline("func.func(buffer-hoisting,buffer-loop-hoisting)");
-            try opm.addPipeline("buffer-deallocation-pipeline");
-            try pm.runOnOp(module.op());
-            std.debug.print("\n--- IR after Bufferization ---\n", .{});
-            module.op().dump();
+            // Create ONE PassManager with the working order from our successful pipeline
+            var pm = try mlir.PassManager.init(self.getContext());
+            defer pm.deinit();
 
-            // 3.3: Lower scf.forall to scf.parallel (now on memrefs)
-            std.debug.print("\n--- Stage 3.3: Lower scf.forall to scf.parallel ---\n", .{});
-            try opm.addPipeline("scf-forall-to-parallel");
-            try pm.runOnOp(module.op());
-            std.debug.print("\n--- IR after scf.forall to scf.parallel ---\n", .{});
-            module.op().dump();
+            // CORRECT ORDER: Bufferization first (tensor → memref)
+            try pm.asOpPassManager().addPipeline("one-shot-bufferize{bufferize-function-boundaries=true}");
+            try pm.asOpPassManager().addPipeline("func.func(buffer-hoisting,buffer-loop-hoisting)");
+            try pm.asOpPassManager().addPipeline("buffer-deallocation-pipeline");
 
-            // 3.4: Map parallel loops to GPU
-            std.debug.print("\n--- Stage 3.4: Map parallel loops to GPU ---\n", .{});
-            try opm.addPipeline("convert-parallel-loops-to-gpu");
-            try pm.runOnOp(module.op());
-            std.debug.print("\n--- IR after parallel to GPU mapping ---\n", .{});
-            module.op().dump();
+            // Then scf-forall-to-parallel (on memrefs, preserving mapping attributes)
+            try pm.asOpPassManager().addPipeline("scf-forall-to-parallel");
 
-            // 3.5: Outline the kernel
-            std.debug.print("\n--- Stage 3.5: GPU Kernel Outlining ---\n", .{});
-            try opm.addPipeline("gpu-kernel-outlining");
-            try pm.runOnOp(module.op());
-            std.debug.print("\n--- IR after GPU kernel outlining ---\n", .{});
-            module.op().dump();
+            // Then GPU conversion pipeline (on memrefs with mapping attributes)
+            try pm.asOpPassManager().addPipeline("convert-parallel-loops-to-gpu");
+            try pm.asOpPassManager().addPipeline("gpu-kernel-outlining");
+            try pm.asOpPassManager().addPipeline("canonicalize,cse");
+            try pm.asOpPassManager().addPipeline("gpu.module(convert-linalg-to-loops)");
+            try pm.asOpPassManager().addPipeline("convert-gpu-to-spirv");
 
-            // 3.6: Cleanup and module lowering
-            std.debug.print("\n--- Stage 3.6: Post-GPU Cleanup and Lowering ---\n", .{});
-            try opm.addPipeline("canonicalize,cse");
-            try opm.addPipeline("gpu.module(convert-linalg-to-loops)");
+            std.debug.print("\n--- Running Unified Pipeline (Working Order) ---\n", .{});
             try pm.runOnOp(module.op());
-            std.debug.print("\n--- IR after Post-GPU Cleanup and Lowering ---\n", .{});
-            module.op().dump();
-
-            // 3.7: GPU to SPIR-V
-            std.debug.print("\n--- Stage 3.7: GPU to SPIR-V ---\n", .{});
-            try opm.addPipeline("convert-gpu-to-spirv");
-            try pm.runOnOp(module.op());
-            std.debug.print("\n--- IR after SPIR-V Conversion ---\n", .{});
-            module.op().dump();
         }
-
 
         std.debug.print("\n--- Final Module IR (Lowered to SPIR-V) ---\n", .{});
         module.op().dump();

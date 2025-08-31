@@ -13,7 +13,7 @@ const TILING_TRANSFORM_SCRIPT =
     \\    // Tile all three dimensions (M, N, K reduction) and map to GPU hierarchy
     \\    // M -> block<x>, N -> block<y>, K -> thread<x>
     \\    %tiled, %loops = transform.structured.tile_using_forall %generic
-    \\        tile_sizes [32, 32, 32]
+    \\        tile_sizes [4, 32, 32]
     \\        (mapping = [#gpu.block<x>, #gpu.block<y>, #gpu.thread<x>])
     \\        : (!transform.any_op) -> (!transform.any_op, !transform.any_op)
     \\

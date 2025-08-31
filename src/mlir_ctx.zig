@@ -155,7 +155,7 @@ pub const MLIRContext = struct {
             std.debug.print("\n--- Running Transform Interpreter (3D Tiling) ---\n", .{});
             try transform_pm.runOnOp(module.op());
         }
-        std.debug.print("\n--- IR after 3D Tiling (Attributed scf.forall) ---\n", .{});
+        std.debug.print("\n--- IR after 3D Tiling (Attributed scf.forall on Tensors) ---\n", .{});
         module.op().dump();
         
         // Clean up the transform script operations.
@@ -173,29 +173,33 @@ pub const MLIRContext = struct {
         _ = c.operationRemoveAttributeByName(module.op().handle, "transform.with_named_sequence");
 
         // === STAGE 3: The Final, Unified Lowering Pipeline ===
-        // This pipeline correctly sequences all steps in a single PassManager run.
+        // This pipeline correctly sequences all passes in a single run.
         {
             var pm = try mlir.PassManager.init(self.getContext());
             defer pm.deinit();
 
             const pipeline =
-                // 1. Bufferize while on tensors, handling scf.forall correctly.
+                // 1. **DOMAIN CROSSING**: Convert the entire module from Tensors to Memrefs.
+                // The bufferizer is smart enough to handle the tensor-based `scf.forall`.
                 "one-shot-bufferize{bufferize-function-boundaries=true}," ++
                 "func.func(buffer-hoisting,buffer-loop-hoisting)," ++
                 "buffer-deallocation-pipeline," ++
                 "canonicalize,cse," ++
+                
+                // 2. **LOWER SCF**: Now that we are on memrefs, lower the `scf.forall`
+                // (which no longer has tensor outputs) to `scf.parallel`.
+                "scf-forall-to-parallel," ++
 
-                // 2. Convert the mapped scf.forall (now on memrefs) DIRECTLY to gpu.launch.
-                "convert-scf-to-gpu," ++
+                // 3. **GPU MAPPING**: Convert the mapped `scf.parallel` to `gpu.launch`.
+                "convert-parallel-loops-to-gpu," ++
 
-                // 3. Outline the gpu.launch body into a gpu.module.
+                // 4. **KERNEL CREATION**: Outline the `gpu.launch` body into a `gpu.module`.
                 "gpu-kernel-outlining," ++
 
-                // 4. Lower the high-level ops inside the GPU kernel.
+                // 5. **KERNEL BODY LOWERING**: Lower the `linalg.generic` op inside the kernel to loops.
                 "gpu.module(convert-linalg-to-loops,canonicalize,cse)," ++
 
-                // 5. Convert the GPU dialect to the SPIR-V dialect.
-                // The convert-gpu-to-spirv pass should handle SPIR-V module creation automatically.
+                // 6. **FINAL CONVERSION**: Convert the GPU and other dialects to SPIR-V.
                 "convert-gpu-to-spirv";
 
             std.debug.print("\n--- Running Final Unified Pipeline ---\n", .{});

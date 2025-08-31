@@ -215,7 +215,7 @@ pub const MLIRContext = struct {
             // 3.6: Cleanup and module lowering
             std.debug.print("\n--- Stage 3.6: Post-GPU Cleanup and Lowering ---\n", .{});
             try opm.addPipeline("canonicalize,cse");
-            try opm.addPipeline("gpu.module(convert-linalg-to-loops,convert-scf-to-cf)");
+            try opm.addPipeline("gpu.module(convert-linalg-to-loops)");
             try pm.runOnOp(module.op());
             std.debug.print("\n--- IR after Post-GPU Cleanup and Lowering ---\n", .{});
             module.op().dump();

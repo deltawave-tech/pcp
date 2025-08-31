@@ -160,11 +160,12 @@ void mlirForceLoadAllRequiredPasses() {
   mlir::registerSCFPasses();
   
   // SPIR-V conversion patterns (force linking by registering conversion passes)
-  std::printf("  - SPIRV conversion passes (arith, memref, scf, func)\n");
+  std::printf("  - SPIRV conversion passes (arith, memref, scf, func, gpu)\n");
   mlir::registerConvertArithToSPIRVPass();
   mlir::registerConvertFuncToSPIRVPass();
   mlir::registerConvertMemRefToSPIRVPass();
   mlir::registerSCFToSPIRVPass();
+  mlir::registerConvertGPUToSPIRVPass();
   
   std::printf("C++: ✅ Minimal pass registration completed successfully!\n");
   std::printf("     (Including Transform dialect and production tiling)\n");

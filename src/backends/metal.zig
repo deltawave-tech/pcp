@@ -152,9 +152,21 @@ pub const MLIRMetalExecutionEngine = struct {
     pub fn deinit(self: *MLIRMetalExecutionEngine) void {
         // DO NOT deinit the context, as we do not own it. The creator is responsible.
         
-        // Clean up compiled resources
+        // --- START: NEW CLEANUP LOGIC ---
+        
+        // Manually free the memory allocated for the keys in the pipeline cache.
+        var pipeline_it = self.compiled_pipelines.iterator();
+        while (pipeline_it.next()) |entry| {
+            // Free the duplicated key string.
+            self.allocator.free(entry.key_ptr.*);
+        }
+
+        // Now it's safe to deinit the hashmaps themselves.
         self.compiled_functions.deinit();
         self.compiled_pipelines.deinit();
+
+        // --- END: NEW CLEANUP LOGIC ---
+
         self.device = null;
         self.command_queue = null;
         self.library = null;

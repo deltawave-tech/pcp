@@ -9,11 +9,14 @@ const TILING_TRANSFORM_SCRIPT =
     \\  transform.named_sequence @__transform_main(%arg0: !transform.any_op) {
     \\    %generic = transform.structured.match ops{["linalg.generic"]} in %arg0
     \\        : (!transform.any_op) -> !transform.any_op
-    \\    // Tile M, N (parallel dimensions) for matrix multiplication GPU mapping
+    \\
+    \\    // Tile all three dimensions (M, N, K reduction) and map to GPU hierarchy
+    \\    // M -> block<x>, N -> block<y>, K -> thread<x>
     \\    %tiled, %loops = transform.structured.tile_using_forall %generic
-    \\        tile_sizes [32, 32]
-    \\        (mapping = [#gpu.block<x>, #gpu.block<y>])
+    \\        tile_sizes [32, 32, 32]
+    \\        (mapping = [#gpu.block<x>, #gpu.block<y>, #gpu.thread<x>])
     \\        : (!transform.any_op) -> (!transform.any_op, !transform.any_op)
+    \\
     \\    transform.yield
     \\  }
     \\}
@@ -122,21 +125,20 @@ pub const MLIRContext = struct {
         c.contextDestroy(self.context);
     }
     
-    /// Lowers the module using the definitive, canonically-ordered GPU pipeline with kernel outlining.
+    /// Lowers the module using the definitive, pass-driven canonical GPU pipeline with 3D tiling.
     pub fn lowerToSPIRV(self: *Self, allocator: Allocator, module: mlir.Module) !void {
         _ = allocator;
-        std.debug.print("=== Executing Definitive GPU Lowering Pipeline with Kernel Outlining ===\n", .{});
+        std.debug.print("=== Executing Definitive 3D Tiling GPU Lowering Pipeline ===\n", .{});
 
         // === STAGE 1 & 2: HLO -> Linalg -> Tiled+Mapped scf.forall (on Tensors) ===
-        // This part of your implementation is correct and remains unchanged.
         {
+            // Prepare the IR by lowering to Linalg on tensors.
             var pm = try mlir.PassManager.init(self.getContext());
             defer pm.deinit();
-            const opm = pm.asOpPassManager();
-            try opm.addPipeline("stablehlo-legalize-to-linalg");
-            try opm.addPipeline("func.func(linalg-generalize-named-ops,canonicalize,cse)");
+            try pm.asOpPassManager().addPipeline("stablehlo-legalize-to-linalg,func.func(linalg-generalize-named-ops,canonicalize,cse)");
             try pm.runOnOp(module.op());
 
+            // Inject and run the new 3D TILING_TRANSFORM_SCRIPT.
             const transform_module = try mlir.Module.parse(self.getContext(), TILING_TRANSFORM_SCRIPT);
             defer transform_module.deinit();
             const main_module_body = module.op().getRegion(0).getBlock(0);
@@ -147,25 +149,24 @@ pub const MLIRContext = struct {
                 op_to_clone = op.getNext();
             }
             c.operationSetAttributeByName(module.op().handle, "transform.with_named_sequence", c.unitAttrGet(self.context));
+            
             var transform_pm = try mlir.PassManager.init(self.getContext());
             defer transform_pm.deinit();
             try transform_pm.asOpPassManager().addPipeline("transform-interpreter");
+            std.debug.print("\n--- Running Transform Interpreter (3D Tiling) ---\n", .{});
             try transform_pm.runOnOp(module.op());
         }
-        std.debug.print("\n--- IR after Stage 2 (Attributed scf.forall on Tensors) ---\n", .{});
+        std.debug.print("\n--- IR after 3D Tiling (Attributed scf.forall) ---\n", .{});
         module.op().dump();
 
-        // === STAGE 3: GPU Dialect Conversion and Final Lowering ===
+        // === STAGE 3: Canonical Lowering Pipeline ===
         {
-            // 3.0: Set SPIR-V target environment (best practice for legalization)
-            std.debug.print("\n--- Stage 3.0: Setting SPIR-V Target Environment ---\n", .{});
-            const target_env_str = "#spirv.target_env<#spirv.vce<v1.3, [Shader, Float16, StorageBuffer16BitAccess], [SPV_KHR_16bit_storage]>, #spirv.resource_limits<>>";
-            const target_attr = c.attributeParseGet(self.context, target_env_str);
-            c.operationSetAttributeByName(module.op().handle, "spirv.target_env", target_attr);
+            var pm = try mlir.PassManager.init(self.getContext());
+            defer pm.deinit();
+            const opm = pm.asOpPassManager();
 
-            // 3.1: Manually clean up the transform script operations
-            std.debug.print("\n--- Stage 3.1: Manually Cleaning Up Transform Script ---\n", .{});
-            _ = c.operationRemoveAttributeByName(module.op().handle, "transform.with_named_sequence");
+            // 3.1: Clean up the transform script operations.
+            std.debug.print("\n--- Stage 3.1: Cleaning Up Transform Script ---\n", .{});
             const module_body = module.op().getRegion(0).getBlock(0);
             var maybe_op = module_body.getFirstOp();
             while (maybe_op) |op| {
@@ -173,57 +174,29 @@ pub const MLIRContext = struct {
                 const op_name_id = c.operationGetName(op.handle);
                 const op_name_ref = c.identifierStr(op_name_id);
                 const op_name = c.fromStringRef(op_name_ref);
-                if (std.mem.startsWith(u8, op_name, "transform.")) {
-                    c.operationDestroy(op.handle);
-                }
+                if (std.mem.startsWith(u8, op_name, "transform.")) c.operationDestroy(op.handle);
                 maybe_op = next_op;
             }
+            _ = c.operationRemoveAttributeByName(module.op().handle, "transform.with_named_sequence");
 
-            // PM1: Bufferization + Forall to Parallel + Map + Outlining
-            var pm1 = try mlir.PassManager.init(self.getContext());
-            defer pm1.deinit();
-            const opm1 = pm1.asOpPassManager();
-            std.debug.print("\n--- Stage 3.2: Bufferization ---\n", .{});
-            try opm1.addPipeline("one-shot-bufferize{bufferize-function-boundaries=true}");
-            try opm1.addPipeline("func.func(buffer-hoisting,buffer-loop-hoisting)");
-            try opm1.addPipeline("buffer-deallocation-pipeline");
-            std.debug.print("\n--- Stage 3.2.1: Lower scf.forall to scf.parallel ---\n", .{});
-            try opm1.addPipeline("scf-forall-to-parallel");
-            try pm1.runOnOp(module.op());
-            std.debug.print("\n--- IR after Forall to Parallel ---\n", .{});
-            module.op().dump();
-            
-            // Continue with GPU mapping and outlining
-            var pm1b = try mlir.PassManager.init(self.getContext());
-            defer pm1b.deinit();
-            const opm1b = pm1b.asOpPassManager();
-            std.debug.print("\n--- Stage 3.3: Map parallel loops to GPU ---\n", .{});
-            try opm1b.addPipeline("gpu-map-parallel-loops");
-            std.debug.print("\n--- Stage 3.4: GPU Kernel Outlining ---\n", .{});
-            try opm1b.addPipeline("gpu-kernel-outlining");
-            try pm1b.runOnOp(module.op());
-            std.debug.print("\n--- IR after GPU Kernel Outlining ---\n", .{});
-            module.op().dump();
+            // 3.2: Lower scf.forall to scf.parallel. This is the bridge.
+            try opm.addPipeline("scf-forall-to-parallel");
 
-            // PM2: Cleanup + Lowering
-            var pm2 = try mlir.PassManager.init(self.getContext());
-            defer pm2.deinit();
-            const opm2 = pm2.asOpPassManager();
-            std.debug.print("\n--- Stage 3.5: Post-GPU Cleanup ---\n", .{});
-            try opm2.addPipeline("canonicalize,cse");
-            std.debug.print("\n--- Stage 3.6: GPU Module Lowering ---\n", .{});
-            try opm2.addPipeline("gpu.module(convert-linalg-to-loops,convert-scf-to-cf)");
-            try pm2.runOnOp(module.op());
-            std.debug.print("\n--- IR after GPU Module Lowering ---\n", .{});
-            module.op().dump();
+            // 3.3: Map the fully-attributed scf.parallel loops to gpu.launch.
+            try opm.addPipeline("convert-parallel-loops-to-gpu");
 
-            // PM3: SPIR-V Conversion
-            var pm3 = try mlir.PassManager.init(self.getContext());
-            defer pm3.deinit();
-            const opm3 = pm3.asOpPassManager();
-            std.debug.print("\n--- Stage 3.7: GPU -> SPIR-V ---\n", .{});
-            try opm3.addPipeline("convert-gpu-to-spirv");
-            try pm3.runOnOp(module.op());
+            // 3.4: Outline the kernel into a gpu.module.
+            try opm.addPipeline("gpu-kernel-outlining");
+
+            // 3.5: Bufferize and finalize the rest of the lowering.
+            try opm.addPipeline("one-shot-bufferize{bufferize-function-boundaries=true}");
+            try opm.addPipeline("buffer-deallocation-pipeline");
+            try opm.addPipeline("gpu.module(func.func(convert-linalg-to-loops))");
+            c.buildAndAppendGpuAndSpirvConversionPipeline(opm.handle);
+            try opm.addPipeline("canonicalize,cse");
+
+            std.debug.print("\n--- Running Final Canonical Lowering Pipeline ---\n", .{});
+            try pm.runOnOp(module.op());
         }
 
         std.debug.print("\n--- Final Module IR (Lowered to SPIR-V) ---\n", .{});
@@ -428,13 +401,13 @@ pub fn testMLIRGPUPipeline(allocator: std.mem.Allocator) !void {
     var mlir_ctx = try MLIRContext.init(allocator);
     defer mlir_ctx.deinit();
     
-    // 2. Create a StableHLO module that will go through the complete pipeline
-    // Using stablehlo.dot_general will test StableHLO -> Linalg -> tiling -> parallel loops -> GPU pipeline.
+    // 2. Create a StableHLO module with 3D batch matrix multiplication for 3D tiling
+    // Using stablehlo.dot_general with batch dimensions will test 3D GPU tiling
     const stablehlo_module_str =
         \\module {
-        \\  func.func @main(%arg0: tensor<128x256xf32>, %arg1: tensor<256x512xf32>) -> tensor<128x512xf32> {
-        \\    %0 = stablehlo.dot_general %arg0, %arg1, contracting_dims = [1] x [0] : (tensor<128x256xf32>, tensor<256x512xf32>) -> tensor<128x512xf32>
-        \\    return %0 : tensor<128x512xf32>
+        \\  func.func @main(%arg0: tensor<8x128x256xf32>, %arg1: tensor<8x256x512xf32>) -> tensor<8x128x512xf32> {
+        \\    %0 = stablehlo.dot_general %arg0, %arg1, batching_dims = [0] x [0], contracting_dims = [2] x [1] : (tensor<8x128x256xf32>, tensor<8x256x512xf32>) -> tensor<8x128x512xf32>
+        \\    return %0 : tensor<8x128x512xf32>
         \\  }
         \\}
     ;

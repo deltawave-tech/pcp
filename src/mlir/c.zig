@@ -88,6 +88,8 @@ pub const c = struct {
     pub extern fn mlirOperationGetName(op: *MlirOperation) *MlirIdentifier;
     pub extern fn mlirIdentifierStr(identifier: *MlirIdentifier) MlirStringRef;
     pub extern fn mlirOperationGetAttributeByName(operation: *MlirOperation, name: MlirStringRef) *MlirAttribute;
+    pub extern fn mlirOperationRemoveAttributeByName(op: *MlirOperation, name: MlirStringRef) bool;
+    pub extern fn mlirAttributeParseGet(ctx: *MlirContext, str: MlirStringRef) *MlirAttribute;
     pub extern fn mlirOperationGetLocation(op: *MlirOperation) *MlirLocation;
     pub extern fn mlirOperationGetNumAttributes(op: *MlirOperation) isize;
     pub extern fn mlirOperationGetAttribute(op: *MlirOperation, pos: isize) MlirNamedAttribute;
@@ -764,5 +766,13 @@ pub const c = struct {
     
     pub fn operationSetAttributeByName(op: *MlirOperation, name: []const u8, attr: *MlirAttribute) void {
         mlirOperationSetAttributeByName(op, stringRefFromString(name), attr);
+    }
+
+    pub fn operationRemoveAttributeByName(op: *MlirOperation, name: []const u8) bool {
+        return mlirOperationRemoveAttributeByName(op, stringRefFromString(name));
+    }
+
+    pub fn attributeParseGet(ctx: *MlirContext, str: []const u8) *MlirAttribute {
+        return mlirAttributeParseGet(ctx, stringRefFromString(str));
     }
 };

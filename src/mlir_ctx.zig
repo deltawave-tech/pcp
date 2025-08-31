@@ -178,26 +178,56 @@ pub const MLIRContext = struct {
                 maybe_op = next_op;
             }
             _ = c.operationRemoveAttributeByName(module.op().handle, "transform.with_named_sequence");
+            
+            std.debug.print("\n--- IR after transform cleanup ---\n", .{});
+            module.op().dump();
 
-            // 3.2: Lower scf.forall to scf.parallel. This is the bridge.
-            try opm.addPipeline("scf-forall-to-parallel");
-
-            // 3.3: Map the fully-attributed scf.parallel loops to gpu.launch.
-            try opm.addPipeline("convert-parallel-loops-to-gpu");
-
-            // 3.4: Outline the kernel into a gpu.module.
-            try opm.addPipeline("gpu-kernel-outlining");
-
-            // 3.5: Bufferize and finalize the rest of the lowering.
+            // 3.2: Bufferization - Move early to convert tensors to memrefs before forall lowering
+            std.debug.print("\n--- Stage 3.2: Bufferization ---\n", .{});
             try opm.addPipeline("one-shot-bufferize{bufferize-function-boundaries=true}");
+            try opm.addPipeline("func.func(buffer-hoisting,buffer-loop-hoisting)");
             try opm.addPipeline("buffer-deallocation-pipeline");
-            try opm.addPipeline("gpu.module(func.func(convert-linalg-to-loops))");
-            c.buildAndAppendGpuAndSpirvConversionPipeline(opm.handle);
-            try opm.addPipeline("canonicalize,cse");
-
-            std.debug.print("\n--- Running Final Canonical Lowering Pipeline ---\n", .{});
             try pm.runOnOp(module.op());
+            std.debug.print("\n--- IR after Bufferization ---\n", .{});
+            module.op().dump();
+
+            // 3.3: Lower scf.forall to scf.parallel (now on memrefs)
+            std.debug.print("\n--- Stage 3.3: Lower scf.forall to scf.parallel ---\n", .{});
+            try opm.addPipeline("scf-forall-to-parallel");
+            try pm.runOnOp(module.op());
+            std.debug.print("\n--- IR after scf.forall to scf.parallel ---\n", .{});
+            module.op().dump();
+
+            // 3.4: Map parallel loops to GPU
+            std.debug.print("\n--- Stage 3.4: Map parallel loops to GPU ---\n", .{});
+            try opm.addPipeline("convert-parallel-loops-to-gpu");
+            try pm.runOnOp(module.op());
+            std.debug.print("\n--- IR after parallel to GPU mapping ---\n", .{});
+            module.op().dump();
+
+            // 3.5: Outline the kernel
+            std.debug.print("\n--- Stage 3.5: GPU Kernel Outlining ---\n", .{});
+            try opm.addPipeline("gpu-kernel-outlining");
+            try pm.runOnOp(module.op());
+            std.debug.print("\n--- IR after GPU kernel outlining ---\n", .{});
+            module.op().dump();
+
+            // 3.6: Cleanup and module lowering
+            std.debug.print("\n--- Stage 3.6: Post-GPU Cleanup and Lowering ---\n", .{});
+            try opm.addPipeline("canonicalize,cse");
+            try opm.addPipeline("gpu.module(convert-linalg-to-loops,convert-scf-to-cf)");
+            try pm.runOnOp(module.op());
+            std.debug.print("\n--- IR after Post-GPU Cleanup and Lowering ---\n", .{});
+            module.op().dump();
+
+            // 3.7: GPU to SPIR-V
+            std.debug.print("\n--- Stage 3.7: GPU to SPIR-V ---\n", .{});
+            try opm.addPipeline("convert-gpu-to-spirv");
+            try pm.runOnOp(module.op());
+            std.debug.print("\n--- IR after SPIR-V Conversion ---\n", .{});
+            module.op().dump();
         }
+
 
         std.debug.print("\n--- Final Module IR (Lowered to SPIR-V) ---\n", .{});
         module.op().dump();

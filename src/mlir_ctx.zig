@@ -14,7 +14,6 @@ const TILING_TRANSFORM_SCRIPT =
     \\    // M -> block<x>, N -> block<y>, K -> thread<x>
     \\    %tiled, %loops = transform.structured.tile_using_forall %generic
     \\        tile_sizes [4, 32, 32]
-    \\        (mapping = [#gpu.block<x>, #gpu.block<y>, #gpu.thread<x>])
     \\        : (!transform.any_op) -> (!transform.any_op, !transform.any_op)
     \\
     \\    transform.yield
@@ -156,43 +155,45 @@ pub const MLIRContext = struct {
         }
         std.debug.print("\n--- IR after 3D Tiling (Attributed scf.forall) ---\n", .{});
         module.op().dump();
+        
+        // Clean up the transform script operations from the IR before proceeding.
+        std.debug.print("\n--- Cleaning Up Transform Script ---\n", .{});
+        const module_body = module.op().getRegion(0).getBlock(0);
+        var maybe_op = module_body.getFirstOp();
+        while (maybe_op) |op| {
+            const next_op = op.getNext();
+            const op_name_id = c.operationGetName(op.handle);
+            const op_name_ref = c.identifierStr(op_name_id);
+            const op_name = c.fromStringRef(op_name_ref);
+            if (std.mem.startsWith(u8, op_name, "transform.")) c.operationDestroy(op.handle);
+            maybe_op = next_op;
+        }
+        _ = c.operationRemoveAttributeByName(module.op().handle, "transform.with_named_sequence");
 
-        // === STAGE 3: Unified Lowering Pipeline (Working Order) ===
+        // === STAGE 3: Unified Domain Crossing (Working Order) ===
         {
-            // First, manually clean the transform script ops from the module.
-            std.debug.print("\n--- Cleaning Up Transform Script ---\n", .{});
-            const module_body = module.op().getRegion(0).getBlock(0);
-            var maybe_op = module_body.getFirstOp();
-            while (maybe_op) |op| {
-                const next_op = op.getNext();
-                const op_name_id = c.operationGetName(op.handle);
-                const op_name_ref = c.identifierStr(op_name_id);
-                const op_name = c.fromStringRef(op_name_ref);
-                if (std.mem.startsWith(u8, op_name, "transform.")) c.operationDestroy(op.handle);
-                maybe_op = next_op;
-            }
-            _ = c.operationRemoveAttributeByName(module.op().handle, "transform.with_named_sequence");
-
-            // Create ONE PassManager with the working order from our successful pipeline
             var pm = try mlir.PassManager.init(self.getContext());
             defer pm.deinit();
 
-            // CORRECT ORDER: Bufferization first (tensor → memref)
+            // Bufferization first (while forall is on tensors)
+            std.debug.print("\n--- Running bufferization on tensor forall ---\n", .{});
             try pm.asOpPassManager().addPipeline("one-shot-bufferize{bufferize-function-boundaries=true}");
             try pm.asOpPassManager().addPipeline("func.func(buffer-hoisting,buffer-loop-hoisting)");
             try pm.asOpPassManager().addPipeline("buffer-deallocation-pipeline");
 
-            // Then scf-forall-to-parallel (on memrefs, preserving mapping attributes)
+            // Then forall-to-parallel (now on memrefs)
+            std.debug.print("\n--- Running scf-forall-to-parallel on memrefs ---\n", .{});
             try pm.asOpPassManager().addPipeline("scf-forall-to-parallel");
 
-            // Then GPU conversion pipeline (on memrefs with mapping attributes)
+            // GPU mapping and conversion
+            try pm.asOpPassManager().addPipeline("func.func(gpu-map-parallel-loops)");
             try pm.asOpPassManager().addPipeline("convert-parallel-loops-to-gpu");
             try pm.asOpPassManager().addPipeline("gpu-kernel-outlining");
             try pm.asOpPassManager().addPipeline("canonicalize,cse");
             try pm.asOpPassManager().addPipeline("gpu.module(convert-linalg-to-loops)");
             try pm.asOpPassManager().addPipeline("convert-gpu-to-spirv");
 
-            std.debug.print("\n--- Running Unified Pipeline (Working Order) ---\n", .{});
+            std.debug.print("\n--- Running unified pipeline ---\n", .{});
             try pm.runOnOp(module.op());
         }
 

@@ -7,17 +7,24 @@ const Allocator = std.mem.Allocator;
 const TILING_TRANSFORM_SCRIPT =
     \\module attributes { transform.with_named_sequence } {
     \\  transform.named_sequence @__transform_main(%arg0: !transform.any_op) {
-    \\    %generic = transform.structured.match ops{["linalg.generic"]} in %arg0
-    \\        : (!transform.any_op) -> !transform.any_op
-    \\
-    \\    // Use the single-stage tiling with the proven mapping syntax.
-    \\    // The tile size [4, 32, 32] correctly tiles all three dimensions,
-    \\    // including the reduction dim, and prevents the loop from being folded away.
-    \\    %tiled, %loops = transform.structured.tile_using_forall %generic
-    \\        tile_sizes [4, 32, 32]
-    \\        (mapping = [#gpu.block<x>, #gpu.block<y>, #gpu.thread<x>])
-    \\        : (!transform.any_op) -> (!transform.any_op, !transform.any_op)
-    \\
+    \\    transform.sequence %arg0 : !transform.any_op failures(propagate) {
+    \\      ^bb1(%arg1: !transform.any_op):
+    \\        %matmul = transform.structured.match ops{["linalg.generic"]} attributes {iterator_types = ["parallel", "parallel", "parallel", "reduction"]} in %arg1 : (!transform.any_op) -> !transform.any_op
+    \\        %split_matmul, %init_or_alloc_op, %more_parallel_fill_op, %split_identities = transform.structured.split_reduction %matmul {split_factor = 8, insert_split_dimension = 3} : (!transform.any_op) -> (!transform.any_op, !transform.any_op, !transform.any_op, !transform.any_op)
+    \\        %tiled_matmul, %forall_matmul = transform.structured.tile_using_forall %split_matmul tile_sizes [4, 32, 32, 8, 0]
+    \\          (mapping = [#gpu.block<x>, #gpu.block<y>, #gpu.thread<x>, #gpu.thread<y>]) : (!transform.any_op) -> (!transform.any_op, !transform.any_op)
+    \\    }
+    \\    transform.yield
+    \\  }
+    \\}
+;
+
+const GPU_MAPPING_SCRIPT =
+    \\module attributes { transform.with_named_sequence } {
+    \\  transform.named_sequence @__transform_main(%arg0: !transform.any_op) {
+    \\    %func = transform.structured.match ops{["func.func"]} in %arg0 : (!transform.any_op) -> !transform.any_op
+    \\    transform.gpu.map_forall_to_blocks %func { generate_gpu_launch } : (!transform.any_op) -> !transform.any_op
+    \\    transform.gpu.map_nested_forall_to_threads %func block_dims = [32, 8, 1] sync_after_distribute = false warp_size = 1 : (!transform.any_op) -> !transform.any_op
     \\    transform.yield
     \\  }
     \\}
@@ -131,13 +138,18 @@ pub const MLIRContext = struct {
         _ = allocator;
         std.debug.print("=== Executing Definitive 3D Tiling GPU Lowering Pipeline ===\n", .{});
 
-        // === STAGE 1 & 2: HLO -> Linalg -> Tiled scf.forall (on Tensors) ===
+        // STAGE 1: StableHLO to Linalg.
         {
             var pm = try mlir.PassManager.init(self.getContext());
             defer pm.deinit();
             try pm.asOpPassManager().addPipeline("stablehlo-legalize-to-linalg,func.func(linalg-generalize-named-ops,canonicalize,cse)");
             try pm.runOnOp(module.op());
+        }
+        std.debug.print("\n--- IR after Stage 1 (StableHLO → Linalg) ---\n", .{});
+        module.op().dump();
 
+        // STAGE 2: Run tiling Transform (now staged).
+        {
             const transform_module = try mlir.Module.parse(self.getContext(), TILING_TRANSFORM_SCRIPT);
             defer transform_module.deinit();
             const main_module_body = module.op().getRegion(0).getBlock(0);
@@ -152,13 +164,13 @@ pub const MLIRContext = struct {
             var transform_pm = try mlir.PassManager.init(self.getContext());
             defer transform_pm.deinit();
             try transform_pm.asOpPassManager().addPipeline("transform-interpreter");
-            std.debug.print("\n--- Running Transform Interpreter (3D Tiling) ---\n", .{});
+            std.debug.print("\n--- Running Transform Interpreter (Staged 3D Tiling) ---\n", .{});
             try transform_pm.runOnOp(module.op());
         }
-        std.debug.print("\n--- IR after 3D Tiling (Attributed scf.forall on Tensors) ---\n", .{});
+        std.debug.print("\n--- IR after Staged 3D Tiling (Nested Attributed scf.forall on Tensors) ---\n", .{});
         module.op().dump();
-        
-        // Clean up the transform script operations.
+
+        // Clean up Transform ops.
         std.debug.print("\n--- Cleaning Up Transform Script ---\n", .{});
         const module_body = module.op().getRegion(0).getBlock(0);
         var maybe_op = module_body.getFirstOp();
@@ -172,37 +184,61 @@ pub const MLIRContext = struct {
         }
         _ = c.operationRemoveAttributeByName(module.op().handle, "transform.with_named_sequence");
 
-        // === STAGE 3: The Final, Unified Lowering Pipeline ===
-        // This pipeline correctly sequences all passes in a single run.
+        // STAGE 3: Bufferization (tensors to memrefs).
         {
             var pm = try mlir.PassManager.init(self.getContext());
             defer pm.deinit();
+            const pipeline = "one-shot-bufferize{bufferize-function-boundaries=true}," ++
+                             "func.func(buffer-hoisting,buffer-loop-hoisting)," ++
+                             "buffer-deallocation-pipeline," ++
+                             "canonicalize,cse";
+            try pm.asOpPassManager().addPipeline(pipeline);
+            try pm.runOnOp(module.op());
+        }
+        std.debug.print("\n--- IR after Bufferization (Nested scf.forall on Memrefs) ---\n", .{});
+        module.op().dump();
 
-            const pipeline =
-                // 1. **DOMAIN CROSSING**: Convert the entire module from Tensors to Memrefs.
-                // The bufferizer is smart enough to handle the tensor-based `scf.forall`.
-                "one-shot-bufferize{bufferize-function-boundaries=true}," ++
-                "func.func(buffer-hoisting,buffer-loop-hoisting)," ++
-                "buffer-deallocation-pipeline," ++
-                "canonicalize,cse," ++
-                
-                // 2. **LOWER SCF**: Now that we are on memrefs, lower the `scf.forall`
-                // (which no longer has tensor outputs) to `scf.parallel`.
-                "scf-forall-to-parallel," ++
+        // STAGE 4: Run GPU mapping Transform (lowers nested forall to gpu.launch).
+        {
+            const gpu_transform_module = try mlir.Module.parse(self.getContext(), GPU_MAPPING_SCRIPT);
+            defer gpu_transform_module.deinit();
+            const main_module_body = module.op().getRegion(0).getBlock(0);
+            const transform_body = gpu_transform_module.op().getRegion(0).getBlock(0);
+            var op_to_clone = transform_body.getFirstOp();
+            while (op_to_clone) |op| {
+                main_module_body.appendOwnedOperation(mlir.Operation{ .handle = c.operationClone(op.handle) });
+                op_to_clone = op.getNext();
+            }
+            c.operationSetAttributeByName(module.op().handle, "transform.with_named_sequence", c.unitAttrGet(self.context));
 
-                // 3. **GPU MAPPING**: Convert the mapped `scf.parallel` to `gpu.launch`.
-                "convert-parallel-loops-to-gpu," ++
+            var transform_pm = try mlir.PassManager.init(self.getContext());
+            defer transform_pm.deinit();
+            try transform_pm.asOpPassManager().addPipeline("transform-interpreter");
+            std.debug.print("\n--- Running Transform Interpreter (GPU Mapping) ---\n", .{});
+            try transform_pm.runOnOp(module.op());
+        }
 
-                // 4. **KERNEL CREATION**: Outline the `gpu.launch` body into a `gpu.module`.
-                "gpu-kernel-outlining," ++
+        // Clean up GPU Transform ops.
+        std.debug.print("\n--- Cleaning Up GPU Transform Script ---\n", .{});
+        const module_body_2 = module.op().getRegion(0).getBlock(0);
+        var maybe_op_2 = module_body_2.getFirstOp();
+        while (maybe_op_2) |op| {
+            const next_op = op.getNext();
+            const op_name_id = c.operationGetName(op.handle);
+            const op_name_ref = c.identifierStr(op_name_id);
+            const op_name = c.fromStringRef(op_name_ref);
+            if (std.mem.startsWith(u8, op_name, "transform.")) c.operationDestroy(op.handle);
+            maybe_op_2 = next_op;
+        }
+        _ = c.operationRemoveAttributeByName(module.op().handle, "transform.with_named_sequence");
 
-                // 5. **KERNEL BODY LOWERING**: Lower the `linalg.generic` op inside the kernel to loops.
-                "gpu.module(convert-linalg-to-loops,canonicalize,cse)," ++
-
-                // 6. **FINAL CONVERSION**: Convert the GPU and other dialects to SPIR-V.
-                "convert-gpu-to-spirv";
-
-            std.debug.print("\n--- Running Final Unified Pipeline ---\n", .{});
+        // STAGE 5: Final lowering.
+        {
+            var pm = try mlir.PassManager.init(self.getContext());
+            defer pm.deinit();
+            const pipeline = "gpu-kernel-outlining," ++
+                             "gpu.module(convert-linalg-to-loops,canonicalize,cse)," ++
+                             "convert-gpu-to-spirv";
             try pm.asOpPassManager().addPipeline(pipeline);
             try pm.runOnOp(module.op());
         }

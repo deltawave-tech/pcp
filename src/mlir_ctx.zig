@@ -435,17 +435,28 @@ pub fn extractGPUKernelInfo(allocator: Allocator, spirv_binary: []const u8) ![]G
 pub fn testMLIRGPUPipeline(allocator: std.mem.Allocator) !void {
     std.debug.print("\n=== Testing MLIR StableHLO → GPU → SPIR-V → Metal Pipeline ===\n", .{});
     
+    // Define our input data for simple 2x2 matrix multiplication
+    const input_a_data = [_]f32{ 1.0, 2.0, 3.0, 4.0 }; // 2x2 matrix
+    const input_b_data = [_]f32{ 5.0, 6.0, 7.0, 8.0 }; // 2x2 matrix
+
+    // Manually calculate the expected "golden" result for verification
+    // C = A @ B
+    // C[0,0] = 1*5 + 2*7 = 19
+    // C[0,1] = 1*6 + 2*8 = 22  
+    // C[1,0] = 3*5 + 4*7 = 43
+    // C[1,1] = 3*6 + 4*8 = 50
+    const expected_output_data = [_]f32{ 19.0, 22.0, 43.0, 50.0 };
+    
     // 1. Initialize MLIR context with GPU pipeline
     var mlir_ctx = try MLIRContext.init(allocator);
     defer mlir_ctx.deinit();
     
-    // 2. Create a StableHLO module with 3D batch matrix multiplication for 3D tiling
-    // Using stablehlo.dot_general with batch dimensions will test 3D GPU tiling
+    // 2. Create a StableHLO module with simple 2x2 matrix multiplication for easier verification
     const stablehlo_module_str =
         \\module {
-        \\  func.func @main(%arg0: tensor<8x128x256xf32>, %arg1: tensor<8x256x512xf32>) -> tensor<8x128x512xf32> {
-        \\    %0 = stablehlo.dot_general %arg0, %arg1, batching_dims = [0] x [0], contracting_dims = [2] x [1] : (tensor<8x128x256xf32>, tensor<8x256x512xf32>) -> tensor<8x128x512xf32>
-        \\    return %0 : tensor<8x128x512xf32>
+        \\  func.func @main(%arg0: tensor<2x2xf32>, %arg1: tensor<2x2xf32>) -> tensor<2x2xf32> {
+        \\    %0 = stablehlo.dot_general %arg0, %arg1, contracting_dims = [1] x [0] : (tensor<2x2xf32>, tensor<2x2xf32>) -> tensor<2x2xf32>
+        \\    return %0 : tensor<2x2xf32>
         \\  }
         \\}
     ;
@@ -490,6 +501,102 @@ pub fn testMLIRGPUPipeline(allocator: std.mem.Allocator) !void {
         allocator.free(kernel_info);
     }
     
+    std.debug.print("\n=== Verifying Metal Compilation Success ===\n", .{});
+
+    // 7. Verify the MSL source contains expected kernel function
+    const msl_contains_kernel = std.mem.indexOf(u8, msl_source, "kernel void") != null or
+                                std.mem.indexOf(u8, msl_source, "kernel float") != null or  
+                                std.mem.indexOf(u8, msl_source, "main_dispatch") != null;
+    
+    if (msl_contains_kernel) {
+        std.debug.print("✅ MSL contains GPU kernel function\n", .{});
+    } else {
+        std.debug.print("⚠ MSL may not contain expected kernel function\n", .{});
+    }
+
+    // 8. Verify kernel name extraction worked
+    if (kernel_info.len > 0) {
+        std.debug.print("✅ Successfully extracted kernel: {s}\n", .{kernel_info[0].name});
+        
+        // 9. Verify the mathematical correctness (CPU verification)
+        std.debug.print("🔍 Verifying mathematical correctness (CPU calculation)...\n", .{});
+        std.debug.print("   Input A: {any}\n", .{input_a_data});
+        std.debug.print("   Input B: {any}\n", .{input_b_data});
+        std.debug.print("   Expected Result: {any}\n", .{expected_output_data});
+        
+        // CPU verification of matrix multiplication
+        var cpu_result = [_]f32{0.0} ** 4;
+        // A @ B for 2x2 matrices
+        cpu_result[0] = input_a_data[0] * input_b_data[0] + input_a_data[1] * input_b_data[2]; // C[0,0]
+        cpu_result[1] = input_a_data[0] * input_b_data[1] + input_a_data[1] * input_b_data[3]; // C[0,1]
+        cpu_result[2] = input_a_data[2] * input_b_data[0] + input_a_data[3] * input_b_data[2]; // C[1,0]
+        cpu_result[3] = input_a_data[2] * input_b_data[1] + input_a_data[3] * input_b_data[3]; // C[1,1]
+        
+        std.debug.print("   CPU Verification: {any}\n", .{cpu_result});
+        
+        const tolerance = 1e-6;
+        for (cpu_result, expected_output_data) |cpu_val, expected_val| {
+            if (@abs(cpu_val - expected_val) > tolerance) {
+                std.debug.print("❌ CPU verification failed! Computed: {}, Expected: {}\n", .{ cpu_val, expected_val });
+                return error.CPUVerificationFailed;
+            }
+        }
+        
+        std.debug.print("✅ CPU verification successful! Math is correct.\n", .{});
+    }
+
+    // --- START: NEW EXECUTION AND VERIFICATION SECTION ---
+
+    std.debug.print("\n=== Verifying Execution on Metal GPU ===\n", .{});
+
+    // 1. Initialize the Metal Backend, PASSING IN our existing MLIR context
+    const metal = @import("backends/metal.zig");
+    try metal.init(allocator, &mlir_ctx);
+    defer metal.deinit();
+    
+    const engine = try metal.getExecutionEngine();
+
+    // 2. Prepare inputs and outputs for the execution engine
+    var input_array = [_][]const f32{ input_a_data[0..], input_b_data[0..] };
+    var actual_gpu_output = [_]f32{ 0.0, 0.0, 0.0, 0.0 };
+    var output_array = [_][]f32{ actual_gpu_output[0..] };
+
+    // 3. Execute the pre-compiled MSL on the GPU
+    // This is the step that actually runs code on the M3.
+    // Now you should see a spike in `mactop`!
+    std.debug.print("🚀 Dispatching kernel to M3 GPU for execution...\n", .{});
+    try engine.executeMSL(msl_source, kernel_info, input_array[0..], output_array[0..]);
+    std.debug.print("✅ GPU execution finished.\n", .{});
+
+    // 4. Verify the result read back from the GPU
+    std.debug.print("🔍 Verifying GPU output against expected result...\n", .{});
+    std.debug.print("   GPU Result: {any}\n", .{actual_gpu_output});
+    std.debug.print("   Expected:   {any}\n", .{expected_output_data});
+
+    const tolerance = 1e-6;
+    for (actual_gpu_output, expected_output_data) |gpu_val, expected_val| {
+        if (@abs(gpu_val - expected_val) > tolerance) {
+            std.debug.print("❌ GPU verification failed! Computed: {}, Expected: {}\n", .{ gpu_val, expected_val });
+            return error.GPUVerificationFailed;
+        }
+    }
+    std.debug.print("✅ Verification successful! The result from the GPU is correct.\n", .{});
+
+    // --- END: NEW EXECUTION AND VERIFICATION SECTION ---
+
+    // 10. Save the generated MSL for inspection
+    std.debug.print("\n=== Generated Metal Shading Language ===\n", .{});
+    try std.fs.cwd().writeFile(.{ .sub_path = "generated_kernel.metal", .data = msl_source });
+    std.debug.print("✓ Saved MSL source to generated_kernel.metal for inspection\n", .{});
+    
+    // Show a snippet of the MSL
+    const msl_preview_len = @min(400, msl_source.len);
+    std.debug.print("MSL Preview ({} bytes shown):\n", .{msl_preview_len});
+    std.debug.print("{s}\n", .{msl_source[0..msl_preview_len]});
+    if (msl_source.len > msl_preview_len) {
+        std.debug.print("... (truncated, see generated_kernel.metal for full source)\n", .{});
+    }
+
     std.debug.print("✓ Complete MLIR GPU pipeline test completed successfully!\n", .{});
     std.debug.print("  Generated {} kernels\n", .{kernel_info.len});
     for (kernel_info) |ki| {

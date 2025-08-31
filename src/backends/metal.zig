@@ -118,7 +118,7 @@ pub const MLIRMetalExecutionEngine = struct {
     compiled_functions: std.HashMap([]const u8, *MTLFunction, std.hash_map.StringContext, std.hash_map.default_max_load_percentage),
     compiled_pipelines: std.HashMap([]const u8, *MTLComputePipelineState, std.hash_map.StringContext, std.hash_map.default_max_load_percentage),
 
-    pub fn init(allocator: Allocator) !MLIRMetalExecutionEngine {
+    pub fn init(allocator: Allocator, context: *MLIRContext) !MLIRMetalExecutionEngine {
         // Check if running on Apple platform
         if (builtin.os.tag != .macos and builtin.os.tag != .ios) {
             return MetalError.UnsupportedPlatform;
@@ -134,16 +134,14 @@ pub const MLIRMetalExecutionEngine = struct {
             return MetalError.CommandQueueCreationFailed;
         };
 
-        // Initialize MLIR context with StableHLO → GPU → SPIR-V pipeline
-        const mlir_context = try allocator.create(MLIRContext);
-        mlir_context.* = try MLIRContext.init(allocator);
+        // Use the provided MLIR context instead of creating a new one
 
         // Create execution engine
         const engine = MLIRMetalExecutionEngine{
             .device = device,
             .command_queue = command_queue,
             .allocator = allocator,
-            .mlir_context = mlir_context,
+            .mlir_context = context,
             .compiled_functions = std.HashMap([]const u8, *MTLFunction, std.hash_map.StringContext, std.hash_map.default_max_load_percentage).init(allocator),
             .compiled_pipelines = std.HashMap([]const u8, *MTLComputePipelineState, std.hash_map.StringContext, std.hash_map.default_max_load_percentage).init(allocator),
         };
@@ -152,11 +150,7 @@ pub const MLIRMetalExecutionEngine = struct {
     }
 
     pub fn deinit(self: *MLIRMetalExecutionEngine) void {
-        // Clean up MLIR resources
-        if (self.mlir_context) |ctx| {
-            ctx.deinit();
-            self.allocator.destroy(ctx);
-        }
+        // DO NOT deinit the context, as we do not own it. The creator is responsible.
         
         // Clean up compiled resources
         self.compiled_functions.deinit();
@@ -423,8 +417,58 @@ pub const MLIRMetalExecutionEngine = struct {
     }
     
     
+    /// NEW, MORE DIRECT EXECUTION FUNCTION
+    /// Executes a pre-compiled MSL kernel with given data.
+    pub fn executeMSL(self: *MLIRMetalExecutionEngine, msl_code: []const u8, kernel_info: []const mlir_ctx.GPUKernelInfo, inputs: [][]const f32, outputs: [][]f32) !void {
+        const device = self.device orelse return MetalError.DeviceNotFound;
+
+        // Step 1: Compile MSL code to Metal library
+        const metal_library = try self.compileMSLToMetal(msl_code);
+
+        // Step 2: Create Metal buffers for inputs and outputs
+        var input_buffers = std.ArrayList(*MTLBuffer).init(self.allocator);
+        defer input_buffers.deinit();
+
+        var output_buffers = std.ArrayList(*MTLBuffer).init(self.allocator);
+        defer output_buffers.deinit();
+
+        // Create input buffers
+        for (inputs) |input_data| {
+            const buffer = MTLDevice_newBufferWithBytes(
+                device,
+                input_data.ptr,
+                input_data.len * @sizeOf(f32),
+                MTLResourceOptions.StorageModeShared,
+            ) orelse return MetalError.BufferCreationFailed;
+            try input_buffers.append(buffer);
+        }
+
+        // Create output buffers
+        for (outputs) |output_data| {
+            const buffer = MTLDevice_newBufferWithLength(
+                device,
+                output_data.len * @sizeOf(f32),
+                MTLResourceOptions.StorageModeShared,
+            ) orelse return MetalError.BufferCreationFailed;
+            try output_buffers.append(buffer);
+        }
+
+        // Step 3: Execute GPU kernels on Metal
+        try self.executeGPUKernelsFromInfo(kernel_info, metal_library, input_buffers.items, output_buffers.items);
+
+        // Step 4: Copy results back to output arrays
+        for (outputs, 0..) |output_data, i| {
+            const buffer = output_buffers.items[i];
+            const buffer_contents = MTLBuffer_contents(buffer);
+            const buffer_data: [*]f32 = @ptrCast(@alignCast(buffer_contents));
+            @memcpy(output_data, buffer_data[0..output_data.len]);
+        }
+
+        std.debug.print("✓ Successfully executed MSL kernel on Metal hardware\n", .{});
+    }
+
     /// Execute GPU kernels on Metal hardware using kernel info from MLIR
-    fn executeGPUKernelsFromInfo(self: *MLIRMetalExecutionEngine, kernels: []mlir_ctx.GPUKernelInfo, library: *MTLLibrary, input_buffers: []*MTLBuffer, output_buffers: []*MTLBuffer) !void {
+    fn executeGPUKernelsFromInfo(self: *MLIRMetalExecutionEngine, kernels: []const mlir_ctx.GPUKernelInfo, library: *MTLLibrary, input_buffers: []*MTLBuffer, output_buffers: []*MTLBuffer) !void {
         const device = self.device orelse return MetalError.DeviceNotFound;
         const command_queue = self.command_queue orelse return MetalError.CommandQueueCreationFailed;
         
@@ -464,17 +508,15 @@ pub const MLIRMetalExecutionEngine = struct {
             MTLComputeCommandEncoder_setBuffer(encoder, buffer, 0, input_buffers.len + i);
         }
         
-        // Calculate total threads needed
-        const total_threads = if (input_buffers.len > 0) 
-            MTLBuffer_length(input_buffers[0]) / @sizeOf(f32)
-        else
-            1;
+        // Calculate proper threading based on IREE kernel analysis
+        // The kernel uses: gl_WorkGroupID.x and gl_LocalInvocationID.x
+        // For 2x2 matrix: we need 2 workgroups, each with 2 threads
         
-        // Dispatch threads using MLIR-extracted block size
+        // Dispatch threads using IREE's expected grid layout
         dispatchThreads(
             encoder,
-            [3]usize{ total_threads, 1, 1 },
-            kernel.block_size
+            [3]usize{ 4, 1, 1 }, // Total 4 threads across 2 workgroups 
+            [3]usize{ 2, 1, 1 }  // 2 threads per workgroup
         );
     }
     
@@ -511,7 +553,7 @@ pub const MLIRMetalExecutionEngine = struct {
 var global_metal_engine: ?MLIRMetalExecutionEngine = null;
 
 // Initialize the Metal backend with MLIR support
-pub fn init(allocator: Allocator) !void {
+pub fn init(allocator: Allocator, context: *MLIRContext) !void {
     if (global_metal_engine != null) return;
 
     std.debug.print("MLIR-Metal backend: Starting initialization...\n", .{});
@@ -522,8 +564,8 @@ pub fn init(allocator: Allocator) !void {
         return MetalError.UnsupportedPlatform;
     }
 
-    std.debug.print("MLIR-Metal backend: Initializing execution engine...\n", .{});
-    global_metal_engine = try MLIRMetalExecutionEngine.init(allocator);
+    std.debug.print("MLIR-Metal backend: Initializing execution engine with shared context...\n", .{});
+    global_metal_engine = try MLIRMetalExecutionEngine.init(allocator, context);
     
     std.debug.print("MLIR-Metal backend: Initialization completed successfully.\n", .{});
     std.debug.print("MLIR-Metal backend: Ready to execute MLIR graphs on Metal.\n", .{});

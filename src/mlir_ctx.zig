@@ -10,9 +10,13 @@ const TILING_TRANSFORM_SCRIPT =
     \\    transform.sequence %arg0 : !transform.any_op failures(propagate) {
     \\      ^bb1(%arg1: !transform.any_op):
     \\        %matmul = transform.structured.match ops{["linalg.generic"]} attributes {iterator_types = ["parallel", "parallel", "parallel", "reduction"]} in %arg1 : (!transform.any_op) -> !transform.any_op
-    \\        %split_matmul, %init_or_alloc_op, %more_parallel_fill_op, %split_identities = transform.structured.split_reduction %matmul {split_factor = 8, insert_split_dimension = 3} : (!transform.any_op) -> (!transform.any_op, !transform.any_op, !transform.any_op, !transform.any_op)
-    \\        %tiled_matmul, %forall_matmul = transform.structured.tile_using_forall %split_matmul tile_sizes [4, 32, 32, 8, 0]
+    \\        %init_or_alloc_op, %more_parallel_fill_op, %split_matmul, %combining_linalg_op = transform.structured.split_reduction %matmul {split_factor = 8, insert_split_dimension = 3} : (!transform.any_op) -> (!transform.any_op, !transform.any_op, !transform.any_op, !transform.any_op)
+    \\        %tiled_split, %forall_split = transform.structured.tile_using_forall %split_matmul tile_sizes [4, 32, 32, 8, 0]
     \\          (mapping = [#gpu.block<x>, #gpu.block<y>, #gpu.thread<x>, #gpu.thread<y>]) : (!transform.any_op) -> (!transform.any_op, !transform.any_op)
+    \\        %tiled_fill, %forall_fill = transform.structured.tile_using_forall %more_parallel_fill_op tile_sizes [4, 32, 32, 8]
+    \\          (mapping = [#gpu.block<x>, #gpu.block<y>, #gpu.thread<x>, #gpu.thread<y>]) : (!transform.any_op) -> (!transform.any_op, !transform.any_op)
+    \\        %tiled_combine, %forall_combine = transform.structured.tile_using_forall %combining_linalg_op tile_sizes [4, 32, 32]
+    \\          (mapping = [#gpu.block<x>, #gpu.block<y>, #gpu.thread<x>]) : (!transform.any_op) -> (!transform.any_op, !transform.any_op)
     \\    }
     \\    transform.yield
     \\  }
@@ -133,119 +137,87 @@ pub const MLIRContext = struct {
         c.contextDestroy(self.context);
     }
     
-    /// Lowers the module using the definitive, pass-driven canonical GPU pipeline with 3D tiling.
-    pub fn lowerToSPIRV(self: *Self, allocator: Allocator, module: mlir.Module) !void {
-        _ = allocator;
-        std.debug.print("=== Executing Definitive 3D Tiling GPU Lowering Pipeline ===\n", .{});
-
-        // STAGE 1: StableHLO to Linalg.
-        {
-            var pm = try mlir.PassManager.init(self.getContext());
-            defer pm.deinit();
-            try pm.asOpPassManager().addPipeline("stablehlo-legalize-to-linalg,func.func(linalg-generalize-named-ops,canonicalize,cse)");
-            try pm.runOnOp(module.op());
+    /// NEW IREE-based SPIR-V compilation replacing the complex manual pipeline
+    pub fn lowerToSPIRV(_: *Self, allocator: Allocator, module: mlir.Module) ![]const u8 {
+        std.debug.print("=== IREE-based SPIR-V Compilation Pipeline ===\n", .{});
+        
+        // 1. Serialize MLIR module to file for IREE compilation
+        const mlir_source = try serializeMLIRModule(allocator, module);
+        defer allocator.free(mlir_source);
+        
+        const temp_mlir_path = "temp_graph.mlir";
+        const temp_vmfb_path = "temp_graph.vmfb"; 
+        const spirv_dump_dir = "temp_spirv_dump";
+        
+        // Write MLIR to temporary file
+        try std.fs.cwd().writeFile(.{ .sub_path = temp_mlir_path, .data = mlir_source });
+        defer std.fs.cwd().deleteFile(temp_mlir_path) catch {};
+        
+        std.debug.print("✓ Saved MLIR module to {s} ({} bytes)\n", .{ temp_mlir_path, mlir_source.len });
+        
+        // 2. Call IREE compiler via subprocess
+        const result = std.process.Child.run(.{
+            .allocator = allocator,
+            .argv = &.{
+                "python3",
+                "iree_compile_wrapper.py",
+                temp_mlir_path,
+                temp_vmfb_path,
+                spirv_dump_dir,
+                "vulkan-spirv"
+            },
+        }) catch |err| {
+            std.debug.print("ERROR: Failed to run IREE compiler: {}\n", .{err});
+            return error.IREESubprocessFailed;
+        };
+        
+        defer {
+            allocator.free(result.stdout);
+            allocator.free(result.stderr);
         }
-        std.debug.print("\n--- IR after Stage 1 (StableHLO → Linalg) ---\n", .{});
-        module.op().dump();
-
-        // STAGE 2: Run tiling Transform (now staged).
-        {
-            const transform_module = try mlir.Module.parse(self.getContext(), TILING_TRANSFORM_SCRIPT);
-            defer transform_module.deinit();
-            const main_module_body = module.op().getRegion(0).getBlock(0);
-            const transform_body = transform_module.op().getRegion(0).getBlock(0);
-            var op_to_clone = transform_body.getFirstOp();
-            while (op_to_clone) |op| {
-                main_module_body.appendOwnedOperation(mlir.Operation{ .handle = c.operationClone(op.handle) });
-                op_to_clone = op.getNext();
+        
+        if (result.term != .Exited or result.term.Exited != 0) {
+            std.debug.print("IREE compiler failed with exit code: {?}\n", .{result.term});
+            std.debug.print("Stdout: {s}\n", .{result.stdout});
+            std.debug.print("Stderr: {s}\n", .{result.stderr});
+            return error.IREECompilationFailed;
+        }
+        
+        std.debug.print("✓ IREE compilation successful:\n{s}\n", .{result.stdout});
+        
+        // 3. Find and read the generated SPIR-V file(s)
+        var spirv_dir = std.fs.cwd().openDir(spirv_dump_dir, .{ .iterate = true }) catch |err| {
+            std.debug.print("ERROR: Could not open SPIR-V dump directory: {}\n", .{err});
+            return error.SPIRVDumpDirNotFound;
+        };
+        defer spirv_dir.close();
+        
+        var iterator = spirv_dir.iterate();
+        var spirv_binary: ?[]const u8 = null;
+        
+        while (try iterator.next()) |entry| {
+            if (entry.kind == .file and std.mem.endsWith(u8, entry.name, ".spv")) {
+                std.debug.print("✓ Found SPIR-V file: {s}\n", .{entry.name});
+                
+                const spirv_file_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ spirv_dump_dir, entry.name });
+                defer allocator.free(spirv_file_path);
+                
+                spirv_binary = try std.fs.cwd().readFileAlloc(allocator, spirv_file_path, 10 * 1024 * 1024);
+                break; // Use first SPIR-V file found
             }
-            c.operationSetAttributeByName(module.op().handle, "transform.with_named_sequence", c.unitAttrGet(self.context));
-
-            var transform_pm = try mlir.PassManager.init(self.getContext());
-            defer transform_pm.deinit();
-            try transform_pm.asOpPassManager().addPipeline("transform-interpreter");
-            std.debug.print("\n--- Running Transform Interpreter (Staged 3D Tiling) ---\n", .{});
-            try transform_pm.runOnOp(module.op());
         }
-        std.debug.print("\n--- IR after Staged 3D Tiling (Nested Attributed scf.forall on Tensors) ---\n", .{});
-        module.op().dump();
-
-        // Clean up Transform ops.
-        std.debug.print("\n--- Cleaning Up Transform Script ---\n", .{});
-        const module_body = module.op().getRegion(0).getBlock(0);
-        var maybe_op = module_body.getFirstOp();
-        while (maybe_op) |op| {
-            const next_op = op.getNext();
-            const op_name_id = c.operationGetName(op.handle);
-            const op_name_ref = c.identifierStr(op_name_id);
-            const op_name = c.fromStringRef(op_name_ref);
-            if (std.mem.startsWith(u8, op_name, "transform.")) c.operationDestroy(op.handle);
-            maybe_op = next_op;
+        
+        // Clean up temporary files
+        std.fs.cwd().deleteFile(temp_vmfb_path) catch {};
+        std.fs.cwd().deleteTree(spirv_dump_dir) catch {};
+        
+        if (spirv_binary == null) {
+            std.debug.print("ERROR: No SPIR-V files were generated by IREE\n", .{});
+            return error.NoSPIRVGenerated;
         }
-        _ = c.operationRemoveAttributeByName(module.op().handle, "transform.with_named_sequence");
-
-        // STAGE 3: Bufferization (tensors to memrefs).
-        {
-            var pm = try mlir.PassManager.init(self.getContext());
-            defer pm.deinit();
-            const pipeline = "one-shot-bufferize{bufferize-function-boundaries=true}," ++
-                             "func.func(buffer-hoisting,buffer-loop-hoisting)," ++
-                             "buffer-deallocation-pipeline," ++
-                             "canonicalize,cse";
-            try pm.asOpPassManager().addPipeline(pipeline);
-            try pm.runOnOp(module.op());
-        }
-        std.debug.print("\n--- IR after Bufferization (Nested scf.forall on Memrefs) ---\n", .{});
-        module.op().dump();
-
-        // STAGE 4: Run GPU mapping Transform (lowers nested forall to gpu.launch).
-        {
-            const gpu_transform_module = try mlir.Module.parse(self.getContext(), GPU_MAPPING_SCRIPT);
-            defer gpu_transform_module.deinit();
-            const main_module_body = module.op().getRegion(0).getBlock(0);
-            const transform_body = gpu_transform_module.op().getRegion(0).getBlock(0);
-            var op_to_clone = transform_body.getFirstOp();
-            while (op_to_clone) |op| {
-                main_module_body.appendOwnedOperation(mlir.Operation{ .handle = c.operationClone(op.handle) });
-                op_to_clone = op.getNext();
-            }
-            c.operationSetAttributeByName(module.op().handle, "transform.with_named_sequence", c.unitAttrGet(self.context));
-
-            var transform_pm = try mlir.PassManager.init(self.getContext());
-            defer transform_pm.deinit();
-            try transform_pm.asOpPassManager().addPipeline("transform-interpreter");
-            std.debug.print("\n--- Running Transform Interpreter (GPU Mapping) ---\n", .{});
-            try transform_pm.runOnOp(module.op());
-        }
-
-        // Clean up GPU Transform ops.
-        std.debug.print("\n--- Cleaning Up GPU Transform Script ---\n", .{});
-        const module_body_2 = module.op().getRegion(0).getBlock(0);
-        var maybe_op_2 = module_body_2.getFirstOp();
-        while (maybe_op_2) |op| {
-            const next_op = op.getNext();
-            const op_name_id = c.operationGetName(op.handle);
-            const op_name_ref = c.identifierStr(op_name_id);
-            const op_name = c.fromStringRef(op_name_ref);
-            if (std.mem.startsWith(u8, op_name, "transform.")) c.operationDestroy(op.handle);
-            maybe_op_2 = next_op;
-        }
-        _ = c.operationRemoveAttributeByName(module.op().handle, "transform.with_named_sequence");
-
-        // STAGE 5: Final lowering.
-        {
-            var pm = try mlir.PassManager.init(self.getContext());
-            defer pm.deinit();
-            const pipeline = "gpu-kernel-outlining," ++
-                             "gpu.module(convert-linalg-to-loops,canonicalize,cse)," ++
-                             "convert-gpu-to-spirv";
-            try pm.asOpPassManager().addPipeline(pipeline);
-            try pm.runOnOp(module.op());
-        }
-
-        std.debug.print("\n--- Final Module IR (Lowered to SPIR-V) ---\n", .{});
-        module.op().dump();
-        std.debug.print("✅ Full GPU Pipeline executed successfully!\n", .{});
+        
+        std.debug.print("✓ Successfully extracted SPIR-V binary ({} bytes)\n", .{spirv_binary.?.len});
+        return spirv_binary.?;
     }
     
     /// Translates a module containing SPIR-V dialect ops into a SPIR-V binary blob
@@ -401,39 +373,61 @@ pub const GPUKernelInfo = struct {
     }
 };
 
-/// Extract GPU kernel metadata from the lowered MLIR module using MLIR API
-pub fn extractGPUKernelInfo(allocator: Allocator, module: mlir.Module) ![]GPUKernelInfo {
-    // Use the C API to extract GPU kernel metadata
-    var c_kernels: [*]c.GPUKernelMetadata = undefined;
-    const count = c.extractGPUKernelMetadata(module.handle, &c_kernels);
-    
+/// Extract kernel names from SPIR-V binary using SPIRV-Cross
+pub fn extractKernelNamesFromSPIRV(allocator: Allocator, spirv_binary: []const u8) ![][]const u8 {
+    var c_names: [*][*:0]const u8 = undefined;
+    const count = c.extractKernelNamesFromSPIRV(spirv_binary, &c_names);
+    defer c.freeKernelNames(c_names, count);
+
     if (count == 0) {
-        std.debug.print("⚠ No GPU kernels found in module, using fallback\n", .{});
+        std.debug.print("⚠ No GPU kernels found in SPIR-V binary\n", .{});
+        // Return empty array
+        return try allocator.alloc([]const u8, 0);
+    }
+
+    const names = try allocator.alloc([]const u8, count);
+    for (0..count) |i| {
+        const kernel_name = std.mem.span(c_names[i]);
+        names[i] = try allocator.dupe(u8, kernel_name);
+    }
+    
+    std.debug.print("✓ Extracted {} GPU kernel names from SPIR-V binary\n", .{names.len});
+    return names;
+}
+
+/// Extract GPU kernel metadata from SPIR-V binary using SPIRV-Cross
+pub fn extractGPUKernelInfo(allocator: Allocator, spirv_binary: []const u8) ![]GPUKernelInfo {
+    // NEW IMPLEMENTATION: Extract names directly from the SPIR-V binary
+    var c_names: [*][*:0]const u8 = undefined;
+    const count = c.extractKernelNamesFromSPIRV(spirv_binary, &c_names);
+    defer c.freeKernelNames(c_names, count);
+
+    if (count == 0) {
+        std.debug.print("⚠ No GPU kernels found in SPIR-V binary, using fallback\n", .{});
         // Fallback to demo kernel info if no kernels found
         const kernels = try allocator.alloc(GPUKernelInfo, 1);
         kernels[0] = GPUKernelInfo{
-            .name = try allocator.dupe(u8, "gpu_kernel_add"),
+            .name = try allocator.dupe(u8, "fallback_kernel"),
             .grid_size = [3]usize{ 1, 1, 1 },
             .block_size = [3]usize{ 256, 1, 1 },
         };
         return kernels;
     }
-    
-    // Convert C kernels to Zig kernels
+
     const kernels = try allocator.alloc(GPUKernelInfo, count);
     for (0..count) |i| {
-        const c_kernel = c_kernels[i];
+        const kernel_name = std.mem.span(c_names[i]);
         kernels[i] = GPUKernelInfo{
-            .name = try allocator.dupe(u8, std.mem.span(c_kernel.name)),
-            .grid_size = [3]usize{ c_kernel.grid_size[0], c_kernel.grid_size[1], c_kernel.grid_size[2] },
-            .block_size = [3]usize{ c_kernel.block_size[0], c_kernel.block_size[1], c_kernel.block_size[2] },
+            .name = try allocator.dupe(u8, kernel_name),
+            // NOTE: We can't get grid/block size from SPIR-V.
+            // This metadata is lost when we leave the MLIR ecosystem.
+            // We must use a sensible default or determine it at runtime.
+            .grid_size = [3]usize{ 1, 1, 1 },
+            .block_size = [3]usize{ 256, 1, 1 },
         };
     }
     
-    // Free C kernels
-    c.freeGPUKernelMetadata(c_kernels, count);
-    
-    std.debug.print("✓ Extracted {} GPU kernels with execution metadata\n", .{kernels.len});
+    std.debug.print("✓ Extracted {} GPU kernel names from SPIR-V binary\n", .{kernels.len});
     return kernels;
 }
 
@@ -466,15 +460,16 @@ pub fn testMLIRGPUPipeline(allocator: std.mem.Allocator) !void {
     
     std.debug.print("✓ Created StableHLO module\n", .{});
     
-    // 3. Lower StableHLO → GPU → SPIR-V
-    std.debug.print("About to call lowerToSPIRV...\n", .{});
-    mlir_ctx.lowerToSPIRV(allocator, module) catch |err| {
-        std.debug.print("ERROR in lowerToSPIRV: {}\n", .{err});
+    // 3. Lower StableHLO → GPU → SPIR-V using IREE
+    std.debug.print("About to call lowerToSPIRV via IREE...\n", .{});
+    const spirv_binary = mlir_ctx.lowerToSPIRV(allocator, module) catch |err| {
+        std.debug.print("ERROR in IREE lowerToSPIRV: {}\n", .{err});
         return err;
     };
+    defer allocator.free(spirv_binary);
     
-    // 4. Extract GPU kernel names
-    const kernel_names = try mlir_ctx.getGpuKernelNames(module);
+    // 4. Extract GPU kernel names from SPIR-V binary
+    const kernel_names = try extractKernelNamesFromSPIRV(allocator, spirv_binary);
     defer {
         for (kernel_names) |name| {
             allocator.free(name);
@@ -482,16 +477,12 @@ pub fn testMLIRGPUPipeline(allocator: std.mem.Allocator) !void {
         allocator.free(kernel_names);
     }
     
-    // 5. Translate to SPIR-V binary
-    const spirv_binary = try mlir_ctx.translateToSPIRV(module);
-    defer allocator.free(spirv_binary);
-    
-    // 6. Translate SPIR-V to MSL
+    // 5. Translate SPIR-V to MSL  
     const msl_source = try translateSpirvToMsl(allocator, spirv_binary);
     defer allocator.free(msl_source);
     
-    // 7. Extract kernel metadata
-    const kernel_info = try extractGPUKernelInfo(allocator, module);
+    // 6. EXTRACT KERNEL INFO FROM THE CORRECT SOURCE: THE SPIR-V BINARY
+    const kernel_info = try extractGPUKernelInfo(allocator, spirv_binary);
     defer {
         for (kernel_info) |*info| {
             info.deinit(allocator);
@@ -500,7 +491,10 @@ pub fn testMLIRGPUPipeline(allocator: std.mem.Allocator) !void {
     }
     
     std.debug.print("✓ Complete MLIR GPU pipeline test completed successfully!\n", .{});
-    std.debug.print("  Generated {} kernels\n", .{kernel_names.len});
+    std.debug.print("  Generated {} kernels\n", .{kernel_info.len});
+    for (kernel_info) |ki| {
+        std.debug.print("    - Kernel Name: {s}\n", .{ki.name});
+    }
     std.debug.print("  SPIR-V binary: {} bytes\n", .{spirv_binary.len});
     std.debug.print("  MSL source: {} bytes\n", .{msl_source.len});
 }

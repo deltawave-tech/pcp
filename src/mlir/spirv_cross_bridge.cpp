@@ -170,4 +170,86 @@ void mlirFreeGPUKernelMetadata(GPUKernelMetadata* kernels, size_t count) {
     free(kernels);
 }
 
+// NEW FUNCTION to extract kernel names using SPIRV-Cross
+size_t mlirExtractKernelNamesFromSPIRV(
+    const uint8_t* spirv_data,
+    size_t spirv_size,
+    const char*** out_names) {
+    
+    // Create SPIRV-Cross context
+    spvc_context context = nullptr;
+    spvc_result result = spvc_context_create(&context);
+    if (result != SPVC_SUCCESS) {
+        *out_names = nullptr;
+        return 0;
+    }
+    
+    // Parse SPIR-V binary
+    spvc_parsed_ir ir = nullptr;
+    result = spvc_context_parse_spirv(context, 
+                                     reinterpret_cast<const SpvId*>(spirv_data), 
+                                     spirv_size / sizeof(SpvId), 
+                                     &ir);
+    if (result != SPVC_SUCCESS) {
+        spvc_context_destroy(context);
+        *out_names = nullptr;
+        return 0;
+    }
+    
+    // Create compiler to access entry points
+    spvc_compiler compiler = nullptr;
+    result = spvc_context_create_compiler(context, SPVC_BACKEND_MSL, ir, 
+                                         SPVC_CAPTURE_MODE_COPY, 
+                                         &compiler);
+    if (result != SPVC_SUCCESS) {
+        spvc_context_destroy(context);
+        *out_names = nullptr;
+        return 0;
+    }
+    
+    // Get entry points
+    const spvc_entry_point* entry_points = nullptr;
+    size_t num_entry_points = 0;
+    result = spvc_compiler_get_entry_points(compiler, &entry_points, &num_entry_points);
+    if (result != SPVC_SUCCESS || num_entry_points == 0) {
+        spvc_context_destroy(context);
+        *out_names = nullptr;
+        return 0;
+    }
+    
+    // Allocate memory for the C-style string array
+    *out_names = static_cast<const char**>(malloc(num_entry_points * sizeof(char*)));
+    if (!*out_names) {
+        spvc_context_destroy(context);
+        return 0;
+    }
+    
+    // Copy entry point names
+    for (size_t i = 0; i < num_entry_points; ++i) {
+        (*out_names)[i] = strdup(entry_points[i].name);
+        if (!(*out_names)[i]) {
+            // Cleanup on failure
+            for (size_t j = 0; j < i; ++j) {
+                free(const_cast<char*>((*out_names)[j]));
+            }
+            free(*out_names);
+            *out_names = nullptr;
+            spvc_context_destroy(context);
+            return 0;
+        }
+    }
+    
+    spvc_context_destroy(context);
+    return num_entry_points;
+}
+
+// NEW FUNCTION to free the memory allocated by the above function
+void mlirFreeKernelNames(const char** names, size_t count) {
+    if (!names) return;
+    for (size_t i = 0; i < count; ++i) {
+        free(const_cast<char*>(names[i]));
+    }
+    free(names);
+}
+
 }

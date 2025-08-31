@@ -285,6 +285,18 @@ pub const c = struct {
         count: usize,
     ) void;
 
+    // NEW EXTERNS FOR KERNEL NAME EXTRACTION FROM SPIR-V
+    extern fn mlirExtractKernelNamesFromSPIRV(
+        spirv_data: [*]const u8,
+        spirv_size: usize,
+        out_names: *[*][*:0]const u8,
+    ) usize;
+
+    extern fn mlirFreeKernelNames(
+        names: [*][*:0]const u8,
+        count: usize,
+    ) void;
+
     // NEW: Module Walking Functions
     pub const MlirWalkResult = enum(c_int) {
         Advance,
@@ -598,6 +610,21 @@ pub const c = struct {
         count: usize,
     ) void {
         mlirFreeGPUKernelMetadata(kernels, count);
+    }
+
+    // NEW WRAPPERS FOR SPIRV KERNEL EXTRACTION
+    pub fn extractKernelNamesFromSPIRV(
+        spirv_data: []const u8,
+        out_names: *[*][*:0]const u8,
+    ) usize {
+        return mlirExtractKernelNamesFromSPIRV(spirv_data.ptr, spirv_data.len, out_names);
+    }
+    
+    pub fn freeKernelNames(
+        names: [*][*:0]const u8,
+        count: usize,
+    ) void {
+        mlirFreeKernelNames(names, count);
     }
 
     // Module walking wrapper functions

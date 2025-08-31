@@ -172,53 +172,35 @@ pub const MLIRContext = struct {
         }
         _ = c.operationRemoveAttributeByName(module.op().handle, "transform.with_named_sequence");
 
-        // === STAGE 3: Granular Lowering (As determined by team's debugging) ===
-        // STEP 1: Bufferization (On Tensors with scf.forall)
+        // === STAGE 3: The Final, Unified Lowering Pipeline ===
+        // This pipeline correctly sequences all steps in a single PassManager run.
         {
             var pm = try mlir.PassManager.init(self.getContext());
             defer pm.deinit();
-            const pipeline = "one-shot-bufferize{bufferize-function-boundaries=true}," ++
-                             "func.func(buffer-hoisting,buffer-loop-hoisting)," ++
-                             "buffer-deallocation-pipeline";
-            std.debug.print("\n--- Running STEP 1: Bufferization ---\n", .{});
-            try pm.asOpPassManager().addPipeline(pipeline);
-            try pm.runOnOp(module.op());
-        }
-        std.debug.print("\n--- IR after Bufferization (Memref with scf.forall) ---\n", .{});
-        module.op().dump();
 
-        // STEP 2: Forall to Parallel (On Memrefs)
-        {
-            var pm = try mlir.PassManager.init(self.getContext());
-            defer pm.deinit();
-            std.debug.print("\n--- Running STEP 2: scf-forall-to-parallel ---\n", .{});
-            try pm.asOpPassManager().addPipeline("scf-forall-to-parallel");
-            try pm.runOnOp(module.op());
-        }
-        std.debug.print("\n--- IR after scf-forall-to-parallel ---\n", .{});
-        module.op().dump();
+            const pipeline =
+                // 1. **THE CRITICAL FIX**: Go directly from `scf.forall` on Tensors to the Memref domain first.
+                // The bufferizer knows how to handle `scf.forall` with tensor semantics.
+                "one-shot-bufferize{bufferize-function-boundaries=true}," ++
+                "func.func(buffer-hoisting,buffer-loop-hoisting)," ++
+                "buffer-deallocation-pipeline," ++
+                "canonicalize,cse," ++
 
-        // STEP 3 & 4: GPU Mapping and Conversion to gpu.launch
-        {
-            var pm = try mlir.PassManager.init(self.getContext());
-            defer pm.deinit();
-            const pipeline = "func.func(gpu-map-parallel-loops)," ++
-                             "convert-parallel-loops-to-gpu";
-            std.debug.print("\n--- Running STEP 3 & 4: GPU Mapping and Launch Conversion ---\n", .{});
-            try pm.asOpPassManager().addPipeline(pipeline);
-            try pm.runOnOp(module.op());
-        }
-        std.debug.print("\n--- IR after convert-parallel-loops-to-gpu ---\n", .{});
-        module.op().dump();
+                // 2. **THE SECOND CRITICAL FIX**: Now that we are on memrefs, use the single, robust
+                // pass that converts the mapped `scf.forall` DIRECTLY to `gpu.launch`.
+                // This bypasses the problematic `scf.parallel` intermediate step.
+                "convert-scf-to-gpu," ++
 
-        // STEP 5 & 6 & 7: Kernel Outlining, Lowering, and SPIR-V Conversion
-        {
-            var pm = try mlir.PassManager.init(self.getContext());
-            defer pm.deinit();
-            const pipeline = "gpu-kernel-outlining," ++
-                             "gpu.module(convert-linalg-to-loops,canonicalize,cse)," ++
-                             "convert-gpu-to-spirv";
-            std.debug.print("\n--- Running STEP 5, 6, 7: Outlining, Kernel Lowering, and SPIR-V Conversion ---\n", .{});
+                // 3. Kernel Outlining: Create the gpu.module with gpu.func kernels.
+                "gpu-kernel-outlining," ++
+
+                // 4. Kernel Body Lowering: Lower the high-level ops inside the GPU kernel.
+                "gpu.module(convert-linalg-to-loops,canonicalize,cse)," ++
+
+                // 5. Final Conversion to SPIR-V: Convert the host and device code.
+                "convert-gpu-to-spirv";
+
+            std.debug.print("\n--- Running Final Unified Pipeline ---\n", .{});
             try pm.asOpPassManager().addPipeline(pipeline);
             try pm.runOnOp(module.op());
         }

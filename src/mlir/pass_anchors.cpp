@@ -38,6 +38,9 @@
 #include "mlir/CAPI/IR.h"    // For MlirDialectRegistry unwrap
 #include "mlir/Conversion/SCFToControlFlow/SCFToControlFlow.h"
 
+// Add Affine dialect passes
+#include "mlir/Dialect/Affine/Passes.h"
+
 // Test pass registration headers  
 #include "mlir/Dialect/Linalg/Passes.h"
 
@@ -158,6 +161,14 @@ void mlirForceLoadAllRequiredPasses() {
   // Register SCF passes (including forall to parallel)
   std::printf("  - SCF passes (including forall to parallel)\n");
   mlir::registerSCFPasses();
+  
+  // Register Affine passes (for lower-affine pass)
+  std::printf("  - Affine passes (for lower-affine)\n");
+  mlir::affine::registerAffinePasses();
+  
+  // Register SCF to ControlFlow conversion (for convert-scf-to-cf)
+  std::printf("  - SCF to ControlFlow conversion (convert-scf-to-cf)\n");
+  mlir::registerSCFToControlFlowPass();
   
   // SPIR-V conversion patterns (force linking by registering conversion passes)
   std::printf("  - SPIRV conversion passes (arith, memref, scf, func, gpu)\n");

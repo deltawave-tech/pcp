@@ -170,31 +170,85 @@ pub const MLIRContext = struct {
         }
         _ = c.operationRemoveAttributeByName(module.op().handle, "transform.with_named_sequence");
 
-        // === STAGE 3: Unified Domain Crossing (Working Order) ===
+        // === STAGE 3: Unified Domain Crossing with Granular Debugging ===
         {
-            var pm = try mlir.PassManager.init(self.getContext());
-            defer pm.deinit();
+            // STEP 1: Bufferization
+            {
+                var pm = try mlir.PassManager.init(self.getContext());
+                defer pm.deinit();
+                std.debug.print("\n--- Running bufferization on tensor forall ---\n", .{});
+                try pm.asOpPassManager().addPipeline("one-shot-bufferize{bufferize-function-boundaries=true}");
+                try pm.asOpPassManager().addPipeline("func.func(buffer-hoisting,buffer-loop-hoisting)");
+                try pm.asOpPassManager().addPipeline("buffer-deallocation-pipeline");
+                try pm.runOnOp(module.op());
+            }
+            std.debug.print("\n--- IR after bufferization (memref domain) ---\n", .{});
+            module.op().dump();
 
-            // Bufferization first (while forall is on tensors)
-            std.debug.print("\n--- Running bufferization on tensor forall ---\n", .{});
-            try pm.asOpPassManager().addPipeline("one-shot-bufferize{bufferize-function-boundaries=true}");
-            try pm.asOpPassManager().addPipeline("func.func(buffer-hoisting,buffer-loop-hoisting)");
-            try pm.asOpPassManager().addPipeline("buffer-deallocation-pipeline");
+            // STEP 2: Forall to Parallel
+            {
+                var pm = try mlir.PassManager.init(self.getContext());
+                defer pm.deinit();
+                std.debug.print("\n--- Running scf-forall-to-parallel ---\n", .{});
+                try pm.asOpPassManager().addPipeline("scf-forall-to-parallel");
+                try pm.runOnOp(module.op());
+            }
+            std.debug.print("\n--- IR after scf-forall-to-parallel ---\n", .{});
+            module.op().dump();
 
-            // Then forall-to-parallel (now on memrefs)
-            std.debug.print("\n--- Running scf-forall-to-parallel on memrefs ---\n", .{});
-            try pm.asOpPassManager().addPipeline("scf-forall-to-parallel");
+            // STEP 3: GPU Mapping
+            {
+                var pm = try mlir.PassManager.init(self.getContext());
+                defer pm.deinit();
+                std.debug.print("\n--- Running GPU mapping ---\n", .{});
+                try pm.asOpPassManager().addPipeline("func.func(gpu-map-parallel-loops)");
+                try pm.runOnOp(module.op());
+            }
+            std.debug.print("\n--- IR after GPU mapping ---\n", .{});
+            module.op().dump();
 
-            // GPU mapping and conversion
-            try pm.asOpPassManager().addPipeline("func.func(gpu-map-parallel-loops)");
-            try pm.asOpPassManager().addPipeline("convert-parallel-loops-to-gpu");
-            try pm.asOpPassManager().addPipeline("gpu-kernel-outlining");
-            try pm.asOpPassManager().addPipeline("canonicalize,cse");
-            try pm.asOpPassManager().addPipeline("gpu.module(convert-linalg-to-loops)");
-            try pm.asOpPassManager().addPipeline("convert-gpu-to-spirv");
+            // STEP 4: Parallel to GPU Launch
+            {
+                var pm = try mlir.PassManager.init(self.getContext());
+                defer pm.deinit();
+                std.debug.print("\n--- Running convert-parallel-loops-to-gpu ---\n", .{});
+                try pm.asOpPassManager().addPipeline("convert-parallel-loops-to-gpu");
+                try pm.runOnOp(module.op());
+            }
+            std.debug.print("\n--- IR after convert-parallel-loops-to-gpu ---\n", .{});
+            module.op().dump();
 
-            std.debug.print("\n--- Running unified pipeline ---\n", .{});
-            try pm.runOnOp(module.op());
+            // STEP 5: GPU Kernel Outlining
+            {
+                var pm = try mlir.PassManager.init(self.getContext());
+                defer pm.deinit();
+                std.debug.print("\n--- Running gpu-kernel-outlining ---\n", .{});
+                try pm.asOpPassManager().addPipeline("gpu-kernel-outlining");
+                try pm.asOpPassManager().addPipeline("canonicalize,cse");
+                try pm.runOnOp(module.op());
+            }
+            std.debug.print("\n--- IR after gpu-kernel-outlining ---\n", .{});
+            module.op().dump();
+
+            // STEP 6: Enhanced GPU Module Lowering
+            {
+                var pm = try mlir.PassManager.init(self.getContext());
+                defer pm.deinit();
+                std.debug.print("\n--- Running enhanced GPU module lowering ---\n", .{});
+                try pm.asOpPassManager().addPipeline("gpu.module(convert-linalg-to-loops,lower-affine,convert-scf-to-cf,canonicalize,cse)");
+                try pm.runOnOp(module.op());
+            }
+            std.debug.print("\n--- IR after enhanced GPU module lowering ---\n", .{});
+            module.op().dump();
+
+            // STEP 7: SPIR-V Conversion
+            {
+                var pm = try mlir.PassManager.init(self.getContext());
+                defer pm.deinit();
+                std.debug.print("\n--- Running convert-gpu-to-spirv ---\n", .{});
+                try pm.asOpPassManager().addPipeline("convert-gpu-to-spirv");
+                try pm.runOnOp(module.op());
+            }
         }
 
         std.debug.print("\n--- Final Module IR (Lowered to SPIR-V) ---\n", .{});

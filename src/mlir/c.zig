@@ -123,6 +123,7 @@ pub const c = struct {
     // Type operations
     extern fn mlirF32TypeGet(ctx: *MlirContext) *MlirType;
     extern fn mlirF64TypeGet(ctx: *MlirContext) *MlirType;
+    pub extern fn mlirIntegerTypeGet(ctx: *MlirContext, bitwidth: c_uint) *MlirType;
     extern fn mlirRankedTensorTypeGet(rank: isize, shape: [*]const i64, elementType: *MlirType, encoding: *MlirAttribute) *MlirType;
     // Correct MLIR C API functions from BuiltinTypes.h
     extern fn mlirShapedTypeGetRank(type: *MlirType) i64;

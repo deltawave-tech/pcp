@@ -231,6 +231,10 @@ pub const Context = struct {
         pub fn getAttribute(self: Self, index: usize) c.c.MlirNamedAttribute {
             return c.c.operationGetAttribute(self.handle, @intCast(index));
         }
+        
+        pub fn verify(self: Self) c.c.MlirLogicalResult {
+            return c.c.mlirOperationVerify(self.handle);
+        }
     };
     
     /// MLIR Region - represents a CFG region
@@ -289,6 +293,15 @@ pub const Context = struct {
         
         pub fn getNumArguments(self: Self) usize {
             return @intCast(c.c.blockGetNumArguments(self.handle));
+        }
+        
+        pub fn getArguments(self: Self, allocator: std.mem.Allocator) ![]Value {
+            const num_args = self.getNumArguments();
+            var args = try allocator.alloc(Value, num_args);
+            for (0..num_args) |i| {
+                args[i] = self.getArgument(i);
+            }
+            return args;
         }
         
         pub fn appendOwnedOperation(self: Self, operation: Operation) void {
@@ -351,6 +364,18 @@ pub const Context = struct {
         
         pub fn f64Type(context: Context) Self {
             return Self{ .handle = c.c.floatTypeGetF64(context.handle) };
+        }
+        
+        pub fn i32Type(context: Context) Self {
+            return Self{ .handle = c.c.mlirIntegerTypeGet(context.handle, 32) };
+        }
+        
+        pub fn i64Type(context: Context) Self {
+            return Self{ .handle = c.c.mlirIntegerTypeGet(context.handle, 64) };
+        }
+        
+        pub fn i1Type(context: Context) Self {
+            return Self{ .handle = c.c.mlirIntegerTypeGet(context.handle, 1) };
         }
         
         pub fn rankedTensorType(context: Context, shape: []const i64, element_type: Self) Self {

@@ -983,6 +983,33 @@ pub fn build(b: *std.Build) void {
     const run_data_pipeline_test_step = b.step("test-data-pipeline", "Run the data pipeline tests");
     run_data_pipeline_test_step.dependOn(&run_data_pipeline_test_cmd.step);
 
+    // GPT-2 model graph construction test executable
+    const gpt2_model_test = b.addExecutable(.{
+        .name = "gpt2_model_test",
+        .root_source_file = b.path("src/examples/gpt2_model_test.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    // Add module dependencies for GPT-2 model test
+    gpt2_model_test.root_module.addImport("pcp", pcp_module);
+    
+    // SINGLE CALL for all MLIR/LLVM/Metal libraries
+    addMLIRSupport(gpt2_model_test, mlir_config);
+
+    // SINGLE CALL for your project's bridge libraries
+    addPCPDependencies(gpt2_model_test, spirv_bridge_lib, metal_bridge_lib);
+
+    // Install the executable
+    b.installArtifact(gpt2_model_test);
+
+    // Run step for GPT-2 model test
+    const run_gpt2_model_test_cmd = b.addRunArtifact(gpt2_model_test);
+    run_gpt2_model_test_cmd.step.dependOn(&gpt2_model_test.step);
+
+    const run_gpt2_model_test_step = b.step("run-gpt2-model-test", "Run the GPT-2 model graph construction test");
+    run_gpt2_model_test_step.dependOn(&run_gpt2_model_test_cmd.step);
+
     // // Property-based testing step
     // const prop_tests = b.addTest(.{
     //     .root_source_file = b.path("src/prop_tests.zig"),

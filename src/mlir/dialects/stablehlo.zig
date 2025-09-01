@@ -179,10 +179,25 @@ pub fn reduce_sum(ctx: mlir.Context, operand: mlir.Value, dimensions: []const i6
 
 /// Creates a stablehlo.compare operation
 pub fn compare(ctx: mlir.Context, lhs: mlir.Value, rhs: mlir.Value, direction: CompareDirection, loc: mlir.Location) mlir.Operation {
-    const direction_attr = mlir.Attribute.integerAttr(ctx, @intFromEnum(direction), mlir.Type.f32Type(ctx));
+    // The attribute must be a STRING, not an integer
+    const direction_str = direction.toString();
+    const direction_attr = mlir.Attribute.stringAttr(ctx, direction_str);
+    
+    // Get the shape from the input tensor and create an i1 tensor type with the same shape
+    const input_type = lhs.getType();
+    const i1_element_type = mlir.Type.i1Type(ctx);
+    
+    // For now, we'll extract the shape dynamically. This is a simplified approach.
+    // In a production system, we'd want proper tensor type introspection.
+    const result_type = if (input_type.as(mlir.RankedTensorType)) |ranked_tensor| blk: {
+        const shape = ranked_tensor.getShape();
+        defer std.heap.page_allocator.free(shape);
+        break :blk mlir.Type.rankedTensorType(ctx, shape, i1_element_type);
+    } else lhs.getType(); // Fallback for non-ranked tensors
+    
     return mlir.Operation.create(ctx, "stablehlo.compare", .{
         .operands = &.{ lhs, rhs },
-        .results = &.{lhs.getType()}, // Should be tensor of i1, but simplified
+        .results = &.{result_type},
         .attributes = &.{.{ "comparison_direction", direction_attr }},
         .location = loc,
     });
@@ -195,6 +210,17 @@ pub const CompareDirection = enum {
     LE, // less than or equal
     GT, // greater than
     GE, // greater than or equal
+
+    pub fn toString(self: CompareDirection) []const u8 {
+        return switch (self) {
+            .EQ => "EQ",
+            .NE => "NE",
+            .LT => "LT",
+            .LE => "LE",
+            .GT => "GT",
+            .GE => "GE",
+        };
+    }
 };
 
 /// Creates a stablehlo.select operation

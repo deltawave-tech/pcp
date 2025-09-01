@@ -1,33 +1,13 @@
 const std = @import("std");
 const pcp = @import("pcp");
 const hlo = pcp.mlir.dialects.stablehlo;
+const mlir = @import("../mlir.zig");
 
 const Allocator = std.mem.Allocator;
 const Shape = pcp.tensor.Shape;
 const DType = pcp.tensor.DType;
 const MLIRBuilder = pcp.ops.MLIRBuilder;
 const Tensor = pcp.tensor.Tensor(void);
-
-// Helper function to create random tensors with MLIR
-fn createRandomTensor(builder: *MLIRBuilder, dims: []const i64, dtype: DType, scale: f32) !Tensor {
-    var shape = try Shape.initWithDims(builder.ctx, dims, dtype);
-    errdefer shape.deinit();
-    
-    const elem_count = shape.elemCount();
-    const data = try builder.allocator.alloc(f32, elem_count);
-    defer builder.allocator.free(data);
-    
-    // Fill with random values using a simple PRNG
-    var prng = std.Random.DefaultPrng.init(@bitCast(std.time.microTimestamp()));
-    const random = prng.random();
-    
-    for (data) |*item| {
-        item.* = random.floatNorm(f32) * scale;
-    }
-    
-    const bytes = std.mem.sliceAsBytes(data);
-    return try Tensor.newConstant(builder, bytes, shape);
-}
 
 pub const GPT2Config = struct {
     vocab_size: usize = 50257,
@@ -37,47 +17,262 @@ pub const GPT2Config = struct {
     n_head: usize = 12,
     layer_norm_epsilon: f32 = 1e-5,
     initializer_range: f32 = 0.02,
+    
+    pub fn nano() GPT2Config {
+        return GPT2Config{
+            .vocab_size = 50257,
+            .n_positions = 128,
+            .n_embd = 32,
+            .n_layer = 2,
+            .n_head = 2,
+            .layer_norm_epsilon = 1e-5,
+            .initializer_range = 0.02,
+        };
+    }
 };
 
-// Attention layer implementation
-pub fn Attention(comptime DataType: type) type {
-    _ = DataType; // Phantom type for compatibility
+/// Count total number of parameters needed for the entire GPT-2 model
+pub fn countTotalParameters(config: GPT2Config) usize {
+    const n_embd = config.n_embd;
+    const n_layer = config.n_layer;
+    const vocab_size = config.vocab_size;
+    const n_positions = config.n_positions;
+    
+    var total: usize = 0;
+    
+    // Token embeddings (vocab_size, n_embd)
+    total += vocab_size * n_embd;
+    
+    // Position embeddings (n_positions, n_embd)
+    total += n_positions * n_embd;
+    
+    // Per-layer parameters
+    for (0..n_layer) |_| {
+        // LayerNorm 1: weight (n_embd) + bias (n_embd)
+        total += n_embd + n_embd;
+        
+        // Attention: c_attn_weight (n_embd, 3*n_embd) + c_attn_bias (3*n_embd) + 
+        //            c_proj_weight (n_embd, n_embd) + c_proj_bias (n_embd)
+        total += n_embd * 3 * n_embd + 3 * n_embd + n_embd * n_embd + n_embd;
+        
+        // LayerNorm 2: weight (n_embd) + bias (n_embd)
+        total += n_embd + n_embd;
+        
+        // MLP: c_fc_weight (n_embd, 4*n_embd) + c_fc_bias (4*n_embd) +
+        //      c_proj_weight (4*n_embd, n_embd) + c_proj_bias (n_embd)
+        total += n_embd * 4 * n_embd + 4 * n_embd + 4 * n_embd * n_embd + n_embd;
+    }
+    
+    // Final LayerNorm: weight (n_embd) + bias (n_embd)
+    total += n_embd + n_embd;
+    
+    // Language model head (n_embd, vocab_size)
+    total += n_embd * vocab_size;
+    
+    return total;
+}
+
+/// Create a list of all parameter shapes for the GPT-2 model in initialization order
+pub fn getParameterShapes(allocator: Allocator, config: GPT2Config) ![][]i64 {
+    const n_embd = config.n_embd;
+    const n_layer = config.n_layer;
+    const vocab_size = config.vocab_size;
+    const n_positions = config.n_positions;
+    
+    var shapes = std.ArrayList([]i64).init(allocator);
+    
+    // Token embeddings (vocab_size, n_embd)
+    try shapes.append(try allocator.dupe(i64, &[_]i64{ @intCast(vocab_size), @intCast(n_embd) }));
+    
+    // Position embeddings (n_positions, n_embd)
+    try shapes.append(try allocator.dupe(i64, &[_]i64{ @intCast(n_positions), @intCast(n_embd) }));
+    
+    // Per-layer parameters
+    for (0..n_layer) |_| {
+        // LayerNorm 1: weight (n_embd) + bias (n_embd)
+        try shapes.append(try allocator.dupe(i64, &[_]i64{@intCast(n_embd)}));
+        try shapes.append(try allocator.dupe(i64, &[_]i64{@intCast(n_embd)}));
+        
+        // Attention: c_attn_weight (n_embd, 3*n_embd) + c_attn_bias (3*n_embd) + 
+        //            c_proj_weight (n_embd, n_embd) + c_proj_bias (n_embd)
+        try shapes.append(try allocator.dupe(i64, &[_]i64{ @intCast(n_embd), @intCast(3 * n_embd) }));
+        try shapes.append(try allocator.dupe(i64, &[_]i64{@intCast(3 * n_embd)}));
+        try shapes.append(try allocator.dupe(i64, &[_]i64{ @intCast(n_embd), @intCast(n_embd) }));
+        try shapes.append(try allocator.dupe(i64, &[_]i64{@intCast(n_embd)}));
+        
+        // LayerNorm 2: weight (n_embd) + bias (n_embd)
+        try shapes.append(try allocator.dupe(i64, &[_]i64{@intCast(n_embd)}));
+        try shapes.append(try allocator.dupe(i64, &[_]i64{@intCast(n_embd)}));
+        
+        // MLP: c_fc_weight (n_embd, 4*n_embd) + c_fc_bias (4*n_embd) +
+        //      c_proj_weight (4*n_embd, n_embd) + c_proj_bias (n_embd)
+        try shapes.append(try allocator.dupe(i64, &[_]i64{ @intCast(n_embd), @intCast(4 * n_embd) }));
+        try shapes.append(try allocator.dupe(i64, &[_]i64{@intCast(4 * n_embd)}));
+        try shapes.append(try allocator.dupe(i64, &[_]i64{ @intCast(4 * n_embd), @intCast(n_embd) }));
+        try shapes.append(try allocator.dupe(i64, &[_]i64{@intCast(n_embd)}));
+    }
+    
+    // Final LayerNorm: weight (n_embd) + bias (n_embd)
+    try shapes.append(try allocator.dupe(i64, &[_]i64{@intCast(n_embd)}));
+    try shapes.append(try allocator.dupe(i64, &[_]i64{@intCast(n_embd)}));
+    
+    // Language model head (n_embd, vocab_size)
+    try shapes.append(try allocator.dupe(i64, &[_]i64{ @intCast(n_embd), @intCast(vocab_size) }));
+    
+    return shapes.toOwnedSlice();
+}
+
+// Layer normalization implementation with correct variance calculation
+pub fn LayerNorm(comptime DataType: type) type {
+    _ = DataType;
     
     return struct {
-        // Weights and biases for queries, keys, values, and output projections
+        weight: Tensor,
+        bias: Tensor,
+        epsilon: f32,
+        n_embd: usize,
+        allocator: Allocator,
+
+        pub fn init(allocator: Allocator, config: GPT2Config, builder: *MLIRBuilder, params: *[]mlir.Value) !@This() {
+            const n_embd = config.n_embd;
+            const epsilon = config.layer_norm_epsilon;
+
+            // Consume parameters from the slice
+            if (params.len < 2) return error.InsufficientParameters;
+            
+            const weight = try builder.newTensor(params.*[0]);
+            const bias = try builder.newTensor(params.*[1]);
+            
+            // Advance the parameter slice
+            params.* = params.*[2..];
+
+            return @This(){
+                .weight = weight,
+                .bias = bias,
+                .epsilon = epsilon,
+                .n_embd = n_embd,
+                .allocator = allocator,
+            };
+        }
+
+        pub fn deinit(self: *@This()) void {
+            self.weight.deinit();
+            self.bias.deinit();
+        }
+
+        /// Mathematically correct layer normalization implementation
+        pub fn forward(self: *@This(), x: Tensor, builder: *MLIRBuilder) !Tensor {
+            const ctx = builder.ctx;
+            const loc = builder.loc;
+            
+            // Input x has shape [batch, seq_len, n_embd]
+            // We normalize along the last dimension (n_embd)
+            const last_dim = x.shape.rank() - 1;
+            const n_embd_size = x.shape.getDimension(last_dim);
+            
+            // Step 1: Calculate mean along last dimension
+            // sum = stablehlo.reduce_sum(x, dimension=last_dim, keep_dims=true)
+            var sum_tensor = try builder.createAndAppendOp(hlo.reduce_sum(ctx, x.value, &[_]i64{last_dim}, true, loc));
+            
+            // Create size constant and divide to get mean
+            const size_const = try builder.scalarConstant(@floatFromInt(n_embd_size));
+            
+            var mean = try builder.createAndAppendOp(hlo.divide(ctx, sum_tensor.value, size_const.value, loc));
+            
+            // Step 2: Calculate variance = mean(x^2) - mean(x)^2
+            // x_squared = stablehlo.multiply(x, x)
+            const x_squared_op = hlo.multiply(ctx, x.value, x.value, loc);
+            var x_squared = try builder.newTensor(x_squared_op.getResult(0));
+
+            
+            // mean_x_squared = reduce_sum(x_squared) / size
+            const sum_x_squared_op = hlo.reduce_sum(ctx, x_squared.value, &[_]i64{last_dim}, true, loc);
+            var sum_x_squared = try builder.newTensor(sum_x_squared_op.getResult(0));
+
+            
+            const mean_x_squared_op = hlo.divide(ctx, sum_x_squared.value, size_const.value, loc);
+            var mean_x_squared = try builder.newTensor(mean_x_squared_op.getResult(0));
+
+            
+            // mean_squared = mean * mean
+            const mean_squared_op = hlo.multiply(ctx, mean.value, mean.value, loc);
+            var mean_squared = try builder.newTensor(mean_squared_op.getResult(0));
+
+            
+            // variance = mean_x_squared - mean_squared
+            const variance_op = hlo.subtract(ctx, mean_x_squared.value, mean_squared.value, loc);
+            var variance = try builder.newTensor(variance_op.getResult(0));
+
+            
+            // Step 3: Apply normalization
+            // Add epsilon: variance_eps = variance + epsilon
+            const epsilon_const = try builder.scalarConstant(self.epsilon);
+            
+            const variance_eps_op = hlo.add(ctx, variance.value, epsilon_const.value, loc);
+            var variance_eps = try builder.newTensor(variance_eps_op.getResult(0));
+
+            
+            // rsqrt_var = rsqrt(variance_eps)
+            const rsqrt_var_op = hlo.rsqrt(ctx, variance_eps.value, loc);
+            var rsqrt_var = try builder.newTensor(rsqrt_var_op.getResult(0));
+
+            
+            // Center x: x_centered = x - mean
+            const x_centered_op = hlo.subtract(ctx, x.value, mean.value, loc);
+            var x_centered = try builder.newTensor(x_centered_op.getResult(0));
+
+            
+            // Normalize: x_norm = x_centered * rsqrt_var
+            const x_norm_op = hlo.multiply(ctx, x_centered.value, rsqrt_var.value, loc);
+            var x_norm = try builder.newTensor(x_norm_op.getResult(0));
+
+            
+            // Step 4: Apply scale and shift
+            // Scale: x_scaled = x_norm * self.weight
+            const x_scaled_op = hlo.multiply(ctx, x_norm.value, self.weight.value, loc);
+            var x_scaled = try builder.newTensor(x_scaled_op.getResult(0));
+
+            
+            // Shift: output = x_scaled + self.bias
+            const output_op = hlo.add(ctx, x_scaled.value, self.bias.value, loc);
+            return builder.newTensor(output_op.getResult(0));
+        }
+
+        pub fn forwardWithGrad(self: *@This(), x: Tensor, builder: *MLIRBuilder) !Tensor {
+            return self.forward(x, builder);
+        }
+    };
+}
+
+// Multi-head causal self-attention implementation
+pub fn Attention(comptime DataType: type) type {
+    _ = DataType;
+    
+    return struct {
         c_attn_weight: Tensor,
         c_attn_bias: Tensor,
         c_proj_weight: Tensor,
         c_proj_bias: Tensor,
-
-        // Configuration
         n_embd: usize,
         n_head: usize,
         head_dim: usize,
         allocator: Allocator,
 
-        // No more Plan-based autodiff - will use MLIR VJP system
-
-        pub fn init(allocator: Allocator, config: GPT2Config, builder: *MLIRBuilder) !@This() {
+        pub fn init(allocator: Allocator, config: GPT2Config, builder: *MLIRBuilder, params: *[]mlir.Value) !@This() {
             const n_embd = config.n_embd;
             const n_head = config.n_head;
             const head_dim = n_embd / n_head;
 
-            // QKV combined weight (n_embd x 3*n_embd) - MLIR constant tensor
-            const c_attn_weight_dims = [_]i64{ @intCast(n_embd), @intCast(3 * n_embd) };
-            const c_attn_weight = try createRandomTensor(builder, &c_attn_weight_dims, .f32, config.initializer_range);
-
-            // QKV combined bias (3*n_embd) - MLIR zero tensor
-            const c_attn_bias_dims = [_]i64{@intCast(3 * n_embd)};
-            const c_attn_bias = try Tensor.zeros(builder, &c_attn_bias_dims, .f32);
-
-            // Output projection weight (n_embd x n_embd) - MLIR constant tensor
-            const c_proj_weight_dims = [_]i64{ @intCast(n_embd), @intCast(n_embd) };
-            const c_proj_weight = try createRandomTensor(builder, &c_proj_weight_dims, .f32, config.initializer_range);
-
-            // Output projection bias (n_embd) - MLIR zero tensor
-            const c_proj_bias_dims = [_]i64{@intCast(n_embd)};
-            const c_proj_bias = try Tensor.zeros(builder, &c_proj_bias_dims, .f32);
+            // Consume parameters from the slice
+            if (params.len < 4) return error.InsufficientParameters;
+            
+            const c_attn_weight = try builder.newTensor(params.*[0]);
+            const c_attn_bias = try builder.newTensor(params.*[1]);
+            const c_proj_weight = try builder.newTensor(params.*[2]);
+            const c_proj_bias = try builder.newTensor(params.*[3]);
+            
+            // Advance the parameter slice
+            params.* = params.*[4..];
 
             return @This(){
                 .c_attn_weight = c_attn_weight,
@@ -92,91 +287,226 @@ pub fn Attention(comptime DataType: type) type {
         }
 
         pub fn deinit(self: *@This()) void {
-            // MLIR tensors are managed by the MLIR context
             self.c_attn_weight.deinit();
             self.c_attn_bias.deinit();
             self.c_proj_weight.deinit();
             self.c_proj_bias.deinit();
         }
 
-        // Forward pass through the attention layer using MLIR operations
+        /// Complete multi-head causal self-attention implementation
         pub fn forward(self: *@This(), x: Tensor, builder: *MLIRBuilder) !Tensor {
-            // Step 1: Compute QKV projections: x @ c_attn_weight + c_attn_bias
-            // x is [batch, seq_len, n_embd], c_attn_weight is [n_embd, 3*n_embd]
-            var qkv_proj = try pcp.ops.matmul(builder, x, self.c_attn_weight);
-            defer qkv_proj.deinit();
+            const ctx = builder.ctx;
+            const loc = builder.loc;
+            
+            // Input x has shape [B, T, C] where B=batch, T=sequence, C=n_embd
+            const batch_size = x.shape.getDimension(0);
+            const seq_len = x.shape.getDimension(1);
+            const n_embd = @as(i64, @intCast(self.n_embd));
+            const n_head = @as(i64, @intCast(self.n_head));
+            const head_dim = @as(i64, @intCast(self.head_dim));
+            
+            // Step 1: QKV projection
+            // qkv = (x @ c_attn_weight) + c_attn_bias  [B, T, 3*C]
+            var qkv_proj = try builder.createAndAppendOp(hlo.dot_general(ctx, x.value, self.c_attn_weight.value, .{
+                .dot_dimension_numbers = hlo.DotDimensionNumbersAttribute{
+                    .lhs_batching_dimensions = &.{},
+                    .rhs_batching_dimensions = &.{},
+                    .lhs_contracting_dimensions = &.{2}, // Contract over C (last dim of x)
+                    .rhs_contracting_dimensions = &.{0}, // Contract over first dim of weight
+                },
+            }));
+            
+            var qkv = try builder.createAndAppendOp(hlo.add(ctx, qkv_proj.value, self.c_attn_bias.value, loc));
 
-            // Add bias using MLIR operations
-            var qkv = try pcp.ops.add(builder, qkv_proj, self.c_attn_bias);
-            defer qkv.deinit();
+            
+            // Step 2: Split QKV into separate Q, K, V tensors
+            // Each has shape [B, T, C]
+            const slice_start_q = [_]i64{ 0, 0, 0 };
+            const slice_limit_q = [_]i64{ batch_size, seq_len, n_embd };
+            const slice_strides = [_]i64{ 1, 1, 1 };
+            
+            const q_op = hlo.slice(ctx, qkv.value, &slice_start_q, &slice_limit_q, &slice_strides, loc);
+            var q = try builder.newTensor(q_op.getResult(0));
 
-            // Step 2: Split QKV into separate query, key, value tensors
-            // TODO: Use stablehlo.slice operations once implemented
-            // For now, use simplified attention (just use QKV as is)
+            
+            const slice_start_k = [_]i64{ 0, 0, n_embd };
+            const slice_limit_k = [_]i64{ batch_size, seq_len, 2 * n_embd };
+            
+            const k_op = hlo.slice(ctx, qkv.value, &slice_start_k, &slice_limit_k, &slice_strides, loc);
+            var k = try builder.newTensor(k_op.getResult(0));
 
-            // Step 3: Compute attention scores: Q @ K^T / sqrt(head_dim)
-            // For simplicity, we'll use a simplified attention mechanism
-            const scaling_factor = 1.0 / std.math.sqrt(@as(f32, @floatFromInt(self.head_dim)));
-            const scale_dims = [_]i64{1, 1, 1};
-            const scale_tensor = try Tensor.filled(builder, &scale_dims, .f32, scaling_factor);
-            defer scale_tensor.deinit();
+            
+            const slice_start_v = [_]i64{ 0, 0, 2 * n_embd };
+            const slice_limit_v = [_]i64{ batch_size, seq_len, 3 * n_embd };
+            
+            const v_op = hlo.slice(ctx, qkv.value, &slice_start_v, &slice_limit_v, &slice_strides, loc);
+            var v = try builder.newTensor(v_op.getResult(0));
 
-            var attention_scores = try pcp.ops.multiply(builder, qkv, scale_tensor);
-            defer attention_scores.deinit();
+            
+            // Step 3: Reshape for multi-head attention
+            // Reshape from [B, T, C] to [B, T, n_head, head_dim]
+            const head_shape = [_]i64{ batch_size, seq_len, n_head, head_dim };
+            
+            const q_reshaped_op = hlo.reshape(ctx, q.value, &head_shape, loc);
+            var q_reshaped = try builder.newTensor(q_reshaped_op.getResult(0));
 
-            // Step 4: Apply softmax to get attention weights
-            var attention_weights = try pcp.ops.softmax(builder, attention_scores);
-            defer attention_weights.deinit();
+            
+            const k_reshaped_op = hlo.reshape(ctx, k.value, &head_shape, loc);
+            var k_reshaped = try builder.newTensor(k_reshaped_op.getResult(0));
 
-            // Step 5: Apply output projection
-            var output_raw = try pcp.ops.matmul(builder, attention_weights, self.c_proj_weight);
-            defer output_raw.deinit();
+            
+            const v_reshaped_op = hlo.reshape(ctx, v.value, &head_shape, loc);
+            var v_reshaped = try builder.newTensor(v_reshaped_op.getResult(0));
 
-            // Add bias to get final output
-            return pcp.ops.add(builder, output_raw, self.c_proj_bias);
+            
+            // Transpose to [B, n_head, T, head_dim] for efficient batched matmul
+            const head_transpose_perm = [_]i64{ 0, 2, 1, 3 };
+            
+            const q_heads_op = hlo.transpose(ctx, q_reshaped.value, &head_transpose_perm, loc);
+            var q_heads = try builder.newTensor(q_heads_op.getResult(0));
+
+            
+            const k_heads_op = hlo.transpose(ctx, k_reshaped.value, &head_transpose_perm, loc);
+            var k_heads = try builder.newTensor(k_heads_op.getResult(0));
+
+            
+            const v_heads_op = hlo.transpose(ctx, v_reshaped.value, &head_transpose_perm, loc);
+            var v_heads = try builder.newTensor(v_heads_op.getResult(0));
+
+            
+            // Step 4: Calculate attention scores
+            // k_transposed: [B, n_head, head_dim, T] for matmul
+            const k_transpose_perm = [_]i64{ 0, 1, 3, 2 };
+            const k_t_op = hlo.transpose(ctx, k_heads.value, &k_transpose_perm, loc);
+            var k_t = try builder.newTensor(k_t_op.getResult(0));
+
+            
+            // scores = q @ k_t  [B, n_head, T, T]
+            var scores = try builder.createAndAppendOp(hlo.dot_general(ctx, q_heads.value, k_t.value, .{
+                .dot_dimension_numbers = hlo.DotDimensionNumbersAttribute{
+                    .lhs_batching_dimensions = &.{0, 1}, // Batch over B and n_head
+                    .rhs_batching_dimensions = &.{0, 1},
+                    .lhs_contracting_dimensions = &.{3}, // Contract over head_dim
+                    .rhs_contracting_dimensions = &.{2},
+                },
+            }));
+            
+            // Scale by 1/sqrt(head_dim)
+            const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(self.head_dim)));
+            const scale_const = try builder.scalarConstant(scale);
+            
+            const scaled_scores_op = hlo.multiply(ctx, scores.value, scale_const.value, loc);
+            var scaled_scores = try builder.newTensor(scaled_scores_op.getResult(0));
+
+            
+            // Step 5: Apply causal mask
+            // Create triangular mask where mask[i, j] = i >= j (allow current and past)
+            const iota_0_op = hlo.iota(ctx, &[_]i64{ seq_len, seq_len }, 0, mlir.Type.i32Type(ctx), loc);
+            var iota_0 = try builder.newTensor(iota_0_op.getResult(0));
+
+            
+            const iota_1_op = hlo.iota(ctx, &[_]i64{ seq_len, seq_len }, 1, mlir.Type.i32Type(ctx), loc);
+            var iota_1 = try builder.newTensor(iota_1_op.getResult(0));
+
+            
+            // mask = iota_0 >= iota_1 (true for lower triangular + diagonal)
+            const mask_2d_op = hlo.compare(ctx, iota_0.value, iota_1.value, hlo.ComparisonDirection.GE, loc);
+            var mask_2d = try builder.newTensor(mask_2d_op.getResult(0));
+
+            
+            // Broadcast mask to [B, n_head, T, T]
+            const mask_broadcast_dims = [_]i64{ 2, 3 };
+            const mask_target_shape = [_]i64{ batch_size, n_head, seq_len, seq_len };
+            const mask_op = hlo.broadcast_in_dim(ctx, mask_2d.value, &mask_target_shape, &mask_broadcast_dims, loc);
+            var mask = try builder.newTensor(mask_op.getResult(0));
+
+            
+            // Apply mask: select(mask, scores, -inf)
+            const neg_inf = try builder.scalarConstant(-1e9);
+            
+            const masked_scores_op = hlo.select(ctx, mask.value, scaled_scores.value, neg_inf.value, loc);
+            var masked_scores = try builder.newTensor(masked_scores_op.getResult(0));
+
+            
+            // Step 6: Apply softmax
+            const attn_weights_op = hlo.softmax(ctx, masked_scores.value, -1, loc);
+            var attn_weights = try builder.newTensor(attn_weights_op.getResult(0));
+
+            
+            // Step 7: Apply attention to values
+            // output = attn_weights @ v_heads  [B, n_head, T, head_dim]
+            const attn_output_op = hlo.dot_general(ctx, attn_weights.value, v_heads.value, .{
+                .dot_dimension_numbers = hlo.DotDimensionNumbersAttribute{
+                    .lhs_batching_dimensions = &.{0, 1},
+                    .rhs_batching_dimensions = &.{0, 1},
+                    .lhs_contracting_dimensions = &.{3}, // Contract over last T dim
+                    .rhs_contracting_dimensions = &.{2},
+                },
+            });
+            var attn_output = try builder.newTensor(attn_output_op.getResult(0));
+            
+            // Step 8: Transpose back and reshape
+            // Transpose from [B, n_head, T, head_dim] to [B, T, n_head, head_dim]
+            const output_transpose_perm = [_]i64{ 0, 2, 1, 3 };
+            const output_transposed_op = hlo.transpose(ctx, attn_output.value, &output_transpose_perm, loc);
+            var output_transposed = try builder.newTensor(output_transposed_op.getResult(0));
+
+            
+            // Reshape to [B, T, C]
+            const output_shape = [_]i64{ batch_size, seq_len, n_embd };
+            const output_reshaped_op = hlo.reshape(ctx, output_transposed.value, &output_shape, loc);
+            var output_reshaped = try builder.newTensor(output_reshaped_op.getResult(0));
+
+            
+            // Step 9: Apply output projection
+            // final_output = (output_reshaped @ c_proj_weight) + c_proj_bias
+            const proj_op = hlo.dot_general(ctx, output_reshaped.value, self.c_proj_weight.value, .{
+                .dot_dimension_numbers = hlo.DotDimensionNumbersAttribute{
+                    .lhs_batching_dimensions = &.{},
+                    .rhs_batching_dimensions = &.{},
+                    .lhs_contracting_dimensions = &.{2}, // Contract over C
+                    .rhs_contracting_dimensions = &.{0},
+                },
+            });
+            var proj_output = try builder.newTensor(proj_op.getResult(0));
+            
+            const final_op = hlo.add(ctx, proj_output.value, self.c_proj_bias.value, loc);
+            return builder.newTensor(final_op.getResult(0));
         }
 
-        // Forward pass with gradient tracking - uses MLIR VJP system
         pub fn forwardWithGrad(self: *@This(), x: Tensor, builder: *MLIRBuilder) !Tensor {
-            // Use the regular forward pass - MLIR will handle gradient computation
             return self.forward(x, builder);
         }
     };
 }
 
-// MLP (Feed-Forward) layer implementation
+// MLP implementation with GELU activation
 pub fn MLP(comptime DataType: type) type {
-    _ = DataType; // Phantom type for compatibility
+    _ = DataType;
     
     return struct {
         c_fc_weight: Tensor,
         c_fc_bias: Tensor,
         c_proj_weight: Tensor,
         c_proj_bias: Tensor,
-
         n_embd: usize,
         n_inner: usize,
         allocator: Allocator,
 
-        // No more Plan-based autodiff - will use MLIR VJP system
-
-        pub fn init(allocator: Allocator, config: GPT2Config, builder: *MLIRBuilder) !@This() {
+        pub fn init(allocator: Allocator, config: GPT2Config, builder: *MLIRBuilder, params: *[]mlir.Value) !@This() {
             const n_embd = config.n_embd;
-            const n_inner = 4 * n_embd; // Typically 4x the embedding dimension
+            const n_inner = 4 * n_embd;
 
-            // FC weights and biases - MLIR constant tensors
-            const c_fc_weight_dims = [_]i64{ @intCast(n_embd), @intCast(n_inner) };
-            const c_fc_weight = try createRandomTensor(builder, &c_fc_weight_dims, .f32, config.initializer_range);
-
-            const c_fc_bias_dims = [_]i64{@intCast(n_inner)};
-            const c_fc_bias = try Tensor.zeros(builder, &c_fc_bias_dims, .f32);
-
-            // Projection weights and biases - MLIR constant tensors
-            const c_proj_weight_dims = [_]i64{ @intCast(n_inner), @intCast(n_embd) };
-            const c_proj_weight = try createRandomTensor(builder, &c_proj_weight_dims, .f32, config.initializer_range);
-
-            const c_proj_bias_dims = [_]i64{@intCast(n_embd)};
-            const c_proj_bias = try Tensor.zeros(builder, &c_proj_bias_dims, .f32);
+            // Consume parameters from the slice
+            if (params.len < 4) return error.InsufficientParameters;
+            
+            const c_fc_weight = try builder.newTensor(params.*[0]);
+            const c_fc_bias = try builder.newTensor(params.*[1]);
+            const c_proj_weight = try builder.newTensor(params.*[2]);
+            const c_proj_bias = try builder.newTensor(params.*[3]);
+            
+            // Advance the parameter slice
+            params.* = params.*[4..];
 
             return @This(){
                 .c_fc_weight = c_fc_weight,
@@ -190,118 +520,111 @@ pub fn MLP(comptime DataType: type) type {
         }
 
         pub fn deinit(self: *@This()) void {
-            // MLIR tensors are managed by the MLIR context
             self.c_fc_weight.deinit();
             self.c_fc_bias.deinit();
             self.c_proj_weight.deinit();
             self.c_proj_bias.deinit();
         }
 
-        // Forward pass using MLIR tensor operations
+        /// GELU activation function: 0.5 * x * (1 + tanh(sqrt(2/π) * (x + 0.044715 * x^3)))
+        fn gelu(self: *@This(), x: Tensor, builder: *MLIRBuilder) !Tensor {
+            _ = self;
+            const ctx = builder.ctx;
+            const loc = builder.loc;
+            
+            // Constants for GELU approximation
+            const sqrt_2_over_pi = try builder.scalarConstant(@sqrt(2.0 / std.math.pi));
+            const coeff = try builder.scalarConstant(0.044715);
+            const half = try builder.scalarConstant(0.5);
+            const one = try builder.scalarConstant(1.0);
+            
+            // x^3
+            const x_squared_op = hlo.multiply(ctx, x.value, x.value, loc);
+            var x_squared = try builder.newTensor(x_squared_op.getResult(0));
+
+            
+            const x_cubed_op = hlo.multiply(ctx, x_squared.value, x.value, loc);
+            var x_cubed = try builder.newTensor(x_cubed_op.getResult(0));
+
+            
+            // 0.044715 * x^3
+            const coeff_x_cubed_op = hlo.multiply(ctx, coeff.value, x_cubed.value, loc);
+            var coeff_x_cubed = try builder.newTensor(coeff_x_cubed_op.getResult(0));
+
+            
+            // x + 0.044715 * x^3
+            const inner_op = hlo.add(ctx, x.value, coeff_x_cubed.value, loc);
+            var inner = try builder.newTensor(inner_op.getResult(0));
+
+            
+            // sqrt(2/π) * (x + 0.044715 * x^3)
+            const scaled_inner_op = hlo.multiply(ctx, sqrt_2_over_pi.value, inner.value, loc);
+            var scaled_inner = try builder.newTensor(scaled_inner_op.getResult(0));
+
+            
+            // tanh(sqrt(2/π) * (x + 0.044715 * x^3))
+            const tanh_op = hlo.tanh(ctx, scaled_inner.value, loc);
+            var tanh_result = try builder.newTensor(tanh_op.getResult(0));
+
+            
+            // 1 + tanh(...)
+            const one_plus_tanh_op = hlo.add(ctx, one.value, tanh_result.value, loc);
+            var one_plus_tanh = try builder.newTensor(one_plus_tanh_op.getResult(0));
+
+            
+            // x * (1 + tanh(...))
+            const x_times_op = hlo.multiply(ctx, x.value, one_plus_tanh.value, loc);
+            var x_times = try builder.newTensor(x_times_op.getResult(0));
+
+            
+            // 0.5 * x * (1 + tanh(...))
+            const result_op = hlo.multiply(ctx, half.value, x_times.value, loc);
+            return builder.newTensor(result_op.getResult(0));
+        }
+
         pub fn forward(self: *@This(), x: Tensor, builder: *MLIRBuilder) !Tensor {
+            const ctx = builder.ctx;
+            const loc = builder.loc;
+            
             // Step 1: First linear layer: x @ c_fc_weight + c_fc_bias
-            // x is [batch, seq_len, n_embd], c_fc_weight is [n_embd, n_inner]
-            var fc_out = try pcp.ops.matmul(builder, x, self.c_fc_weight);
-            defer fc_out.deinit();
+            var fc_proj = try builder.createAndAppendOp(hlo.dot_general(ctx, x.value, self.c_fc_weight.value, .{
+                .dot_dimension_numbers = hlo.DotDimensionNumbersAttribute{
+                    .lhs_batching_dimensions = &.{},
+                    .rhs_batching_dimensions = &.{},
+                    .lhs_contracting_dimensions = &.{2}, // Contract over n_embd
+                    .rhs_contracting_dimensions = &.{0},
+                },
+            }));
+            
+            var fc_biased = try builder.createAndAppendOp(hlo.add(ctx, fc_proj.value, self.c_fc_bias.value, loc));
 
-            // Add bias using MLIR operations
-            var fc_biased = try pcp.ops.add(builder, fc_out, self.c_fc_bias);
-            defer fc_biased.deinit();
+            
+            // Step 2: Apply GELU activation
+            var fc_activated = try self.gelu(fc_biased, builder);
 
-            // Step 2: Apply activation (ReLU)
-            var fc_activated = try pcp.ops.relu(builder, fc_biased);
-            defer fc_activated.deinit();
-
+            
             // Step 3: Second linear layer: activated @ c_proj_weight + c_proj_bias
-            // activated is [batch, seq_len, n_inner], c_proj_weight is [n_inner, n_embd]
-            var proj_out = try pcp.ops.matmul(builder, fc_activated, self.c_proj_weight);
-            defer proj_out.deinit();
-
-            // Add bias to get final output
-            return pcp.ops.add(builder, proj_out, self.c_proj_bias);
+            const proj_op = hlo.dot_general(ctx, fc_activated.value, self.c_proj_weight.value, .{
+                .dot_dimension_numbers = hlo.DotDimensionNumbersAttribute{
+                    .lhs_batching_dimensions = &.{},
+                    .rhs_batching_dimensions = &.{},
+                    .lhs_contracting_dimensions = &.{2}, // Contract over n_inner
+                    .rhs_contracting_dimensions = &.{0},
+                },
+            });
+            var proj_output = try builder.newTensor(proj_op.getResult(0));
+            
+            const final_op = hlo.add(ctx, proj_output.value, self.c_proj_bias.value, loc);
+            return builder.newTensor(final_op.getResult(0));
         }
 
-        // Forward pass with gradient tracking - uses MLIR VJP system
         pub fn forwardWithGrad(self: *@This(), x: Tensor, builder: *MLIRBuilder) !Tensor {
-            // Use the regular forward pass - MLIR will handle gradient computation
             return self.forward(x, builder);
         }
     };
 }
 
-// Layer normalization implementation
-pub fn LayerNorm(comptime DataType: type) type {
-    _ = DataType; // Phantom type for compatibility
-    
-    return struct {
-        weight: Tensor,
-        bias: Tensor,
-        epsilon: f32,
-        n_embd: usize,
-        allocator: Allocator,
-
-        // No more Plan-based autodiff - will use MLIR VJP system
-
-        pub fn init(allocator: Allocator, config: GPT2Config, builder: *MLIRBuilder) !@This() {
-            const n_embd = config.n_embd;
-            const epsilon = config.layer_norm_epsilon;
-
-            const weight_dims = [_]i64{@intCast(n_embd)};
-            const weight = try Tensor.filled(builder, &weight_dims, .f32, 1.0);
-
-            const bias_dims = [_]i64{@intCast(n_embd)};
-            const bias = try Tensor.zeros(builder, &bias_dims, .f32);
-
-            return @This(){
-                .weight = weight,
-                .bias = bias,
-                .epsilon = epsilon,
-                .n_embd = n_embd,
-                .allocator = allocator,
-            };
-        }
-
-        pub fn deinit(self: *@This()) void {
-            // MLIR tensors are managed by the MLIR context
-            self.weight.deinit();
-            self.bias.deinit();
-        }
-
-        // Layer normalization using MLIR operations
-        pub fn forward(self: *@This(), x: Tensor, builder: *MLIRBuilder) !Tensor {
-            // Full implementation would need reduce_mean and reduce_variance.
-            // We will approximate with reduce_sum and element count.
-            const last_dim_idx = x.shape.rank() - 1;
-            const last_dim_size = x.shape.getDimension(last_dim_idx);
-            
-            // Step 1: Calculate mean along last dimension
-            var sum = try pcp.ops.reduceSum(builder, x, &[_]i64{@intCast(last_dim_idx)});
-            defer sum.deinit();
-            const count_tensor = try Tensor.filled(builder, &[_]i64{1}, .f32, @as(f32, @floatFromInt(last_dim_size)));
-            defer count_tensor.deinit();
-            var mean = try pcp.ops.divide(builder, sum, count_tensor);
-            defer mean.deinit();
-            
-            // Step 2: Center the input: x - mean
-            const centered = try pcp.ops.subtract(builder, x, mean);
-            defer centered.deinit();
-            
-            // Step 3: Apply scale and shift using broadcasting
-            const scaled = try pcp.ops.multiply(builder, centered, self.weight);
-            defer scaled.deinit();
-            
-            return pcp.ops.add(builder, scaled, self.bias);
-        }
-
-        // Forward with gradient tracking - uses MLIR VJP system
-        pub fn forwardWithGrad(self: *@This(), x: Tensor, builder: *MLIRBuilder) !Tensor {
-            // Use the regular forward pass - MLIR will handle gradient computation
-            return self.forward(x, builder);
-        }
-    };
-}
-
-// Transformer layer (attention + MLP)
+// Transformer block
 pub fn Block(comptime DataType: type) type {
     return struct {
         ln_1: LayerNorm(DataType),
@@ -310,13 +633,11 @@ pub fn Block(comptime DataType: type) type {
         mlp: MLP(DataType),
         allocator: Allocator,
 
-        // No more Plan-based autodiff - will use MLIR VJP system
-
-        pub fn init(allocator: Allocator, config: GPT2Config, builder: *MLIRBuilder) !@This() {
-            const ln_1 = try LayerNorm(DataType).init(allocator, config, builder);
-            const attn = try Attention(DataType).init(allocator, config, builder);
-            const ln_2 = try LayerNorm(DataType).init(allocator, config, builder);
-            const mlp = try MLP(DataType).init(allocator, config, builder);
+        pub fn init(allocator: Allocator, config: GPT2Config, builder: *MLIRBuilder, params: *[]mlir.Value) !@This() {
+            const ln_1 = try LayerNorm(DataType).init(allocator, config, builder, params);
+            const attn = try Attention(DataType).init(allocator, config, builder, params);
+            const ln_2 = try LayerNorm(DataType).init(allocator, config, builder, params);
+            const mlp = try MLP(DataType).init(allocator, config, builder, params);
 
             return @This(){
                 .ln_1 = ln_1,
@@ -334,103 +655,121 @@ pub fn Block(comptime DataType: type) type {
             self.mlp.deinit();
         }
 
-        // Forward pass using MLIR operations
         pub fn forward(self: *@This(), x: Tensor, builder: *MLIRBuilder) !Tensor {
-            // Step 1: Layer norm -> attention
+            const ctx = builder.ctx;
+            const loc = builder.loc;
+            
+            // Pre-norm architecture: LayerNorm -> Attention -> Add residual
             var norm1 = try self.ln_1.forward(x, builder);
-            defer norm1.deinit();
 
-            // Step 2: Apply attention to normalized input
+
             var attn_output = try self.attn.forward(norm1, builder);
-            defer attn_output.deinit();
 
-            // Step 3: Add attention output to input (residual connection)
-            var res1 = try pcp.ops.add(builder, x, attn_output);
-            defer res1.deinit();
 
-            // Step 4: Layer norm on residual output
+            // Residual connection 1
+            const res1_op = hlo.add(ctx, x.value, attn_output.value, loc);
+            var res1 = try builder.newTensor(res1_op.getResult(0));
+
+
+            // Pre-norm architecture: LayerNorm -> MLP -> Add residual
             var norm2 = try self.ln_2.forward(res1, builder);
-            defer norm2.deinit();
 
-            // Step 5: Apply MLP to normalized residual
+
             var mlp_output = try self.mlp.forward(norm2, builder);
-            defer mlp_output.deinit();
 
-            // Step 6: Add MLP output to residual (second residual connection)
-            return pcp.ops.add(builder, res1, mlp_output);
+
+            // Residual connection 2
+            const res2_op = hlo.add(ctx, res1.value, mlp_output.value, loc);
+            return builder.newTensor(res2_op.getResult(0));
         }
 
-        // Forward pass with gradient tracking - uses MLIR VJP system
         pub fn forwardWithGrad(self: *@This(), x: Tensor, builder: *MLIRBuilder) !Tensor {
-            // Step 1: Layer norm -> attention
-            var norm1 = try self.ln_1.forwardWithGrad(x, builder);
-            defer norm1.deinit();
-
-            // Step 2: Apply attention with gradient tracking
-            var attn_output = try self.attn.forwardWithGrad(norm1, builder);
-            defer attn_output.deinit();
-
-            // Step 3: Add attention output to input (residual connection)
-            var res1 = try pcp.ops.add(builder, x, attn_output);
-            defer res1.deinit();
-
-            // Step 4: Layer norm on residual output
-            var norm2 = try self.ln_2.forwardWithGrad(res1, builder);
-            defer norm2.deinit();
-
-            // Step 5: Apply MLP to normalized residual with gradient tracking
-            var mlp_output = try self.mlp.forwardWithGrad(norm2, builder);
-            defer mlp_output.deinit();
-
-            // Step 6: Add MLP output to residual (second residual connection)
-            return pcp.ops.add(builder, res1, mlp_output);
+            return self.forward(x, builder);
         }
     };
 }
 
-// Main GPT-2 model
-// Cross-entropy loss function for language modeling using MLIR operations
+/// Correct cross-entropy loss implementation
 pub fn crossEntropyLoss(comptime DataType: type) type {
-    _ = DataType; // Phantom type for compatibility
+    _ = DataType;
     
     return struct {
-        pub fn run(allocator: Allocator, logits: Tensor, targets: Tensor) !Tensor {
-            _ = allocator; // Not needed for MLIR tensor operations
+        pub fn run(allocator: Allocator, logits: Tensor, targets: Tensor, builder: *MLIRBuilder) !Tensor {
+            _ = allocator;
+            const ctx = builder.ctx;
+            const loc = builder.loc;
             
-            // For now, implement a simplified cross-entropy loss
-            // In a complete implementation, we would:
-            // 1. Apply softmax to logits
-            // 2. Compute negative log-likelihood for target indices
-            // 3. Average over batch and sequence dimensions
+            // logits: [B, T, V] where V = vocab_size
+            // targets: [B, T] with integer token IDs
             
-            // Simplified approach: create a scalar loss tensor
-            // This is not mathematically correct but allows the compilation to succeed
-            _ = targets; // Mark as used
+            const batch_size = logits.shape.getDimension(0);
+            const seq_len = logits.shape.getDimension(1);
+            const vocab_size = logits.shape.getDimension(2);
             
-            // Create a small scalar loss value (placeholder)
-            const loss_dims = [_]i64{1};
-            const loss = try Tensor.filled(logits.builder, &loss_dims, .f32, 0.01);
+            // Step 1: Convert targets to one-hot encoding [B, T, V]
+            // First convert targets to i32 type as required by one_hot
+            const i32_type = mlir.Type.i32Type(ctx);
+            const targets_shape = [_]i64{ batch_size, seq_len };
+            const targets_i32_type = mlir.Type.rankedTensorType(ctx, &targets_shape, i32_type);
+            const targets_i32_op = hlo.convert(ctx, targets.value, targets_i32_type, loc);
+            var targets_i32 = try builder.newTensor(targets_i32_op.getResult(0));
             
-            return loss;
+            const one_hot_op = hlo.one_hot(ctx, targets_i32.value, vocab_size, 1.0, 0.0, 2, mlir.Type.f32Type(ctx), loc);
+            var targets_one_hot = try builder.newTensor(one_hot_op.getResult(0));
+            
+            // Step 2: Compute log softmax
+            // log_softmax(x) = x - log(sum(exp(x), axis=-1))
+            const exp_logits_op = hlo.exponential(ctx, logits.value, loc);
+            var exp_logits = try builder.newTensor(exp_logits_op.getResult(0));
+
+            
+            const sum_exp_op = hlo.reduce_sum(ctx, exp_logits.value, &[_]i64{2}, true, loc);
+            var sum_exp = try builder.newTensor(sum_exp_op.getResult(0));
+
+            
+            const log_sum_exp_op = hlo.log(ctx, sum_exp.value, loc);
+            var log_sum_exp = try builder.newTensor(log_sum_exp_op.getResult(0));
+
+            
+            const log_probs_op = hlo.subtract(ctx, logits.value, log_sum_exp.value, loc);
+            var log_probs = try builder.newTensor(log_probs_op.getResult(0));
+
+            
+            // Step 3: Select correct log probabilities
+            // Multiply log_probs by one-hot targets to zero out incorrect classes
+            const selected_log_probs_op = hlo.multiply(ctx, log_probs.value, targets_one_hot.value, loc);
+            var selected_log_probs = try builder.newTensor(selected_log_probs_op.getResult(0));
+
+            
+            // Sum over vocabulary dimension to get negative log likelihood per token
+            const nll_per_token_op = hlo.reduce_sum(ctx, selected_log_probs.value, &[_]i64{2}, false, loc);
+            var nll_per_token = try builder.newTensor(nll_per_token_op.getResult(0));
+
+            
+            // Step 4: Compute mean loss
+            // Negate to get positive loss values
+            const neg_one = try builder.scalarConstant(-1.0);
+            
+            const loss_per_token_op = hlo.multiply(ctx, nll_per_token.value, neg_one.value, loc);
+            var loss_per_token = try builder.newTensor(loss_per_token_op.getResult(0));
+
+            
+            // Sum all losses
+            const total_loss_op = hlo.reduce_sum(ctx, loss_per_token.value, &[_]i64{0, 1}, false, loc);
+            var total_loss = try builder.newTensor(total_loss_op.getResult(0));
+
+            
+            // Divide by number of tokens to get mean loss
+            const num_tokens = batch_size * seq_len;
+            const num_tokens_const = try builder.scalarConstant(@floatFromInt(num_tokens));
+            
+            const mean_loss_op = hlo.divide(ctx, total_loss.value, num_tokens_const.value, loc);
+            return builder.newTensor(mean_loss_op.getResult(0));
         }
     };
 }
 
-// Compute perplexity from loss
-pub fn computePerplexity(comptime DataType: type) type {
-    const loss_func = crossEntropyLoss(DataType).run;
-
-    return struct {
-        pub fn run(allocator: Allocator, logits: Tensor, targets: Tensor) !f32 {
-            var loss = try loss_func(allocator, logits, targets);
-            defer loss.deinit();
-            // For MLIR tensors, we can't extract scalar values directly
-            // Return a placeholder perplexity
-            return 1.0;
-        }
-    };
-}
-
+// Main GPT-2 model with trainable parameters
 pub fn GPT2(comptime DataType: type) type {
     return struct {
         wte: Tensor, // Token embeddings
@@ -442,29 +781,26 @@ pub fn GPT2(comptime DataType: type) type {
         config: GPT2Config,
         allocator: Allocator,
 
-        // No more Plan-based autodiff - will use MLIR VJP system
-
-        pub fn init(allocator: Allocator, config: GPT2Config, builder: *MLIRBuilder) !@This() {
-            // Token embeddings (vocab_size x n_embd) - MLIR constant tensor
-            const wte_dims = [_]i64{ @intCast(config.vocab_size), @intCast(config.n_embd) };
-            const wte = try createRandomTensor(builder, &wte_dims, .f32, config.initializer_range);
-
-            // Position embeddings (n_positions x n_embd) - MLIR constant tensor
-            const wpe_dims = [_]i64{ @intCast(config.n_positions), @intCast(config.n_embd) };
-            const wpe = try createRandomTensor(builder, &wpe_dims, .f32, config.initializer_range);
+        pub fn init(allocator: Allocator, config: GPT2Config, builder: *MLIRBuilder, params: *[]mlir.Value) !@This() {
+            // Consume token embeddings
+            if (params.len < 2) return error.InsufficientParameters;
+            const wte = try builder.newTensor(params.*[0]);
+            const wpe = try builder.newTensor(params.*[1]);
+            params.* = params.*[2..];
 
             // Create transformer blocks
             const blocks = try allocator.alloc(Block(DataType), config.n_layer);
             for (blocks) |*block| {
-                block.* = try Block(DataType).init(allocator, config, builder);
+                block.* = try Block(DataType).init(allocator, config, builder, params);
             }
 
             // Final layer norm
-            const ln_f = try LayerNorm(DataType).init(allocator, config, builder);
+            const ln_f = try LayerNorm(DataType).init(allocator, config, builder, params);
 
-            // Language model head (n_embd x vocab_size) - MLIR constant tensor
-            const lm_dims = [_]i64{ @intCast(config.n_embd), @intCast(config.vocab_size) };
-            const lm_head = try createRandomTensor(builder, &lm_dims, .f32, config.initializer_range);
+            // Language model head
+            if (params.len < 1) return error.InsufficientParameters;
+            const lm_head = try builder.newTensor(params.*[0]);
+            params.* = params.*[1..];
 
             return @This(){
                 .wte = wte,
@@ -478,81 +814,68 @@ pub fn GPT2(comptime DataType: type) type {
         }
 
         pub fn deinit(self: *@This()) void {
-            // Clean up tensors - MLIR context manages tensor memory
             self.wte.deinit();
             self.wpe.deinit();
-
+            
             for (self.blocks) |*block| {
                 block.deinit();
             }
             self.allocator.free(self.blocks);
-
+            
             self.ln_f.deinit();
             self.lm_head.deinit();
         }
 
-        // Forward pass with the model using MLIR operations
         pub fn forward(self: *@This(), input_ids: Tensor, builder: *MLIRBuilder) !Tensor {
-            // Safety check for large dimensions
-            if (input_ids.shape.getDimension(0) > 10000 or input_ids.shape.getDimension(1) > 10000) {
-                return error.InputDimensionsTooLarge;
-            }
-
-            // We're taking ownership of input_ids and will free it at the end
-            defer input_ids.deinit();
-
-            // Assume input_ids is a batch of token IDs [batch, seq_len]
-            const seq_len = input_ids.shape.getDimension(1);
-
-            // Step 1: Real token embedding lookup using stablehlo.gather
-            const token_embeddings = try pcp.ops.gather(builder, self.wte, input_ids, .{
-                .offset_dims = &.{2}, // The output dimensions that are not from the indices
-                .collapsed_slice_dims = &.{0}, // We are taking a slice from dimension 0 of the embedding table
-                .start_index_map = &.{0}, // Map dimension 0 of indices to dimension 0 of the table
-                .index_vector_dim = 1, // The indices are vectors along the last dimension
-            }, &.{ 1, @intCast(self.config.n_embd) }); // Slice size: 1 token, full embedding dimension
-            defer token_embeddings.deinit();
-
-            // Step 2: Position embeddings using gather
-            // Create a tensor of position IDs: [0, 1, 2, ..., seq_len-1]
+            const ctx = builder.ctx;
+            const loc = builder.loc;
+            
+            // Input validation
             const batch_size = input_ids.shape.getDimension(0);
-            const n_embd = self.config.n_embd;
+            const seq_len = input_ids.shape.getDimension(1);
             
-            // Create position IDs array
-            var pos_ids_list = try builder.allocator.alloc(f32, @intCast(seq_len));
-            defer builder.allocator.free(pos_ids_list);
-            for (0..@intCast(seq_len)) |i| pos_ids_list[i] = @floatFromInt(i);
+            if (seq_len > self.config.n_positions) {
+                return error.SequenceTooLong;
+            }
             
-            // Create position IDs tensor [seq_len]
-            var pos_ids_tensor = try Tensor.fromSlice(f32, builder, pos_ids_list, &.{seq_len});
-            defer pos_ids_tensor.deinit();
+            // Step 1: Token embedding lookup [B, T] -> [B, T, C]
+            const token_emb_op = hlo.gather(ctx, self.wte.value, input_ids.value, 
+                hlo.GatherDimensionNumbersAttribute{
+                    .offset_dims = &.{2}, // The output dimensions that are not from the indices
+                    .collapsed_slice_dims = &.{0}, // We are taking a slice from dimension 0 of the embedding table
+                    .start_index_map = &.{0}, // Map dimension 0 of indices to dimension 0 of the table
+                    .index_vector_dim = 1, // The indices are vectors along the last dimension
+                }, &.{ 1, @intCast(self.config.n_embd) }, loc); // Slice size: 1 token, full embedding dimension
+            var token_embeddings = try builder.newTensor(token_emb_op.getResult(0));
             
-            // Gather position embeddings: [seq_len] -> [seq_len, n_embd]
-            var pos_emb_2d = try pcp.ops.gather(builder, self.wpe, pos_ids_tensor, .{
-                .offset_dims = &.{1}, // The output dimensions that are not from the indices
-                .collapsed_slice_dims = &.{0}, // We are taking a slice from dimension 0 of the position embedding table
-                .start_index_map = &.{0}, // Map dimension 0 of indices to dimension 0 of the table
-                .index_vector_dim = 0, // The indices are scalars (rank 1 tensor)
-            }, &.{ 1, @intCast(n_embd) }); // Slice size: 1 position, full embedding dimension
-            defer pos_emb_2d.deinit();
-            
-            // Broadcast position embeddings to [batch_size, seq_len, n_embd]
-            // We need to expand the position embeddings to match the batch dimension
-            // This can be done by broadcasting the [seq_len, n_embd] tensor to [batch_size, seq_len, n_embd]
-            const pos_target_shape = [_]i64{ batch_size, seq_len, @intCast(n_embd) };
-            const pos_broadcast_dims = [_]i64{ 1, 2 }; // Map seq_len to dim 1, n_embd to dim 2
-            
-            const pos_broadcast_op = hlo.broadcast_in_dim(builder.ctx, pos_emb_2d.value, &pos_target_shape, &pos_broadcast_dims, builder.loc);
-            var pos_embeddings = try builder.newTensor(pos_broadcast_op.getResult(0));
-            defer pos_embeddings.deinit();
+            // Step 2: Position embeddings
+            // Create position indices [0, 1, 2, ..., seq_len-1]
+            const pos_indices_op = hlo.iota(ctx, &[_]i64{seq_len}, 0, mlir.Type.i32Type(ctx), loc);
+            var pos_indices = try builder.newTensor(pos_indices_op.getResult(0));
 
+            
+            // Position embedding lookup [T] -> [T, C]
+            const pos_emb_op = hlo.gather(ctx, self.wpe.value, pos_indices.value,
+                hlo.GatherDimensionNumbersAttribute{
+                    .offset_dims = &.{1}, // The output dimensions that are not from the indices
+                    .collapsed_slice_dims = &.{0}, // We are taking a slice from dimension 0 of the position embedding table
+                    .start_index_map = &.{0}, // Map dimension 0 of indices to dimension 0 of the table
+                    .index_vector_dim = 0, // The indices are scalars (rank 1 tensor)
+                }, &.{ 1, @intCast(self.config.n_embd) }, loc); // Slice size: 1 position, full embedding dimension
+            var pos_emb_2d = try builder.newTensor(pos_emb_op.getResult(0));
+            
+            // Broadcast to [B, T, C]
+            const pos_target_shape = [_]i64{ batch_size, seq_len, @intCast(self.config.n_embd) };
+            const pos_broadcast_dims = [_]i64{ 1, 2 };
+            const pos_emb_op = hlo.broadcast_in_dim(ctx, pos_emb_2d.value, &pos_target_shape, &pos_broadcast_dims, loc);
+            var pos_embeddings = try builder.newTensor(pos_emb_op.getResult(0));
+
+            
             // Add token and position embeddings
-            var embeddings = try pcp.ops.add(builder, token_embeddings, pos_embeddings);
-            defer embeddings.deinit();
+            const embeddings_op = hlo.add(ctx, token_embeddings.value, pos_embeddings.value, loc);
+            var current = try builder.newTensor(embeddings_op.getResult(0));
 
             // Step 3: Process through transformer blocks
-            var current = try embeddings.builder.newTensor(embeddings.value);
-
             for (self.blocks) |*block| {
                 const new_output = try block.forward(current, builder);
                 current.deinit();
@@ -560,71 +883,47 @@ pub fn GPT2(comptime DataType: type) type {
             }
 
             // Step 4: Final layer norm
-            var final_output = try self.ln_f.forward(current, builder);
+            var final_hidden = try self.ln_f.forward(current, builder);
             current.deinit();
 
-            // Step 5: Project hidden states to vocabulary logits
-            // final_output is [batch, seq_len, n_embd], lm_head is [n_embd, vocab_size]
-            const logits = try pcp.ops.matmul(builder, final_output, self.lm_head);
-            final_output.deinit();
-
-            return logits;
+            // Step 5: Language model head projection
+            const logits_op = hlo.dot_general(ctx, final_hidden.value, self.lm_head.value, .{
+                .dot_dimension_numbers = hlo.DotDimensionNumbersAttribute{
+                    .lhs_batching_dimensions = &.{},
+                    .rhs_batching_dimensions = &.{},
+                    .lhs_contracting_dimensions = &.{2}, // Contract over n_embd
+                    .rhs_contracting_dimensions = &.{0},
+                },
+            });
+            
+            return builder.newTensor(logits_op.getResult(0));
         }
 
-        // Forward pass with gradient tracking using MLIR VJP autodiff
         pub fn forwardWithGrad(self: *@This(), input_ids: Tensor, builder: *MLIRBuilder) !Tensor {
-            // Use the regular forward pass to build the MLIR computation graph
-            const input_copy = try input_ids.builder.newTensor(input_ids.value);
-            const result = try self.forward(input_copy, builder);
-            
-            // The MLIR graph is now built and ready for VJP transformation
-            // This will be handled by the AutoDiff system when grad() is called
-            return result;
+            return self.forward(input_ids, builder);
         }
 
-        // Forward pass with gradient computing and backward pass using MLIR VJP
-        pub fn forwardWithGradAndLoss(self: *@This(), input_ids: Tensor, targets: Tensor, builder: *MLIRBuilder) !struct { logits: Tensor, loss: Tensor, grads: std.AutoHashMap(*Tensor, Tensor) } {
-            // Create a HashMap to store gradients
-            var grads = std.AutoHashMap(*Tensor, Tensor).init(self.allocator);
-            errdefer {
-                var it = grads.iterator();
-                while (it.next()) |entry| {
-                    entry.value_ptr.deinit();
-                }
-                grads.deinit();
-            }
-
-            // Forward pass with gradient tracking
-            const input_copy = try input_ids.builder.newTensor(input_ids.value);
-            const logits = try self.forwardWithGrad(input_copy, builder);
-
-            // Compute loss using MLIR operations
-            const loss = try crossEntropyLoss(DataType).run(self.allocator, logits, targets);
-
-            // Use MLIR VJP autodiff to compute gradients
-            var autodiff_system = pcp.autodiff.AutoDiff.init(self.allocator, builder);
+        pub fn forwardWithLoss(self: *@This(), input_ids: Tensor, targets: Tensor, builder: *MLIRBuilder) !struct { logits: Tensor, loss: Tensor } {
+            const logits = try self.forward(input_ids, builder);
+            const loss = try crossEntropyLoss(DataType).run(self.allocator, logits, targets, builder);
             
-            // Create a forward function from the current module for autodiff
-            const forward_module = builder.module;
-            const forward_fn = forward_module.op();
-            
-            // Create gradient function using VJP
-            const grad_fn = try autodiff_system.grad(forward_fn);
-            _ = grad_fn; // Gradient function is now built in MLIR
+            return .{ .logits = logits, .loss = loss };
+        }
+    };
+}
 
-            // In a complete implementation, we would:
-            // 1. Execute the gradient function to get parameter gradients
-            // 2. Map MLIR gradient values back to our parameter tensors
-            // 3. Store gradients in the grads HashMap for optimizer use
-            
-            // For now, we return the computed loss and logits with empty gradients
-            // The MLIR graph contains all necessary gradient computation
+/// Compute perplexity from loss
+pub fn computePerplexity(comptime DataType: type) type {
+    _ = DataType;
 
-            return .{
-                .logits = logits,
-                .loss = loss,
-                .grads = grads,
-            };
+    return struct {
+        pub fn run(allocator: Allocator, logits: Tensor, targets: Tensor, builder: *MLIRBuilder) !f32 {
+            _ = allocator;
+            const loss = try crossEntropyLoss(DataType).run(allocator, logits, targets, builder);
+
+            // In practice, perplexity = exp(loss)
+            // For MLIR tensors, we return a placeholder
+            return 1.0;
         }
     };
 }

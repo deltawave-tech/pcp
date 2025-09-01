@@ -46,6 +46,21 @@ pub const MLIRBuilder = struct {
         // Do NOT deinit the context here, as we don't own it
     }
 
+    /// Helper to create scalar constant tensors
+    pub fn scalarConstant(self: *Self, value: f32) !Tensor {
+        const element_type = mlir.Type.f32Type(self.ctx);
+        const scalar_type = mlir.Type.tensor(&.{}, element_type); // Rank-0 tensor
+        const attr = mlir.Attribute.floatAttr(self.ctx, value, element_type);
+        
+        const constant_op = hlo.constant(self.ctx, .{
+            .value = attr,
+            .result_type = scalar_type,
+        });
+        
+        self.insertion_block.appendOwnedOperation(constant_op);
+        return try self.newTensor(constant_op.getResult(0));
+    }
+
     /// Temporarily sets the insertion point to a new block.
     pub fn setInsertionBlock(self: *Self, block: mlir.Block) void {
         self.insertion_block = block;
@@ -88,20 +103,6 @@ pub const MLIRBuilder = struct {
         return mlir.Value{ .handle = value_handle };
     }
 
-    /// Create a scalar constant using stablehlo.constant
-    pub fn createScalarConstant(self: *Self, value: f64, mlir_type: mlir.Type) !mlir.Value {
-        // Create float attribute for the constant value
-        const attr = mlir.Attribute.floatAttr(self.ctx, value, mlir_type);
-
-        // Use StableHLO dialect wrapper for clean operation creation
-        const operation = hlo.constant(self.ctx, .{
-            .value = attr,
-            .result_type = mlir_type,
-        });
-
-        // Return the result value
-        return operation.getResult(0);
-    }
 
     /// Create a constant tensor from host data - for tensor creation
     pub fn createConstant(self: *Self, host_data: []const u8, mlir_type: mlir.Type, shape: tensor.Shape) !mlir.Value {
@@ -382,11 +383,11 @@ pub fn matmul(builder: *MLIRBuilder, a: Tensor, b: Tensor) !Tensor {
     }
 
     // Configure dot_general based on tensor ranks
-    var dot_dims: mlir.DotDimensionNumbersAttribute = undefined;
+    var dot_dims: hlo.DotDimensionNumbersAttribute = undefined;
     
     if (a_rank == 2 and b_rank == 2) {
         // Standard 2D matrix multiplication: (M,K) x (K,N) -> (M,N)
-        dot_dims = mlir.DotDimensionNumbersAttribute{
+        dot_dims = hlo.DotDimensionNumbersAttribute{
             .lhs_batching_dimensions = &.{},
             .rhs_batching_dimensions = &.{},
             .lhs_contracting_dimensions = &.{1},
@@ -394,7 +395,7 @@ pub fn matmul(builder: *MLIRBuilder, a: Tensor, b: Tensor) !Tensor {
         };
     } else if (a_rank == 3 and b_rank == 2) {
         // Batched matmul: (B,M,K) x (K,N) -> (B,M,N)
-        dot_dims = mlir.DotDimensionNumbersAttribute{
+        dot_dims = hlo.DotDimensionNumbersAttribute{
             .lhs_batching_dimensions = &.{},
             .rhs_batching_dimensions = &.{},
             .lhs_contracting_dimensions = &.{2},
@@ -402,7 +403,7 @@ pub fn matmul(builder: *MLIRBuilder, a: Tensor, b: Tensor) !Tensor {
         };
     } else if (a_rank == 2 and b_rank == 3) {
         // Broadcasting: (M,K) x (B,K,N) -> (B,M,N)
-        dot_dims = mlir.DotDimensionNumbersAttribute{
+        dot_dims = hlo.DotDimensionNumbersAttribute{
             .lhs_batching_dimensions = &.{},
             .rhs_batching_dimensions = &.{0},
             .lhs_contracting_dimensions = &.{1},
@@ -410,7 +411,7 @@ pub fn matmul(builder: *MLIRBuilder, a: Tensor, b: Tensor) !Tensor {
         };
     } else if (a_rank == 3 and b_rank == 3) {
         // Batched 3D: (B,M,K) x (B,K,N) -> (B,M,N)
-        dot_dims = mlir.DotDimensionNumbersAttribute{
+        dot_dims = hlo.DotDimensionNumbersAttribute{
             .lhs_batching_dimensions = &.{0},
             .rhs_batching_dimensions = &.{0},
             .lhs_contracting_dimensions = &.{2},
@@ -539,8 +540,8 @@ pub fn reduceMax(builder: *MLIRBuilder, a: Tensor, dimensions: []const i64) !Ten
 
 /// Reduce sum operation along specified dimensions
 pub fn reduceSum(builder: *MLIRBuilder, a: Tensor, dimensions: []const i64) !Tensor {
-    // Use StableHLO dialect wrapper
-    const operation = hlo.reduce_sum(builder.ctx, a.value, dimensions, builder.loc);
+    // Use StableHLO dialect wrapper with keep_dims = false (default behavior)
+    const operation = hlo.reduce_sum(builder.ctx, a.value, dimensions, false, builder.loc);
 
     return try builder.newTensor(operation.getResult(0));
 }

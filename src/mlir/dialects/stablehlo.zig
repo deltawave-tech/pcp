@@ -138,27 +138,31 @@ pub fn reduce_max(ctx: mlir.Context, operand: mlir.Value, dimensions: []const i6
 }
 
 /// Creates a stablehlo.reduce_sum operation
-pub fn reduce_sum(ctx: mlir.Context, operand: mlir.Value, dimensions: []const i64, loc: mlir.Location) mlir.Operation {
+pub fn reduce_sum(ctx: mlir.Context, operand: mlir.Value, dimensions: []const i64, keep_dims: bool, loc: mlir.Location) mlir.Operation {
     const dimensions_attr = mlir.Attribute.denseI64ArrayAttr(ctx, dimensions);
     
-    // Calculate result shape by removing reduced dimensions
+    // Calculate result shape based on keep_dims
     const input_type = operand.getType().as(mlir.RankedTensorType) orelse unreachable;
     const input_shape = input_type.getShape();
     const element_type = input_type.getElementType();
     
-    // For simplicity, assume single dimension reduction for now
     var result_shape = std.ArrayList(i64).init(std.heap.page_allocator);
     defer result_shape.deinit();
     
     for (input_shape, 0..) |dim, i| {
         var is_reduced = false;
         for (dimensions) |red_dim| {
-            if (i == red_dim) {
+            if (@as(usize, @intCast(red_dim)) == i) {
                 is_reduced = true;
                 break;
             }
         }
-        if (!is_reduced) {
+        if (is_reduced) {
+            if (keep_dims) {
+                result_shape.append(1) catch unreachable;
+            }
+            // else: skip dimension (remove it)
+        } else {
             result_shape.append(dim) catch unreachable;
         }
     }
@@ -226,6 +230,41 @@ pub fn transpose(ctx: mlir.Context, operand: mlir.Value, permutation: []const i6
     });
 }
 
+/// Attribute for stablehlo.dot_general dimension numbers.
+pub const DotDimensionNumbersAttribute = struct {
+    lhs_batching_dimensions: []const i64,
+    rhs_batching_dimensions: []const i64,
+    lhs_contracting_dimensions: []const i64,
+    rhs_contracting_dimensions: []const i64,
+
+    pub fn asAttr(self: @This(), ctx: mlir.Context) mlir.Attribute {
+        const c_api = @import("../../mlir/c.zig").c;
+
+        // Create attributes for each field
+        const lhs_batching_attr = mlir.Attribute.denseI64ArrayAttr(ctx, self.lhs_batching_dimensions);
+        const rhs_batching_attr = mlir.Attribute.denseI64ArrayAttr(ctx, self.rhs_batching_dimensions);
+        const lhs_contracting_attr = mlir.Attribute.denseI64ArrayAttr(ctx, self.lhs_contracting_dimensions);
+        const rhs_contracting_attr = mlir.Attribute.denseI64ArrayAttr(ctx, self.rhs_contracting_dimensions);
+
+        // Create identifiers for attribute names
+        const lhs_batching_id = c_api.identifierGet(ctx.handle, "lhs_batching_dimensions");
+        const rhs_batching_id = c_api.identifierGet(ctx.handle, "rhs_batching_dimensions");
+        const lhs_contracting_id = c_api.identifierGet(ctx.handle, "lhs_contracting_dimensions");
+        const rhs_contracting_id = c_api.identifierGet(ctx.handle, "rhs_contracting_dimensions");
+
+        // Create named attributes
+        const named_attrs = [_]c_api.MlirNamedAttribute{
+            .{ .name = lhs_batching_id, .attribute = lhs_batching_attr.handle },
+            .{ .name = rhs_batching_id, .attribute = rhs_batching_attr.handle },
+            .{ .name = lhs_contracting_id, .attribute = lhs_contracting_attr.handle },
+            .{ .name = rhs_contracting_id, .attribute = rhs_contracting_attr.handle },
+        };
+
+        // Create and return the dictionary attribute
+        return mlir.Attribute.dictionary(ctx, &named_attrs);
+    }
+};
+
 /// Creates a stablehlo.dot_general operation for matrix multiplication
 /// This is the most complex operation due to its attributes
 pub fn dot_general(
@@ -233,7 +272,7 @@ pub fn dot_general(
     lhs: mlir.Value,
     rhs: mlir.Value,
     args: struct {
-        dot_dimension_numbers: mlir.DotDimensionNumbersAttribute,
+        dot_dimension_numbers: DotDimensionNumbersAttribute,
     },
 ) mlir.Operation {
     const lhs_type = lhs.getType().as(mlir.RankedTensorType).?;
@@ -245,7 +284,7 @@ pub fn dot_general(
     defer result_dims.deinit();
     
     // Add batching dimensions
-    for (args.dot_dimension_numbers.getLhsBatchingDimensions()) |dim_idx| {
+    for (args.dot_dimension_numbers.lhs_batching_dimensions) |dim_idx| {
         result_dims.append(lhs_type.getDimension(@intCast(dim_idx))) catch @panic("OOM");
     }
     
@@ -253,14 +292,14 @@ pub fn dot_general(
     for (0..lhs_type.getRank()) |i| {
         const i_i64 = @as(i64, @intCast(i));
         var is_batching = false;
-        for (args.dot_dimension_numbers.getLhsBatchingDimensions()) |batch_dim| {
+        for (args.dot_dimension_numbers.lhs_batching_dimensions) |batch_dim| {
             if (i_i64 == batch_dim) {
                 is_batching = true;
                 break;
             }
         }
         var is_contracting = false;
-        for (args.dot_dimension_numbers.getLhsContractingDimensions()) |contract_dim| {
+        for (args.dot_dimension_numbers.lhs_contracting_dimensions) |contract_dim| {
             if (i_i64 == contract_dim) {
                 is_contracting = true;
                 break;
@@ -275,14 +314,14 @@ pub fn dot_general(
     for (0..rhs_type.getRank()) |i| {
         const i_i64 = @as(i64, @intCast(i));
         var is_batching = false;
-        for (args.dot_dimension_numbers.getRhsBatchingDimensions()) |batch_dim| {
+        for (args.dot_dimension_numbers.rhs_batching_dimensions) |batch_dim| {
             if (i_i64 == batch_dim) {
                 is_batching = true;
                 break;
             }
         }
         var is_contracting = false;
-        for (args.dot_dimension_numbers.getRhsContractingDimensions()) |contract_dim| {
+        for (args.dot_dimension_numbers.rhs_contracting_dimensions) |contract_dim| {
             if (i_i64 == contract_dim) {
                 is_contracting = true;
                 break;
@@ -295,10 +334,12 @@ pub fn dot_general(
     
     const result_type = mlir.Type.tensor(result_dims.items, lhs_type.getElementType());
 
+    const dot_dim_attr = args.dot_dimension_numbers.asAttr(ctx);
+    
     return mlir.Operation.create(ctx, "stablehlo.dot_general", .{
         .operands = &.{ lhs, rhs },
         .results = &.{result_type},
-        .attributes = &.{.{ "dot_dimension_numbers", args.dot_dimension_numbers.asAttr() }},
+        .attributes = &.{.{ "dot_dimension_numbers", dot_dim_attr }},
         .location = mlir.Location.unknown(ctx),
     });
 }
@@ -435,6 +476,138 @@ pub fn onesConstant(ctx: mlir.Context, shape: []const i64, element_type: mlir.Ty
     return constant(ctx, .{
         .value = attr,
         .result_type = tensor_type,
+    });
+}
+
+/// Creates a stablehlo.rsqrt operation (reciprocal square root)
+pub fn rsqrt(ctx: mlir.Context, operand: mlir.Value, loc: mlir.Location) mlir.Operation {
+    return mlir.Operation.create(ctx, "stablehlo.rsqrt", .{
+        .operands = &.{operand},
+        .results = &.{operand.getType()},
+        .location = loc,
+    });
+}
+
+/// Creates a stablehlo.log operation
+pub fn log(ctx: mlir.Context, operand: mlir.Value, loc: mlir.Location) mlir.Operation {
+    return mlir.Operation.create(ctx, "stablehlo.log", .{
+        .operands = &.{operand},
+        .results = &.{operand.getType()},
+        .location = loc,
+    });
+}
+
+/// Creates a stablehlo.tanh operation
+pub fn tanh(ctx: mlir.Context, operand: mlir.Value, loc: mlir.Location) mlir.Operation {
+    return mlir.Operation.create(ctx, "stablehlo.tanh", .{
+        .operands = &.{operand},
+        .results = &.{operand.getType()},
+        .location = loc,
+    });
+}
+
+/// Creates a stablehlo.slice operation
+pub fn slice(ctx: mlir.Context, operand: mlir.Value, start_indices: []const i64, limit_indices: []const i64, strides: []const i64, loc: mlir.Location) mlir.Operation {
+    const start_attr = mlir.Attribute.denseI64ArrayAttr(ctx, start_indices);
+    const limit_attr = mlir.Attribute.denseI64ArrayAttr(ctx, limit_indices);
+    const strides_attr = mlir.Attribute.denseI64ArrayAttr(ctx, strides);
+    
+    // Calculate result shape
+    const input_type = operand.getType().as(mlir.RankedTensorType) orelse unreachable;
+    var result_dims = std.ArrayList(i64).init(std.heap.page_allocator);
+    defer result_dims.deinit();
+    
+    for (start_indices, limit_indices, strides) |start, limit, stride| {
+        const dim_size = @divFloor(limit - start + stride - 1, stride);
+        result_dims.append(dim_size) catch unreachable;
+    }
+    
+    const result_type = mlir.Type.tensor(result_dims.items, input_type.getElementType());
+    
+    return mlir.Operation.create(ctx, "stablehlo.slice", .{
+        .operands = &.{operand},
+        .results = &.{result_type},
+        .attributes = &.{
+            .{ "start_indices", start_attr },
+            .{ "limit_indices", limit_attr },
+            .{ "strides", strides_attr },
+        },
+        .location = loc,
+    });
+}
+
+/// Creates a stablehlo.iota operation
+pub fn iota(ctx: mlir.Context, shape: []const i64, iota_dimension: i64, element_type: mlir.Type, loc: mlir.Location) mlir.Operation {
+    const iota_dimension_attr = mlir.Attribute.integerAttr(ctx, iota_dimension, mlir.Type.i64Type(ctx));
+    const result_type = mlir.Type.tensor(shape, element_type);
+    
+    return mlir.Operation.create(ctx, "stablehlo.iota", .{
+        .operands = &.{},
+        .results = &.{result_type},
+        .attributes = &.{.{ "iota_dimension", iota_dimension_attr }},
+        .location = loc,
+    });
+}
+
+/// Creates a stablehlo.one_hot operation
+pub fn one_hot(ctx: mlir.Context, indices: mlir.Value, depth: i64, on_value: f32, off_value: f32, axis: i64, element_type: mlir.Type, loc: mlir.Location) mlir.Operation {
+    const depth_attr = mlir.Attribute.integerAttr(ctx, depth, mlir.Type.i64Type(ctx));
+    const axis_attr = mlir.Attribute.integerAttr(ctx, axis, mlir.Type.i64Type(ctx));
+    const on_value_attr = mlir.Attribute.floatAttr(ctx, on_value, element_type);
+    const off_value_attr = mlir.Attribute.floatAttr(ctx, off_value, element_type);
+    
+    // Calculate result shape
+    const indices_type = indices.getType().as(mlir.RankedTensorType) orelse unreachable;
+    const indices_shape = indices_type.getShape();
+    
+    var result_dims = std.ArrayList(i64).init(std.heap.page_allocator);
+    defer result_dims.deinit();
+    
+    // Insert depth dimension at axis position
+    for (indices_shape, 0..) |dim, i| {
+        if (@as(i64, @intCast(i)) == axis) {
+            result_dims.append(depth) catch unreachable;
+        }
+        result_dims.append(dim) catch unreachable;
+    }
+    // If axis is at the end
+    if (axis == @as(i64, @intCast(indices_shape.len))) {
+        result_dims.append(depth) catch unreachable;
+    }
+    
+    const result_type = mlir.Type.tensor(result_dims.items, element_type);
+    
+    return mlir.Operation.create(ctx, "stablehlo.one_hot", .{
+        .operands = &.{indices},
+        .results = &.{result_type},
+        .attributes = &.{
+            .{ "depth", depth_attr },
+            .{ "axis", axis_attr },
+            .{ "on_value", on_value_attr },
+            .{ "off_value", off_value_attr },
+        },
+        .location = loc,
+    });
+}
+
+/// Creates a stablehlo.convert operation
+pub fn convert(ctx: mlir.Context, operand: mlir.Value, result_type: mlir.Type, loc: mlir.Location) mlir.Operation {
+    return mlir.Operation.create(ctx, "stablehlo.convert", .{
+        .operands = &.{operand},
+        .results = &.{result_type},
+        .location = loc,
+    });
+}
+
+/// Creates a stablehlo.softmax operation 
+pub fn softmax(ctx: mlir.Context, operand: mlir.Value, axis: i64, loc: mlir.Location) mlir.Operation {
+    const axis_attr = mlir.Attribute.integerAttr(ctx, axis, mlir.Type.i64Type(ctx));
+    
+    return mlir.Operation.create(ctx, "stablehlo.softmax", .{
+        .operands = &.{operand},
+        .results = &.{operand.getType()},
+        .attributes = &.{.{ "axis", axis_attr }},
+        .location = loc,
     });
 }
 

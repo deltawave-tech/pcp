@@ -962,6 +962,27 @@ pub fn build(b: *std.Build) void {
     const run_demo_step = b.step("run-demo", "Run the demo distributed training system (no MLIR)");
     run_demo_step.dependOn(&run_demo_cmd.step);
 
+    // Data pipeline test executable
+    const data_pipeline_test = b.addExecutable(.{
+        .name = "data_pipeline_test",
+        .root_source_file = b.path("src/examples/data_pipeline_test.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    // Add module dependencies for data pipeline test
+    data_pipeline_test.root_module.addImport("pcp", pcp_module);
+
+    // Install the executable
+    b.installArtifact(data_pipeline_test);
+
+    // Run step for data pipeline test
+    const run_data_pipeline_test_cmd = b.addRunArtifact(data_pipeline_test);
+    run_data_pipeline_test_cmd.step.dependOn(&data_pipeline_test.step);
+
+    const run_data_pipeline_test_step = b.step("test-data-pipeline", "Run the data pipeline tests");
+    run_data_pipeline_test_step.dependOn(&run_data_pipeline_test_cmd.step);
+
     // // Property-based testing step
     // const prop_tests = b.addTest(.{
     //     .root_source_file = b.path("src/prop_tests.zig"),

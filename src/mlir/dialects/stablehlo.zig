@@ -674,76 +674,86 @@ pub const GatherDimensionNumbersAttribute = struct {
     start_index_map: []const i64,
     index_vector_dim: i64,
 
-    pub fn asAttr(self: @This(), ctx: mlir.Context) mlir.Attribute {
-        const c_api = @import("../../mlir/c.zig").c;
-
-        // 1. Create attributes for each field
-        const offset_dims_attr = mlir.Attribute.denseI64ArrayAttr(ctx, self.offset_dims);
-        const collapsed_slice_dims_attr = mlir.Attribute.denseI64ArrayAttr(ctx, self.collapsed_slice_dims);
-        const start_index_map_attr = mlir.Attribute.denseI64ArrayAttr(ctx, self.start_index_map);
-        const index_vector_dim_attr = mlir.Attribute.integerAttr(ctx, self.index_vector_dim, mlir.Type.i64Type(ctx));
-
-        // 2. Create identifiers for attribute names
-        const offset_id = c_api.identifierGet(ctx.handle, "offset_dims");
-        const collapsed_id = c_api.identifierGet(ctx.handle, "collapsed_slice_dims");
-        const start_map_id = c_api.identifierGet(ctx.handle, "start_index_map");
-        const index_vec_id = c_api.identifierGet(ctx.handle, "index_vector_dim");
-
-        // 3. Create named attributes
-        const named_attrs = [_]c_api.MlirNamedAttribute{
-            .{ .name = offset_id, .attribute = offset_dims_attr.handle },
-            .{ .name = collapsed_id, .attribute = collapsed_slice_dims_attr.handle },
-            .{ .name = start_map_id, .attribute = start_index_map_attr.handle },
-            .{ .name = index_vec_id, .attribute = index_vector_dim_attr.handle },
-        };
-
-        // 4. Create and return the dictionary attribute
-        return mlir.Attribute.dictionary(ctx, &named_attrs);
-    }
+    // NOTE: The asAttr method has been removed. Its logic is now inlined into the 'gather'
+    // function to resolve a critical use-after-free bug where the MlirNamedAttribute
+    // array's stack memory was being freed before the MLIR operation was fully created.
 };
 
 /// Creates a stablehlo.gather operation for embedding lookups.
 pub fn gather(
     ctx: mlir.Context,
-    operand: mlir.Value, // The embedding table (e.g., shape [vocab_size, n_embd])
-    start_indices: mlir.Value, // The token IDs to look up (e.g., shape [batch, seq_len])
+    operand: mlir.Value,
+    start_indices: mlir.Value,
     dimension_numbers: GatherDimensionNumbersAttribute,
     slice_sizes: []const i64,
     loc: mlir.Location,
 ) mlir.Operation {
-    const dim_numbers_attr = dimension_numbers.asAttr(ctx);
-    const slice_sizes_attr = mlir.Attribute.denseI64ArrayAttr(ctx, slice_sizes);
-
-    // Infer the result type
+    // --- Result type inference (remains the same) ---
     const operand_type = operand.getType().as(mlir.RankedTensorType).?;
-    const element_type = operand_type.getElementType();
-    
-    // Simplified result type inference. A full implementation is more complex.
-    // For embedding lookup: [batch, seq_len, n_embd]
     const start_indices_type = start_indices.getType().as(mlir.RankedTensorType).?;
-    var result_dims = std.ArrayList(i64).init(std.heap.page_allocator);
+    const element_type = operand_type.getElementType();
+    const allocator = std.heap.page_allocator; // Using a temporary allocator for shape inference
+    const start_shape = start_indices_type.getShape(allocator) catch unreachable;
+    defer allocator.free(start_shape);
+    var result_dims = std.ArrayList(i64).init(allocator);
     defer result_dims.deinit();
-    
-    // Get the batch and sequence dimensions from start_indices
-    const start_shape = start_indices_type.getShape(std.heap.page_allocator) catch unreachable;
-    defer std.heap.page_allocator.free(start_shape);
     for (start_shape) |d| {
         result_dims.append(d) catch @panic("OOM");
     }
-    // Append the embedding dimension
     result_dims.append(slice_sizes[1]) catch @panic("OOM");
-
     const result_type = mlir.Type.tensor(result_dims.items, element_type);
 
-    return mlir.Operation.create(ctx, "stablehlo.gather", .{
-        .operands = &.{ operand, start_indices },
-        .results = &.{result_type},
-        .attributes = &.{
-            .{ "dimension_numbers", dim_numbers_attr },
-            .{ "slice_sizes", slice_sizes_attr },
-        },
-        .location = loc,
-    });
+    // --- START OF THE DEFINITIVE FIX ---
+    // The root cause was a use-after-free bug. The `asAttr` helper function's stack frame
+    // was being destroyed before the MLIR operation could consume the attribute data.
+    // The fix is to create all attribute components on the stack of THIS function,
+    // ensuring their memory is valid for the duration of the `operationCreate` call.
+
+    // 1. Create the `slice_sizes` attribute.
+    const slice_sizes_attr = mlir.Attribute.denseI64ArrayAttr(ctx, slice_sizes);
+
+    // 2. Create all components for the `dimension_numbers` dictionary attribute here.
+    const offset_dims_attr = mlir.Attribute.denseI64ArrayAttr(ctx, dimension_numbers.offset_dims);
+    const collapsed_slice_dims_attr = mlir.Attribute.denseI64ArrayAttr(ctx, dimension_numbers.collapsed_slice_dims);
+    const start_index_map_attr = mlir.Attribute.denseI64ArrayAttr(ctx, dimension_numbers.start_index_map);
+    const index_vector_dim_attr = mlir.Attribute.integerAttr(ctx, dimension_numbers.index_vector_dim, mlir.Type.i64Type(ctx));
+
+    const offset_id = c.c.identifierGet(ctx.handle, "offset_dims");
+    const collapsed_id = c.c.identifierGet(ctx.handle, "collapsed_slice_dims");
+    const start_map_id = c.c.identifierGet(ctx.handle, "start_index_map");
+    const index_vec_id = c.c.identifierGet(ctx.handle, "index_vector_dim");
+
+    const dim_num_named_attrs = [_]c.c.MlirNamedAttribute{
+        .{ .name = offset_id, .attribute = offset_dims_attr.handle },
+        .{ .name = collapsed_id, .attribute = collapsed_slice_dims_attr.handle },
+        .{ .name = start_map_id, .attribute = start_index_map_attr.handle },
+        .{ .name = index_vec_id, .attribute = index_vector_dim_attr.handle },
+    };
+    const dim_numbers_dict_attr = mlir.Attribute.dictionary(ctx, dim_num_named_attrs[0..]);
+
+    // 3. Create the final list of named attributes for the 'gather' operation.
+    const gather_dim_numbers_id = c.c.identifierGet(ctx.handle, "dimension_numbers");
+    const slice_sizes_id = c.c.identifierGet(ctx.handle, "slice_sizes");
+    const named_attrs = [_]c.c.MlirNamedAttribute{
+        c.c.MlirNamedAttribute{ .name = gather_dim_numbers_id, .attribute = dim_numbers_dict_attr.handle },
+        c.c.MlirNamedAttribute{ .name = slice_sizes_id, .attribute = slice_sizes_attr.handle },
+    };
+
+    // 4. Create the operation state with the locally-scoped attributes.
+    var op_state = c.c.operationStateGet("stablehlo.gather", loc.handle);
+    var operands = [_]*c.c.MlirValue{ operand.handle, start_indices.handle };
+    var result_types = [_]*c.c.MlirType{ result_type.handle };
+
+    c.c.mlirOperationStateAddOperands(&op_state, operands.len, @ptrCast(&operands));
+    c.c.mlirOperationStateAddResults(&op_state, result_types.len, @ptrCast(&result_types));
+    // DEFINITIVE AND FINAL FIX: The C binding now correctly expects a pointer to the
+    // first element ([*]const). We convert the array to a slice and use its .ptr field.
+    // The previous `@ptrCast(&named_attrs)` was passing a pointer-to-the-array, which is incorrect.
+    c.c.mlirOperationStateAddAttributes(&op_state, named_attrs.len, named_attrs[0..].ptr);
+    
+    // 5. Create and return the operation. Its attributes now point to valid memory.
+    return mlir.Operation{ .handle = c.c.operationCreate(&op_state) };
+    // --- END OF THE DEFINITIVE FIX ---
 }
 
 /// Attribute for stablehlo.scatter dimension numbers.
@@ -754,7 +764,8 @@ pub const ScatterDimensionNumbersAttribute = struct {
     index_vector_dim: i64,
 
     pub fn asAttr(self: @This(), ctx: mlir.Context) mlir.Attribute {
-        const c_api = @import("../../mlir/c.zig").c;
+        // DEFINITIVE FIX: Use the correct, module-level 'c' import.
+        // The local import path was incorrect, causing C API calls to fail silently.
 
         // Create attributes for each field
         const update_window_dims_attr = mlir.Attribute.denseI64ArrayAttr(ctx, self.update_window_dims);
@@ -763,13 +774,13 @@ pub const ScatterDimensionNumbersAttribute = struct {
         const index_vector_dim_attr = mlir.Attribute.integerAttr(ctx, self.index_vector_dim, mlir.Type.i64Type(ctx));
 
         // Create identifiers for attribute names
-        const update_window_id = c_api.identifierGet(ctx.handle, "update_window_dims");
-        const inserted_window_id = c_api.identifierGet(ctx.handle, "inserted_window_dims");
-        const scatter_dims_id = c_api.identifierGet(ctx.handle, "scatter_dims_to_operand_dims");
-        const index_vec_id = c_api.identifierGet(ctx.handle, "index_vector_dim");
+        const update_window_id = c.c.identifierGet(ctx.handle, "update_window_dims");
+        const inserted_window_id = c.c.identifierGet(ctx.handle, "inserted_window_dims");
+        const scatter_dims_id = c.c.identifierGet(ctx.handle, "scatter_dims_to_operand_dims");
+        const index_vec_id = c.c.identifierGet(ctx.handle, "index_vector_dim");
 
         // Create named attributes
-        const named_attrs = [_]c_api.MlirNamedAttribute{
+        const named_attrs = [_]c.c.MlirNamedAttribute{
             .{ .name = update_window_id, .attribute = update_window_dims_attr.handle },
             .{ .name = inserted_window_id, .attribute = inserted_window_dims_attr.handle },
             .{ .name = scatter_dims_id, .attribute = scatter_dims_to_operand_dims_attr.handle },

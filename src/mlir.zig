@@ -477,6 +477,8 @@ pub const Context = struct {
         
         /// Create a dictionary attribute from named attributes.
         pub fn dictionary(context: Context, named_attrs: []const c.c.MlirNamedAttribute) Self {
+            // DEFINITIVE FIX: Use the correct wrapper function that properly unpacks the slice.
+            // The c.c.dictionaryAttrGet wrapper correctly converts the slice to length+pointer.
             return Self{ .handle = c.c.dictionaryAttrGet(context.handle, named_attrs) };
         }
         

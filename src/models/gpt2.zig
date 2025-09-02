@@ -183,7 +183,7 @@ pub fn LayerNorm(comptime DataType: type) type {
             const x_squared = try ops.multiply(builder, x, x);
             
             // mean_x_squared = reduce_sum(x_squared) / size
-            const sum_x_squared = try ops.reduceSum(builder, x_squared, &[_]i64{@intCast(last_dim)}, false);
+            const sum_x_squared = try ops.reduceSum(builder, x_squared, &[_]i64{@intCast(last_dim)}, true); // keep_dims=true for shape consistency
             const mean_x_squared = try ops.divide(builder, sum_x_squared, size_const);
             
             // mean_squared = mean * mean
@@ -675,27 +675,39 @@ pub fn GPT2(comptime DataType: type) type {
             }
             
             // Step 1: Token embedding lookup [B, T] -> [B, T, C]
-            const token_embeddings = try ops.gather(builder, self.wte, input_ids, 
+            // FIX: Expand input_ids to [B, T, 1] for scalar indices (index vector size=1)
+            const input_shape = try input_ids.shape.getDims(self.allocator);
+            defer self.allocator.free(input_shape);
+            var expanded_shape = try self.allocator.alloc(i64, input_shape.len + 1);
+            defer self.allocator.free(expanded_shape);
+            @memcpy(expanded_shape[0..input_shape.len], input_shape);
+            expanded_shape[input_shape.len] = 1;
+            const expanded_input_ids = try ops.reshape(builder, input_ids, expanded_shape);
+
+            const token_embeddings = try ops.gather(builder, self.wte, expanded_input_ids, 
                 hlo.GatherDimensionNumbersAttribute{
-                    .offset_dims = &.{2}, // The output dimensions that are not from the indices
-                    .collapsed_slice_dims = &.{0}, // We are taking a slice from dimension 0 of the embedding table
-                    .start_index_map = &.{0}, // Map dimension 0 of indices to dimension 0 of the table
-                    .index_vector_dim = 1, // The indices are vectors along the last dimension
-                }, &.{ 1, @intCast(self.config.n_embd) }); // Slice size: 1 token, full embedding dimension
+                    .offset_dims = &.{2}, // embd dim at output position 2
+                    .collapsed_slice_dims = &.{0},
+                    .start_index_map = &.{0},
+                    .index_vector_dim = 2, // FIX: Now 2 (last dim of expanded indices)
+                }, &.{ 1, @intCast(self.config.n_embd) });
             
             // Step 2: Position embeddings
             // Create position indices [0, 1, 2, ..., seq_len-1]
             const pos_indices = try ops.iota(builder, &[_]i64{seq_len}, 0, mlir.Type.i32Type(ctx));
 
-            
-            // Position embedding lookup [T] -> [T, C]
-            const pos_emb_2d = try ops.gather(builder, self.wpe, pos_indices,
+            // FIX: Expand pos_indices to [seq_len, 1]
+            const pos_expanded_shape = [_]i64{ seq_len, 1 };
+            const expanded_pos_indices = try ops.reshape(builder, pos_indices, &pos_expanded_shape);
+
+            // Position embedding lookup [seq_len, 1] -> [seq_len, C]
+            const pos_emb_2d = try ops.gather(builder, self.wpe, expanded_pos_indices,
                 hlo.GatherDimensionNumbersAttribute{
-                    .offset_dims = &.{1}, // The output dimensions that are not from the indices
-                    .collapsed_slice_dims = &.{0}, // We are taking a slice from dimension 0 of the position embedding table
-                    .start_index_map = &.{0}, // Map dimension 0 of indices to dimension 0 of the table
-                    .index_vector_dim = 0, // The indices are scalars (rank 1 tensor)
-                }, &.{ 1, @intCast(self.config.n_embd) }); // Slice size: 1 position, full embedding dimension
+                    .offset_dims = &.{1}, // FIX: embd at position 1
+                    .collapsed_slice_dims = &.{0},
+                    .start_index_map = &.{0},
+                    .index_vector_dim = 1, // FIX: Now 1 (last dim of expanded pos indices)
+                }, &.{ 1, @intCast(self.config.n_embd) });
             
             // Broadcast to [B, T, C]
             const pos_target_shape = [_]i64{ batch_size, seq_len, @intCast(self.config.n_embd) };

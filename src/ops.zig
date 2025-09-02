@@ -392,6 +392,15 @@ pub fn matmul(builder: *MLIRBuilder, a: Tensor, b: Tensor) !Tensor {
             return error.IncompatibleShapes;
         }
     }
+    // Case 5: 4D x 4D (multi-batch, e.g., multi-head attention)
+    else if (a_rank == 4 and b_rank == 4) {
+        // For multi-head attention: [B, n_head, T, head_dim] x [B, n_head, head_dim, T] -> [B, n_head, T, T]
+        if (a.shape.getDimension(0) != b.shape.getDimension(0) or // Batch size must match
+            a.shape.getDimension(1) != b.shape.getDimension(1) or // Number of heads must match  
+            a.shape.getDimension(3) != b.shape.getDimension(2)) { // Contracting dimension must match
+            return error.IncompatibleShapes;
+        }
+    }
     else {
         return error.InvalidRank; // Unsupported combination
     }
@@ -430,6 +439,15 @@ pub fn matmul(builder: *MLIRBuilder, a: Tensor, b: Tensor) !Tensor {
             .rhs_batching_dimensions = &.{0},
             .lhs_contracting_dimensions = &.{2},
             .rhs_contracting_dimensions = &.{1},
+        };
+    } else if (a_rank == 4 and b_rank == 4) {
+        // Multi-head attention: (B,H,T,D) x (B,H,D,T) -> (B,H,T,T)
+        // Batch over first two dimensions, contract over inner dimensions
+        dot_dims = hlo.DotDimensionNumbersAttribute{
+            .lhs_batching_dimensions = &.{0, 1}, // Batch over B and n_head
+            .rhs_batching_dimensions = &.{0, 1}, // Batch over B and n_head
+            .lhs_contracting_dimensions = &.{3}, // Contract over head_dim (last dim of lhs)
+            .rhs_contracting_dimensions = &.{2}, // Contract over head_dim (3rd dim of rhs)
         };
     }
 
@@ -520,7 +538,7 @@ pub fn softmax(builder: *MLIRBuilder, a: Tensor) !Tensor {
     // This is numerically stable version
 
     // Step 1: Find max along last dimension for numerical stability
-    const max_val = try reduceMax(builder, a, &[_]i64{@intCast(a.shape.rank() - 1)});
+    const max_val = try reduceMax(builder, a, &[_]i64{@intCast(a.shape.rank() - 1)}, true); // keep_dims=true for broadcasting
     defer max_val.deinit();
 
     // Step 2: Subtract max from input: x - max(x)
@@ -548,11 +566,39 @@ pub fn exp(builder: *MLIRBuilder, a: Tensor) !Tensor {
 }
 
 /// Reduce max operation along specified dimensions
-pub fn reduceMax(builder: *MLIRBuilder, a: Tensor, dimensions: []const i64) !Tensor {
-    // Use StableHLO dialect wrapper
+pub fn reduceMax(builder: *MLIRBuilder, a: Tensor, dimensions: []const i64, keep_dims: bool) !Tensor {
+    // First, perform the reduction (always removes dimensions in MLIR)
     const operation = hlo.reduce_max(builder.ctx, a.value, dimensions, builder.loc);
+    const reduced_tensor = try builder.createAndAppendOp(operation);
 
-    return try builder.createAndAppendOp(operation);
+    // If keep_dims is true, reshape to restore the reduced dimensions as size-1 dimensions
+    if (keep_dims) {
+        const input_shape = try a.shape.getDims(builder.allocator);
+        defer builder.allocator.free(input_shape);
+        
+        var result_shape_list = std.ArrayList(i64).init(builder.allocator);
+        defer result_shape_list.deinit();
+        
+        for (input_shape, 0..) |dim, i| {
+            var is_reduced = false;
+            for (dimensions) |red_dim| {
+                if (@as(i64, @intCast(i)) == red_dim) {
+                    is_reduced = true;
+                    break;
+                }
+            }
+            if (is_reduced) {
+                try result_shape_list.append(1); // Keep dimension as size 1
+            } else {
+                try result_shape_list.append(dim);
+            }
+        }
+        
+        // Reshape to add back the singleton dimensions
+        return reshape(builder, reduced_tensor, result_shape_list.items);
+    } else {
+        return reduced_tensor;
+    }
 }
 
 /// Reduce sum operation along specified dimensions
@@ -697,7 +743,7 @@ pub fn gather(
     dimension_numbers: hlo.GatherDimensionNumbersAttribute,
     slice_sizes: []const i64,
 ) !Tensor {
-    // Use StableHLO dialect wrapper
+    // Use the corrected StableHLO dialect wrapper
     const operation = hlo.gather(builder.ctx, operand.value, start_indices.value, dimension_numbers, slice_sizes, builder.loc);
     
     return try builder.createAndAppendOp(operation);

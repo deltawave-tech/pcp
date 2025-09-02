@@ -20,15 +20,18 @@ pub const c = struct {
         name: MlirStringRef,
         location: *MlirLocation,
         nResults: isize,
-        results: [*]*MlirType,
+        results: [*]const *MlirType,
         nOperands: isize,
-        operands: [*]*MlirValue,
+        operands: [*]const *MlirValue,
         nRegions: isize,
-        regions: [*]*MlirRegion,
+        regions: [*]const *MlirRegion,
         nSuccessors: isize,
-        successors: [*]*MlirBlock,
+        successors: [*]const *MlirBlock,
         nAttributes: isize,
-        attributes: [*]*MlirAttribute,
+        // DEFINITIVE FIX: The C API defines this field as `const MlirNamedAttribute *`,
+        // which corresponds to `[*]const MlirNamedAttribute` in Zig. The previous
+        // type `[*]*MlirAttribute` was incorrect and the root cause of the attribute bug.
+        attributes: [*]const MlirNamedAttribute,
         enableResultTypeInference: bool,
     };
 
@@ -110,7 +113,9 @@ pub const c = struct {
     extern fn mlirOperationStateGet(name: MlirStringRef, location: *MlirLocation) MlirOperationState;
     pub extern fn mlirOperationStateAddOperands(state: *MlirOperationState, n: isize, operands: [*]*MlirValue) void;
     pub extern fn mlirOperationStateAddResults(state: *MlirOperationState, n: isize, results: [*]*MlirType) void;
-    pub extern fn mlirOperationStateAddAttributes(state: *MlirOperationState, n: isize, attributes: [*]*MlirNamedAttribute) void;
+    // DEFINITIVE FIX: The C API expects a pointer to the first element of the array (*),
+    // not a pointer-to-a-pointer (**). The binding is now corrected to [*]const.
+    pub extern fn mlirOperationStateAddAttributes(state: *MlirOperationState, n: isize, attributes: [*]const MlirNamedAttribute) void;
     extern fn mlirOperationStateAddOwnedRegions(state: *MlirOperationState, n: isize, regions: [*]*MlirRegion) void;
 
     // Named attribute

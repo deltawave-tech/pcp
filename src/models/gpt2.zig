@@ -269,7 +269,6 @@ pub fn Attention(comptime DataType: type) type {
         /// Complete multi-head causal self-attention implementation
         pub fn forward(self: *@This(), x: Tensor, builder: *MLIRBuilder) !Tensor {
             const ctx = builder.ctx;
-            const loc = builder.loc;
             
             // Input x has shape [B, T, C] where B=batch, T=sequence, C=n_embd
             const batch_size = x.shape.getDimension(0);
@@ -280,16 +279,9 @@ pub fn Attention(comptime DataType: type) type {
             
             // Step 1: QKV projection
             // qkv = (x @ c_attn_weight) + c_attn_bias  [B, T, 3*C]
-            const qkv_proj = try builder.createAndAppendOp(hlo.dot_general(ctx, x.value, self.c_attn_weight.value, .{
-                .dot_dimension_numbers = hlo.DotDimensionNumbersAttribute{
-                    .lhs_batching_dimensions = &.{},
-                    .rhs_batching_dimensions = &.{},
-                    .lhs_contracting_dimensions = &.{2}, // Contract over C (last dim of x)
-                    .rhs_contracting_dimensions = &.{0}, // Contract over first dim of weight
-                },
-            }));
+            const qkv_proj = try ops.matmul(builder, x, self.c_attn_weight);
             
-            const qkv = try builder.createAndAppendOp(hlo.add(ctx, qkv_proj.value, self.c_attn_bias.value, loc));
+            const qkv = try ops.add(builder, qkv_proj, self.c_attn_bias);
 
             
             // Step 2: Split QKV into separate Q, K, V tensors
@@ -673,7 +665,6 @@ pub fn GPT2(comptime DataType: type) type {
 
         pub fn forward(self: *@This(), input_ids: Tensor, builder: *MLIRBuilder) !Tensor {
             const ctx = builder.ctx;
-            const loc = builder.loc;
             
             // Input validation
             const batch_size = input_ids.shape.getDimension(0);
@@ -684,41 +675,36 @@ pub fn GPT2(comptime DataType: type) type {
             }
             
             // Step 1: Token embedding lookup [B, T] -> [B, T, C]
-            const token_emb_op = hlo.gather(ctx, self.wte.value, input_ids.value, 
+            const token_embeddings = try ops.gather(builder, self.wte, input_ids, 
                 hlo.GatherDimensionNumbersAttribute{
                     .offset_dims = &.{2}, // The output dimensions that are not from the indices
                     .collapsed_slice_dims = &.{0}, // We are taking a slice from dimension 0 of the embedding table
                     .start_index_map = &.{0}, // Map dimension 0 of indices to dimension 0 of the table
                     .index_vector_dim = 1, // The indices are vectors along the last dimension
-                }, &.{ 1, @intCast(self.config.n_embd) }, loc); // Slice size: 1 token, full embedding dimension
-            const token_embeddings = try builder.newTensor(token_emb_op.getResult(0));
+                }, &.{ 1, @intCast(self.config.n_embd) }); // Slice size: 1 token, full embedding dimension
             
             // Step 2: Position embeddings
             // Create position indices [0, 1, 2, ..., seq_len-1]
-            const pos_indices_op = hlo.iota(ctx, &[_]i64{seq_len}, 0, mlir.Type.i32Type(ctx), loc);
-            const pos_indices = try builder.newTensor(pos_indices_op.getResult(0));
+            const pos_indices = try ops.iota(builder, &[_]i64{seq_len}, 0, mlir.Type.i32Type(ctx));
 
             
             // Position embedding lookup [T] -> [T, C]
-            const pos_emb_op = hlo.gather(ctx, self.wpe.value, pos_indices.value,
+            const pos_emb_2d = try ops.gather(builder, self.wpe, pos_indices,
                 hlo.GatherDimensionNumbersAttribute{
                     .offset_dims = &.{1}, // The output dimensions that are not from the indices
                     .collapsed_slice_dims = &.{0}, // We are taking a slice from dimension 0 of the position embedding table
                     .start_index_map = &.{0}, // Map dimension 0 of indices to dimension 0 of the table
                     .index_vector_dim = 0, // The indices are scalars (rank 1 tensor)
-                }, &.{ 1, @intCast(self.config.n_embd) }, loc); // Slice size: 1 position, full embedding dimension
-            const pos_emb_2d = try builder.newTensor(pos_emb_op.getResult(0));
+                }, &.{ 1, @intCast(self.config.n_embd) }); // Slice size: 1 position, full embedding dimension
             
             // Broadcast to [B, T, C]
             const pos_target_shape = [_]i64{ batch_size, seq_len, @intCast(self.config.n_embd) };
             const pos_broadcast_dims = [_]i64{ 1, 2 };
-            const pos_emb_broadcast_op = hlo.broadcast_in_dim(ctx, pos_emb_2d.value, &pos_target_shape, &pos_broadcast_dims, loc);
-            const pos_embeddings = try builder.newTensor(pos_emb_broadcast_op.getResult(0));
+            const pos_embeddings = try ops.broadcastInDim(builder, pos_emb_2d, &pos_target_shape, &pos_broadcast_dims);
 
             
             // Add token and position embeddings
-            const embeddings_op = hlo.add(ctx, token_embeddings.value, pos_embeddings.value, loc);
-            const current = try builder.newTensor(embeddings_op.getResult(0));
+            const current = try ops.add(builder, token_embeddings, pos_embeddings);
 
             // Step 3: Process through transformer blocks
             var current_output = current;
@@ -733,16 +719,7 @@ pub fn GPT2(comptime DataType: type) type {
             current_output.deinit();
 
             // Step 5: Language model head projection
-            const logits_op = hlo.dot_general(ctx, final_hidden.value, self.lm_head.value, .{
-                .dot_dimension_numbers = hlo.DotDimensionNumbersAttribute{
-                    .lhs_batching_dimensions = &.{},
-                    .rhs_batching_dimensions = &.{},
-                    .lhs_contracting_dimensions = &.{2}, // Contract over n_embd
-                    .rhs_contracting_dimensions = &.{0},
-                },
-            });
-            
-            return builder.newTensor(logits_op.getResult(0));
+            return ops.matmul(builder, final_hidden, self.lm_head);
         }
 
         pub fn forwardWithLoss(self: *@This(), input_ids: Tensor, targets: Tensor, builder: *MLIRBuilder) !struct { logits: Tensor, loss: Tensor } {

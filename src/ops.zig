@@ -117,7 +117,7 @@ pub const MLIRBuilder = struct {
             .location = self.loc,
         });
 
-        // Attach the new constant operation to the builder's default insertion block.
+        // Use the robust "create and append" pattern
         self.insertion_block.appendOwnedOperation(constant_op);
         
         // Return the result value
@@ -298,7 +298,7 @@ fn broadcastTensors(builder: *MLIRBuilder, a: Tensor, b: Tensor) !struct { Tenso
         }
 
         const op = hlo.broadcast_in_dim(builder.ctx, a.value, target_shape, broadcast_dims.items, builder.loc);
-        a_broadcasted = try builder.newTensor(op.getResult(0));
+        a_broadcasted = try builder.createAndAppendOp(op);
     }
 
     // 3. Broadcast 'b' if necessary
@@ -312,7 +312,7 @@ fn broadcastTensors(builder: *MLIRBuilder, a: Tensor, b: Tensor) !struct { Tenso
         }
 
         const op = hlo.broadcast_in_dim(builder.ctx, b.value, target_shape, broadcast_dims.items, builder.loc);
-        b_broadcasted = try builder.newTensor(op.getResult(0));
+        b_broadcasted = try builder.createAndAppendOp(op);
     }
     
     return .{ a_broadcasted, b_broadcasted };
@@ -452,14 +452,12 @@ pub fn relu(builder: *MLIRBuilder, a: Tensor) !Tensor {
 
     const dims = try a.shape.getDims(builder.allocator);
     defer builder.allocator.free(dims);
-    const zero_op = hlo.zeroConstant(builder.ctx, dims, element_type);
-    builder.insertion_block.appendOwnedOperation(zero_op);
-    const zero_value = zero_op.getResult(0);
+    
+    // Create zero constant using the robust constant function
+    const zero_tensor = try constant(builder, 0.0, dims, element_type);
 
     // Use maximum operation: max(a, 0)
-    const operation = hlo.maximum(builder.ctx, a.value, zero_value, builder.loc);
-
-    return try builder.createAndAppendOp(operation);
+    return maximum(builder, a, zero_tensor);
 }
 
 /// Transpose a tensor using stablehlo.transpose

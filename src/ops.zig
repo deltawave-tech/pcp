@@ -447,7 +447,7 @@ pub fn matmul(builder: *MLIRBuilder, a: Tensor, b: Tensor) !Tensor {
         .dot_dimension_numbers = dot_dims,
     });
 
-    return try builder.newTensor(operation.getResult(0));
+    return try builder.createAndAppendOp(operation);
 }
 
 /// ReLU activation using stablehlo.maximum with zero constant
@@ -462,12 +462,13 @@ pub fn relu(builder: *MLIRBuilder, a: Tensor) !Tensor {
     const dims = try a.shape.getDims(builder.allocator);
     defer builder.allocator.free(dims);
     const zero_op = hlo.zeroConstant(builder.ctx, dims, element_type);
+    builder.insertion_block.appendOwnedOperation(zero_op);
     const zero_value = zero_op.getResult(0);
 
     // Use maximum operation: max(a, 0)
     const operation = hlo.maximum(builder.ctx, a.value, zero_value, builder.loc);
 
-    return try builder.newTensor(operation.getResult(0));
+    return try builder.createAndAppendOp(operation);
 }
 
 /// Transpose a tensor using stablehlo.transpose
@@ -554,7 +555,7 @@ pub fn exp(builder: *MLIRBuilder, a: Tensor) !Tensor {
     // Use StableHLO dialect wrapper
     const operation = hlo.exponential(builder.ctx, a.value, builder.loc);
 
-    return try builder.newTensor(operation.getResult(0));
+    return try builder.createAndAppendOp(operation);
 }
 
 /// Reduce max operation along specified dimensions
@@ -562,28 +563,56 @@ pub fn reduceMax(builder: *MLIRBuilder, a: Tensor, dimensions: []const i64) !Ten
     // Use StableHLO dialect wrapper
     const operation = hlo.reduce_max(builder.ctx, a.value, dimensions, builder.loc);
 
-    return try builder.newTensor(operation.getResult(0));
+    return try builder.createAndAppendOp(operation);
 }
 
 /// Reduce sum operation along specified dimensions
 pub fn reduceSum(builder: *MLIRBuilder, a: Tensor, dimensions: []const i64, keep_dims: bool) !Tensor {
-    // Pass keep_dims to the HLO builder
-    const operation = hlo.reduce_sum(builder.ctx, a.value, dimensions, keep_dims, builder.loc);
+    // First, perform the reduction (always removes dimensions in MLIR)
+    const operation = try hlo.reduce_sum(builder.ctx, builder, a.value, dimensions, builder.loc);
+    const reduced_tensor = try builder.createAndAppendOp(operation);
 
-    // Append the operation and return the new tensor
-    return try builder.createAndAppendOp(operation);
+    // If keep_dims is true, reshape to restore the reduced dimensions as size-1 dimensions
+    if (keep_dims) {
+        const input_shape = try a.shape.getDims(builder.allocator);
+        defer builder.allocator.free(input_shape);
+        
+        var result_shape_list = std.ArrayList(i64).init(builder.allocator);
+        defer result_shape_list.deinit();
+        
+        for (input_shape, 0..) |dim, i| {
+            var is_reduced = false;
+            for (dimensions) |red_dim| {
+                if (@as(i64, @intCast(i)) == red_dim) {
+                    is_reduced = true;
+                    break;
+                }
+            }
+            if (is_reduced) {
+                try result_shape_list.append(1); // Keep dimension as size 1
+            } else {
+                try result_shape_list.append(dim);
+            }
+        }
+        
+        // Reshape to add back the singleton dimensions
+        return reshape(builder, reduced_tensor, result_shape_list.items);
+    } else {
+        return reduced_tensor;
+    }
 }
 
 /// Create a constant tensor
 pub fn constant(builder: *MLIRBuilder, value: f64, shape: []const i64, element_type: mlir.Type) !Tensor {
     // Use StableHLO dialect wrapper for scalar constant
     const operation = hlo.scalarConstant(builder.ctx, value, element_type);
+    builder.insertion_block.appendOwnedOperation(operation);
 
     // If we need a non-scalar, broadcast it
     if (shape.len > 0) {
         const scalar_value = operation.getResult(0);
         const broadcast_op = hlo.broadcast_in_dim(builder.ctx, scalar_value, shape, &.{}, builder.loc);
-        return try builder.newTensor(broadcast_op.getResult(0));
+        return try builder.createAndAppendOp(broadcast_op);
     } else {
         return try builder.newTensor(operation.getResult(0));
     }
@@ -600,7 +629,7 @@ pub fn gather(
     // Use StableHLO dialect wrapper
     const operation = hlo.gather(builder.ctx, operand.value, start_indices.value, dimension_numbers, slice_sizes, builder.loc);
     
-    return try builder.newTensor(operation.getResult(0));
+    return try builder.createAndAppendOp(operation);
 }
 
 /// Test function for MLIR operations using dialect wrappers

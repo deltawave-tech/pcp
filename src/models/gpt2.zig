@@ -171,7 +171,7 @@ pub fn LayerNorm(comptime DataType: type) type {
             
             // Step 1: Calculate mean along last dimension
             // sum = stablehlo.reduce_sum(x, dimension=last_dim, keep_dims=true)
-            const sum_tensor = try builder.createAndAppendOp(hlo.reduce_sum(ctx, x.value, &[_]i64{@intCast(last_dim)}, true, loc));
+            const sum_tensor = try builder.createAndAppendOp(try hlo.reduce_sum(ctx, builder, x.value, &[_]i64{@intCast(last_dim)}, loc));
             
             // Create size constant and divide to get mean
             const size_const = try builder.scalarConstant(@floatFromInt(n_embd_size));
@@ -180,38 +180,57 @@ pub fn LayerNorm(comptime DataType: type) type {
             
             // Step 2: Calculate variance = mean(x^2) - mean(x)^2 (working directly with values)
             // x_squared = stablehlo.multiply(x, x)
-            const x_squared_val = hlo.multiply(ctx, x.value, x.value, loc).getResult(0);
+            const x_squared_op = hlo.multiply(ctx, x.value, x.value, loc);
+            builder.insertion_block.appendOwnedOperation(x_squared_op);
+            const x_squared_val = x_squared_op.getResult(0);
             
             // mean_x_squared = reduce_sum(x_squared) / size
-            const sum_x_squared_val = hlo.reduce_sum(ctx, x_squared_val, &[_]i64{@intCast(last_dim)}, true, loc).getResult(0);
-            const mean_x_squared_val = hlo.divide(ctx, sum_x_squared_val, size_const.value, loc).getResult(0);
+            const sum_x_squared_val = (try hlo.reduce_sum(ctx, builder, x_squared_val, &[_]i64{@intCast(last_dim)}, loc)).getResult(0);
+            const mean_x_squared_op = hlo.divide(ctx, sum_x_squared_val, size_const.value, loc);
+            builder.insertion_block.appendOwnedOperation(mean_x_squared_op);
+            const mean_x_squared_val = mean_x_squared_op.getResult(0);
             
             // mean_squared = mean * mean
-            const mean_squared_val = hlo.multiply(ctx, mean.value, mean.value, loc).getResult(0);
+            const mean_squared_op = hlo.multiply(ctx, mean.value, mean.value, loc);
+            builder.insertion_block.appendOwnedOperation(mean_squared_op);
+            const mean_squared_val = mean_squared_op.getResult(0);
             
             // variance = mean_x_squared - mean_squared
-            const variance_val = hlo.subtract(ctx, mean_x_squared_val, mean_squared_val, loc).getResult(0);
+            const variance_op = hlo.subtract(ctx, mean_x_squared_val, mean_squared_val, loc);
+            builder.insertion_block.appendOwnedOperation(variance_op);
+            const variance_val = variance_op.getResult(0);
             
             // Step 3: Apply normalization
             // Add epsilon: variance_eps = variance + epsilon
             const epsilon_const = try builder.scalarConstant(self.epsilon);
-            const variance_eps_val = hlo.add(ctx, variance_val, epsilon_const.value, loc).getResult(0);
+            const variance_eps_op = hlo.add(ctx, variance_val, epsilon_const.value, loc);
+            builder.insertion_block.appendOwnedOperation(variance_eps_op);
+            const variance_eps_val = variance_eps_op.getResult(0);
             
             // rsqrt_var = rsqrt(variance_eps)
-            const rsqrt_var_val = hlo.rsqrt(ctx, variance_eps_val, loc).getResult(0);
+            const rsqrt_var_op = hlo.rsqrt(ctx, variance_eps_val, loc);
+            builder.insertion_block.appendOwnedOperation(rsqrt_var_op);
+            const rsqrt_var_val = rsqrt_var_op.getResult(0);
             
             // Center x: x_centered = x - mean
-            const x_centered_val = hlo.subtract(ctx, x.value, mean.value, loc).getResult(0);
+            const x_centered_op = hlo.subtract(ctx, x.value, mean.value, loc);
+            builder.insertion_block.appendOwnedOperation(x_centered_op);
+            const x_centered_val = x_centered_op.getResult(0);
             
             // Normalize: x_norm = x_centered * rsqrt_var
-            const x_norm_val = hlo.multiply(ctx, x_centered_val, rsqrt_var_val, loc).getResult(0);
+            const x_norm_op = hlo.multiply(ctx, x_centered_val, rsqrt_var_val, loc);
+            builder.insertion_block.appendOwnedOperation(x_norm_op);
+            const x_norm_val = x_norm_op.getResult(0);
             
             // Step 4: Apply scale and shift
             // Scale: x_scaled = x_norm * self.weight
-            const x_scaled_val = hlo.multiply(ctx, x_norm_val, self.weight.value, loc).getResult(0);
+            const x_scaled_op = hlo.multiply(ctx, x_norm_val, self.weight.value, loc);
+            builder.insertion_block.appendOwnedOperation(x_scaled_op);
+            const x_scaled_val = x_scaled_op.getResult(0);
             
             // Shift: output = x_scaled + self.bias
             const output_op = hlo.add(ctx, x_scaled_val, self.bias.value, loc);
+            builder.insertion_block.appendOwnedOperation(output_op);
             return builder.newTensor(output_op.getResult(0));
         }
     };
@@ -664,29 +683,29 @@ pub fn crossEntropyLoss(comptime DataType: type) type {
             // Step 2: Compute log softmax
             // log_softmax(x) = x - log(sum(exp(x), axis=-1))
             const exp_logits_op = hlo.exponential(ctx, logits.value, loc);
+            builder.insertion_block.appendOwnedOperation(exp_logits_op);
             const exp_logits = try builder.newTensor(exp_logits_op.getResult(0));
 
-            
-            const sum_exp_op = hlo.reduce_sum(ctx, exp_logits.value, &[_]i64{2}, true, loc);
+            const sum_exp_op = try hlo.reduce_sum(ctx, builder, exp_logits.value, &[_]i64{2}, loc);
             const sum_exp = try builder.newTensor(sum_exp_op.getResult(0));
 
-            
             const log_sum_exp_op = hlo.log(ctx, sum_exp.value, loc);
+            builder.insertion_block.appendOwnedOperation(log_sum_exp_op);
             const log_sum_exp = try builder.newTensor(log_sum_exp_op.getResult(0));
 
             
             const log_probs_op = hlo.subtract(ctx, logits.value, log_sum_exp.value, loc);
+            builder.insertion_block.appendOwnedOperation(log_probs_op);
             const log_probs = try builder.newTensor(log_probs_op.getResult(0));
 
-            
             // Step 3: Select correct log probabilities
             // Multiply log_probs by one-hot targets to zero out incorrect classes
             const selected_log_probs_op = hlo.multiply(ctx, log_probs.value, targets_one_hot.value, loc);
+            builder.insertion_block.appendOwnedOperation(selected_log_probs_op);
             const selected_log_probs = try builder.newTensor(selected_log_probs_op.getResult(0));
 
-            
             // Sum over vocabulary dimension to get negative log likelihood per token
-            const nll_per_token_op = hlo.reduce_sum(ctx, selected_log_probs.value, &[_]i64{2}, false, loc);
+            const nll_per_token_op = try hlo.reduce_sum(ctx, builder, selected_log_probs.value, &[_]i64{2}, loc);
             const nll_per_token = try builder.newTensor(nll_per_token_op.getResult(0));
 
             
@@ -695,11 +714,11 @@ pub fn crossEntropyLoss(comptime DataType: type) type {
             const neg_one = try builder.scalarConstant(-1.0);
             
             const loss_per_token_op = hlo.multiply(ctx, nll_per_token.value, neg_one.value, loc);
+            builder.insertion_block.appendOwnedOperation(loss_per_token_op);
             const loss_per_token = try builder.newTensor(loss_per_token_op.getResult(0));
 
-            
             // Sum all losses
-            const total_loss_op = hlo.reduce_sum(ctx, loss_per_token.value, &[_]i64{0, 1}, false, loc);
+            const total_loss_op = try hlo.reduce_sum(ctx, builder, loss_per_token.value, &[_]i64{0, 1}, loc);
             const total_loss = try builder.newTensor(total_loss_op.getResult(0));
 
             
@@ -708,6 +727,7 @@ pub fn crossEntropyLoss(comptime DataType: type) type {
             const num_tokens_const = try builder.scalarConstant(@floatFromInt(num_tokens));
             
             const mean_loss_op = hlo.divide(ctx, total_loss.value, num_tokens_const.value, loc);
+            builder.insertion_block.appendOwnedOperation(mean_loss_op);
             return builder.newTensor(mean_loss_op.getResult(0));
         }
     };

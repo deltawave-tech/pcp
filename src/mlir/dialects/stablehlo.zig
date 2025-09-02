@@ -138,24 +138,26 @@ pub fn reduce_max(ctx: mlir.Context, operand: mlir.Value, dimensions: []const i6
     });
 }
 
-/// Creates a stablehlo.reduce operation with a summation body.
+/// Creates a generic stablehlo.reduce operation with a summation body.
 pub fn reduce_sum(
     ctx: mlir.Context,
+    builder: *const @import("../../ops.zig").MLIRBuilder, // Pass in the builder
     operand: mlir.Value,
     dimensions: []const i64,
-    keep_dims: bool,
     loc: mlir.Location,
-) mlir.Operation {
-    const dimensions_attr = mlir.Attribute.denseI64ArrayAttr(ctx, dimensions);
+) !mlir.Operation {
+    const c_api = @import("../c.zig").c;
+    const allocator = builder.allocator;
+
+    // 1. Calculate result type (always removes dimensions)
     const input_type = operand.getType().as(mlir.RankedTensorType).?;
-    const input_shape = input_type.getShape(std.heap.page_allocator) catch unreachable;
-    defer std.heap.page_allocator.free(input_shape);
+    const input_shape = try input_type.getShape(allocator);
+    defer allocator.free(input_shape);
     const element_type = input_type.getElementType();
 
-    // CORRECTED: Calculate result shape based on keep_dims
-    var result_shape_list = std.ArrayList(i64).init(std.heap.page_allocator);
+    var result_shape_list = std.ArrayList(i64).init(allocator);
     defer result_shape_list.deinit();
-
+    
     for (input_shape, 0..) |dim, i| {
         var is_reduced = false;
         for (dimensions) |red_dim| {
@@ -164,48 +166,67 @@ pub fn reduce_sum(
                 break;
             }
         }
-        if (is_reduced) {
-            if (keep_dims) {
-                result_shape_list.append(1) catch unreachable;
-            }
-        } else {
-            result_shape_list.append(dim) catch unreachable;
+        if (!is_reduced) {
+            try result_shape_list.append(dim);
         }
     }
     const result_type = mlir.Type.rankedTensorType(ctx, result_shape_list.items, element_type);
 
-    // This operation is complex to build manually. For now, we assume a simplified
-    // `stablehlo.reduce_sum` exists for clarity. In a full implementation, this would
-    // build a `stablehlo.reduce` with a region containing an `stablehlo.add`.
-    return mlir.Operation.create(ctx, "stablehlo.reduce_sum", .{
-        .operands = &.{operand},
-        .results = &.{result_type},
-        .attributes = &.{.{ "dimensions", dimensions_attr }},
-        .location = loc,
-    });
+    // 2. Create the zero constant for init_value
+    const zero_attr = mlir.Attribute.floatAttr(ctx, 0.0, element_type);
+    const scalar_type = mlir.Type.tensor(&.{}, element_type);
+    const init_constant_op = constant(ctx, .{ .value = zero_attr, .result_type = scalar_type });
+
+    // FIX: Attach the constant op to the graph before using its result.
+    // This resolves the <<UNKNOWN SSA VALUE>> error.
+    builder.insertion_block.appendOwnedOperation(init_constant_op);
+    const init_value = init_constant_op.getResult(0);
+
+    // 3. Create the reduction body (region -> block)
+    const body_region = c_api.regionCreate();
+    const body_block = mlir.Block{ .handle = c_api.blockCreate(0, @constCast(@ptrCast(&[_]*c_api.MlirType{})), @constCast(@ptrCast(&[_]*c_api.MlirLocation{}))) };
+    c_api.regionAppendOwnedBlock(body_region, body_block.handle);
+
+    // 4. Add arguments and the 'add' operation to the body
+    const lhs_arg = body_block.addArgument(scalar_type, loc);
+    const rhs_arg = body_block.addArgument(scalar_type, loc);
+    const add_op = add(ctx, lhs_arg, rhs_arg, loc);
+    c_api.blockAppendOwnedOperation(body_block.handle, add_op.handle);
+    const return_op = mlir.Operation.create(ctx, "stablehlo.return", .{ .operands = &.{add_op.getResult(0)} });
+    c_api.blockAppendOwnedOperation(body_block.handle, return_op.handle);
+    
+    // 5. Build the final stablehlo.reduce operation state
+    var state = c_api.operationStateGet("stablehlo.reduce", loc.handle);
+    const operands = [_]*c_api.MlirValue{ operand.handle, init_value.handle };
+    c_api.mlirOperationStateAddOperands(&state, operands.len, @constCast(@ptrCast(&operands[0])));
+    const results = [_]*c_api.MlirType{ result_type.handle };
+    c_api.mlirOperationStateAddResults(&state, results.len, @constCast(@ptrCast(&results[0])));
+    const regions = [_]*c_api.MlirRegion{ body_region };
+    c_api.operationStateAddOwnedRegions(&state, regions.len, @constCast(@ptrCast(&regions[0])));
+    const dimensions_attr = mlir.Attribute.denseI64ArrayAttr(ctx, dimensions);
+    const attr_name_id = c_api.identifierGet(ctx.handle, "dimensions");
+    const named_attr = c_api.MlirNamedAttribute{ .name = attr_name_id, .attribute = dimensions_attr.handle };
+    c_api.mlirOperationStateAddAttributes(&state, 1, @constCast(@ptrCast(&named_attr)));
+
+    return mlir.Operation{ .handle = c_api.operationCreate(&state) };
 }
 
 /// Creates a stablehlo.compare operation
 pub fn compare(ctx: mlir.Context, lhs: mlir.Value, rhs: mlir.Value, direction: CompareDirection, loc: mlir.Location) mlir.Operation {
-    // The attribute must be a STRING, not an integer
     const direction_str = direction.toString();
     const direction_attr = mlir.Attribute.stringAttr(ctx, direction_str);
     
-    // Get the shape from the input tensor and create an i1 tensor type with the same shape
-    const input_type = lhs.getType();
-    const i1_element_type = mlir.Type.i1Type(ctx);
+    // CORRECTED: The result of a comparison is a tensor of booleans (i1).
+    const input_type = lhs.getType().as(mlir.RankedTensorType).?;
+    const input_shape = input_type.getShape(std.heap.page_allocator) catch unreachable;
+    defer std.heap.page_allocator.free(input_shape);
     
-    // For now, we'll extract the shape dynamically. This is a simplified approach.
-    // In a production system, we'd want proper tensor type introspection.
-    const result_type = if (input_type.as(mlir.RankedTensorType)) |ranked_tensor| blk: {
-        const shape = ranked_tensor.getShape(std.heap.page_allocator) catch unreachable;
-        defer std.heap.page_allocator.free(shape);
-        break :blk mlir.Type.rankedTensorType(ctx, shape, i1_element_type);
-    } else lhs.getType(); // Fallback for non-ranked tensors
+    const i1_element_type = mlir.Type.i1Type(ctx);
+    const result_type = mlir.Type.rankedTensorType(ctx, input_shape, i1_element_type);
     
     return mlir.Operation.create(ctx, "stablehlo.compare", .{
         .operands = &.{ lhs, rhs },
-        .results = &.{result_type},
+        .results = &.{result_type}, // Use the correct i1 tensor type here
         .attributes = &.{.{ "comparison_direction", direction_attr }},
         .location = loc,
     });
@@ -427,7 +448,7 @@ pub fn concatenate(ctx: mlir.Context, operands: []const mlir.Value, dimension: i
     }
     
     const result_type = mlir.Type.tensor(result_dims.items, first_type.getElementType());
-    const dimension_attr = mlir.Attribute.integerAttr(ctx, dimension, mlir.Type.f32Type(ctx)); // Should be i64 type
+    const dimension_attr = mlir.Attribute.integerAttr(ctx, dimension, mlir.Type.i64Type(ctx));
     
     // Convert []const mlir.Value to [*]*c.c.MlirValue for C API
     var c_operands = std.ArrayList(*c.c.MlirValue).init(std.heap.page_allocator);
@@ -660,7 +681,7 @@ pub const GatherDimensionNumbersAttribute = struct {
         const offset_dims_attr = mlir.Attribute.denseI64ArrayAttr(ctx, self.offset_dims);
         const collapsed_slice_dims_attr = mlir.Attribute.denseI64ArrayAttr(ctx, self.collapsed_slice_dims);
         const start_index_map_attr = mlir.Attribute.denseI64ArrayAttr(ctx, self.start_index_map);
-        const index_vector_dim_attr = mlir.Attribute.integerAttr(ctx, self.index_vector_dim, mlir.Type.f32Type(ctx));
+        const index_vector_dim_attr = mlir.Attribute.integerAttr(ctx, self.index_vector_dim, mlir.Type.i64Type(ctx));
 
         // 2. Create identifiers for attribute names
         const offset_id = c_api.identifierGet(ctx.handle, "offset_dims");
@@ -739,7 +760,7 @@ pub const ScatterDimensionNumbersAttribute = struct {
         const update_window_dims_attr = mlir.Attribute.denseI64ArrayAttr(ctx, self.update_window_dims);
         const inserted_window_dims_attr = mlir.Attribute.denseI64ArrayAttr(ctx, self.inserted_window_dims);
         const scatter_dims_to_operand_dims_attr = mlir.Attribute.denseI64ArrayAttr(ctx, self.scatter_dims_to_operand_dims);
-        const index_vector_dim_attr = mlir.Attribute.integerAttr(ctx, self.index_vector_dim, mlir.Type.f32Type(ctx));
+        const index_vector_dim_attr = mlir.Attribute.integerAttr(ctx, self.index_vector_dim, mlir.Type.i64Type(ctx));
 
         // Create identifiers for attribute names
         const update_window_id = c_api.identifierGet(ctx.handle, "update_window_dims");

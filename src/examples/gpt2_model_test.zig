@@ -55,7 +55,10 @@ pub fn main() !void {
 
     // 4. Create the function and get its entry block and arguments
     const result = try builder.createFunction("gpt2_training_step", func_type);
-    _ = result.func_op; // Attach to module automatically
+
+    // FIX: Explicitly append the newly created function to the module's body.
+    builder.module_body.appendOwnedOperation(result.func_op);
+
     const entry_block = result.entry_block;
 
     // Set the builder's insertion point to inside our new function

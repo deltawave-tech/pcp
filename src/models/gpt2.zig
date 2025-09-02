@@ -686,10 +686,12 @@ pub fn GPT2(comptime DataType: type) type {
 
             const token_embeddings = try ops.gather(builder, self.wte, expanded_input_ids, 
                 hlo.GatherDimensionNumbersAttribute{
-                    .offset_dims = &.{2}, // embd dim at output position 2
+                    .offset_dims = &.{2},
                     .collapsed_slice_dims = &.{0},
                     .start_index_map = &.{0},
-                    .index_vector_dim = 2, // FIX: Now 2 (last dim of expanded indices)
+                    .index_vector_dim = 2,
+                    .operand_batching_dims = &.{},
+                    .start_indices_batching_dims = &.{},
                 }, &.{ 1, @intCast(self.config.n_embd) });
             
             // Step 2: Position embeddings
@@ -703,10 +705,12 @@ pub fn GPT2(comptime DataType: type) type {
             // Position embedding lookup [seq_len, 1] -> [seq_len, C]
             const pos_emb_2d = try ops.gather(builder, self.wpe, expanded_pos_indices,
                 hlo.GatherDimensionNumbersAttribute{
-                    .offset_dims = &.{1}, // FIX: embd at position 1
+                    .offset_dims = &.{1},
                     .collapsed_slice_dims = &.{0},
                     .start_index_map = &.{0},
-                    .index_vector_dim = 1, // FIX: Now 1 (last dim of expanded pos indices)
+                    .index_vector_dim = 1,
+                    .operand_batching_dims = &.{},
+                    .start_indices_batching_dims = &.{},
                 }, &.{ 1, @intCast(self.config.n_embd) });
             
             // Broadcast to [B, T, C]

@@ -98,6 +98,9 @@ pub const c = struct {
     pub extern fn mlirOperationGetAttribute(op: *MlirOperation, pos: isize) MlirNamedAttribute;
     pub extern fn mlirTypeAttrGetType(attr: *MlirAttribute) *MlirType;
 
+    // Add this extern
+    pub extern fn mlirBoolAttrGet(ctx: *MlirContext, value: c_int) *MlirAttribute;
+
     // Graph traversal operations
     extern fn mlirOperationGetRegion(op: *MlirOperation, pos: isize) *MlirRegion;
     extern fn mlirRegionGetFirstBlock(region: *MlirRegion) *MlirBlock;

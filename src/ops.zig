@@ -280,6 +280,7 @@ fn broadcastTensors(builder: *MLIRBuilder, a: Tensor, b: Tensor) !struct { Tenso
         const b_dim = if (i < b_rank) b.shape.getDimension(b_rank - 1 - i) else 1;
 
         if (a_dim != b_dim and a_dim != 1 and b_dim != 1) {
+            std.log.err("Broadcast error: a_dim={}, b_dim={}, a_rank={}, b_rank={}, max_rank={}, i={}", .{a_dim, b_dim, a_rank, b_rank, max_rank, i});
             return error.IncompatibleBroadcastShapes;
         }
         target_shape_list.items[max_rank - 1 - i] = @max(a_dim, b_dim);
@@ -568,7 +569,8 @@ pub fn exp(builder: *MLIRBuilder, a: Tensor) !Tensor {
 /// Reduce max operation along specified dimensions
 pub fn reduceMax(builder: *MLIRBuilder, a: Tensor, dimensions: []const i64, keep_dims: bool) !Tensor {
     // First, perform the reduction (always removes dimensions in MLIR)
-    const operation = hlo.reduce_max(builder.ctx, a.value, dimensions, builder.loc);
+    // The call now correctly passes the builder.
+    const operation = try hlo.reduce_max(builder.ctx, builder, a.value, dimensions, builder.loc);
     const reduced_tensor = try builder.createAndAppendOp(operation);
 
     // If keep_dims is true, reshape to restore the reduced dimensions as size-1 dimensions
@@ -663,9 +665,11 @@ pub fn iota(builder: *MLIRBuilder, shape: []const i64, iota_dimension: i64, elem
 
 /// Compare operation for element-wise comparisons
 pub fn compare(builder: *MLIRBuilder, lhs: Tensor, rhs: Tensor, direction: hlo.CompareDirection) !Tensor {
-    // Use StableHLO dialect wrapper
-    const operation = hlo.compare(builder.ctx, lhs.value, rhs.value, direction, builder.loc);
+    // Determine compare_type based on element type
+    const elem_type = lhs.value.getType().as(mlir.RankedTensorType).?.getElementType();
+    const compare_type = if (elem_type.handle == mlir.Type.i32Type(builder.ctx).handle) hlo.CompareType.SIGNED else hlo.CompareType.FLOAT; // Adjust as needed
 
+    const operation = hlo.compare(builder.ctx, lhs.value, rhs.value, direction, compare_type, builder.loc);
     return try builder.createAndAppendOp(operation);
 }
 
@@ -679,8 +683,22 @@ pub fn broadcastInDim(builder: *MLIRBuilder, operand: Tensor, target_shape: []co
 
 /// Select operation for conditional selection
 pub fn select(builder: *MLIRBuilder, pred: Tensor, on_true: Tensor, on_false: Tensor) !Tensor {
-    // Use StableHLO dialect wrapper
-    const operation = hlo.select(builder.ctx, pred.value, on_true.value, on_false.value, builder.loc);
+    // Handle broadcasting for on_false if it's scalar (rank 0)
+    var on_false_final = on_false;
+    if (on_false.shape.rank() == 0) {
+        // Get the target shape from on_true (since select result is on_true's type)
+        const target_shape = try on_true.shape.getDims(builder.allocator);
+        defer builder.allocator.free(target_shape);
+        
+        // Broadcast scalar to full shape with empty broadcast_dims
+        on_false_final = try broadcastInDim(builder, on_false, target_shape, &.{});
+    }
+
+    // Similarly for on_true if needed, but assume it's already matching
+    // Pred should be broadcast-compatible, but in our cases it's full shape
+
+    // Create the operation with potentially broadcasted operands
+    const operation = hlo.select(builder.ctx, pred.value, on_true.value, on_false_final.value, builder.loc);
 
     return try builder.createAndAppendOp(operation);
 }

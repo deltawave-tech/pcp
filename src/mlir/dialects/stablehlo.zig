@@ -102,40 +102,76 @@ pub fn exponential(ctx: mlir.Context, operand: mlir.Value, loc: mlir.Location) m
 }
 
 /// Creates a stablehlo.reduce_max operation
-pub fn reduce_max(ctx: mlir.Context, operand: mlir.Value, dimensions: []const i64, loc: mlir.Location) mlir.Operation {
-    const dimensions_attr = mlir.Attribute.denseI64ArrayAttr(ctx, dimensions);
-    
-    // Calculate result shape by removing reduced dimensions
-    const input_type = operand.getType().as(mlir.RankedTensorType) orelse unreachable;
-    const input_shape = input_type.getShape(std.heap.page_allocator) catch unreachable;
-    defer std.heap.page_allocator.free(input_shape);
+/// Creates a stablehlo.reduce operation with a 'maximum' body.
+pub fn reduce_max(
+    ctx: mlir.Context,
+    builder: *const @import("../../ops.zig").MLIRBuilder, // Pass in the builder
+    operand: mlir.Value,
+    dimensions: []const i64,
+    loc: mlir.Location,
+) !mlir.Operation {
+    const c_api = @import("../c.zig").c;
+    const allocator = builder.allocator;
+
+    // 1. Calculate result type (removes reduced dimensions)
+    const input_type = operand.getType().as(mlir.RankedTensorType).?;
     const element_type = input_type.getElementType();
-    
-    // For simplicity, assume single dimension reduction for now
-    var result_shape = std.ArrayList(i64).init(std.heap.page_allocator);
-    defer result_shape.deinit();
-    
+    const input_shape = try input_type.getShape(allocator);
+    defer allocator.free(input_shape);
+
+    var result_shape_list = std.ArrayList(i64).init(allocator);
+    defer result_shape_list.deinit();
+
     for (input_shape, 0..) |dim, i| {
         var is_reduced = false;
         for (dimensions) |red_dim| {
-            if (i == red_dim) {
+            if (@as(i64, @intCast(i)) == red_dim) {
                 is_reduced = true;
                 break;
             }
         }
         if (!is_reduced) {
-            result_shape.append(dim) catch unreachable;
+            try result_shape_list.append(dim);
         }
     }
-    
-    const result_type = mlir.Type.rankedTensorType(ctx, result_shape.items, element_type);
-    
-    return mlir.Operation.create(ctx, "stablehlo.reduce_max", .{
-        .operands = &.{operand},
-        .results = &.{result_type},
-        .attributes = &.{.{ "dimensions", dimensions_attr }},
-        .location = loc,
-    });
+    const result_type = mlir.Type.rankedTensorType(ctx, result_shape_list.items, element_type);
+
+    // 2. Create the init_value: negative infinity for floats, which is the identity element for max reduction.
+    const neg_inf = std.math.inf(f32) * -1.0;
+    const scalar_type = mlir.Type.tensor(&.{}, element_type);
+    const neg_inf_attr = mlir.Attribute.denseElementsAttrSplat(scalar_type, @floatCast(neg_inf));
+    const init_constant_op = constant(ctx, .{ .value = neg_inf_attr, .result_type = scalar_type });
+
+    builder.insertion_block.appendOwnedOperation(init_constant_op);
+    const init_value = init_constant_op.getResult(0);
+
+    // 3. Create the reduction body (region -> block)
+    const body_region = c_api.regionCreate();
+    const body_block = mlir.Block{ .handle = c_api.blockCreate(0, @constCast(@ptrCast(&[_]*c_api.MlirType{})), @constCast(@ptrCast(&[_]*c_api.MlirLocation{}))) };
+    c_api.regionAppendOwnedBlock(body_region, body_block.handle);
+
+    // 4. Add arguments and the 'maximum' operation to the body
+    const lhs_arg = body_block.addArgument(scalar_type, loc);
+    const rhs_arg = body_block.addArgument(scalar_type, loc);
+    const max_op = maximum(ctx, lhs_arg, rhs_arg, loc); // Use stablehlo.maximum
+    c_api.blockAppendOwnedOperation(body_block.handle, max_op.handle);
+    const return_op = mlir.Operation.create(ctx, "stablehlo.return", .{ .operands = &.{max_op.getResult(0)} });
+    c_api.blockAppendOwnedOperation(body_block.handle, return_op.handle);
+
+    // 5. Build the final stablehlo.reduce operation state
+    var state = c_api.operationStateGet("stablehlo.reduce", loc.handle);
+    const operands = [_]*c_api.MlirValue{ operand.handle, init_value.handle };
+    c_api.mlirOperationStateAddOperands(&state, operands.len, @constCast(@ptrCast(&operands[0])));
+    const results = [_]*c_api.MlirType{ result_type.handle };
+    c_api.mlirOperationStateAddResults(&state, results.len, @constCast(@ptrCast(&results[0])));
+    const regions = [_]*c_api.MlirRegion{ body_region };
+    c_api.operationStateAddOwnedRegions(&state, regions.len, @constCast(@ptrCast(&regions[0])));
+    const dimensions_attr = mlir.Attribute.denseI64ArrayAttr(ctx, dimensions);
+    const attr_name_id = c_api.identifierGet(ctx.handle, "dimensions");
+    const named_attr = c_api.MlirNamedAttribute{ .name = attr_name_id, .attribute = dimensions_attr.handle };
+    c_api.mlirOperationStateAddAttributes(&state, 1, @constCast(@ptrCast(&named_attr)));
+
+    return mlir.Operation{ .handle = c_api.operationCreate(&state) };
 }
 
 /// Creates a generic stablehlo.reduce operation with a summation body.
@@ -212,10 +248,7 @@ pub fn reduce_sum(
 }
 
 /// Creates a stablehlo.compare operation
-pub fn compare(ctx: mlir.Context, lhs: mlir.Value, rhs: mlir.Value, direction: CompareDirection, loc: mlir.Location) mlir.Operation {
-    const direction_str = direction.toString();
-    const direction_attr = mlir.Attribute.stringAttr(ctx, direction_str);
-    
+pub fn compare(ctx: mlir.Context, lhs: mlir.Value, rhs: mlir.Value, direction: CompareDirection, compare_type: CompareType, loc: mlir.Location) mlir.Operation {
     // CORRECTED: The result of a comparison is a tensor of booleans (i1).
     const input_type = lhs.getType().as(mlir.RankedTensorType).?;
     const input_shape = input_type.getShape(std.heap.page_allocator) catch unreachable;
@@ -223,13 +256,45 @@ pub fn compare(ctx: mlir.Context, lhs: mlir.Value, rhs: mlir.Value, direction: C
     
     const i1_element_type = mlir.Type.i1Type(ctx);
     const result_type = mlir.Type.rankedTensorType(ctx, input_shape, i1_element_type);
+
+    // Build string for comparison_direction
+    var dir_str_buf = std.ArrayList(u8).init(std.heap.page_allocator);
+    defer dir_str_buf.deinit();
+    dir_str_buf.appendSlice("#stablehlo<comparison_direction ") catch @panic("OOM");
+    dir_str_buf.appendSlice(direction.toString()) catch @panic("OOM");
+    dir_str_buf.appendSlice(">") catch @panic("OOM");
+    const dir_str_ref = c.c.MlirStringRef{ .data = dir_str_buf.items.ptr, .length = dir_str_buf.items.len };
+    const direction_attr_handle = c.c.mlirAttributeParseGet(ctx.handle, dir_str_ref);
+    const direction_attr = mlir.Attribute{ .handle = direction_attr_handle };
+
+    // Build string for compare_type
+    var type_str_buf = std.ArrayList(u8).init(std.heap.page_allocator);
+    defer type_str_buf.deinit();
+    type_str_buf.appendSlice("#stablehlo<comparison_type ") catch @panic("OOM");
+    type_str_buf.appendSlice(compare_type.toString()) catch @panic("OOM");
+    type_str_buf.appendSlice(">") catch @panic("OOM");
+    const type_str_ref = c.c.MlirStringRef{ .data = type_str_buf.items.ptr, .length = type_str_buf.items.len };
+    const type_attr_handle = c.c.mlirAttributeParseGet(ctx.handle, type_str_ref);
+    const type_attr = mlir.Attribute{ .handle = type_attr_handle };
+
+    // Attributes
+    const direction_id = c.c.identifierGet(ctx.handle, "comparison_direction");
+    const type_id = c.c.identifierGet(ctx.handle, "compare_type");
+    const named_attrs = [_]c.c.MlirNamedAttribute{
+        .{ .name = direction_id, .attribute = direction_attr.handle },
+        .{ .name = type_id, .attribute = type_attr.handle },
+    };
+
+    // Create operation using low-level C API
+    var op_state = c.c.operationStateGet("stablehlo.compare", loc.handle);
+    var operands = [_]*c.c.MlirValue{ lhs.handle, rhs.handle };
+    var result_types = [_]*c.c.MlirType{ result_type.handle };
+
+    c.c.mlirOperationStateAddOperands(&op_state, operands.len, @ptrCast(&operands));
+    c.c.mlirOperationStateAddResults(&op_state, result_types.len, @ptrCast(&result_types));
+    c.c.mlirOperationStateAddAttributes(&op_state, named_attrs.len, named_attrs[0..].ptr);
     
-    return mlir.Operation.create(ctx, "stablehlo.compare", .{
-        .operands = &.{ lhs, rhs },
-        .results = &.{result_type}, // Use the correct i1 tensor type here
-        .attributes = &.{.{ "comparison_direction", direction_attr }},
-        .location = loc,
-    });
+    return mlir.Operation{ .handle = c.c.operationCreate(&op_state) };
 }
 
 pub const CompareDirection = enum {
@@ -248,6 +313,22 @@ pub const CompareDirection = enum {
             .LE => "LE",
             .GT => "GT",
             .GE => "GE",
+        };
+    }
+};
+
+pub const CompareType = enum {
+    FLOAT,
+    TOTALORDER,
+    SIGNED,
+    UNSIGNED,
+
+    pub fn toString(self: CompareType) []const u8 {
+        return switch (self) {
+            .FLOAT => "FLOAT",
+            .TOTALORDER => "TOTALORDER",
+            .SIGNED => "SIGNED",
+            .UNSIGNED => "UNSIGNED",
         };
     }
 };
@@ -293,30 +374,34 @@ pub const DotDimensionNumbersAttribute = struct {
     rhs_contracting_dimensions: []const i64,
 
     pub fn asAttr(self: @This(), ctx: mlir.Context) mlir.Attribute {
-        const c_api = @import("../../mlir/c.zig").c;
+        var str_buf = std.ArrayList(u8).init(std.heap.page_allocator);
+        defer str_buf.deinit();
 
-        // Create attributes for each field
-        const lhs_batching_attr = mlir.Attribute.denseI64ArrayAttr(ctx, self.lhs_batching_dimensions);
-        const rhs_batching_attr = mlir.Attribute.denseI64ArrayAttr(ctx, self.rhs_batching_dimensions);
-        const lhs_contracting_attr = mlir.Attribute.denseI64ArrayAttr(ctx, self.lhs_contracting_dimensions);
-        const rhs_contracting_attr = mlir.Attribute.denseI64ArrayAttr(ctx, self.rhs_contracting_dimensions);
+        str_buf.appendSlice("#stablehlo.dot<lhs_batching_dimensions = [") catch @panic("OOM");
+        for (self.lhs_batching_dimensions, 0..) |d, i| {
+            if (i > 0) str_buf.appendSlice(", ") catch @panic("OOM");
+            std.fmt.format(str_buf.writer(), "{}", .{d}) catch @panic("OOM");
+        }
+        str_buf.appendSlice("], rhs_batching_dimensions = [") catch @panic("OOM");
+        for (self.rhs_batching_dimensions, 0..) |d, i| {
+            if (i > 0) str_buf.appendSlice(", ") catch @panic("OOM");
+            std.fmt.format(str_buf.writer(), "{}", .{d}) catch @panic("OOM");
+        }
+        str_buf.appendSlice("], lhs_contracting_dimensions = [") catch @panic("OOM");
+        for (self.lhs_contracting_dimensions, 0..) |d, i| {
+            if (i > 0) str_buf.appendSlice(", ") catch @panic("OOM");
+            std.fmt.format(str_buf.writer(), "{}", .{d}) catch @panic("OOM");
+        }
+        str_buf.appendSlice("], rhs_contracting_dimensions = [") catch @panic("OOM");
+        for (self.rhs_contracting_dimensions, 0..) |d, i| {
+            if (i > 0) str_buf.appendSlice(", ") catch @panic("OOM");
+            std.fmt.format(str_buf.writer(), "{}", .{d}) catch @panic("OOM");
+        }
+        str_buf.appendSlice("]>") catch @panic("OOM");
 
-        // Create identifiers for attribute names
-        const lhs_batching_id = c_api.identifierGet(ctx.handle, "lhs_batching_dimensions");
-        const rhs_batching_id = c_api.identifierGet(ctx.handle, "rhs_batching_dimensions");
-        const lhs_contracting_id = c_api.identifierGet(ctx.handle, "lhs_contracting_dimensions");
-        const rhs_contracting_id = c_api.identifierGet(ctx.handle, "rhs_contracting_dimensions");
-
-        // Create named attributes
-        const named_attrs = [_]c_api.MlirNamedAttribute{
-            .{ .name = lhs_batching_id, .attribute = lhs_batching_attr.handle },
-            .{ .name = rhs_batching_id, .attribute = rhs_batching_attr.handle },
-            .{ .name = lhs_contracting_id, .attribute = lhs_contracting_attr.handle },
-            .{ .name = rhs_contracting_id, .attribute = rhs_contracting_attr.handle },
-        };
-
-        // Create and return the dictionary attribute
-        return mlir.Attribute.dictionary(ctx, &named_attrs);
+        const str_ref = c.c.MlirStringRef{ .data = str_buf.items.ptr, .length = str_buf.items.len };
+        const attr_handle = c.c.mlirAttributeParseGet(ctx.handle, str_ref);
+        return mlir.Attribute{ .handle = attr_handle };
     }
 };
 
@@ -605,13 +690,14 @@ pub fn iota(ctx: mlir.Context, shape: []const i64, iota_dimension: i64, element_
 }
 
 /// Creates a stablehlo.one_hot operation
+/// Creates a stablehlo.one_hot operation
 pub fn one_hot(ctx: mlir.Context, indices: mlir.Value, depth: i64, on_value: f32, off_value: f32, axis: i64, element_type: mlir.Type, loc: mlir.Location) mlir.Operation {
-    const depth_attr = mlir.Attribute.integerAttr(ctx, depth, mlir.Type.i64Type(ctx));
+    // REMOVED: const depth_attr = mlir.Attribute.integerAttr(ctx, depth, mlir.Type.i64Type(ctx));
     const axis_attr = mlir.Attribute.integerAttr(ctx, axis, mlir.Type.i64Type(ctx));
-    const on_value_attr = mlir.Attribute.floatAttr(ctx, on_value, element_type);
-    const off_value_attr = mlir.Attribute.floatAttr(ctx, off_value, element_type);
+    const on_value_attr = mlir.Attribute.floatAttr(ctx, @floatCast(on_value), element_type);
+    const off_value_attr = mlir.Attribute.floatAttr(ctx, @floatCast(off_value), element_type);
     
-    // Calculate result shape
+    // Calculate result shape (this part is already correct and uses 'depth')
     const indices_type = indices.getType().as(mlir.RankedTensorType) orelse unreachable;
     const indices_shape = indices_type.getShape(std.heap.page_allocator) catch unreachable;
     defer std.heap.page_allocator.free(indices_shape);
@@ -637,7 +723,7 @@ pub fn one_hot(ctx: mlir.Context, indices: mlir.Value, depth: i64, on_value: f32
         .operands = &.{indices},
         .results = &.{result_type},
         .attributes = &.{
-            .{ "depth", depth_attr },
+            // REMOVED: .{ "depth", depth_attr },
             .{ "axis", axis_attr },
             .{ "on_value", on_value_attr },
             .{ "off_value", off_value_attr },
@@ -673,13 +759,10 @@ pub const GatherDimensionNumbersAttribute = struct {
     collapsed_slice_dims: []const i64,
     start_index_map: []const i64,
     index_vector_dim: i64,
-
-    // NOTE: The asAttr method has been removed. Its logic is now inlined into the 'gather'
-    // function to resolve a critical use-after-free bug where the MlirNamedAttribute
-    // array's stack memory was being freed before the MLIR operation was fully created.
+    operand_batching_dims: []const i64,
+    start_indices_batching_dims: []const i64,
 };
 
-/// Creates a stablehlo.gather operation for embedding lookups.
 pub fn gather(
     ctx: mlir.Context,
     operand: mlir.Value,
@@ -688,7 +771,7 @@ pub fn gather(
     slice_sizes: []const i64,
     loc: mlir.Location,
 ) mlir.Operation {
-    // --- Result type inference (remains the same) ---
+    // Result type inference (unchanged, but ensure it accounts for batching correctly if needed)
     const operand_type = operand.getType().as(mlir.RankedTensorType).?;
     const start_indices_type = start_indices.getType().as(mlir.RankedTensorType).?;
     const element_type = operand_type.getElementType();
@@ -697,63 +780,84 @@ pub fn gather(
     defer allocator.free(start_shape);
     var result_dims = std.ArrayList(i64).init(allocator);
     defer result_dims.deinit();
-    for (start_shape) |d| {
-        result_dims.append(d) catch @panic("OOM");
+
+    // FIX: Append only the prefix dimensions, excluding the index_vector_dim
+    const index_vector_dim = dimension_numbers.index_vector_dim;
+    for (0..start_indices_type.getRank()) |i| {
+        if (@as(i64, @intCast(i)) != index_vector_dim) {
+            result_dims.append(start_shape[i]) catch @panic("OOM");
+        }
     }
+
+    // Append the non-collapsed slice dimensions. For embeddings, this is just the embedding size.
+    // In general, append all slice_sizes[j] where j not in collapsed_slice_dims.
+    // But since collapsed={0}, slice_sizes[0]=1 (collapsed), [1]=embd (not), append [1].
     result_dims.append(slice_sizes[1]) catch @panic("OOM");
+
     const result_type = mlir.Type.tensor(result_dims.items, element_type);
 
-    // --- START OF THE DEFINITIVE FIX ---
-    // The root cause was a use-after-free bug. The `asAttr` helper function's stack frame
-    // was being destroyed before the MLIR operation could consume the attribute data.
-    // The fix is to create all attribute components on the stack of THIS function,
-    // ensuring their memory is valid for the duration of the `operationCreate` call.
-
-    // 1. Create the `slice_sizes` attribute.
     const slice_sizes_attr = mlir.Attribute.denseI64ArrayAttr(ctx, slice_sizes);
 
-    // 2. Create all components for the `dimension_numbers` dictionary attribute here.
-    const offset_dims_attr = mlir.Attribute.denseI64ArrayAttr(ctx, dimension_numbers.offset_dims);
-    const collapsed_slice_dims_attr = mlir.Attribute.denseI64ArrayAttr(ctx, dimension_numbers.collapsed_slice_dims);
-    const start_index_map_attr = mlir.Attribute.denseI64ArrayAttr(ctx, dimension_numbers.start_index_map);
-    const index_vector_dim_attr = mlir.Attribute.integerAttr(ctx, dimension_numbers.index_vector_dim, mlir.Type.i64Type(ctx));
+    // NEW: Build the string for #stablehlo.gather<...>
+    var str_buf = std.ArrayList(u8).init(std.heap.page_allocator);
+    defer str_buf.deinit();
 
-    const offset_id = c.c.identifierGet(ctx.handle, "offset_dims");
-    const collapsed_id = c.c.identifierGet(ctx.handle, "collapsed_slice_dims");
-    const start_map_id = c.c.identifierGet(ctx.handle, "start_index_map");
-    const index_vec_id = c.c.identifierGet(ctx.handle, "index_vector_dim");
+    str_buf.appendSlice("#stablehlo.gather<offset_dims = [") catch @panic("OOM");
+    for (dimension_numbers.offset_dims, 0..) |d, i| {
+        if (i > 0) str_buf.appendSlice(", ") catch @panic("OOM");
+        std.fmt.format(str_buf.writer(), "{}", .{d}) catch @panic("OOM");
+    }
+    str_buf.appendSlice("], collapsed_slice_dims = [") catch @panic("OOM");
+    for (dimension_numbers.collapsed_slice_dims, 0..) |d, i| {
+        if (i > 0) str_buf.appendSlice(", ") catch @panic("OOM");
+        std.fmt.format(str_buf.writer(), "{}", .{d}) catch @panic("OOM");
+    }
+    str_buf.appendSlice("], start_index_map = [") catch @panic("OOM");
+    for (dimension_numbers.start_index_map, 0..) |d, i| {
+        if (i > 0) str_buf.appendSlice(", ") catch @panic("OOM");
+        std.fmt.format(str_buf.writer(), "{}", .{d}) catch @panic("OOM");
+    }
+    str_buf.appendSlice("], index_vector_dim = ") catch @panic("OOM");
+    std.fmt.format(str_buf.writer(), "{}", .{dimension_numbers.index_vector_dim}) catch @panic("OOM");
+    str_buf.appendSlice(", operand_batching_dims = [") catch @panic("OOM");
+    for (dimension_numbers.operand_batching_dims, 0..) |d, i| {
+        if (i > 0) str_buf.appendSlice(", ") catch @panic("OOM");
+        std.fmt.format(str_buf.writer(), "{}", .{d}) catch @panic("OOM");
+    }
+    str_buf.appendSlice("], start_indices_batching_dims = [") catch @panic("OOM");
+    for (dimension_numbers.start_indices_batching_dims, 0..) |d, i| {
+        if (i > 0) str_buf.appendSlice(", ") catch @panic("OOM");
+        std.fmt.format(str_buf.writer(), "{}", .{d}) catch @panic("OOM");
+    }
+    str_buf.appendSlice("]>") catch @panic("OOM");
 
-    const dim_num_named_attrs = [_]c.c.MlirNamedAttribute{
-        .{ .name = offset_id, .attribute = offset_dims_attr.handle },
-        .{ .name = collapsed_id, .attribute = collapsed_slice_dims_attr.handle },
-        .{ .name = start_map_id, .attribute = start_index_map_attr.handle },
-        .{ .name = index_vec_id, .attribute = index_vector_dim_attr.handle },
-    };
-    const dim_numbers_dict_attr = mlir.Attribute.dictionary(ctx, dim_num_named_attrs[0..]);
+    const str_ref = c.c.MlirStringRef{ .data = str_buf.items.ptr, .length = str_buf.items.len };
+    const dim_numbers_attr_handle = c.c.mlirAttributeParseGet(ctx.handle, str_ref);
+    const dim_numbers_attr = mlir.Attribute{ .handle = dim_numbers_attr_handle };
 
-    // 3. Create the final list of named attributes for the 'gather' operation.
+    // Add indices_are_sorted
+    const sorted_id = c.c.identifierGet(ctx.handle, "indices_are_sorted");
+    const sorted_attr = mlir.Attribute.boolAttr(ctx, false);
+
+    // named_attrs now includes sorted
     const gather_dim_numbers_id = c.c.identifierGet(ctx.handle, "dimension_numbers");
     const slice_sizes_id = c.c.identifierGet(ctx.handle, "slice_sizes");
     const named_attrs = [_]c.c.MlirNamedAttribute{
-        c.c.MlirNamedAttribute{ .name = gather_dim_numbers_id, .attribute = dim_numbers_dict_attr.handle },
-        c.c.MlirNamedAttribute{ .name = slice_sizes_id, .attribute = slice_sizes_attr.handle },
+        .{ .name = gather_dim_numbers_id, .attribute = dim_numbers_attr.handle },
+        .{ .name = slice_sizes_id, .attribute = slice_sizes_attr.handle },
+        .{ .name = sorted_id, .attribute = sorted_attr.handle },
     };
 
-    // 4. Create the operation state with the locally-scoped attributes.
+    // Create the operation state
     var op_state = c.c.operationStateGet("stablehlo.gather", loc.handle);
     var operands = [_]*c.c.MlirValue{ operand.handle, start_indices.handle };
     var result_types = [_]*c.c.MlirType{ result_type.handle };
 
     c.c.mlirOperationStateAddOperands(&op_state, operands.len, @ptrCast(&operands));
     c.c.mlirOperationStateAddResults(&op_state, result_types.len, @ptrCast(&result_types));
-    // DEFINITIVE AND FINAL FIX: The C binding now correctly expects a pointer to the
-    // first element ([*]const). We convert the array to a slice and use its .ptr field.
-    // The previous `@ptrCast(&named_attrs)` was passing a pointer-to-the-array, which is incorrect.
     c.c.mlirOperationStateAddAttributes(&op_state, named_attrs.len, named_attrs[0..].ptr);
     
-    // 5. Create and return the operation. Its attributes now point to valid memory.
     return mlir.Operation{ .handle = c.c.operationCreate(&op_state) };
-    // --- END OF THE DEFINITIVE FIX ---
 }
 
 /// Attribute for stablehlo.scatter dimension numbers.

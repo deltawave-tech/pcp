@@ -491,6 +491,11 @@ pub const Context = struct {
         pub fn stringAttr(context: Context, value: []const u8) Self {
             return Self{ .handle = c.c.stringAttrGet(context.handle, value) };
         }
+        
+        /// Create a boolean attribute
+        pub fn boolAttr(context: Context, value: bool) Self {
+            return Self{ .handle = c.c.mlirBoolAttrGet(context.handle, if (value) 1 else 0) };
+        }
     };
     
     /// Dot dimension numbers attribute for matmul operations

@@ -151,7 +151,8 @@ pub const MLIRContext = struct {
         
         // Write MLIR to temporary file
         try std.fs.cwd().writeFile(.{ .sub_path = temp_mlir_path, .data = mlir_source });
-        defer std.fs.cwd().deleteFile(temp_mlir_path) catch {};
+        // TEMP: Don't delete the file so we can inspect it
+        // defer std.fs.cwd().deleteFile(temp_mlir_path) catch {};
         
         std.debug.print("✓ Saved MLIR module to {s} ({} bytes)\n", .{ temp_mlir_path, mlir_source.len });
         

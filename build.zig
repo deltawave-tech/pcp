@@ -1010,6 +1010,60 @@ pub fn build(b: *std.Build) void {
     const run_gpt2_model_test_step = b.step("run-gpt2-model-test", "Run the GPT-2 model graph construction test");
     run_gpt2_model_test_step.dependOn(&run_gpt2_model_test_cmd.step);
 
+    // Isolated VJP Tests - Numerical verification of core autodiff rules
+    const isolated_vjp_tests = b.addExecutable(.{
+        .name = "isolated_vjp_tests",
+        .root_source_file = b.path("src/examples/isolated_vjp_tests.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    // Add module dependencies
+    isolated_vjp_tests.root_module.addImport("pcp", pcp_module);
+    
+    // SINGLE CALL for all MLIR/LLVM/Metal libraries
+    addMLIRSupport(isolated_vjp_tests, mlir_config);
+
+    // SINGLE CALL for your project's bridge libraries
+    addPCPDependencies(isolated_vjp_tests, spirv_bridge_lib, metal_bridge_lib);
+
+    // Install the test executable
+    b.installArtifact(isolated_vjp_tests);
+
+    // Run step for isolated VJP tests
+    const run_isolated_vjp_tests_cmd = b.addRunArtifact(isolated_vjp_tests);
+    run_isolated_vjp_tests_cmd.step.dependOn(&isolated_vjp_tests.step);
+
+    const run_isolated_vjp_tests_step = b.step("run-isolated-vjp-tests", "Run isolated VJP numerical verification tests");
+    run_isolated_vjp_tests_step.dependOn(&run_isolated_vjp_tests_cmd.step);
+
+    // End-to-End Transformer Block Autodiff Test
+    const end_to_end_transformer_test = b.addExecutable(.{
+        .name = "end_to_end_transformer_test",
+        .root_source_file = b.path("src/examples/end_to_end_transformer_test.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    // Add module dependencies for end-to-end transformer test
+    end_to_end_transformer_test.root_module.addImport("pcp", pcp_module);
+    
+    // SINGLE CALL for all MLIR/LLVM/Metal libraries
+    addMLIRSupport(end_to_end_transformer_test, mlir_config);
+
+    // SINGLE CALL for your project's bridge libraries
+    addPCPDependencies(end_to_end_transformer_test, spirv_bridge_lib, metal_bridge_lib);
+
+    // Install the test executable
+    b.installArtifact(end_to_end_transformer_test);
+
+    // Run step for end-to-end transformer test
+    const run_end_to_end_transformer_test_cmd = b.addRunArtifact(end_to_end_transformer_test);
+    run_end_to_end_transformer_test_cmd.step.dependOn(&end_to_end_transformer_test.step);
+
+    const run_end_to_end_transformer_test_step = b.step("run-end-to-end-transformer-test", "Run end-to-end transformer block autodiff test with finite difference verification");
+    run_end_to_end_transformer_test_step.dependOn(&run_end_to_end_transformer_test_cmd.step);
+
     // // Property-based testing step
     // const prop_tests = b.addTest(.{
     //     .root_source_file = b.path("src/prop_tests.zig"),

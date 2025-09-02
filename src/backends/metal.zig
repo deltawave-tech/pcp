@@ -329,7 +329,7 @@ pub const MLIRMetalExecutionEngine = struct {
         
         // Step 1: Lower MLIR module through the StableHLO → GPU → SPIR-V pipeline
         std.debug.print("Lowering MLIR module through StableHLO → GPU → SPIR-V pipeline...\n", .{});
-        try mlir_context.lowerToSPIRV(self.allocator, module);
+        _ = try mlir_context.lowerToSPIRV(self.allocator, module);
         
         // Step 2: Extract GPU kernel names from the lowered module
         const kernel_names = try mlir_context.getGpuKernelNames(module);
@@ -353,7 +353,7 @@ pub const MLIRMetalExecutionEngine = struct {
         const metal_library = try self.compileMSLToMetal(msl_code);
         
         // Step 5: Extract GPU kernel metadata
-        const gpu_kernels = try mlir_ctx.extractGPUKernelInfo(self.allocator, module);
+        const gpu_kernels = try mlir_ctx.extractGPUKernelInfo(self.allocator, spirv_binary);
         defer {
             for (gpu_kernels) |*kernel| {
                 kernel.deinit(self.allocator);

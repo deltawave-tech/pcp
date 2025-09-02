@@ -73,10 +73,18 @@ pub const MLIRBuilder = struct {
 
 
     /// Helper to create a new tensor from an mlir.Value
-    /// Create constant operation with data
     pub fn newTensor(self: *Self, value: mlir.Value) !Tensor {
         const mlir_type = value.getType();
-        const shaped_type = mlir.RankedTensorType{ .handle = mlir_type.handle };
+
+        // SAFE: Use the .as() method to safely cast to a RankedTensorType.
+        const shaped_type = mlir_type.as(mlir.RankedTensorType) orelse {
+            // If the cast fails, it's not a ranked tensor. Return an error.
+            std.log.err("Attempted to create a Tensor from a non-RankedTensorType value.", .{});
+            // For better debugging, you could dump the value here:
+            // @import("mlir/c.zig").c.mlirValueDump(value.handle);
+            return error.InvalidTensorType;
+        };
+
         const shape = try tensor.Shape.fromMLIR(shaped_type, self.allocator);
         return Tensor{
             .shape = shape,
@@ -178,17 +186,23 @@ pub const MLIRBuilder = struct {
         std.log.info("MLIRBuilder.createFunction: Getting operation state...", .{});
         var state = c_api.operationStateGet("func.func", self.loc.handle);
 
-        // 2. Add the function's attributes (type and name)
+        // 2. Add the function's attributes (type, name, and now visibility)
         std.log.info("MLIRBuilder.createFunction: Creating attributes...", .{});
         const func_type_attr = mlir.Attribute.typeAttr(func_type);
         const sym_name_attr = mlir.Attribute.stringAttr(self.ctx, name);
 
+        // FIX: Add the 'sym_visibility' attribute and set it to "private".
+        // This resolves the MLIR validation error.
+        const visibility_attr = mlir.Attribute.stringAttr(self.ctx, "private");
+
         const func_type_id = c_api.identifierGet(self.ctx.handle, "function_type");
         const sym_name_id = c_api.identifierGet(self.ctx.handle, "sym_name");
+        const visibility_id = c_api.identifierGet(self.ctx.handle, "sym_visibility");
 
         var named_attrs = [_]c_api.MlirNamedAttribute{
             .{ .name = func_type_id, .attribute = func_type_attr.handle },
             .{ .name = sym_name_id, .attribute = sym_name_attr.handle },
+            .{ .name = visibility_id, .attribute = visibility_attr.handle }, // Add the new attribute here
         };
         c_api.mlirOperationStateAddAttributes(&state, named_attrs.len, @ptrCast(&named_attrs[0]));
         std.log.info("MLIRBuilder.createFunction: Attributes added", .{});
@@ -205,6 +219,15 @@ pub const MLIRBuilder = struct {
         const func_op_handle = c_api.operationCreate(&state);
         const func_op = mlir.Operation{ .handle = func_op_handle };
         std.log.info("MLIRBuilder.createFunction: Operation created", .{});
+
+        // VERIFY the operation. If it's malformed, we find out now.
+        std.log.info("MLIRBuilder.createFunction: Verifying created function...", .{});
+        if (!func_op.verify()) {
+            std.log.err("MLIR operation verification failed for function '{s}'. Dumping operation:", .{name});
+            func_op.dump();
+            return error.OperationVerificationFailed;
+        }
+        std.log.info("MLIRBuilder.createFunction: Function verified successfully", .{});
 
         // --- START FIX ---
         // The `bootstrap_region` handle is now stale. Get the canonical region handle
@@ -429,9 +452,13 @@ pub fn matmul(builder: *MLIRBuilder, a: Tensor, b: Tensor) !Tensor {
 
 /// ReLU activation using stablehlo.maximum with zero constant
 pub fn relu(builder: *MLIRBuilder, a: Tensor) !Tensor {
-    // Create zero constant with same type as input
-    const element_type = a.value.getType().as(mlir.RankedTensorType).?.getElementType();
-    // Get dimensions as slice for hlo API
+    // SAFE: Validate the input tensor's type before proceeding.
+    const ranked_tensor_type = a.value.getType().as(mlir.RankedTensorType) orelse {
+        std.log.err("relu operation requires a RankedTensorType input.", .{});
+        return error.InvalidInputType;
+    };
+    const element_type = ranked_tensor_type.getElementType();
+
     const dims = try a.shape.getDims(builder.allocator);
     defer builder.allocator.free(dims);
     const zero_op = hlo.zeroConstant(builder.ctx, dims, element_type);
@@ -514,8 +541,8 @@ pub fn softmax(builder: *MLIRBuilder, a: Tensor) !Tensor {
     const exp_shifted = try exp(builder, shifted);
     defer exp_shifted.deinit();
 
-    // Step 4: Sum exp values along last dimension
-    const sum_exp = try reduceSum(builder, exp_shifted, &[_]i64{@intCast(a.shape.rank() - 1)});
+    // Step 4: Sum exp values along last dimension, keeping rank for broadcasting
+    const sum_exp = try reduceSum(builder, exp_shifted, &[_]i64{@intCast(a.shape.rank() - 1)}, true); // FIX: keep_dims = true
     defer sum_exp.deinit();
 
     // Step 5: Divide: exp(x - max(x)) / sum(exp(x - max(x)))
@@ -539,11 +566,12 @@ pub fn reduceMax(builder: *MLIRBuilder, a: Tensor, dimensions: []const i64) !Ten
 }
 
 /// Reduce sum operation along specified dimensions
-pub fn reduceSum(builder: *MLIRBuilder, a: Tensor, dimensions: []const i64) !Tensor {
-    // Use StableHLO dialect wrapper with keep_dims = false (default behavior)
-    const operation = hlo.reduce_sum(builder.ctx, a.value, dimensions, false, builder.loc);
+pub fn reduceSum(builder: *MLIRBuilder, a: Tensor, dimensions: []const i64, keep_dims: bool) !Tensor {
+    // Pass keep_dims to the HLO builder
+    const operation = hlo.reduce_sum(builder.ctx, a.value, dimensions, keep_dims, builder.loc);
 
-    return try builder.newTensor(operation.getResult(0));
+    // Append the operation and return the new tensor
+    return try builder.createAndAppendOp(operation);
 }
 
 /// Create a constant tensor

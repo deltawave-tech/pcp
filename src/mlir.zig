@@ -232,8 +232,8 @@ pub const Context = struct {
             return c.c.operationGetAttribute(self.handle, @intCast(index));
         }
         
-        pub fn verify(self: Self) c.c.MlirLogicalResult {
-            return c.c.mlirOperationVerify(self.handle);
+        pub fn verify(self: Self) bool {
+            return c.c.mlirOperationVerify(self.handle).isSuccess();
         }
     };
     
@@ -435,6 +435,11 @@ pub const Context = struct {
             return Type{ .handle = c.c.valueGetType(self.handle) };
         }
         
+        /// Dump this value to stdout for debugging
+        pub fn dump(self: Self) void {
+            c.c.mlirValueDump(self.handle);
+        }
+        
     };
     
     /// MLIR Attribute - represents compile-time constants and metadata
@@ -554,9 +559,10 @@ pub const Context = struct {
         }
         
         /// Get the shape as a slice of dimensions
-        pub fn getShape(self: Self) []i64 {
+        /// Caller is responsible for freeing the returned slice
+        pub fn getShape(self: Self, allocator: std.mem.Allocator) ![]i64 {
             const rank = self.getRank();
-            var shape = std.heap.page_allocator.alloc(i64, rank) catch unreachable;
+            const shape = try allocator.alloc(i64, rank);
             for (0..rank) |i| {
                 shape[i] = self.getDimension(i);
             }

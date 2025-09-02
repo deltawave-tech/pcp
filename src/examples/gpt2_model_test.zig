@@ -74,8 +74,13 @@ pub fn main() !void {
     const x = try builder.newTensor(all_func_args[param_shapes.len]);
     const y = try builder.newTensor(all_func_args[param_shapes.len + 1]);
 
+    std.debug.print("Debug: About to call model.forwardWithLoss...\n", .{});
+    std.debug.print("Debug: Input x type: {}\n", .{@intFromPtr(x.value.getType().handle)});
+    std.debug.print("Debug: Input y type: {}\n", .{@intFromPtr(y.value.getType().handle)});
+    
     // 6. Build the forward pass and loss calculation graph
     const outputs = try model.forwardWithLoss(x, y, &builder);
+    std.debug.print("Debug: model.forwardWithLoss completed successfully...\n", .{});
     
     // 7. Create the `func.return` operation
     _ = try builder.createAndAttach("func.return", &.{outputs.loss.value}, &.{});
@@ -87,7 +92,7 @@ pub fn main() !void {
 
     // 9. (Crucial) Verify the module. This will catch any MLIR errors.
     const verification_result = builder.module.op().verify();
-    if (verification_result.isFailure()) {
+    if (!verification_result) {
         std.debug.print("💣 MLIR verification failed!\n", .{});
         return error.MLIRVerificationFailed;
     }

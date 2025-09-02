@@ -136,6 +136,7 @@ pub const c = struct {
     pub extern fn mlirBlockAddArgument(block: *MlirBlock, type: *MlirType, loc: *MlirLocation) *MlirValue;
     pub extern fn mlirValueIsAOpResult(value: *MlirValue) bool;
     pub extern fn mlirOpResultGetOwner(value: *MlirValue) *MlirOperation;
+    pub extern fn mlirValueDump(value: *MlirValue) void;
     extern fn mlirStringRefFromString(str: [*:0]const u8) MlirStringRef;
     extern fn mlirBlockGetArgument(block: *MlirBlock, pos: isize) *MlirValue;
     extern fn mlirBlockGetNumArguments(block: *MlirBlock) isize;

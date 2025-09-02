@@ -306,7 +306,8 @@ pub const MLIRMetalExecutionEngine = struct {
         
         // Calculate number of elements from the tensor type
         const tensor_type = value.getType().as(mlir.RankedTensorType).?;
-        const shape = tensor_type.getShape();
+        const shape = tensor_type.getShape(self.allocator) catch return error.OutOfMemory;
+        defer self.allocator.free(shape);
         var num_elements: usize = 1;
         for (shape) |dim| {
             num_elements *= @intCast(dim);

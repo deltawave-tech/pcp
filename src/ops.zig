@@ -727,12 +727,77 @@ pub fn convert(builder: *MLIRBuilder, a: Tensor, target_type: mlir.Type) !Tensor
     return try builder.createAndAppendOp(operation);
 }
 
-/// One-hot encoding operation
 pub fn oneHot(builder: *MLIRBuilder, indices: Tensor, depth: i64, on_value: f64, off_value: f64, axis: i64, element_type: mlir.Type) !Tensor {
-    // Use StableHLO dialect wrapper
-    const operation = hlo.one_hot(builder.ctx, indices.value, depth, @floatCast(on_value), @floatCast(off_value), axis, element_type, builder.loc);
+    const ctx = builder.ctx;
+    const allocator = builder.allocator;
 
-    return try builder.createAndAppendOp(operation);
+    // Normalize axis if negative
+    const indices_rank = indices.shape.rank();
+    const effective_axis = if (axis < 0) axis + @as(i64, @intCast(indices_rank + 1)) else axis;
+
+    if (effective_axis < 0 or effective_axis > indices_rank) {
+        return error.InvalidAxis;
+    }
+
+    // Get indices shape
+    const indices_shape = try indices.shape.getDims(allocator);
+    defer allocator.free(indices_shape);
+
+    // Calculate result shape: insert depth at effective_axis
+    var result_shape = try allocator.alloc(i64, indices_rank + 1);
+    defer allocator.free(result_shape);
+
+    @memcpy(result_shape[0..@intCast(effective_axis)], indices_shape[0..@intCast(effective_axis)]);
+    result_shape[@intCast(effective_axis)] = depth;
+    @memcpy(result_shape[@as(usize, @intCast(effective_axis)) + 1 ..], indices_shape[@intCast(effective_axis)..]);
+
+    // Create iota tensor: [0 .. depth-1] along a 1D tensor
+    const iota_shape = [_]i64{depth};
+    const iota_elem_type = mlir.Type.i64Type(ctx);
+    const iota_tensor = try iota(builder, &iota_shape, 0, iota_elem_type);
+
+    // Broadcast iota to result shape, placing it at effective_axis
+    var iota_broadcast_dims = try allocator.alloc(i64, 1);
+    defer allocator.free(iota_broadcast_dims);
+    iota_broadcast_dims[0] = effective_axis;
+
+    const broadcast_iota = try broadcastInDim(builder, iota_tensor, result_shape, iota_broadcast_dims);
+
+    // Convert indices to i64 if necessary
+    const indices_elem_type = indices.value.getType().as(mlir.RankedTensorType).?.getElementType();
+    var indices_for_compare = indices;
+    if (indices_elem_type.handle != iota_elem_type.handle) {
+        const indices_i64_type = mlir.Type.rankedTensorType(ctx, indices_shape, iota_elem_type);
+        indices_for_compare = try convert(builder, indices, indices_i64_type);
+    }
+
+    // Broadcast indices to result shape, inserting singleton at effective_axis
+    var indices_broadcast_shape = try allocator.alloc(i64, result_shape.len);
+    defer allocator.free(indices_broadcast_shape);
+    @memcpy(indices_broadcast_shape, result_shape);
+    indices_broadcast_shape[@intCast(effective_axis)] = 1;
+
+    var indices_broadcast_dims = try allocator.alloc(i64, indices_rank);
+    defer allocator.free(indices_broadcast_dims);
+    var dim_idx: i64 = 0;
+    for (0..result_shape.len) |i| {
+        if (@as(i64, @intCast(i)) != effective_axis) {
+            indices_broadcast_dims[@intCast(dim_idx)] = @intCast(i);
+            dim_idx += 1;
+        }
+    }
+
+    const broadcast_indices = try broadcastInDim(builder, indices_for_compare, result_shape, indices_broadcast_dims);
+
+    // Compare equality: indices_broadcast == iota_broadcast
+    const eq_tensor = try compare(builder, broadcast_indices, broadcast_iota, .EQ);
+
+    // Create on_value and off_value tensors
+    const on_tensor = try constant(builder, on_value, result_shape, element_type);
+    const off_tensor = try constant(builder, off_value, result_shape, element_type);
+
+    // Select based on equality
+    return select(builder, eq_tensor, on_tensor, off_tensor);
 }
 
 /// Creates a constant tensor from a scalar value, broadcasting to a given shape.

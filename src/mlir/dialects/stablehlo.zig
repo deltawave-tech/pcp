@@ -690,46 +690,50 @@ pub fn iota(ctx: mlir.Context, shape: []const i64, iota_dimension: i64, element_
 }
 
 /// Creates a stablehlo.one_hot operation
-/// Creates a stablehlo.one_hot operation
-pub fn one_hot(ctx: mlir.Context, indices: mlir.Value, depth: i64, on_value: f32, off_value: f32, axis: i64, element_type: mlir.Type, loc: mlir.Location) mlir.Operation {
-    // REMOVED: const depth_attr = mlir.Attribute.integerAttr(ctx, depth, mlir.Type.i64Type(ctx));
+/// Creates a chlo.one_hot operation
+pub fn one_hot(ctx: mlir.Context, indices: mlir.Value, depth: i64, on_value: f32, off_value: f32, axis: i64, element_type: mlir.Type, loc: mlir.Location) !mlir.Operation {
     const axis_attr = mlir.Attribute.integerAttr(ctx, axis, mlir.Type.i64Type(ctx));
     const on_value_attr = mlir.Attribute.floatAttr(ctx, @floatCast(on_value), element_type);
     const off_value_attr = mlir.Attribute.floatAttr(ctx, @floatCast(off_value), element_type);
-    
-    // Calculate result shape (this part is already correct and uses 'depth')
-    const indices_type = indices.getType().as(mlir.RankedTensorType) orelse unreachable;
-    const indices_shape = indices_type.getShape(std.heap.page_allocator) catch unreachable;
+
+    // ... (shape calculation logic remains the same) ...
+    const indices_type = indices.getType().as(mlir.RankedTensorType) orelse return error.InvalidTensorType;
+    const indices_shape = try indices_type.getShape(std.heap.page_allocator);
     defer std.heap.page_allocator.free(indices_shape);
     
     var result_dims = std.ArrayList(i64).init(std.heap.page_allocator);
     defer result_dims.deinit();
     
-    // Insert depth dimension at axis position
     for (indices_shape, 0..) |dim, i| {
         if (@as(i64, @intCast(i)) == axis) {
-            result_dims.append(depth) catch unreachable;
+            try result_dims.append(depth);
         }
-        result_dims.append(dim) catch unreachable;
+        try result_dims.append(dim);
     }
-    // If axis is at the end
     if (axis == @as(i64, @intCast(indices_shape.len))) {
-        result_dims.append(depth) catch unreachable;
+        try result_dims.append(depth);
     }
     
     const result_type = mlir.Type.tensor(result_dims.items, element_type);
-    
-    return mlir.Operation.create(ctx, "stablehlo.one_hot", .{
+
+    // CHANGE THE OPERATION NAME HERE
+    const op = mlir.Operation.create(ctx, "chlo.one_hot", .{
         .operands = &.{indices},
         .results = &.{result_type},
         .attributes = &.{
-            // REMOVED: .{ "depth", depth_attr },
             .{ "axis", axis_attr },
             .{ "on_value", on_value_attr },
             .{ "off_value", off_value_attr },
         },
         .location = loc,
     });
+    
+    // Since we are now creating a `chlo` op, we need to manually add the depth attribute.
+    const depth_attr = mlir.Attribute.integerAttr(ctx, depth, mlir.Type.i64Type(ctx));
+    const c_api = @import("../c.zig").c;
+    c_api.operationSetAttributeByName(op.handle, "depth", depth_attr.handle);
+    
+    return op;
 }
 
 /// Creates a stablehlo.convert operation

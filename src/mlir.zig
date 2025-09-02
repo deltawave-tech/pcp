@@ -470,6 +470,11 @@ pub const Context = struct {
             return Self{ .handle = c.c.mlirDenseElementsAttrRawBufferGet(shaped_type.handle, host_data.len, host_data.ptr) };
         }
         
+        /// Create a dense elements attribute by "splatting" a single value across all elements
+        pub fn denseElementsAttrSplat(shaped_type: Type, value: f64) Self {
+            return Self{ .handle = c.c.mlirDenseElementsAttrFloatSplatGet(shaped_type.handle, value) };
+        }
+        
         /// Create a dictionary attribute from named attributes.
         pub fn dictionary(context: Context, named_attrs: []const c.c.MlirNamedAttribute) Self {
             return Self{ .handle = c.c.dictionaryAttrGet(context.handle, named_attrs) };

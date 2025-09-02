@@ -49,16 +49,7 @@ pub const MLIRBuilder = struct {
     /// Helper to create scalar constant tensors
     pub fn scalarConstant(self: *Self, value: f32) !Tensor {
         const element_type = mlir.Type.f32Type(self.ctx);
-        const scalar_type = mlir.Type.tensor(&.{}, element_type); // Rank-0 tensor
-        const attr = mlir.Attribute.floatAttr(self.ctx, value, element_type);
-        
-        const constant_op = hlo.constant(self.ctx, .{
-            .value = attr,
-            .result_type = scalar_type,
-        });
-        
-        self.insertion_block.appendOwnedOperation(constant_op);
-        return try self.newTensor(constant_op.getResult(0));
+        return constant(self, @floatCast(value), &.{}, element_type);
     }
 
     /// Temporarily sets the insertion point to a new block.
@@ -602,20 +593,102 @@ pub fn reduceSum(builder: *MLIRBuilder, a: Tensor, dimensions: []const i64, keep
     }
 }
 
-/// Create a constant tensor
-pub fn constant(builder: *MLIRBuilder, value: f64, shape: []const i64, element_type: mlir.Type) !Tensor {
-    // Use StableHLO dialect wrapper for scalar constant
-    const operation = hlo.scalarConstant(builder.ctx, value, element_type);
-    builder.insertion_block.appendOwnedOperation(operation);
+/// Element-wise reciprocal square root (1/sqrt(x))
+pub fn rsqrt(builder: *MLIRBuilder, a: Tensor) !Tensor {
+    // Use StableHLO dialect wrapper
+    const operation = hlo.rsqrt(builder.ctx, a.value, builder.loc);
 
-    // If we need a non-scalar, broadcast it
-    if (shape.len > 0) {
-        const scalar_value = operation.getResult(0);
-        const broadcast_op = hlo.broadcast_in_dim(builder.ctx, scalar_value, shape, &.{}, builder.loc);
-        return try builder.createAndAppendOp(broadcast_op);
-    } else {
-        return try builder.newTensor(operation.getResult(0));
-    }
+    return try builder.createAndAppendOp(operation);
+}
+
+/// Slice operation to extract sub-tensors
+pub fn slice(builder: *MLIRBuilder, a: Tensor, start_indices: []const i64, limit_indices: []const i64, strides: []const i64) !Tensor {
+    // Use StableHLO dialect wrapper
+    const operation = hlo.slice(builder.ctx, a.value, start_indices, limit_indices, strides, builder.loc);
+
+    return try builder.createAndAppendOp(operation);
+}
+
+/// Iota operation to create tensors with incrementing values along a dimension
+pub fn iota(builder: *MLIRBuilder, shape: []const i64, iota_dimension: i64, element_type: mlir.Type) !Tensor {
+    // Use StableHLO dialect wrapper
+    const operation = hlo.iota(builder.ctx, shape, iota_dimension, element_type, builder.loc);
+
+    return try builder.createAndAppendOp(operation);
+}
+
+/// Compare operation for element-wise comparisons
+pub fn compare(builder: *MLIRBuilder, lhs: Tensor, rhs: Tensor, direction: hlo.CompareDirection) !Tensor {
+    // Use StableHLO dialect wrapper
+    const operation = hlo.compare(builder.ctx, lhs.value, rhs.value, direction, builder.loc);
+
+    return try builder.createAndAppendOp(operation);
+}
+
+/// Broadcast in dimension operation
+pub fn broadcastInDim(builder: *MLIRBuilder, operand: Tensor, target_shape: []const i64, broadcast_dimensions: []const i64) !Tensor {
+    // Use StableHLO dialect wrapper
+    const operation = hlo.broadcast_in_dim(builder.ctx, operand.value, target_shape, broadcast_dimensions, builder.loc);
+
+    return try builder.createAndAppendOp(operation);
+}
+
+/// Select operation for conditional selection
+pub fn select(builder: *MLIRBuilder, pred: Tensor, on_true: Tensor, on_false: Tensor) !Tensor {
+    // Use StableHLO dialect wrapper
+    const operation = hlo.select(builder.ctx, pred.value, on_true.value, on_false.value, builder.loc);
+
+    return try builder.createAndAppendOp(operation);
+}
+
+/// Element-wise tanh operation
+pub fn tanh(builder: *MLIRBuilder, a: Tensor) !Tensor {
+    // Use StableHLO dialect wrapper
+    const operation = hlo.tanh(builder.ctx, a.value, builder.loc);
+
+    return try builder.createAndAppendOp(operation);
+}
+
+/// Element-wise natural logarithm
+pub fn log(builder: *MLIRBuilder, a: Tensor) !Tensor {
+    // Use StableHLO dialect wrapper
+    const operation = hlo.log(builder.ctx, a.value, builder.loc);
+
+    return try builder.createAndAppendOp(operation);
+}
+
+/// Type conversion operation
+pub fn convert(builder: *MLIRBuilder, a: Tensor, target_type: mlir.Type) !Tensor {
+    // Use StableHLO dialect wrapper
+    const operation = hlo.convert(builder.ctx, a.value, target_type, builder.loc);
+
+    return try builder.createAndAppendOp(operation);
+}
+
+/// One-hot encoding operation
+pub fn oneHot(builder: *MLIRBuilder, indices: Tensor, depth: i64, on_value: f64, off_value: f64, axis: i64, element_type: mlir.Type) !Tensor {
+    // Use StableHLO dialect wrapper
+    const operation = hlo.one_hot(builder.ctx, indices.value, depth, @floatCast(on_value), @floatCast(off_value), axis, element_type, builder.loc);
+
+    return try builder.createAndAppendOp(operation);
+}
+
+/// Creates a constant tensor from a scalar value, broadcasting to a given shape.
+/// This is now the single source of truth for creating constants.
+pub fn constant(builder: *MLIRBuilder, value: f64, shape: []const i64, element_type: mlir.Type) !Tensor {
+    const tensor_type = mlir.Type.rankedTensorType(builder.ctx, shape, element_type);
+    
+    // Create a dense attribute for the value. For a scalar, this is simple.
+    // For a tensor, it broadcasts the value across the shape.
+    const attr = mlir.Attribute.denseElementsAttrSplat(tensor_type, value);
+
+    const constant_op = hlo.constant(builder.ctx, .{
+        .value = attr,
+        .result_type = tensor_type,
+    });
+    
+    // Use the reliable "create and append" pattern.
+    return builder.createAndAppendOp(constant_op);
 }
 
 /// Gather operation for embedding lookups

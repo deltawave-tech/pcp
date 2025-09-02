@@ -164,6 +164,7 @@ pub const c = struct {
     // Attribute operations for constants
     extern fn mlirAttributeGetNull() *MlirAttribute;
     pub extern fn mlirDenseElementsAttrRawBufferGet(shapedType: *MlirType, rawBufferSize: usize, rawBuffer: *const anyopaque) *MlirAttribute;
+    pub extern fn mlirDenseElementsAttrFloatSplatGet(shapedType: *MlirType, value: f64) *MlirAttribute;
     pub extern fn mlirFloatAttrDoubleGet(ctx: *MlirContext, type: *MlirType, value: f64) *MlirAttribute;
     pub extern fn mlirIntegerAttrGet(type: *MlirType, value: i64) *MlirAttribute;
     pub extern fn mlirDenseI64ArrayGet(ctx: *MlirContext, size: isize, values: [*]const i64) *MlirAttribute;

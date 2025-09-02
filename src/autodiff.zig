@@ -439,7 +439,7 @@ fn reluVJP(
     
     if (!isValueFromConstantOp(x)) {
         // Create mask: x > 0
-        const zero = try builder.createScalarConstant(0.0, x.getType());
+        const zero = try builder.scalarConstant(0.0);
         const mask = try builder.createAndAttach("stablehlo.compare", &.{ x, zero }, &.{x.getType()}); // x > 0
         
         // Apply mask: grad_out * mask
@@ -582,8 +582,15 @@ fn gatherVJP(
     if (!isValueFromConstantOp(operand)) {
         const original_shape_type = operand.getType();
         
-        // Create zero tensor with original shape
-        const zero_tensor = try builder.createAndAttach("stablehlo.constant", &.{}, &.{original_shape_type});
+        // Create zero tensor with original shape using proper constant creation
+        const ranked_type = original_shape_type.as(mlir.RankedTensorType) orelse return error.InvalidTensorType;
+        const shape = try ranked_type.getShape(builder.allocator);
+        defer builder.allocator.free(shape);
+        const element_type = ranked_type.getElementType();
+        
+        const zero_constant_op = hlo.zeroConstant(builder.ctx, shape, element_type);
+        builder.insertion_block.appendOwnedOperation(zero_constant_op);
+        const zero_tensor = zero_constant_op;
         
         // Use proper stablehlo.scatter operation with dimension numbers
         // For embedding lookup, we typically scatter back to dimension 0

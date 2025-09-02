@@ -67,7 +67,7 @@ pub fn constant(ctx: mlir.Context, args: struct {
 /// Creates a zero constant tensor
 pub fn zeroConstant(ctx: mlir.Context, shape: []const i64, element_type: mlir.Type) mlir.Operation {
     const tensor_type = mlir.Type.rankedTensorType(ctx, shape, element_type);
-    const zero_attr = mlir.Attribute.floatAttr(ctx, 0.0, element_type);
+    const zero_attr = mlir.Attribute.denseElementsAttrSplat(tensor_type, 0.0);
     return constant(ctx, .{
         .value = zero_attr,
         .result_type = tensor_type,
@@ -172,9 +172,9 @@ pub fn reduce_sum(
     }
     const result_type = mlir.Type.rankedTensorType(ctx, result_shape_list.items, element_type);
 
-    // 2. Create the zero constant for init_value
-    const zero_attr = mlir.Attribute.floatAttr(ctx, 0.0, element_type);
+    // 2. Create the zero constant for init_value using centralized denseElementsAttrSplat
     const scalar_type = mlir.Type.tensor(&.{}, element_type);
+    const zero_attr = mlir.Attribute.denseElementsAttrSplat(scalar_type, 0.0);
     const init_constant_op = constant(ctx, .{ .value = zero_attr, .result_type = scalar_type });
 
     // FIX: Attach the constant op to the graph before using its result.
@@ -503,8 +503,8 @@ pub fn reduce(ctx: mlir.Context, operand: mlir.Value, init_value: mlir.Value, di
 
 /// Create a scalar constant
 pub fn scalarConstant(ctx: mlir.Context, value: f64, element_type: mlir.Type) mlir.Operation {
-    const attr = mlir.Attribute.floatAttr(ctx, value, element_type);
     const scalar_type = mlir.Type.tensor(&.{}, element_type); // Scalar tensor (rank 0)
+    const attr = mlir.Attribute.denseElementsAttrSplat(scalar_type, value);
     
     return constant(ctx, .{
         .value = attr,
@@ -514,8 +514,8 @@ pub fn scalarConstant(ctx: mlir.Context, value: f64, element_type: mlir.Type) ml
 
 /// Create a zero constant of given shape and type (renamed to avoid duplicate)
 pub fn zeroTensor(ctx: mlir.Context, shape: []const i64, element_type: mlir.Type) mlir.Operation {
-    const attr = mlir.Attribute.floatAttr(ctx, 0.0, element_type);
     const tensor_type = mlir.Type.tensor(shape, element_type);
+    const attr = mlir.Attribute.denseElementsAttrSplat(tensor_type, 0.0);
     
     return constant(ctx, .{
         .value = attr,
@@ -525,8 +525,8 @@ pub fn zeroTensor(ctx: mlir.Context, shape: []const i64, element_type: mlir.Type
 
 /// Create a ones constant of given shape and type
 pub fn onesConstant(ctx: mlir.Context, shape: []const i64, element_type: mlir.Type) mlir.Operation {
-    const attr = mlir.Attribute.floatAttr(ctx, 1.0, element_type);
     const tensor_type = mlir.Type.tensor(shape, element_type);
+    const attr = mlir.Attribute.denseElementsAttrSplat(tensor_type, 1.0);
     
     return constant(ctx, .{
         .value = attr,

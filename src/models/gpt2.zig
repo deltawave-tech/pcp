@@ -1,6 +1,7 @@
 const std = @import("std");
 const hlo = @import("../mlir/dialects/stablehlo.zig");
 const mlir = @import("../mlir.zig");
+const ops = @import("../ops.zig");
 
 const Allocator = std.mem.Allocator;
 const Shape = @import("../tensor.zig").Shape;
@@ -162,7 +163,6 @@ pub fn LayerNorm(comptime DataType: type) type {
         /// Mathematically correct layer normalization implementation
         pub fn forward(self: *@This(), x: Tensor, builder: *MLIRBuilder) !Tensor {
             const ctx = builder.ctx;
-            const loc = builder.loc;
             
             // Input x has shape [batch, seq_len, n_embd]
             // We normalize along the last dimension (n_embd)
@@ -171,67 +171,48 @@ pub fn LayerNorm(comptime DataType: type) type {
             
             // Step 1: Calculate mean along last dimension
             // sum = stablehlo.reduce_sum(x, dimension=last_dim, keep_dims=true)
-            const sum_tensor = try builder.createAndAppendOp(try hlo.reduce_sum(ctx, builder, x.value, &[_]i64{@intCast(last_dim)}, loc));
+            const sum_tensor = try ops.reduceSum(builder, x, &[_]i64{@intCast(last_dim)}, true); // keep_dims=true for broadcasting
             
             // Create size constant and divide to get mean
-            const size_const = try builder.scalarConstant(@floatFromInt(n_embd_size));
+            const size_const = try ops.constant(builder, @floatFromInt(n_embd_size), &.{}, mlir.Type.f32Type(ctx));
             
-            const mean = try builder.createAndAppendOp(hlo.divide(ctx, sum_tensor.value, size_const.value, loc));
+            const mean = try ops.divide(builder, sum_tensor, size_const);
             
-            // Step 2: Calculate variance = mean(x^2) - mean(x)^2 (working directly with values)
+            // Step 2: Calculate variance = mean(x^2) - mean(x)^2
             // x_squared = stablehlo.multiply(x, x)
-            const x_squared_op = hlo.multiply(ctx, x.value, x.value, loc);
-            builder.insertion_block.appendOwnedOperation(x_squared_op);
-            const x_squared_val = x_squared_op.getResult(0);
+            const x_squared = try ops.multiply(builder, x, x);
             
             // mean_x_squared = reduce_sum(x_squared) / size
-            const sum_x_squared_val = (try hlo.reduce_sum(ctx, builder, x_squared_val, &[_]i64{@intCast(last_dim)}, loc)).getResult(0);
-            const mean_x_squared_op = hlo.divide(ctx, sum_x_squared_val, size_const.value, loc);
-            builder.insertion_block.appendOwnedOperation(mean_x_squared_op);
-            const mean_x_squared_val = mean_x_squared_op.getResult(0);
+            const sum_x_squared = try ops.reduceSum(builder, x_squared, &[_]i64{@intCast(last_dim)}, false);
+            const mean_x_squared = try ops.divide(builder, sum_x_squared, size_const);
             
             // mean_squared = mean * mean
-            const mean_squared_op = hlo.multiply(ctx, mean.value, mean.value, loc);
-            builder.insertion_block.appendOwnedOperation(mean_squared_op);
-            const mean_squared_val = mean_squared_op.getResult(0);
+            const mean_squared = try ops.multiply(builder, mean, mean);
             
             // variance = mean_x_squared - mean_squared
-            const variance_op = hlo.subtract(ctx, mean_x_squared_val, mean_squared_val, loc);
-            builder.insertion_block.appendOwnedOperation(variance_op);
-            const variance_val = variance_op.getResult(0);
+            const variance = try ops.subtract(builder, mean_x_squared, mean_squared);
             
             // Step 3: Apply normalization
             // Add epsilon: variance_eps = variance + epsilon
-            const epsilon_const = try builder.scalarConstant(self.epsilon);
-            const variance_eps_op = hlo.add(ctx, variance_val, epsilon_const.value, loc);
-            builder.insertion_block.appendOwnedOperation(variance_eps_op);
-            const variance_eps_val = variance_eps_op.getResult(0);
+            const epsilon_const = try ops.constant(builder, self.epsilon, &.{}, mlir.Type.f32Type(ctx));
+            const variance_eps = try ops.add(builder, variance, epsilon_const);
             
             // rsqrt_var = rsqrt(variance_eps)
-            const rsqrt_var_op = hlo.rsqrt(ctx, variance_eps_val, loc);
-            builder.insertion_block.appendOwnedOperation(rsqrt_var_op);
-            const rsqrt_var_val = rsqrt_var_op.getResult(0);
+            const rsqrt_var = try ops.rsqrt(builder, variance_eps);
             
             // Center x: x_centered = x - mean
-            const x_centered_op = hlo.subtract(ctx, x.value, mean.value, loc);
-            builder.insertion_block.appendOwnedOperation(x_centered_op);
-            const x_centered_val = x_centered_op.getResult(0);
+            const x_centered = try ops.subtract(builder, x, mean);
             
             // Normalize: x_norm = x_centered * rsqrt_var
-            const x_norm_op = hlo.multiply(ctx, x_centered_val, rsqrt_var_val, loc);
-            builder.insertion_block.appendOwnedOperation(x_norm_op);
-            const x_norm_val = x_norm_op.getResult(0);
+            const x_norm = try ops.multiply(builder, x_centered, rsqrt_var);
             
             // Step 4: Apply scale and shift
             // Scale: x_scaled = x_norm * self.weight
-            const x_scaled_op = hlo.multiply(ctx, x_norm_val, self.weight.value, loc);
-            builder.insertion_block.appendOwnedOperation(x_scaled_op);
-            const x_scaled_val = x_scaled_op.getResult(0);
+            const x_scaled = try ops.multiply(builder, x_norm, self.weight);
             
             // Shift: output = x_scaled + self.bias
-            const output_op = hlo.add(ctx, x_scaled_val, self.bias.value, loc);
-            builder.insertion_block.appendOwnedOperation(output_op);
-            return builder.newTensor(output_op.getResult(0));
+            const output = try ops.add(builder, x_scaled, self.bias);
+            return output;
         }
     };
 }
@@ -317,153 +298,111 @@ pub fn Attention(comptime DataType: type) type {
             const slice_limit_q = [_]i64{ batch_size, seq_len, n_embd };
             const slice_strides = [_]i64{ 1, 1, 1 };
             
-            const q_op = hlo.slice(ctx, qkv.value, &slice_start_q, &slice_limit_q, &slice_strides, loc);
-            const q = try builder.newTensor(q_op.getResult(0));
+            const q = try ops.slice(builder, qkv, &slice_start_q, &slice_limit_q, &slice_strides);
 
             
             const slice_start_k = [_]i64{ 0, 0, n_embd };
             const slice_limit_k = [_]i64{ batch_size, seq_len, 2 * n_embd };
             
-            const k_op = hlo.slice(ctx, qkv.value, &slice_start_k, &slice_limit_k, &slice_strides, loc);
-            const k = try builder.newTensor(k_op.getResult(0));
+            const k = try ops.slice(builder, qkv, &slice_start_k, &slice_limit_k, &slice_strides);
 
             
             const slice_start_v = [_]i64{ 0, 0, 2 * n_embd };
             const slice_limit_v = [_]i64{ batch_size, seq_len, 3 * n_embd };
             
-            const v_op = hlo.slice(ctx, qkv.value, &slice_start_v, &slice_limit_v, &slice_strides, loc);
-            const v = try builder.newTensor(v_op.getResult(0));
+            const v = try ops.slice(builder, qkv, &slice_start_v, &slice_limit_v, &slice_strides);
 
             
             // Step 3: Reshape for multi-head attention
             // Reshape from [B, T, C] to [B, T, n_head, head_dim]
             const head_shape = [_]i64{ batch_size, seq_len, n_head, head_dim };
             
-            const q_reshaped_op = hlo.reshape(ctx, q.value, &head_shape, loc);
-            const q_reshaped = try builder.newTensor(q_reshaped_op.getResult(0));
+            const q_reshaped = try ops.reshape(builder, q, &head_shape);
 
             
-            const k_reshaped_op = hlo.reshape(ctx, k.value, &head_shape, loc);
-            const k_reshaped = try builder.newTensor(k_reshaped_op.getResult(0));
+            const k_reshaped = try ops.reshape(builder, k, &head_shape);
 
             
-            const v_reshaped_op = hlo.reshape(ctx, v.value, &head_shape, loc);
-            const v_reshaped = try builder.newTensor(v_reshaped_op.getResult(0));
+            const v_reshaped = try ops.reshape(builder, v, &head_shape);
 
             
             // Transpose to [B, n_head, T, head_dim] for efficient batched matmul
             const head_transpose_perm = [_]i64{ 0, 2, 1, 3 };
             
-            const q_heads_op = hlo.transpose(ctx, q_reshaped.value, &head_transpose_perm, loc);
-            const q_heads = try builder.newTensor(q_heads_op.getResult(0));
+            const q_heads = try ops.transpose(builder, q_reshaped, &head_transpose_perm);
 
             
-            const k_heads_op = hlo.transpose(ctx, k_reshaped.value, &head_transpose_perm, loc);
-            const k_heads = try builder.newTensor(k_heads_op.getResult(0));
+            const k_heads = try ops.transpose(builder, k_reshaped, &head_transpose_perm);
 
             
-            const v_heads_op = hlo.transpose(ctx, v_reshaped.value, &head_transpose_perm, loc);
-            const v_heads = try builder.newTensor(v_heads_op.getResult(0));
+            const v_heads = try ops.transpose(builder, v_reshaped, &head_transpose_perm);
 
             
             // Step 4: Calculate attention scores
             // k_transposed: [B, n_head, head_dim, T] for matmul
             const k_transpose_perm = [_]i64{ 0, 1, 3, 2 };
-            const k_t_op = hlo.transpose(ctx, k_heads.value, &k_transpose_perm, loc);
-            const k_t = try builder.newTensor(k_t_op.getResult(0));
+            const k_t = try ops.transpose(builder, k_heads, &k_transpose_perm);
 
             
             // scores = q @ k_t  [B, n_head, T, T]
-            const scores = try builder.createAndAppendOp(hlo.dot_general(ctx, q_heads.value, k_t.value, .{
-                .dot_dimension_numbers = hlo.DotDimensionNumbersAttribute{
-                    .lhs_batching_dimensions = &.{0, 1}, // Batch over B and n_head
-                    .rhs_batching_dimensions = &.{0, 1},
-                    .lhs_contracting_dimensions = &.{3}, // Contract over head_dim
-                    .rhs_contracting_dimensions = &.{2},
-                },
-            }));
+            const scores = try ops.matmul(builder, q_heads, k_t);
             
             // Scale by 1/sqrt(head_dim)
             const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(self.head_dim)));
             const scale_const = try builder.scalarConstant(scale);
             
-            const scaled_scores_op = hlo.multiply(ctx, scores.value, scale_const.value, loc);
-            const scaled_scores = try builder.newTensor(scaled_scores_op.getResult(0));
+            const scaled_scores = try ops.multiply(builder, scores, scale_const);
 
             
             // Step 5: Apply causal mask
             // Create triangular mask where mask[i, j] = i >= j (allow current and past)
-            const iota_0_op = hlo.iota(ctx, &[_]i64{ seq_len, seq_len }, 0, mlir.Type.i32Type(ctx), loc);
-            const iota_0 = try builder.newTensor(iota_0_op.getResult(0));
+            const iota_0 = try ops.iota(builder, &[_]i64{ seq_len, seq_len }, 0, mlir.Type.i32Type(ctx));
 
             
-            const iota_1_op = hlo.iota(ctx, &[_]i64{ seq_len, seq_len }, 1, mlir.Type.i32Type(ctx), loc);
-            const iota_1 = try builder.newTensor(iota_1_op.getResult(0));
+            const iota_1 = try ops.iota(builder, &[_]i64{ seq_len, seq_len }, 1, mlir.Type.i32Type(ctx));
 
             
             // mask = iota_0 >= iota_1 (true for lower triangular + diagonal)
-            const mask_2d_op = hlo.compare(ctx, iota_0.value, iota_1.value, hlo.CompareDirection.GE, loc);
-            const mask_2d = try builder.newTensor(mask_2d_op.getResult(0));
+            const mask_2d = try ops.compare(builder, iota_0, iota_1, hlo.CompareDirection.GE);
 
             
             // Broadcast mask to [B, n_head, T, T]
             const mask_broadcast_dims = [_]i64{ 2, 3 };
             const mask_target_shape = [_]i64{ batch_size, n_head, seq_len, seq_len };
-            const mask_op = hlo.broadcast_in_dim(ctx, mask_2d.value, &mask_target_shape, &mask_broadcast_dims, loc);
-            const mask = try builder.newTensor(mask_op.getResult(0));
+            const mask = try ops.broadcastInDim(builder, mask_2d, &mask_target_shape, &mask_broadcast_dims);
 
             
             // Apply mask: select(mask, scores, -inf)
             const neg_inf = try builder.scalarConstant(-1e9);
             
-            const masked_scores_op = hlo.select(ctx, mask.value, scaled_scores.value, neg_inf.value, loc);
-            const masked_scores = try builder.newTensor(masked_scores_op.getResult(0));
+            const masked_scores = try ops.select(builder, mask, scaled_scores, neg_inf);
 
             
             // Step 6: Apply softmax
-            const attn_weights_op = hlo.softmax(ctx, masked_scores.value, -1, loc);
-            const attn_weights = try builder.newTensor(attn_weights_op.getResult(0));
+            const attn_weights = try ops.softmax(builder, masked_scores);
 
             
             // Step 7: Apply attention to values
             // output = attn_weights @ v_heads  [B, n_head, T, head_dim]
-            const attn_output_op = hlo.dot_general(ctx, attn_weights.value, v_heads.value, .{
-                .dot_dimension_numbers = hlo.DotDimensionNumbersAttribute{
-                    .lhs_batching_dimensions = &.{0, 1},
-                    .rhs_batching_dimensions = &.{0, 1},
-                    .lhs_contracting_dimensions = &.{3}, // Contract over last T dim
-                    .rhs_contracting_dimensions = &.{2},
-                },
-            });
-            const attn_output = try builder.newTensor(attn_output_op.getResult(0));
+            const attn_output = try ops.matmul(builder, attn_weights, v_heads);
             
             // Step 8: Transpose back and reshape
             // Transpose from [B, n_head, T, head_dim] to [B, T, n_head, head_dim]
             const output_transpose_perm = [_]i64{ 0, 2, 1, 3 };
-            const output_transposed_op = hlo.transpose(ctx, attn_output.value, &output_transpose_perm, loc);
-            const output_transposed = try builder.newTensor(output_transposed_op.getResult(0));
+            const output_transposed = try ops.transpose(builder, attn_output, &output_transpose_perm);
 
             
             // Reshape to [B, T, C]
             const output_shape = [_]i64{ batch_size, seq_len, n_embd };
-            const output_reshaped_op = hlo.reshape(ctx, output_transposed.value, &output_shape, loc);
-            const output_reshaped = try builder.newTensor(output_reshaped_op.getResult(0));
+            const output_reshaped = try ops.reshape(builder, output_transposed, &output_shape);
 
             
             // Step 9: Apply output projection
             // final_output = (output_reshaped @ c_proj_weight) + c_proj_bias
-            const proj_op = hlo.dot_general(ctx, output_reshaped.value, self.c_proj_weight.value, .{
-                .dot_dimension_numbers = hlo.DotDimensionNumbersAttribute{
-                    .lhs_batching_dimensions = &.{},
-                    .rhs_batching_dimensions = &.{},
-                    .lhs_contracting_dimensions = &.{2}, // Contract over C
-                    .rhs_contracting_dimensions = &.{0},
-                },
-            });
-            const proj_output = try builder.newTensor(proj_op.getResult(0));
+            const proj_output = try ops.matmul(builder, output_reshaped, self.c_proj_weight);
             
-            const final_op = hlo.add(ctx, proj_output.value, self.c_proj_bias.value, loc);
-            return builder.newTensor(final_op.getResult(0));
+            const final_output = try ops.add(builder, proj_output, self.c_proj_bias);
+            return final_output;
         }
     };
 }
@@ -517,8 +456,6 @@ pub fn MLP(comptime DataType: type) type {
         /// GELU activation function: 0.5 * x * (1 + tanh(sqrt(2/π) * (x + 0.044715 * x^3)))
         fn gelu(self: *@This(), x: Tensor, builder: *MLIRBuilder) !Tensor {
             _ = self;
-            const ctx = builder.ctx;
-            const loc = builder.loc;
             
             // Constants for GELU approximation
             const sqrt_2_over_pi = try builder.scalarConstant(@sqrt(2.0 / std.math.pi));
@@ -526,48 +463,36 @@ pub fn MLP(comptime DataType: type) type {
             const half = try builder.scalarConstant(0.5);
             const one = try builder.scalarConstant(1.0);
             
-            // x^3 (working directly with values)
-            const x_squared_val = hlo.multiply(ctx, x.value, x.value, loc).getResult(0);
-            const x_cubed_val = hlo.multiply(ctx, x_squared_val, x.value, loc).getResult(0);
+            // x^3
+            const x_squared = try ops.multiply(builder, x, x);
+            const x_cubed = try ops.multiply(builder, x_squared, x);
             
             // 0.044715 * x^3
-            const coeff_x_cubed_val = hlo.multiply(ctx, coeff.value, x_cubed_val, loc).getResult(0);
+            const coeff_x_cubed = try ops.multiply(builder, coeff, x_cubed);
             
             // x + 0.044715 * x^3
-            const inner_val = hlo.add(ctx, x.value, coeff_x_cubed_val, loc).getResult(0);
+            const inner = try ops.add(builder, x, coeff_x_cubed);
             
             // sqrt(2/π) * (x + 0.044715 * x^3)
-            const scaled_inner_val = hlo.multiply(ctx, sqrt_2_over_pi.value, inner_val, loc).getResult(0);
+            const scaled_inner = try ops.multiply(builder, sqrt_2_over_pi, inner);
             
             // tanh(sqrt(2/π) * (x + 0.044715 * x^3))
-            const tanh_result_val = hlo.tanh(ctx, scaled_inner_val, loc).getResult(0);
+            const tanh_result = try ops.tanh(builder, scaled_inner);
             
             // 1 + tanh(...)
-            const one_plus_tanh_val = hlo.add(ctx, one.value, tanh_result_val, loc).getResult(0);
+            const one_plus_tanh = try ops.add(builder, one, tanh_result);
             
             // x * (1 + tanh(...))
-            const x_times_val = hlo.multiply(ctx, x.value, one_plus_tanh_val, loc).getResult(0);
+            const x_times = try ops.multiply(builder, x, one_plus_tanh);
             
             // 0.5 * x * (1 + tanh(...))
-            const result_op = hlo.multiply(ctx, half.value, x_times_val, loc);
-            return builder.newTensor(result_op.getResult(0));
+            return ops.multiply(builder, half, x_times);
         }
 
         pub fn forward(self: *@This(), x: Tensor, builder: *MLIRBuilder) !Tensor {
-            const ctx = builder.ctx;
-            const loc = builder.loc;
-            
             // Step 1: First linear layer: x @ c_fc_weight + c_fc_bias
-            const fc_proj = try builder.createAndAppendOp(hlo.dot_general(ctx, x.value, self.c_fc_weight.value, .{
-                .dot_dimension_numbers = hlo.DotDimensionNumbersAttribute{
-                    .lhs_batching_dimensions = &.{},
-                    .rhs_batching_dimensions = &.{},
-                    .lhs_contracting_dimensions = &.{2}, // Contract over n_embd
-                    .rhs_contracting_dimensions = &.{0},
-                },
-            }));
-            
-            const fc_biased = try builder.createAndAppendOp(hlo.add(ctx, fc_proj.value, self.c_fc_bias.value, loc));
+            const fc_proj = try ops.matmul(builder, x, self.c_fc_weight);
+            const fc_biased = try ops.add(builder, fc_proj, self.c_fc_bias);
 
             
             // Step 2: Apply GELU activation
@@ -575,18 +500,9 @@ pub fn MLP(comptime DataType: type) type {
 
             
             // Step 3: Second linear layer: activated @ c_proj_weight + c_proj_bias
-            const proj_op = hlo.dot_general(ctx, fc_activated.value, self.c_proj_weight.value, .{
-                .dot_dimension_numbers = hlo.DotDimensionNumbersAttribute{
-                    .lhs_batching_dimensions = &.{},
-                    .rhs_batching_dimensions = &.{},
-                    .lhs_contracting_dimensions = &.{2}, // Contract over n_inner
-                    .rhs_contracting_dimensions = &.{0},
-                },
-            });
-            const proj_output = try builder.newTensor(proj_op.getResult(0));
-            
-            const final_op = hlo.add(ctx, proj_output.value, self.c_proj_bias.value, loc);
-            return builder.newTensor(final_op.getResult(0));
+            const proj_output = try ops.matmul(builder, fc_activated, self.c_proj_weight);
+            const final_output = try ops.add(builder, proj_output, self.c_proj_bias);
+            return final_output;
         }
     };
 }
@@ -623,31 +539,20 @@ pub fn Block(comptime DataType: type) type {
         }
 
         pub fn forward(self: *@This(), x: Tensor, builder: *MLIRBuilder) !Tensor {
-            const ctx = builder.ctx;
-            const loc = builder.loc;
-            
             // Pre-norm architecture: LayerNorm -> Attention -> Add residual
             const norm1 = try self.ln_1.forward(x, builder);
-
-
             const attn_output = try self.attn.forward(norm1, builder);
 
-
             // Residual connection 1
-            const res1_op = hlo.add(ctx, x.value, attn_output.value, loc);
-            const res1 = try builder.newTensor(res1_op.getResult(0));
-
+            const res1 = try ops.add(builder, x, attn_output);
 
             // Pre-norm architecture: LayerNorm -> MLP -> Add residual
             const norm2 = try self.ln_2.forward(res1, builder);
-
-
             const mlp_output = try self.mlp.forward(norm2, builder);
 
-
             // Residual connection 2
-            const res2_op = hlo.add(ctx, res1.value, mlp_output.value, loc);
-            return builder.newTensor(res2_op.getResult(0));
+            const res2 = try ops.add(builder, res1, mlp_output);
+            return res2;
         }
     };
 }
@@ -660,7 +565,6 @@ pub fn crossEntropyLoss(comptime DataType: type) type {
         pub fn run(allocator: Allocator, logits: Tensor, targets: Tensor, builder: *MLIRBuilder) !Tensor {
             _ = allocator;
             const ctx = builder.ctx;
-            const loc = builder.loc;
             
             // logits: [B, T, V] where V = vocab_size
             // targets: [B, T] with integer token IDs
@@ -674,61 +578,38 @@ pub fn crossEntropyLoss(comptime DataType: type) type {
             const i32_type = mlir.Type.i32Type(ctx);
             const targets_shape = [_]i64{ batch_size, seq_len };
             const targets_i32_type = mlir.Type.rankedTensorType(ctx, &targets_shape, i32_type);
-            const targets_i32_op = hlo.convert(ctx, targets.value, targets_i32_type, loc);
-            const targets_i32 = try builder.newTensor(targets_i32_op.getResult(0));
+            const targets_i32 = try ops.convert(builder, targets, targets_i32_type);
             
-            const one_hot_op = hlo.one_hot(ctx, targets_i32.value, vocab_size, 1.0, 0.0, 2, mlir.Type.f32Type(ctx), loc);
-            const targets_one_hot = try builder.newTensor(one_hot_op.getResult(0));
+            const targets_one_hot = try ops.oneHot(builder, targets_i32, vocab_size, 1.0, 0.0, 2, mlir.Type.f32Type(ctx));
             
             // Step 2: Compute log softmax
             // log_softmax(x) = x - log(sum(exp(x), axis=-1))
-            const exp_logits_op = hlo.exponential(ctx, logits.value, loc);
-            builder.insertion_block.appendOwnedOperation(exp_logits_op);
-            const exp_logits = try builder.newTensor(exp_logits_op.getResult(0));
-
-            const sum_exp_op = try hlo.reduce_sum(ctx, builder, exp_logits.value, &[_]i64{2}, loc);
-            const sum_exp = try builder.newTensor(sum_exp_op.getResult(0));
-
-            const log_sum_exp_op = hlo.log(ctx, sum_exp.value, loc);
-            builder.insertion_block.appendOwnedOperation(log_sum_exp_op);
-            const log_sum_exp = try builder.newTensor(log_sum_exp_op.getResult(0));
-
-            
-            const log_probs_op = hlo.subtract(ctx, logits.value, log_sum_exp.value, loc);
-            builder.insertion_block.appendOwnedOperation(log_probs_op);
-            const log_probs = try builder.newTensor(log_probs_op.getResult(0));
+            const exp_logits = try ops.exp(builder, logits);
+            const sum_exp = try ops.reduceSum(builder, exp_logits, &[_]i64{2}, true); // keep_dims for broadcasting
+            const log_sum_exp = try ops.log(builder, sum_exp);
+            const log_probs = try ops.subtract(builder, logits, log_sum_exp);
 
             // Step 3: Select correct log probabilities
             // Multiply log_probs by one-hot targets to zero out incorrect classes
-            const selected_log_probs_op = hlo.multiply(ctx, log_probs.value, targets_one_hot.value, loc);
-            builder.insertion_block.appendOwnedOperation(selected_log_probs_op);
-            const selected_log_probs = try builder.newTensor(selected_log_probs_op.getResult(0));
+            const selected_log_probs = try ops.multiply(builder, log_probs, targets_one_hot);
 
             // Sum over vocabulary dimension to get negative log likelihood per token
-            const nll_per_token_op = try hlo.reduce_sum(ctx, builder, selected_log_probs.value, &[_]i64{2}, loc);
-            const nll_per_token = try builder.newTensor(nll_per_token_op.getResult(0));
+            const nll_per_token = try ops.reduceSum(builder, selected_log_probs, &[_]i64{2}, false);
 
             
             // Step 4: Compute mean loss
             // Negate to get positive loss values
-            const neg_one = try builder.scalarConstant(-1.0);
-            
-            const loss_per_token_op = hlo.multiply(ctx, nll_per_token.value, neg_one.value, loc);
-            builder.insertion_block.appendOwnedOperation(loss_per_token_op);
-            const loss_per_token = try builder.newTensor(loss_per_token_op.getResult(0));
+            const neg_one = try ops.constant(builder, -1.0, &.{}, mlir.Type.f32Type(ctx));
+            const loss_per_token = try ops.multiply(builder, nll_per_token, neg_one);
 
             // Sum all losses
-            const total_loss_op = try hlo.reduce_sum(ctx, builder, loss_per_token.value, &[_]i64{0, 1}, loc);
-            const total_loss = try builder.newTensor(total_loss_op.getResult(0));
-
+            const total_loss = try ops.reduceSum(builder, loss_per_token, &[_]i64{0, 1}, false);
             
             // Divide by number of tokens to get mean loss
             const num_tokens = batch_size * seq_len;
-            const num_tokens_const = try builder.scalarConstant(@floatFromInt(num_tokens));
-            
-            const mean_loss_op = hlo.divide(ctx, total_loss.value, num_tokens_const.value, loc);
-            builder.insertion_block.appendOwnedOperation(mean_loss_op);
-            return builder.newTensor(mean_loss_op.getResult(0));
+            const num_tokens_const = try ops.constant(builder, @floatFromInt(num_tokens), &.{}, mlir.Type.f32Type(ctx));
+            const mean_loss = try ops.divide(builder, total_loss, num_tokens_const);
+            return mean_loss;
         }
     };
 }

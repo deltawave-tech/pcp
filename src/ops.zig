@@ -173,91 +173,55 @@ pub const MLIRBuilder = struct {
         std.log.info("MLIRBuilder.createFunction: Creating function '{s}'...", .{name});
         const c_api = @import("mlir/c.zig").c;
 
-        // 1. Create the operation state for a `func.func`
-        std.log.info("MLIRBuilder.createFunction: Getting operation state...", .{});
+        // 1. Create the operation state WITHOUT a region initially.
+        // This prevents the verifier from complaining about an un-nested function.
         var state = c_api.operationStateGet("func.func", self.loc.handle);
 
-        // 2. Add the function's attributes (type, name, and now visibility)
-        std.log.info("MLIRBuilder.createFunction: Creating attributes...", .{});
+        // 2. Add the function's attributes (type and name).
+        // You are correct: sym_visibility is not needed for top-level functions.
         const func_type_attr = mlir.Attribute.typeAttr(func_type);
         const sym_name_attr = mlir.Attribute.stringAttr(self.ctx, name);
 
-        // FIX: Add the 'sym_visibility' attribute and set it to "private".
-        // This resolves the MLIR validation error.
-        const visibility_attr = mlir.Attribute.stringAttr(self.ctx, "private");
-
         const func_type_id = c_api.identifierGet(self.ctx.handle, "function_type");
         const sym_name_id = c_api.identifierGet(self.ctx.handle, "sym_name");
-        const visibility_id = c_api.identifierGet(self.ctx.handle, "sym_visibility");
 
         var named_attrs = [_]c_api.MlirNamedAttribute{
             .{ .name = func_type_id, .attribute = func_type_attr.handle },
             .{ .name = sym_name_id, .attribute = sym_name_attr.handle },
-            .{ .name = visibility_id, .attribute = visibility_attr.handle }, // Add the new attribute here
         };
         c_api.mlirOperationStateAddAttributes(&state, named_attrs.len, @ptrCast(&named_attrs[0]));
-        std.log.info("MLIRBuilder.createFunction: Attributes added", .{});
-
-        // 3. Create and add a region for the function's body
-        std.log.info("MLIRBuilder.createFunction: Creating bootstrap region...", .{});
-        const bootstrap_region = c_api.regionCreate();
-        var regions = [_]*c_api.MlirRegion{bootstrap_region};
+        
+        // Add one region placeholder.
+        var regions = [_]*c_api.MlirRegion{c_api.regionCreate()};
         c_api.operationStateAddOwnedRegions(&state, 1, @ptrCast(&regions[0]));
-        std.log.info("MLIRBuilder.createFunction: Bootstrap region added", .{});
 
-        // 4. Create the final func.func operation
-        std.log.info("MLIRBuilder.createFunction: Creating operation...", .{});
+        // 3. Create the function operation.
         const func_op_handle = c_api.operationCreate(&state);
         const func_op = mlir.Operation{ .handle = func_op_handle };
-        std.log.info("MLIRBuilder.createFunction: Operation created", .{});
-
-        // VERIFY the operation. If it's malformed, we find out now.
-        std.log.info("MLIRBuilder.createFunction: Verifying created function...", .{});
-        if (!func_op.verify()) {
-            std.log.err("MLIR operation verification failed for function '{s}'. Dumping operation:", .{name});
-            func_op.dump();
-            return error.OperationVerificationFailed;
-        }
-        std.log.info("MLIRBuilder.createFunction: Function verified successfully", .{});
-
-        // --- START FIX ---
-        // The `bootstrap_region` handle is now stale. Get the canonical region handle
-        // directly from the newly created operation. This is the ONLY safe way.
-        std.log.info("MLIRBuilder.createFunction: Getting canonical region handle...", .{});
-        const canonical_region = c_api.operationGetRegion(func_op.handle, 0);
-        std.log.info("MLIRBuilder.createFunction: Canonical region handle retrieved", .{});
-        // --- END FIX ---
-
-        // 5. Get or create the entry block for the function body
-        std.log.info("MLIRBuilder.createFunction: Getting/creating entry block...", .{});
         
-        // Check if the region already has a block (some MLIR operations auto-create blocks)
-        const region_wrapper = mlir.Region{ .handle = canonical_region };
-        const existing_block = region_wrapper.getBlock(0);
-        const block = if (@intFromPtr(existing_block.handle) != 0) blk: {
-            std.log.info("MLIRBuilder.createFunction: Using existing block from region", .{});
-            break :blk existing_block;
-        } else blk: {
-            std.log.info("MLIRBuilder.createFunction: Creating new block...", .{});
-            const new_block = try createBlock();
-            std.log.info("MLIRBuilder.createFunction: Appending new block to canonical region...", .{});
-            c_api.regionAppendOwnedBlock(canonical_region, new_block.handle);
-            std.log.info("MLIRBuilder.createFunction: New block appended successfully", .{});
-            break :blk new_block;
-        };
+        // 4. CRITICAL STEP: Immediately attach the (empty) function to the module's body.
+        self.module_body.appendOwnedOperation(func_op);
 
-        // 6. Add block arguments based on the function type
+        // 5. Now, create and add the entry block to the function's region.
+        const region = func_op.getRegion(0);
+        const entry_block = try createBlock();
+        c_api.regionAppendOwnedBlock(region.handle, entry_block.handle);
+
+        // 6. Add block arguments based on the function type.
         std.log.info("MLIRBuilder.createFunction: Adding block arguments...", .{});
         const func_type_wrapper = func_type.as(mlir.FunctionType) orelse return error.NotAFunctionType;
         const num_inputs = func_type_wrapper.getNumInputs();
         for (0..num_inputs) |i| {
             const input_type = func_type_wrapper.getInput(i);
-            _ = block.addArgument(input_type, self.loc);
+            _ = entry_block.addArgument(input_type, self.loc);
         }
         std.log.info("MLIRBuilder.createFunction: Block arguments added ({})", .{num_inputs});
 
-        std.log.info("MLIRBuilder.createFunction: Function '{s}' created successfully", .{name});
-        return .{ .func_op = func_op, .entry_block = block };
+        std.log.info("MLIRBuilder.createFunction: Function '{s}' created and attached successfully.", .{name});
+        
+        // Note: Verification removed - will be done after function body is complete
+
+        return .{ .func_op = func_op, .entry_block = entry_block };
     }
 };
 
@@ -299,7 +263,8 @@ fn broadcastTensors(builder: *MLIRBuilder, a: Tensor, b: Tensor) !struct { Tenso
         }
 
         const op = hlo.broadcast_in_dim(builder.ctx, a.value, target_shape, broadcast_dims.items, builder.loc);
-        a_broadcasted = try builder.createAndAppendOp(op);
+        builder.insertion_block.appendOwnedOperation(op);  // <-- FIX: Append the broadcast op
+        a_broadcasted = try builder.newTensor(op.getResult(0));
     }
 
     // 3. Broadcast 'b' if necessary
@@ -313,7 +278,8 @@ fn broadcastTensors(builder: *MLIRBuilder, a: Tensor, b: Tensor) !struct { Tenso
         }
 
         const op = hlo.broadcast_in_dim(builder.ctx, b.value, target_shape, broadcast_dims.items, builder.loc);
-        b_broadcasted = try builder.createAndAppendOp(op);
+        builder.insertion_block.appendOwnedOperation(op);  // <-- FIX: Append the broadcast op
+        b_broadcasted = try builder.newTensor(op.getResult(0));
     }
     
     return .{ a_broadcasted, b_broadcasted };

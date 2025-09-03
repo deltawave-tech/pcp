@@ -413,10 +413,17 @@ pub const MLIRMetalExecutionEngine = struct {
     fn compileMSLToMetal(self: *MLIRMetalExecutionEngine, msl_code: []const u8) !*MTLLibrary {
         const device = self.device orelse return MetalError.DeviceNotFound;
         
+        // --- START FIX: Ensure MSL code is null-terminated for C interop ---
+        // The msl_code slice from Zig is not null-terminated. The Objective-C
+        // NSString API expects a C-style, null-terminated string.
+        const msl_c_string = try std.fmt.allocPrintZ(self.allocator, "{s}", .{msl_code});
+        defer self.allocator.free(msl_c_string);
+
         // Create NSString from MSL code
         const source_str = NSString_alloc();
-        const source = NSString_initWithUTF8String(source_str, @ptrCast(msl_code));
+        const source = NSString_initWithUTF8String(source_str, msl_c_string);
         defer NSString_release(source);
+        // --- END FIX ---
         
         // Compile the Metal code
         var compile_error: ?*NSError = null;

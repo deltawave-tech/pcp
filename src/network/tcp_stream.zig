@@ -44,13 +44,26 @@ pub const TcpStreamManager = struct {
     pub fn receive(stream: net.Stream, allocator: Allocator) !std.json.Parsed(MessageEnvelope) {
         // Read the length prefix (4 bytes for u32)
         var length_bytes: [4]u8 = undefined;
-        _ = try stream.readAll(&length_bytes);
+        const bytes_read = stream.readAll(&length_bytes) catch |err| {
+            std.log.err("Failed to read length prefix from TCP stream: {}", .{err});
+            return err;
+        };
+        std.log.debug("Successfully read {} bytes for length prefix", .{bytes_read});
         const data_length = std.mem.readInt(u32, &length_bytes, .little);
+        
+        // Debug: Log raw bytes and parsed length (only for invalid messages)
+        if (data_length > 100 * 1024 * 1024) {
+            std.log.debug("Invalid length prefix bytes: {} {} {} {} -> parsed as {} bytes", .{
+                length_bytes[0], length_bytes[1], length_bytes[2], length_bytes[3], data_length
+            });
+        }
         
         // Sanity check - prevent excessive memory allocation
         // Note: GPT-2 model parameters can be 40MB+ raw, 53MB+ after encoding
         if (data_length > 100 * 1024 * 1024) { // 100MB limit for large model parameters
-            std.log.warn("Message exceeds size limit: {} MB", .{data_length / (1024 * 1024)});
+            std.log.err("Message exceeds size limit: {} MB (raw bytes: {} {} {} {})", .{
+                data_length / (1024 * 1024), length_bytes[0], length_bytes[1], length_bytes[2], length_bytes[3]
+            });
             return error.MessageTooLarge;
         }
         
@@ -61,10 +74,11 @@ pub const TcpStreamManager = struct {
         
         // Read exactly data_length bytes
         const json_data = try allocator.alloc(u8, data_length);
+        errdefer allocator.free(json_data);
         _ = try stream.readAll(json_data);
         
-        // Parse JSON back to MessageEnvelope
-        const parsed = try MessageEnvelope.fromJsonString(json_data, allocator);
+        // Parse JSON data using parseFromSlice (Zig 0.14 compatible)
+        const parsed = try std.json.parseFromSlice(MessageEnvelope, allocator, json_data, .{});
         
         std.log.debug("Received message: type={s}, length={}, from_node={}, from_service={s}", .{
             parsed.value.msg_type,

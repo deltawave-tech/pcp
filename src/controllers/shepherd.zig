@@ -125,17 +125,6 @@ pub const Shepherd = struct {
         
         const join_msg = parsed_join_msg.value;
         
-        // Debug: Log the received message details
-        std.log.info("DEBUG: Received message details:", .{});
-        std.log.info("  msg_type: '{s}' (length: {})", .{ join_msg.msg_type, join_msg.msg_type.len });
-        std.log.info("  msg_id: {}", .{join_msg.msg_id});
-        std.log.info("  sender_node: {}", .{join_msg.sender_node});
-        std.log.info("  sender_service: {s}", .{join_msg.sender_service});
-        std.log.info("  Expected: '{s}' (length: {})", .{ MessageType.JOIN_REQUEST, MessageType.JOIN_REQUEST.len });
-        
-        // Print raw bytes of msg_type for debugging
-        std.log.info("  msg_type raw bytes: {any}", .{join_msg.msg_type});
-        std.log.info("  JOIN_REQUEST raw bytes: {any}", .{MessageType.JOIN_REQUEST});
         
         // Validate it's a JoinRequest
         if (!std.mem.eql(u8, join_msg.msg_type, MessageType.JOIN_REQUEST)) {
@@ -154,13 +143,10 @@ pub const Shepherd = struct {
         // Update monitoring
         monitoring.setWorkerCount(self.worker_pool.items.len);
         
-        std.log.info("Worker {} connected from {}", .{ assigned_node_id, stream });
+        std.log.info("Worker {} connected", .{assigned_node_id});
         
         // Send JoinAccept response
-        std.log.info("DEBUG: Creating empty JSON object for JOIN_ACCEPT", .{});
         const empty_obj = std.json.Value{ .object = std.json.ObjectMap.init(self.allocator) };
-        
-        std.log.info("DEBUG: Creating JOIN_ACCEPT message", .{});
         const join_accept = tcp_stream.createMessage(
             0, // coordinator node_id
             "shepherd", // coordinator service
@@ -171,24 +157,17 @@ pub const Shepherd = struct {
             empty_obj,
         );
         
-        std.log.info("DEBUG: Serializing JOIN_ACCEPT message to JSON", .{});
         const json_buffer = join_accept.asJsonString(self.allocator) catch |err| {
-            std.log.err("Failed to serialize JOIN_ACCEPT message: {}", .{err});
+            std.log.err("Failed to serialize JOIN_ACCEPT: {}", .{err});
             return;
         };
         defer json_buffer.deinit();
-        
-        std.log.info("DEBUG: JOIN_ACCEPT JSON size: {} bytes", .{json_buffer.items.len});
-        if (json_buffer.items.len > 1000) {
-            std.log.warn("JOIN_ACCEPT message is unexpectedly large! First 500 chars: {s}", .{json_buffer.items[0..@min(500, json_buffer.items.len)]});
-        }
         
         TcpStreamManager.send(stream, join_accept, self.allocator) catch |err| {
             std.log.err("Failed to send join accept: {}", .{err});
             return;
         };
         
-        std.log.info("Worker {} successfully joined the network", .{assigned_node_id});
         
         // Enter worker message handling loop
         try self.handleWorkerMessages(assigned_node_id, stream);
@@ -230,16 +209,10 @@ pub const Shepherd = struct {
     }
     
     /// Handle inner loop completion from worker
-    fn handleInnerLoopComplete(_: *Self, worker_id: NodeId, msg: MessageEnvelope) !void {
-        std.log.info("Worker {} completed inner loop", .{worker_id});
-        
+    fn handleInnerLoopComplete(_: *Self, _: NodeId, _: MessageEnvelope) !void {
         // TODO: Process the parameters from the message
         // This would involve deserializing the model parameters and 
         // adding them to the parameter aggregation
-        _ = msg;
-        
-        // For now, just log the completion
-        std.log.debug("Processing parameters from worker {}", .{worker_id});
     }
     
     /// Remove a worker from the pool
@@ -247,7 +220,7 @@ pub const Shepherd = struct {
         for (self.worker_pool.items, 0..) |worker, i| {
             if (worker.node_id == worker_id) {
                 _ = self.worker_pool.swapRemove(i);
-                std.log.info("Removed worker {} from pool", .{worker_id});
+                std.log.info("Worker {} disconnected", .{worker_id});
                 // Update monitoring after worker removal
                 monitoring.setWorkerCount(self.worker_pool.items.len);
                 return;
@@ -316,11 +289,10 @@ pub const Shepherd = struct {
             msg_id += 1;
         }
         
-        std.log.info("Broadcasted {s} to {} workers", .{ msg_type, self.worker_pool.items.len });
     }
     
     /// Collect responses from all workers
-    pub fn collectFromWorkers(self: *Self, expected_msg_type: []const u8) !ArrayList(MessageEnvelope) {
+    pub fn collectFromWorkers(self: *Self, _: []const u8) !ArrayList(MessageEnvelope) {
         const responses = ArrayList(MessageEnvelope).init(self.allocator);
         var received_count: usize = 0;
         
@@ -333,7 +305,6 @@ pub const Shepherd = struct {
             received_count += 1; // Placeholder
         }
         
-        std.log.info("Collected {} responses of type {s}", .{ responses.items.len, expected_msg_type });
         return responses;
     }
     

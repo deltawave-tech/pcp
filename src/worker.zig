@@ -80,6 +80,7 @@ pub const Worker = struct {
         // Cleanup cached module if it exists
         if (self.cached_module) |mod| {
             mod.deinit();
+            self.cached_module = null; // Prevent double-free
         }
         
         self.client.deinit();
@@ -108,10 +109,13 @@ pub const Worker = struct {
         );
         
         try self.client.send(join_request);
-        std.log.debug("Sent JoinRequest to Shepherd", .{});
         
         // Wait for JoinAccept
-        const parsed_join_accept = try self.client.receive();
+        std.log.debug("Worker waiting for JoinAccept response from shepherd...", .{});
+        const parsed_join_accept = self.client.receive() catch |err| {
+            std.log.err("Failed to receive JoinAccept from shepherd: {}", .{err});
+            return err;
+        };
         defer parsed_join_accept.deinit();
         
         const join_accept = parsed_join_accept.value;
@@ -125,7 +129,6 @@ pub const Worker = struct {
         self.state = .connected;
         self.is_running = true;
         
-        std.log.info("Successfully joined network with NodeId {}", .{self.node_id.?});
     }
     
     /// Main worker loop - listen for commands from Shepherd
@@ -165,7 +168,6 @@ pub const Worker = struct {
     
     /// Handles the one-time setup message, deserializing and caching the MLIR module
     fn handleInitializeGraph(self: *Self, msg: MessageEnvelope) !void {
-        std.log.info("Worker {} received training graph for initialization.", .{self.node_id.?});
 
         // De-initialize any old module
         if (self.cached_module) |mod| {
@@ -187,18 +189,28 @@ pub const Worker = struct {
 
         // Deserialize and cache the module using the worker's own context
         const module = try mlir_ctx.deserializeMLIRModule(self.allocator, self.mlir_context.getContext(), graph_str);
+        errdefer module.deinit(); // Cleanup on error to prevent leak
         
-        // Debug: Check if module is valid immediately after deserialization
+        // Validate deserialized module
         const test_op = module.op();
         if (@intFromPtr(test_op.handle) == 0) {
-            std.log.err("ERROR: Module operation handle is null immediately after deserialization!", .{});
+            std.log.err("Invalid deserialized module", .{});
             return error.InvalidDeserializedModule;
         }
-        std.log.info("✓ Module operation handle is valid after deserialization: 0x{x}", .{@intFromPtr(test_op.handle)});
         
+        // Verify the module is well-formed
+        const verification_result = test_op.verify();
+        if (!verification_result) {
+            std.log.err("Deserialized MLIR module failed verification", .{});
+            std.debug.print("Dumping invalid module for debugging:\n", .{});
+            test_op.dump();
+            return error.ModuleVerificationFailed;
+        }
+        
+        // Successfully validated, cache the module
         self.cached_module = module;
 
-        std.log.info("Worker {} successfully cached the training graph.", .{self.node_id.?});
+        std.log.info("Worker {} initialized training graph", .{self.node_id.?});
         // No response is needed. The worker is now ready for START_INNER_LOOP.
     }
     
@@ -212,13 +224,12 @@ pub const Worker = struct {
             return error.GraphNotInitialized;
         };
         
-        // Debug: Check module validity before using it
+        // Validate cached module
         const verify_op = module.op();
         if (@intFromPtr(verify_op.handle) == 0) {
-            std.log.err("ERROR: Cached module operation handle became null! Module may have been corrupted.", .{});
+            std.log.err("Cached module corrupted", .{});
             return error.CorruptedCachedModule;
         }
-        std.log.info("✓ Cached module operation handle is valid: 0x{x}", .{@intFromPtr(verify_op.handle)});
 
         // 2. The payload is Base64-encoded Cap'n Proto data
         const b64_encoded_payload = switch (msg.data) {
@@ -241,9 +252,23 @@ pub const Worker = struct {
         const input_ids_bytes = try reader.getInputIds();
         const targets_bytes = try reader.getTargets();
 
-        std.log.info("Worker received: {} param bytes, {} input_ids bytes, {} targets bytes", .{
+        // VALIDATION: Log deserialized sizes and validate data
+        std.log.info("Received params: {} bytes, inputs: {} bytes, targets: {} bytes", .{
             params_bytes.len, input_ids_bytes.len, targets_bytes.len
         });
+        
+        if (params_bytes.len == 0) {
+            std.log.err("Empty parameters received in handleStartInnerLoop", .{});
+            return error.EmptyParameters;
+        }
+        if (input_ids_bytes.len == 0) {
+            std.log.err("Empty input_ids received in handleStartInnerLoop", .{});
+            return error.EmptyInputIds;
+        }
+        if (targets_bytes.len == 0) {
+            std.log.err("Empty targets received in handleStartInnerLoop", .{});
+            return error.EmptyTargets;
+        }
 
         // 6. Package inputs for the backend: [master_params, input_ids, targets]
         var inputs_array = [_][]const u8{ params_bytes, input_ids_bytes, targets_bytes };
@@ -290,7 +315,7 @@ pub const Worker = struct {
         );
         
         try self.client.send(response);
-        std.log.info("Worker {} completed inner loop and sent Cap'n Proto results.", .{self.node_id.?});
+        std.log.info("Worker {} completed inner loop", .{self.node_id.?});
         self.state = .connected;
     }
     
@@ -305,7 +330,6 @@ pub const Worker = struct {
     /// Handle Shutdown command from Shepherd
     fn handleShutdown(self: *Self, msg: MessageEnvelope) void {
         _ = msg;
-        std.log.info("Worker {} received shutdown command", .{self.node_id.?});
         self.state = .shutting_down;
         self.is_running = false;
     }
@@ -343,7 +367,6 @@ pub const Worker = struct {
     pub fn disconnect(self: *Self) void {
         self.is_running = false;
         self.state = .disconnected;
-        std.log.info("Worker {} disconnected", .{self.node_id orelse 0});
     }
 };
 

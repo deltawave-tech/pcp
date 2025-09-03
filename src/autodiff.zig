@@ -180,9 +180,7 @@ pub fn buildGradientGraph(
     // Collect gradients and create return statement using the SHARED builder
     try finalizeGradientFunction(allocator, builder, gradient_fn, forward_fn, &adjoint_map);
     
-    std.debug.print("✓ Successfully built gradient graph\n", .{});
-    std.debug.print("--- Gradient Graph (now safe to dump!) ---\n", .{});
-    gradient_fn.dump();
+    // Gradient function built successfully
     
     // Return the gradient function (not the whole module)
     return gradient_fn;

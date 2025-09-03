@@ -85,36 +85,22 @@ pub const DiLoCo = struct {
 
     // Change the init signature to accept the generic executor and DataLoader
     pub fn init(allocator: Allocator, coordinator: *Shepherd, config: DiLoCoConfig, executor: Executor, mlir_builder: *MLIRBuilder, dataset: *DataLoader) !Self {
-        std.log.info("DiLoCo.init: Starting initialization...", .{});
-        
         // The MLIRBuilder is now passed in, ensuring a single context.
-        std.log.info("DiLoCo.init: Creating element type...", .{});
-        std.log.info("DiLoCo.init: mlir_builder pointer = {}", .{@intFromPtr(mlir_builder)});
-        std.log.info("DiLoCo.init: mlir_builder.ctx handle = {}", .{@intFromPtr(mlir_builder.ctx.handle)});
-        std.log.info("DiLoCo.init: About to call f32Type...", .{});
         const element_type = mlir.Type.f32Type(mlir_builder.ctx);
-        std.log.info("DiLoCo.init: f32Type call succeeded", .{});
 
         // Configure and create Nesterov optimizer
-        std.log.info("DiLoCo.init: Configuring Nesterov optimizer...", .{});
         const nesterov_config = nesterov_mlir.NesterovMLIRConfiguration(f32){
             .learning_rate = config.base_config.learning_rate,
             .momentum = config.nesterov_momentum,
         };
 
-        std.log.info("DiLoCo.init: Allocating Nesterov optimizer memory...", .{});
         const nesterov_optimizer = try allocator.create(NesterovMLIR);
-        std.log.info("DiLoCo.init: Memory allocated, calling NesterovMLIR.init...", .{});
         nesterov_optimizer.* = try NesterovMLIR.init(allocator, mlir_builder, nesterov_config, element_type);
-        std.log.info("DiLoCo.init: Nesterov optimizer created successfully", .{});
 
         // Set up parameter shapes for GPT-2 model
-        std.log.info("DiLoCo.init: Setting up parameter shapes for GPT-2 model...", .{});
         const parameter_shapes = try getParameterShapes(allocator, config.gpt2_config);
-        std.log.info("DiLoCo.init: Created {} parameter shapes for GPT-2", .{parameter_shapes.len});
 
         // Create a partial instance to build the worker graph
-        std.log.info("DiLoCo.init: Creating partial instance...", .{});
         var partial_self = Self{
             .allocator = allocator,
             .coordinator = undefined, // Not used during graph building
@@ -133,10 +119,7 @@ pub const DiLoCo = struct {
         };
 
         // Build the worker graph ONCE during initialization using the safe function builder
-        std.log.info("DiLoCo.init: Building worker training graph...", .{});
         const graph = try partial_self.buildWorkerTrainingGraph(mlir_builder);
-        mlir_builder.module.op().dump(); // Debug print the state of the shared builder's module
-        std.log.info("DiLoCo.init: Worker training graph built successfully", .{});
 
         return Self{
             .allocator = allocator,
@@ -196,7 +179,6 @@ pub const DiLoCo = struct {
     pub fn run(ptr: *anyopaque) !void {
         const self: *Self = @ptrCast(@alignCast(ptr));
 
-        std.log.info("👻 DiLoCo.run() starting...", .{});
 
         self.status = .initializing;
         monitoring.setStatus(.initializing);
@@ -204,25 +186,19 @@ pub const DiLoCo = struct {
         // Calculate total parameter count from GPT-2 config
         const total_param_count = gpt2.countTotalParameters(self.config.gpt2_config);
         monitoring.setModelInfo(total_param_count, self.config.base_config.learning_rate);
-        std.log.info("✓ DiLoCo status and monitoring initialized with {} GPT-2 parameters", .{total_param_count});
 
         // Initialize master parameters
-        std.log.info("Initializing master parameters...", .{});
         try self.initializeMasterParameters();
-        std.log.info("✓ Master parameters initialized successfully", .{});
 
         // PHASE 0: SETUP WORKERS (ONE-TIME)
-        std.log.info("Setting up workers...", .{});
         try self.setupWorkers();
-        std.log.info("✓ Workers setup completed", .{});
 
         self.status = .running;
         monitoring.setStatus(.running);
 
         // Main outer loop
-        for (0..self.config.base_config.outer_loop_steps) |outer_step| {
+        for (0..self.config.base_config.outer_loop_steps) |_| {
             const start_time = std.time.milliTimestamp();
-            std.log.info("DiLoCo outer loop step {}/{}", .{ outer_step + 1, self.config.base_config.outer_loop_steps });
 
             // Phase 0: Get a fresh batch of training data
             const batch_size = 4;
@@ -230,7 +206,6 @@ pub const DiLoCo = struct {
             const batch = try self.data_loader.getBatch(batch_size, block_size);
             defer self.allocator.free(batch.x);
             defer self.allocator.free(batch.y);
-            std.log.info("Loaded batch with {} input tokens and {} target tokens", .{ batch.x.len, batch.y.len });
 
             // Phase 1: Broadcast master parameters and data batch to all workers
             try self.broadcastMasterParametersAndBatch(batch);
@@ -260,13 +235,11 @@ pub const DiLoCo = struct {
 
         self.status = .completed;
         monitoring.setStatus(.completed);
-        std.log.info("DiLoCo training completed", .{});
     }
 
     /// Initialize master parameters using MLIR for GPT-2 model
     fn initializeMasterParameters(self: *Self) !void {
-        const total_param_count = gpt2.countTotalParameters(self.config.gpt2_config);
-        std.log.info("🎲 Initializing {} GPT-2 parameter tensors (total {} elements)...", .{ self.parameter_shapes.len, total_param_count });
+        _ = gpt2.countTotalParameters(self.config.gpt2_config);
 
         // Allocate array for master parameter tensors
         const param_tensors = try self.allocator.alloc(Tensor, self.parameter_shapes.len);
@@ -282,7 +255,6 @@ pub const DiLoCo = struct {
                 element_count *= @intCast(dim);
             }
 
-            std.log.info("Initializing parameter {} with shape [{d}] ({} elements)", .{ i, shape, element_count });
 
             // Create parameter data with Xavier initialization
             const param_data = try self.allocator.alloc(f32, element_count);
@@ -298,14 +270,12 @@ pub const DiLoCo = struct {
         }
 
         self.master_parameters = param_tensors;
-        std.log.info("🌙 Initialized {} GPT-2 parameter tensors with Xavier initialization", .{param_tensors.len});
     }
 
     /// Create a dedicated forward+loss function that will be differentiated
     /// This is a well-formed func.func operation that autodiff can process
     /// Now builds the complete GPT-2 training graph: forward pass + cross entropy loss
     fn buildForwardAndLossFunction(self: *Self, builder: *ops.MLIRBuilder) !mlir.Operation {
-        std.log.info("buildForwardAndLossFunction: Building FULL GPT-2 training graph...", .{});
         const config = self.config.gpt2_config;
         const f32_type = mlir.Type.f32Type(builder.ctx);
         const i32_type = mlir.Type.i32Type(builder.ctx);
@@ -351,19 +321,16 @@ pub const DiLoCo = struct {
         const x = try builder.newTensor(all_func_args[self.parameter_shapes.len]);
         const y = try builder.newTensor(all_func_args[self.parameter_shapes.len + 1]);
 
-        std.log.info("buildForwardAndLossFunction: Instantiating GPT-2 model with {} parameters...", .{params_slice.len});
 
         // 5. Instantiate the GPT-2 model and build the graph
         var model = try GPT2Model.init(self.allocator, config, builder, &params_slice);
         defer model.deinit();
         const outputs = try model.forwardWithLoss(x, y, builder);
 
-        std.log.info("buildForwardAndLossFunction: GPT-2 forward pass and loss completed", .{});
 
         // 6. Return the loss
         _ = try builder.createAndAttach("func.return", &.{outputs.loss.value}, &.{}, .{});
 
-        std.log.info("buildForwardAndLossFunction: GPT-2 training graph built successfully.", .{});
         return func_op;
     }
 
@@ -401,74 +368,56 @@ pub const DiLoCo = struct {
         const dtype_size = t.shape.dtype.sizeInBytes();
         const num_bytes = elem_count * dtype_size;
         
-        std.log.info("DEBUG extractTensorData: shape.elemCount()={}, dtype.sizeInBytes()={}, calculated num_bytes={}", .{ elem_count, dtype_size, num_bytes });
+        // Debug: Log extraction details
+        std.log.debug("Extracting tensor data: elements={}, dtype_size={}, total_bytes={}", .{
+            elem_count, dtype_size, num_bytes
+        });
         
         // Sanity check - if num_bytes is gigantic, there's a bug in the calculation
         if (num_bytes > 100 * 1024 * 1024) { // 100MB per tensor is way too large
-            std.log.err("ERROR: extractTensorData calculated tensor size {} MB - this is definitely wrong!", .{ num_bytes / (1024 * 1024) });
+            std.log.err("Tensor size calculation error: {} bytes (elements={}, dtype_size={})", .{
+                num_bytes, elem_count, dtype_size
+            });
             return error.TensorSizeCalculationError;
         }
         
+        // Check if raw data pointer is valid
+        if (@intFromPtr(raw_data_ptr) == 0) {
+            std.log.err("MLIR returned null pointer for tensor raw data", .{});
+            return error.InvalidRawDataPointer;
+        }
+        
         const data_slice: [*]const u8 = @ptrCast(raw_data_ptr);
+        const result = self.allocator.dupe(u8, data_slice[0..num_bytes]);
+        
+        // Debug: Check for patterns in the extracted data
+        if (num_bytes > 0) {
+            const sample_size = @min(16, num_bytes);
+            std.log.debug("First {} bytes: {any}", .{ sample_size, data_slice[0..sample_size] });
+        }
 
         // 5. Return a duplicate of the data for the caller to own
-        std.log.info("DEBUG extractTensorData: Successfully extracting {} bytes", .{num_bytes});
-        return self.allocator.dupe(u8, data_slice[0..num_bytes]);
+        return result;
     }
 
     /// Build the complete worker training graph as MLIR module using Function-as-a-Unit pattern
     /// This creates: forward_fn -> autodiff -> main_fn that orchestrates the full training step
     fn buildWorkerTrainingGraph(self: *Self, builder: *MLIRBuilder) ![]u8 {
-        std.log.info("DiLoCo: Building REAL autodiff-enabled worker training graph with Function-as-a-Unit pattern...", .{});
 
         // === Part 1: Create the forward+loss function to be differentiated ===
-        std.log.info("Creating forward+loss function...", .{});
-        std.log.info("buildWorkerTrainingGraph: builder pointer = {}", .{@intFromPtr(builder)});
-        std.log.info("buildWorkerTrainingGraph: About to call buildForwardAndLossFunction...", .{});
         const forward_fn_op = try self.buildForwardAndLossFunction(builder);
-        std.log.info("Forward+loss function created successfully", .{});
         // NOTE: Function is already automatically attached to module by createFunction
 
         // === Part 2: Differentiate the forward function ===
-        std.log.info("Differentiating forward function with autodiff.buildGradientGraph...", .{});
         
-        // DEBUG: Verify function structure before calling autodiff
-        std.log.info("DEBUG: Verifying forward function structure...", .{});
+        // Verify function structure before calling autodiff
         const func_region = forward_fn_op.getRegion(0);
         const func_block = func_region.getBlock(0);
         
-        // Debug: Check all operations in the block
-        std.log.info("DEBUG: Walking through all operations in function block...", .{});
-        var maybe_op = func_block.getFirstOp();
-        var op_count: usize = 0;
-        while (maybe_op) |op| {
-            const op_name = op.getName();
-            std.log.info("DEBUG: Operation {}: {s}", .{ op_count, op_name });
-            if (std.mem.eql(u8, op_name, "func.return")) {
-                std.log.info("DEBUG: Found func.return operation!", .{});
-            }
-            maybe_op = op.getNext();
-            op_count += 1;
-        }
-        std.log.info("DEBUG: Total operations in function block: {}", .{op_count});
-        
         const maybe_terminator = func_block.getLastOp();
         const maybe_last_op = func_block.getLastOpGeneric();
-        if (maybe_terminator) |terminator| {
-            std.log.info("DEBUG: Found terminator operation in forward function", .{});
-            terminator.dump();
-        } else {
-            std.log.info("DEBUG: ERROR - No terminator found via getLastOp()!", .{});
-        }
-        
-        if (maybe_last_op) |last_op| {
-            const last_op_name = last_op.getName();
-            std.log.info("DEBUG: Last operation via getLastOpGeneric(): {s}", .{last_op_name});
-            if (std.mem.eql(u8, last_op_name, "func.return")) {
-                std.log.info("DEBUG: Last operation IS func.return!", .{});
-            }
-        } else {
-            std.log.info("DEBUG: ERROR - No last operation found via getLastOpGeneric()!", .{});
+        if (maybe_terminator == null or maybe_last_op == null) {
+            return error.MalformedFunction;
         }
         
         // The autodiff function will add its own generated function to the module.
@@ -479,7 +428,6 @@ pub const DiLoCo = struct {
         const grad_fn_name = "gpt2_forward_and_loss_grad";
 
         // === Part 3: Create the main worker function that orchestrates everything ===
-        std.log.info("Creating main worker orchestration function...", .{});
 
         // Define types for main function - now with all GPT-2 parameters
         const f32_type = mlir.Type.f32Type(builder.ctx);
@@ -515,7 +463,6 @@ pub const DiLoCo = struct {
 
         // --- REFACTORED MAIN FUNCTION CREATION ---
         // Use the safe helper to create the main function
-        std.log.info("Creating main orchestration function with safe helper...", .{});
         const main_result = try builder.createFunction("main", main_func_type);
         const main_block = main_result.entry_block;
 
@@ -534,7 +481,6 @@ pub const DiLoCo = struct {
         const initial_params = main_func_args[0..param_count];
         const inputs = main_func_args[param_count];
         const targets = main_func_args[param_count + 1];
-        std.log.info("Main function created with {} parameter arguments", .{param_count});
         // --- END REFACTORED MAIN FUNCTION CREATION ---
 
         // Build forward call operands: all parameters + inputs + targets
@@ -621,20 +567,16 @@ pub const DiLoCo = struct {
         _ = try builder.createAndAttach("func.return", updated_param_values.items, &.{}, .{});
 
         // === Part 4: Debug and serialize the complete module ===
-        std.log.info("Complete worker module with {} functions created successfully", .{3}); // forward_fn, grad_fn, main
 
-        // Dump the module for debugging
-        builder.module.op().dump();
+        // Module built successfully
 
         const serialized = try @import("../mlir_ctx.zig").serializeMLIRModule(self.allocator, builder.module);
 
-        std.log.info("✓ DiLoCo REAL autodiff worker training graph built and serialized ({} bytes).", .{serialized.len});
         return serialized;
     }
 
     /// Broadcasts the pre-built training graph to all workers for initialization
     fn setupWorkers(self: *Self) !void {
-        std.log.info("Broadcasting training graph to workers for setup...", .{});
 
         // Base64 encode the serialized graph for safe JSON transport
         const b64_len = std.base64.standard.Encoder.calcSize(self.serialized_worker_graph.len);
@@ -649,7 +591,7 @@ pub const DiLoCo = struct {
         // Broadcast InitializeGraph message with the encoded graph
         try self.coordinator.broadcastToWorkers(MessageType.INITIALIZE_GRAPH, json_payload);
 
-        std.log.info("Training graph sent to {} workers for caching.", .{self.coordinator.getWorkerCount()});
+        std.log.info("Training graph sent to {} workers", .{self.coordinator.getWorkerCount()});
     }
 
     /// Broadcast master parameters to all workers using Cap'n Proto
@@ -690,7 +632,6 @@ pub const DiLoCo = struct {
         // Broadcast StartInnerLoop message with Cap'n Proto
         try self.coordinator.broadcastToWorkers(MessageType.START_INNER_LOOP, json_payload);
 
-        std.log.debug("Broadcasted Cap'n Proto encoded parameters ({} tensors) to {} workers", .{ param_tensors.len, self.coordinator.getWorkerCount() });
     }
 
     /// Broadcast master parameters and data batch to all workers using Cap'n Proto
@@ -711,13 +652,28 @@ pub const DiLoCo = struct {
             try total_param_bytes.appendSlice(tensor_data);
         }
 
-        std.log.info("DEBUG: Total raw parameter bytes: {} ({} MB)", .{ total_param_bytes.items.len, total_param_bytes.items.len / (1024 * 1024) });
 
         // Serialize batch data as raw bytes (u32 tokens -> bytes)
         const input_ids_bytes = std.mem.sliceAsBytes(batch.x);
         const targets_bytes = std.mem.sliceAsBytes(batch.y);
         
-        std.log.info("DEBUG: Batch sizes - input_ids: {} bytes, targets: {} bytes", .{ input_ids_bytes.len, targets_bytes.len });
+        // VALIDATION: Check that we have valid data before serialization
+        if (total_param_bytes.items.len == 0) {
+            std.log.err("Empty parameters detected in broadcastMasterParametersAndBatch", .{});
+            return error.EmptyParameters;
+        }
+        if (input_ids_bytes.len == 0) {
+            std.log.err("Empty input_ids detected in broadcastMasterParametersAndBatch", .{});
+            return error.EmptyInputIds;
+        }
+        if (targets_bytes.len == 0) {
+            std.log.err("Empty targets detected in broadcastMasterParametersAndBatch", .{});
+            return error.EmptyTargets;
+        }
+        
+        std.log.info("Broadcasting params: {} bytes, input_ids: {} bytes, targets: {} bytes", .{
+            total_param_bytes.items.len, input_ids_bytes.len, targets_bytes.len
+        });
 
         // Create WorkerPayload with parameters and batch data
         const worker_payload = binary_protocol.WorkerPayload{
@@ -726,11 +682,26 @@ pub const DiLoCo = struct {
             .targets = targets_bytes,
         };
         
-        std.log.info("DEBUG: About to serialize WorkerPayload with Cap'n Proto...", .{});
         const capnp_bytes = try worker_payload.serialize(self.allocator);
         defer self.allocator.free(capnp_bytes);
         
-        std.log.info("DEBUG: Cap'n Proto serialization result: {} bytes ({} MB)", .{ capnp_bytes.len, capnp_bytes.len / (1024 * 1024) });
+        // Debug: Check Cap'n Proto serialization output
+        std.log.info("Cap'n Proto serialized to {} bytes", .{capnp_bytes.len});
+        if (capnp_bytes.len > 0) {
+            const sample_size = @min(32, capnp_bytes.len);
+            std.log.info("Cap'n Proto first {} bytes: {any}", .{ sample_size, capnp_bytes[0..sample_size] });
+            
+            // Check if data is mostly zeros (which would become 'A's in Base64)
+            var zero_count: usize = 0;
+            const check_size = @min(1024, capnp_bytes.len);
+            for (capnp_bytes[0..check_size]) |byte| {
+                if (byte == 0) zero_count += 1;
+            }
+            std.log.info("Cap'n Proto zero density: {}/{} ({d:.1}%)", .{
+                zero_count, check_size, (@as(f32, @floatFromInt(zero_count)) / @as(f32, @floatFromInt(check_size))) * 100.0
+            });
+        }
+        
 
         // Base64 encode the binary data
         const b64_len = std.base64.standard.Encoder.calcSize(capnp_bytes.len);
@@ -739,7 +710,6 @@ pub const DiLoCo = struct {
 
         const encoded_len = std.base64.standard.Encoder.encode(b64_encoded_payload, capnp_bytes).len;
         
-        std.log.info("DEBUG: Base64 encoding result: {} bytes ({} MB)", .{ encoded_len, encoded_len / (1024 * 1024) });
 
         // Create JSON payload with Base64-encoded binary data
         const json_payload = std.json.Value{ .string = b64_encoded_payload[0..encoded_len] };
@@ -747,17 +717,10 @@ pub const DiLoCo = struct {
         // Broadcast StartInnerLoop message with Cap'n Proto
         try self.coordinator.broadcastToWorkers(MessageType.START_INNER_LOOP, json_payload);
 
-        std.log.debug("Broadcasted parameters ({} tensors) + batch ({} inputs, {} targets) to {} workers", .{ 
-            param_tensors.len, 
-            batch.x.len, 
-            batch.y.len, 
-            self.coordinator.getWorkerCount() 
-        });
     }
 
     /// Collect results from workers after inner loop using Cap'n Proto
     fn collectWorkerResults(self: *Self) !ArrayList(WorkerResult) {
-        std.log.info("Collecting Cap'n Proto results from workers", .{});
         const responses = try self.coordinator.collectFromWorkers(MessageType.INNER_LOOP_COMPLETE);
         defer responses.deinit();
 
@@ -795,7 +758,6 @@ pub const DiLoCo = struct {
             try results.append(result);
         }
 
-        std.log.info("Collected {} Cap'n Proto results from workers", .{results.items.len});
         return results;
     }
 
@@ -805,7 +767,6 @@ pub const DiLoCo = struct {
             return error.NoWorkerResults;
         }
 
-        std.log.info("Updating {} GPT-2 parameter tensors using MLIR Nesterov optimizer with {} worker results", .{ self.parameter_shapes.len, worker_results.items.len });
 
         const param_tensors = self.master_parameters.?;
 
@@ -850,7 +811,7 @@ pub const DiLoCo = struct {
         // Update metrics
         self.metrics.loss = self.calculateAverageLoss(worker_results);
 
-        std.log.info("All {} GPT-2 parameters updated using MLIR Nesterov, average loss: {d:.4}", .{ param_tensors.len, self.metrics.loss });
+        std.log.info("Parameters updated, loss: {d:.4}", .{self.metrics.loss});
     }
 
     /// Average parameters from all workers (new byte-based version)
@@ -1018,9 +979,8 @@ pub fn testDiLoCo(allocator: Allocator) !void {
     try std.testing.expectEqual(@as(usize, 0), diloco.current_epoch);
     
     // Test GPT-2 configuration
-    const expected_param_count = gpt2.countTotalParameters(config.gpt2_config);
-    const actual_param_shapes = diloco.parameter_shapes.len;
-    std.log.info("GPT-2 nano has {} parameter tensors with total {} parameters", .{ actual_param_shapes, expected_param_count });
+    _ = gpt2.countTotalParameters(config.gpt2_config);
+    _ = diloco.parameter_shapes.len;
 
     std.log.info("✓ DiLoCo MLIR algorithm test completed");
 }

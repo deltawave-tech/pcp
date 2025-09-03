@@ -158,22 +158,33 @@ pub const MLIRContext = struct {
     pub fn lowerToSPIRV(_: *Self, allocator: Allocator, module: mlir.Module) ![]const u8 {
         std.debug.print("=== IREE-based SPIR-V Compilation Pipeline ===\n", .{});
         
+        std.debug.print("Step 1: About to serialize MLIR module...\n", .{});
         // 1. Serialize MLIR module to file for IREE compilation
-        const mlir_source = try serializeMLIRModule(allocator, module);
+        const mlir_source = serializeMLIRModule(allocator, module) catch |err| {
+            std.debug.print("ERROR: Failed to serialize MLIR module: {}\n", .{err});
+            return err;
+        };
         defer allocator.free(mlir_source);
+        std.debug.print("Step 1 complete: Serialized {} bytes\n", .{mlir_source.len});
         
         const temp_mlir_path = "temp_graph.mlir";
         const temp_vmfb_path = "temp_graph.vmfb"; 
         const spirv_dump_dir = "temp_spirv_dump";
         
+        std.debug.print("Step 2: About to write MLIR file...\n", .{});
         // Write MLIR to temporary file
-        try std.fs.cwd().writeFile(.{ .sub_path = temp_mlir_path, .data = mlir_source });
-        // TEMP: Don't delete the file so we can inspect it
-        // defer std.fs.cwd().deleteFile(temp_mlir_path) catch {};
+        std.fs.cwd().writeFile(.{ .sub_path = temp_mlir_path, .data = mlir_source }) catch |err| {
+            std.debug.print("ERROR: Failed to write MLIR file: {}\n", .{err});
+            return err;
+        };
+        std.debug.print("Step 2 complete: Wrote file {s}\n", .{temp_mlir_path});
         
         std.debug.print("✓ Saved MLIR module to {s} ({} bytes)\n", .{ temp_mlir_path, mlir_source.len });
         
         // 2. Call IREE compiler via subprocess
+        std.debug.print("About to execute IREE compiler subprocess...\n", .{});
+        std.debug.print("Command: python3 iree_compile_wrapper.py {s} {s} {s} vulkan-spirv\n", .{ temp_mlir_path, temp_vmfb_path, spirv_dump_dir });
+        
         const result = std.process.Child.run(.{
             .allocator = allocator,
             .argv = &.{
@@ -186,8 +197,26 @@ pub const MLIRContext = struct {
             },
         }) catch |err| {
             std.debug.print("ERROR: Failed to run IREE compiler: {}\n", .{err});
+            std.debug.print("This might indicate IREE is not installed or python3 is not available\n", .{});
+            
+            // Check if we can at least call python3
+            const python_test = std.process.Child.run(.{
+                .allocator = allocator,
+                .argv = &.{ "python3", "--version" },
+            }) catch |py_err| {
+                std.debug.print("ERROR: python3 not found: {}\n", .{py_err});
+                return error.Python3NotFound;
+            };
+            defer {
+                allocator.free(python_test.stdout);
+                allocator.free(python_test.stderr);
+            }
+            std.debug.print("Python3 is available: {s}\n", .{python_test.stdout});
+            
             return error.IREESubprocessFailed;
         };
+        
+        std.debug.print("IREE subprocess completed with term: {?}\n", .{result.term});
         
         defer {
             allocator.free(result.stdout);
@@ -320,18 +349,63 @@ pub const MLIRContext = struct {
 
 /// Serialize an MLIR module to a string representation for network transfer.
 pub fn serializeMLIRModule(allocator: Allocator, module: mlir.Module) ![]u8 {
+    std.debug.print("serializeMLIRModule: Creating buffer...\n", .{});
     var buffer = std.ArrayList(u8).init(allocator);
+    var serialization_error = false;
+    
+    const SerializationContext = struct {
+        buffer: *std.ArrayList(u8),
+        error_flag: *bool,
+    };
+    
+    var ctx = SerializationContext{
+        .buffer = &buffer,
+        .error_flag = &serialization_error,
+    };
     
     const writeToArrayList = struct {
         fn callback(data_ptr: [*]const u8, data_len: usize, userData: ?*anyopaque) callconv(.C) void {
-            const list = @as(*std.ArrayList(u8), @ptrCast(@alignCast(userData.?)));
+            const context = @as(*SerializationContext, @ptrCast(@alignCast(userData.?)));
             const data = data_ptr[0..data_len];
-            list.appendSlice(data) catch {};
+            
+            std.debug.print("MLIR serialization callback: appending {} bytes (total so far: {})\n", .{ data_len, context.buffer.items.len });
+            
+            // Add bounds checking to prevent buffer overflow
+            if (data_len > 100 * 1024 * 1024) { // 100MB sanity check
+                std.debug.print("ERROR: MLIR serialization data chunk too large: {} bytes\n", .{data_len});
+                context.error_flag.* = true;
+                return;
+            }
+            context.buffer.appendSlice(data) catch |err| {
+                std.debug.print("ERROR: Failed to append MLIR data chunk of {} bytes: {}\n", .{ data_len, err });
+                context.error_flag.* = true;
+                return;
+            };
         }
     }.callback;
 
-    c.mlirOperationPrint(module.op().handle, writeToArrayList, &buffer);
-    const serialized = try buffer.toOwnedSlice();
+    std.debug.print("serializeMLIRModule: About to call mlirOperationPrint...\n", .{});
+    // Add null checks
+    const module_op = module.op();
+    if (@intFromPtr(module_op.handle) == 0) {
+        std.debug.print("ERROR: Module operation handle is null\n", .{});
+        return error.NullModuleHandle;
+    }
+    
+    c.mlirOperationPrint(module_op.handle, writeToArrayList, &ctx);
+    std.debug.print("serializeMLIRModule: mlirOperationPrint completed, buffer size: {}\n", .{buffer.items.len});
+    
+    // Check if any errors occurred during serialization
+    if (serialization_error) {
+        std.debug.print("ERROR: MLIR serialization failed due to callback errors\n", .{});
+        buffer.deinit();
+        return error.MLIRSerializationFailed;
+    }
+    
+    const serialized = buffer.toOwnedSlice() catch |err| {
+        std.debug.print("ERROR: Failed to convert buffer to owned slice: {}\n", .{err});
+        return err;
+    };
     std.debug.print("✓ Serialized MLIR module to {} bytes\n", .{serialized.len});
     return serialized;
 }
@@ -339,7 +413,68 @@ pub fn serializeMLIRModule(allocator: Allocator, module: mlir.Module) ![]u8 {
 /// Deserialize an MLIR module from a string representation.
 pub fn deserializeMLIRModule(allocator: Allocator, context: mlir.Context, data: []const u8) !mlir.Module {
     _ = allocator;
-    const module = try mlir.Module.parse(context, data);
+    
+    std.debug.print("deserializeMLIRModule: About to parse {} bytes of MLIR data...\n", .{data.len});
+    
+    // Check if context is valid
+    if (@intFromPtr(context.handle) == 0) {
+        std.debug.print("ERROR: MLIR context handle is null in deserialization!\n", .{});
+        return error.NullContextHandle;
+    }
+    std.debug.print("✓ MLIR context handle is valid: 0x{x}\n", .{@intFromPtr(context.handle)});
+    
+    // Show first 200 chars of MLIR data for debugging
+    const preview_len = @min(200, data.len);
+    std.debug.print("MLIR data preview ({} chars): {s}\n", .{ preview_len, data[0..preview_len] });
+    
+    // Also show data around line 870 where the error occurs
+    if (data.len > 870) {
+        std.debug.print("Investigating line 870 error - looking for problematic area...\n", .{});
+        
+        // Find approximate line 870 (assuming ~80 chars per line average)
+        const approx_char_pos = 870 * 80;
+        const start_pos = if (approx_char_pos > 100) approx_char_pos - 100 else 0;
+        const end_pos = @min(approx_char_pos + 200, data.len);
+        
+        if (start_pos < data.len) {
+            std.debug.print("Data around estimated line 870 (chars {}-{}): {s}\n", .{ start_pos, end_pos, data[start_pos..end_pos] });
+        }
+        
+        // Look for null bytes or invalid characters
+        var null_count: usize = 0;
+        var first_null: ?usize = null;
+        for (data, 0..) |byte, i| {
+            if (byte == 0) {
+                null_count += 1;
+                if (first_null == null) first_null = i;
+            }
+        }
+        
+        if (null_count > 0) {
+            std.debug.print("WARNING: Found {} null bytes in MLIR data! First at position {}\n", .{ null_count, first_null.? });
+        }
+    }
+    
+    const module = mlir.Module.parse(context, data) catch |err| {
+        std.debug.print("ERROR: mlir.Module.parse failed: {}\n", .{err});
+        return err;
+    };
+    
+    std.debug.print("✓ mlir.Module.parse completed, checking module handle...\n", .{});
+    if (@intFromPtr(module.handle) == 0) {
+        std.debug.print("ERROR: Parsed module has null handle!\n", .{});
+        return error.NullParsedModuleHandle;
+    }
+    std.debug.print("✓ Parsed module handle is valid: 0x{x}\n", .{@intFromPtr(module.handle)});
+    
+    // Check operation handle immediately
+    const test_op = module.op();
+    if (@intFromPtr(test_op.handle) == 0) {
+        std.debug.print("ERROR: Module operation handle is null after parsing!\n", .{});
+        return error.NullOperationHandle;
+    }
+    std.debug.print("✓ Module operation handle is valid: 0x{x}\n", .{@intFromPtr(test_op.handle)});
+    
     std.debug.print("✓ Deserialized MLIR module from {} bytes\n", .{data.len});
     return module;
 }

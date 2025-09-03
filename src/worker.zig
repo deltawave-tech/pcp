@@ -112,13 +112,13 @@ pub const Worker = struct {
         
         // Wait for JoinAccept
         std.log.debug("Worker waiting for JoinAccept response from shepherd...", .{});
-        const parsed_join_accept = self.client.receive() catch |err| {
+        const join_accept_result = self.client.receive() catch |err| {
             std.log.err("Failed to receive JoinAccept from shepherd: {}", .{err});
             return err;
         };
-        defer parsed_join_accept.deinit();
-        
-        const join_accept = parsed_join_accept.value;
+        defer join_accept_result.parsed.deinit();
+        defer self.allocator.free(join_accept_result.buffer); // Free the buffer
+        const join_accept = join_accept_result.parsed.value;
         
         if (!std.mem.eql(u8, join_accept.msg_type, MessageType.JOIN_ACCEPT)) {
             return error.UnexpectedMessage;
@@ -141,14 +141,14 @@ pub const Worker = struct {
         
         while (self.is_running) {
             // Receive command from Shepherd
-            const parsed_msg = self.client.receive() catch |err| {
+            const receive_result = self.client.receive() catch |err| {
                 std.log.err("Failed to receive message from Shepherd: {}", .{err});
                 self.state = .disconnected;
                 return;
             };
-            defer parsed_msg.deinit();
-            
-            const msg = parsed_msg.value;
+            defer receive_result.parsed.deinit();
+            defer self.allocator.free(receive_result.buffer); // Free the buffer
+            const msg = receive_result.parsed.value;
             
             // Handle different message types
             if (std.mem.eql(u8, msg.msg_type, MessageType.INITIALIZE_GRAPH)) {

@@ -4,6 +4,12 @@
 const std = @import("std");
 const net = std.net;
 const Allocator = std.mem.Allocator;
+
+/// Return type for receive operations
+pub const ReceiveResult = struct {
+    parsed: std.json.Parsed(MessageEnvelope),
+    buffer: []u8,
+};
 const message = @import("message.zig");
 const MessageEnvelope = message.MessageEnvelope;
 
@@ -41,7 +47,7 @@ pub const TcpStreamManager = struct {
 
     /// Receive a MessageEnvelope from a TCP stream
     /// Reads length prefix first, then exactly that many bytes
-    pub fn receive(stream: net.Stream, allocator: Allocator) !std.json.Parsed(MessageEnvelope) {
+    pub fn receive(stream: net.Stream, allocator: Allocator) !ReceiveResult {
         // Read the length prefix (4 bytes for u32)
         var length_bytes: [4]u8 = undefined;
         const bytes_read = stream.readAll(&length_bytes) catch |err| {
@@ -74,10 +80,10 @@ pub const TcpStreamManager = struct {
         
         // Read exactly data_length bytes
         const json_data = try allocator.alloc(u8, data_length);
-        errdefer allocator.free(json_data);
+        // DO NOT defer allocator.free(json_data) here; we are returning it.
+        
         _ = try stream.readAll(json_data);
         
-        // Parse JSON data using parseFromSlice (Zig 0.14 compatible)
         const parsed = try std.json.parseFromSlice(MessageEnvelope, allocator, json_data, .{});
         
         std.log.debug("Received message: type={s}, length={}, from_node={}, from_service={s}", .{
@@ -87,7 +93,8 @@ pub const TcpStreamManager = struct {
             parsed.value.sender_service,
         });
         
-        return parsed;
+        // Return both the parsed object and the buffer
+        return .{ .parsed = parsed, .buffer = json_data };
     }
     
     /// Receive a MessageEnvelope with a timeout
@@ -180,7 +187,7 @@ pub const TcpClient = struct {
     }
     
     /// Receive a message using the TcpStreamManager
-    pub fn receive(self: Self) !std.json.Parsed(MessageEnvelope) {
+    pub fn receive(self: Self) !ReceiveResult {
         const stream = try self.getStream();
         return try TcpStreamManager.receive(stream, self.allocator);
     }

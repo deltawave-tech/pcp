@@ -61,10 +61,11 @@ fn testClientFunction(allocator: std.mem.Allocator, host: []const u8, port: u16)
     std.log.debug("Client sent test message");
     
     // Receive response
-    const parsed_response = try client.receive();
-    defer parsed_response.deinit();
+    const response_result = try client.receive();
+    defer response_result.parsed.deinit();
+    defer allocator.free(response_result.buffer);
     
-    const response = parsed_response.value;
+    const response = response_result.parsed.value;
     
     std.log.debug("Client received response: type={s}", .{response.msg_type});
     

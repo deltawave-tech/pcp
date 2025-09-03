@@ -117,13 +117,14 @@ pub const Shepherd = struct {
         defer stream.close();
         
         // Wait for JoinRequest from worker
-        const parsed_join_msg = TcpStreamManager.receive(stream, self.allocator) catch |err| {
+        const join_msg_result = TcpStreamManager.receive(stream, self.allocator) catch |err| {
             std.log.err("Failed to receive join message: {}", .{err});
             return;
         };
-        defer parsed_join_msg.deinit();
+        defer join_msg_result.parsed.deinit();
+        defer self.allocator.free(join_msg_result.buffer);
         
-        const join_msg = parsed_join_msg.value;
+        const join_msg = join_msg_result.parsed.value;
         
         
         // Validate it's a JoinRequest
@@ -176,16 +177,17 @@ pub const Shepherd = struct {
     /// Handle ongoing messages from a worker
     fn handleWorkerMessages(self: *Self, worker_id: NodeId, stream: net.Stream) !void {
         while (self.is_running) {
-            const parsed_msg = TcpStreamManager.receive(stream, self.allocator) catch |err| {
+            const msg_result = TcpStreamManager.receive(stream, self.allocator) catch |err| {
                 std.log.warn("Worker {} disconnected: {}", .{ worker_id, err });
                 self.removeWorker(worker_id);
                 // Update monitoring after worker removal
                 monitoring.setWorkerCount(self.worker_pool.items.len);
                 return;
             };
-            defer parsed_msg.deinit();
+            defer msg_result.parsed.deinit();
+            defer self.allocator.free(msg_result.buffer);
             
-            const msg = parsed_msg.value;
+            const msg = msg_result.parsed.value;
             
             // Handle different message types
             if (std.mem.eql(u8, msg.msg_type, MessageType.HEARTBEAT)) {

@@ -41,7 +41,8 @@ pub const c = struct {
         length: usize,
     };
 
-    // String utilities (will be defined later in the file)
+    // String utilities
+    extern fn mlirStringRefCreateFromCString(str: [*:0]const u8) MlirStringRef;
 
     // Logical result for MLIR operations
     pub const MlirLogicalResult = extern struct {
@@ -88,6 +89,7 @@ pub const c = struct {
     // ADD THIS NEW EXTERN
     pub extern fn mlirOperationVerify(op: *MlirOperation) MlirLogicalResult;
     pub extern fn mlirOperationGetOperand(op: *MlirOperation, pos: isize) *MlirValue;
+    pub extern fn mlirOperationSetOperand(op: *MlirOperation, pos: isize, newValue: *MlirValue) void;
     pub extern fn mlirOperationGetName(op: *MlirOperation) *MlirIdentifier;
     pub extern fn mlirIdentifierStr(identifier: *MlirIdentifier) MlirStringRef;
     pub extern fn mlirOperationGetAttributeByName(operation: *MlirOperation, name: MlirStringRef) *MlirAttribute;
@@ -147,6 +149,12 @@ pub const c = struct {
     pub extern fn mlirValueDump(value: *MlirValue) void;
     extern fn mlirStringRefFromString(str: [*:0]const u8) MlirStringRef;
     extern fn mlirBlockGetArgument(block: *MlirBlock, pos: isize) *MlirValue;
+    
+    // Dense array attribute operations
+    pub extern fn mlirAttributeIsADenseI64Array(attr: *MlirAttribute) bool;
+    pub extern fn mlirDenseI64ArrayGet(ctx: *MlirContext, num_elements: isize, elements: [*]const i64) *MlirAttribute;
+    pub extern fn mlirDenseArrayGetNumElements(attr: *MlirAttribute) isize;
+    pub extern fn mlirDenseI64ArrayGetElement(attr: *MlirAttribute, pos: isize) i64;
     extern fn mlirBlockGetNumArguments(block: *MlirBlock) isize;
 
     // Function type operations
@@ -175,7 +183,6 @@ pub const c = struct {
     pub extern fn mlirDenseElementsAttrFloatSplatGet(shapedType: *MlirType, value: f64) *MlirAttribute;
     pub extern fn mlirFloatAttrDoubleGet(ctx: *MlirContext, type: *MlirType, value: f64) *MlirAttribute;
     pub extern fn mlirIntegerAttrGet(type: *MlirType, value: i64) *MlirAttribute;
-    pub extern fn mlirDenseI64ArrayGet(ctx: *MlirContext, size: isize, values: [*]const i64) *MlirAttribute;
     extern fn mlirAttributeIsAString(attr: *MlirAttribute) bool;
     extern fn mlirStringAttrGet(ctx: *MlirContext, str: MlirStringRef) *MlirAttribute;
     
@@ -338,6 +345,10 @@ pub const c = struct {
         const result = try allocator.alloc(u8, sref.length);
         @memcpy(result, sref.data[0..sref.length]);
         return result;
+    }
+
+    pub fn stringRefCreateFromCString(str: [*:0]const u8) MlirStringRef {
+        return mlirStringRefCreateFromCString(str);
     }
 
     // Context wrapper functions
@@ -810,5 +821,22 @@ pub const c = struct {
 
     pub fn attributeParseGet(ctx: *MlirContext, str: []const u8) *MlirAttribute {
         return mlirAttributeParseGet(ctx, stringRefFromString(str));
+    }
+
+    // Dense array attribute wrapper functions
+    pub fn attributeIsADenseI64Array(attr: *MlirAttribute) bool {
+        return mlirAttributeIsADenseI64Array(attr);
+    }
+
+    pub fn denseArrayGetNumElements(attr: *MlirAttribute) isize {
+        return mlirDenseArrayGetNumElements(attr);
+    }
+
+    pub fn denseI64ArrayGet(ctx: *MlirContext, num_elements: isize, elements: []const i64) *MlirAttribute {
+        return mlirDenseI64ArrayGet(ctx, num_elements, elements.ptr);
+    }
+
+    pub fn denseI64ArrayGetElement(attr: *MlirAttribute, pos: isize) i64 {
+        return mlirDenseI64ArrayGetElement(attr, pos);
     }
 };

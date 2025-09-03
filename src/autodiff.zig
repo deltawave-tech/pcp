@@ -13,9 +13,12 @@ const MLIRBuilder = ops.MLIRBuilder;
 
 /// Vector-Jacobian Product (VJP) function signature
 /// Takes the forward operation and output gradients, returns input gradients
+/// NEW: Also takes primals (operands of the forward op) that are already mapped to the gradient scope.
+/// And the original operation for accessing attributes when needed.
 const VJPFn = *const fn(
     builder: *MLIRBuilder,
-    op: mlir.Operation,
+    original_op: mlir.Operation,
+    primals: []const mlir.Value,
     adjoints: []const mlir.Value,
 ) anyerror![]mlir.Value;
 
@@ -93,6 +96,10 @@ pub fn buildGradientGraph(
     // Map from forward-pass values (primals) to their gradients (adjoints)
     var adjoint_map = std.AutoHashMap(mlir.Value, mlir.Value).init(allocator);
     defer adjoint_map.deinit();
+
+    // NEW: Map from forward-pass values to their corresponding values in the gradient function's scope
+    var value_map = std.AutoHashMap(mlir.Value, mlir.Value).init(allocator);
+    defer value_map.deinit();
     
     // Get the operations in reverse topological order
     std.debug.print("Getting operations in reverse order...\n", .{});
@@ -100,38 +107,63 @@ pub fn buildGradientGraph(
     defer allocator.free(ops_reversed);
     std.debug.print("Got {} operations in reverse order\n", .{ops_reversed.len});
     
-    // Initialize gradient of loss (output) to 1.0
-    std.debug.print("Getting return value from forward function...\n", .{});
-    const loss_value = getReturnValue(forward_fn) orelse {
-        std.debug.print("Error: No return operation found in forward function\n", .{});
-        return error.NoReturnOperation;
-    };
-    std.debug.print("Creating ones data...\n", .{});
-    const ones_data = [_]f32{1.0};
-    const ones_bytes = std.mem.sliceAsBytes(ones_data[0..]);
-    std.debug.print("Creating ones shape...\n", .{});
-    var ones_shape = try tensor.Shape.initWithDims(builder.ctx, &[_]i64{1}, .f32);
-    defer ones_shape.deinit();
-    std.debug.print("Creating ones constant...\n", .{});
-    const loss_type = loss_value.getType();
-    const ones_constant = try builder.createConstant(ones_bytes, loss_type, ones_shape);
-    std.debug.print("Putting loss value in adjoint map...\n", .{});
-    try adjoint_map.put(loss_value, ones_constant);
+    // --- START: NEW INITIALIZATION LOGIC ---
+    // 1. Map the arguments of the forward function to the arguments of the gradient function
+    const forward_block = forward_fn.getRegion(0).getBlock(0);
+    const num_forward_args = forward_block.getNumArguments();
+    for (0..num_forward_args) |i| {
+        const forward_arg = forward_block.getArgument(i);
+        const grad_arg = grad_fn_block.addArgument(forward_arg.getType(), builder.loc);
+        try value_map.put(forward_arg, grad_arg);
+    }
+
+    // 2. The *last* argument of the gradient function is the incoming gradient for the forward function's result
+    const loss_value = getReturnValue(forward_fn) orelse return error.NoReturnOperation;
+    const loss_grad_arg = grad_fn_block.addArgument(loss_value.getType(), builder.loc);
+    try adjoint_map.put(loss_value, loss_grad_arg);
+    // --- END: NEW INITIALIZATION LOGIC ---
     
-    std.debug.print("Starting reverse-mode AD through {} operations...\n", .{ops_reversed.len});
+    // CRITICAL FIX: First pass - build value_map by processing operations in FORWARD order
+    // This ensures all primal values are available in gradient scope before we compute gradients
+    std.debug.print("First pass: Building primal value mappings in forward order...\n", .{});
+    const ops_forward = try getOperationsInForwardOrder(allocator, forward_fn);
+    defer allocator.free(ops_forward);
     
-    // Debug: Print operation names
-    for (ops_reversed, 0..) |op, i| {
+    for (ops_forward) |op| {
         const op_name = op.getName();
-        std.debug.print("  Operation {}: {s}\n", .{i, op_name});
+        
+        if (std.mem.eql(u8, op_name, "stablehlo.constant")) {
+            // Clone constants into gradient scope
+            const cloned_op = mlir.Operation{ .handle = c.operationClone(op.handle) };
+            builder.insertion_block.appendOwnedOperation(cloned_op);
+            try value_map.put(op.getResult(0), cloned_op.getResult(0));
+        } else if (!std.mem.eql(u8, op_name, "func.return")) {
+            // Clone regular operations into gradient scope with mapped operands
+            const cloned_op = mlir.Operation{ .handle = c.operationClone(op.handle) };
+            
+            // Replace operands with their mapped versions
+            for (0..cloned_op.getNumOperands()) |i| {
+                const primal_operand = op.getOperand(i);
+                if (value_map.get(primal_operand)) |mapped_operand| {
+                    c.mlirOperationSetOperand(cloned_op.handle, @intCast(i), mapped_operand.handle);
+                }
+            }
+            
+            builder.insertion_block.appendOwnedOperation(cloned_op);
+            
+            // Map the results
+            for (0..op.getNumResults()) |i| {
+                try value_map.put(op.getResult(i), cloned_op.getResult(i));
+            }
+        }
     }
     
-    std.debug.print("Starting VJP processing loop...\n", .{});
+    std.debug.print("Second pass: Computing gradients in reverse order...\n", .{});
     
     // Walk the forward graph backwards, applying VJP rules using the SHARED builder
     for (ops_reversed) |op| {
         std.debug.print("Processing operation VJP for: {s}\n", .{op.getName()});
-        try processOperationVJP(allocator, builder, op, &adjoint_map);
+        try processOperationVJP(allocator, builder, op, &adjoint_map, &value_map);
     }
     
     // Collect gradients and create return statement using the SHARED builder
@@ -151,6 +183,7 @@ fn processOperationVJP(
     builder: *MLIRBuilder,
     op: mlir.Operation,
     adjoint_map: *std.AutoHashMap(mlir.Value, mlir.Value),
+    value_map: *std.AutoHashMap(mlir.Value, mlir.Value),
 ) !void {
     const op_name = op.getName();
     
@@ -162,15 +195,37 @@ fn processOperationVJP(
         // No gradient flows through this operation
         return;
     }
+
+    // Constants are now handled in the first pass, so we can skip them here
+    if (std.mem.eql(u8, op_name, "stablehlo.constant")) {
+        return;
+    }
     
     // Runtime dispatch to the correct VJP rule
     if (getVjpFn(op_name)) |vjp_rule| {
-        // Apply the VJP rule to get input gradients
-        const input_gradients = try vjp_rule(builder, op, output_gradients);
+        // NEW: Look up primals in the value_map to get handles valid in the grad scope.
+        var mapped_primals = std.ArrayList(mlir.Value).init(allocator);
+        defer mapped_primals.deinit();
+
+        for (0..op.getNumOperands()) |i| {
+            const primal_operand = op.getOperand(i);
+            const mapped_operand = value_map.get(primal_operand) orelse {
+                // This is the error we were seeing. It means a value wasn't mapped.
+                // This should now be resolved by handling constants correctly.
+                std.debug.print("FATAL: Could not find primal value in value_map. This indicates a bug in the reverse walk or constant handling.\n", .{});
+                op.dump();
+                return error.PrimalValueNotFound;
+            };
+            try mapped_primals.append(mapped_operand);
+        }
+
+        const input_gradients = try vjp_rule(builder, op, mapped_primals.items, output_gradients);
         defer allocator.free(input_gradients);
         
         // Add input gradients to the adjoint map
         try addInputGradients(builder, op, input_gradients, adjoint_map);
+        
+        // NOTE: Forward operations are now pre-built in the first pass, so we don't need to recreate them here
     } else {
         std.debug.print("Warning: No VJP rule for operation: {s}\n", .{op_name});
     }
@@ -179,15 +234,16 @@ fn processOperationVJP(
 /// VJP rule for addition: both inputs get the same gradient
 fn addVJP(
     builder: *MLIRBuilder,
-    op: mlir.Operation,
+    original_op: mlir.Operation,
+    primals: []const mlir.Value,
     adjoints: []const mlir.Value,
 ) ![]mlir.Value {
-    _ = op; // For now, we don't use the op parameter
-    std.debug.assert(adjoints.len == 1);
+    _ = original_op;
+    _ = primals;
     const grad_out = adjoints[0];
 
     var result = std.ArrayList(mlir.Value).init(builder.allocator);
-    errdefer result.deinit();
+    defer result.deinit();
 
     // Gradient for both inputs is just the output gradient.
     try result.append(grad_out);
@@ -199,24 +255,22 @@ fn addVJP(
 /// VJP rule for subtraction: da = grad_out, db = -grad_out
 fn subtractVJP(
     builder: *MLIRBuilder,
-    op: mlir.Operation,
+    original_op: mlir.Operation,
+    primals: []const mlir.Value,
     adjoints: []const mlir.Value,
 ) ![]mlir.Value {
-    std.debug.assert(adjoints.len == 1);
-    
+    _ = original_op;
     const grad_out = adjoints[0];
-    const a = op.getOperand(0);
-    const b = op.getOperand(1);
-    
     var result = std.ArrayList(mlir.Value).init(builder.allocator);
+    defer result.deinit();
     
     // da = grad_out
-    if (!isValueFromConstantOp(a)) {
+    if (primals.len > 0) {
         try result.append(grad_out);
     }
     
     // db = -grad_out
-    if (!isValueFromConstantOp(b)) {
+    if (primals.len > 1) {
         const neg_grad = try builder.createAndAttach("stablehlo.negate", &.{grad_out}, &.{grad_out.getType()});
         try result.append(neg_grad.getResult(0));
     }
@@ -227,28 +281,25 @@ fn subtractVJP(
 /// VJP rule for multiplication: da = grad_out * b, db = grad_out * a
 fn multiplyVJP(
     builder: *MLIRBuilder,
-    op: mlir.Operation,
+    original_op: mlir.Operation,
+    primals: []const mlir.Value,
     adjoints: []const mlir.Value,
 ) ![]mlir.Value {
-    std.debug.assert(adjoints.len == 1);
-    
+    _ = original_op;
     const grad_out = adjoints[0];
-    const a = op.getOperand(0); // Primal 'a'
-    const b = op.getOperand(1); // Primal 'b'
+    const a = primals[0]; // Primal 'a' - NOW VALID IN THIS SCOPE
+    const b = primals[1]; // Primal 'b' - NOW VALID IN THIS SCOPE
     
     var result = std.ArrayList(mlir.Value).init(builder.allocator);
+    defer result.deinit();
     
     // da = grad_out * b
-    if (!isValueFromConstantOp(a)) {
-        const grad_a = try builder.createAndAttach("stablehlo.multiply", &.{ grad_out, b }, &.{grad_out.getType()});
-        try result.append(grad_a.getResult(0));
-    }
+    const grad_a = try builder.createAndAttach("stablehlo.multiply", &.{ grad_out, b }, &.{grad_out.getType()});
+    try result.append(grad_a.getResult(0));
     
     // db = grad_out * a  
-    if (!isValueFromConstantOp(b)) {
-        const grad_b = try builder.createAndAttach("stablehlo.multiply", &.{ grad_out, a }, &.{grad_out.getType()});
-        try result.append(grad_b.getResult(0));
-    }
+    const grad_b = try builder.createAndAttach("stablehlo.multiply", &.{ grad_out, a }, &.{grad_out.getType()});
+    try result.append(grad_b.getResult(0));
     
     return result.toOwnedSlice();
 }
@@ -256,35 +307,32 @@ fn multiplyVJP(
 /// VJP rule for division: da = grad_out / b, db = -grad_out * a / (b * b)
 fn divideVJP(
     builder: *MLIRBuilder,
-    op: mlir.Operation,
+    original_op: mlir.Operation,
+    primals: []const mlir.Value,
     adjoints: []const mlir.Value,
 ) ![]mlir.Value {
-    std.debug.assert(adjoints.len == 1);
-    
+    _ = original_op;
     const grad_out = adjoints[0];
-    const a = op.getOperand(0); // Primal 'a'
-    const b = op.getOperand(1); // Primal 'b'
+    const a = primals[0];
+    const b = primals[1];
     
     var result = std.ArrayList(mlir.Value).init(builder.allocator);
+    defer result.deinit();
     
     // da = grad_out / b
-    if (!isValueFromConstantOp(a)) {
-        const grad_a = try builder.createAndAttach("stablehlo.divide", &.{ grad_out, b }, &.{grad_out.getType()});
-        try result.append(grad_a.getResult(0));
-    }
+    const grad_a = try builder.createAndAttach("stablehlo.divide", &.{ grad_out, b }, &.{grad_out.getType()});
+    try result.append(grad_a.getResult(0));
     
     // db = -grad_out * a / (b * b)
-    if (!isValueFromConstantOp(b)) {
-        // Compute a * grad_out
-        const a_times_grad = try builder.createAndAttach("stablehlo.multiply", &.{ a, grad_out }, &.{grad_out.getType()});
-        // Compute b * b
-        const b_squared = try builder.createAndAttach("stablehlo.multiply", &.{ b, b }, &.{b.getType()});
-        // Compute (a * grad_out) / (b * b)
-        const positive_grad_b = try builder.createAndAttach("stablehlo.divide", &.{ a_times_grad.getResult(0), b_squared.getResult(0) }, &.{grad_out.getType()});
-        // Negate to get -grad_out * a / (b * b)
-        const grad_b = try builder.createAndAttach("stablehlo.negate", &.{ positive_grad_b.getResult(0) }, &.{grad_out.getType()});
-        try result.append(grad_b.getResult(0));
-    }
+    // Compute a * grad_out
+    const a_times_grad = try builder.createAndAttach("stablehlo.multiply", &.{ a, grad_out }, &.{grad_out.getType()});
+    // Compute b * b
+    const b_squared = try builder.createAndAttach("stablehlo.multiply", &.{ b, b }, &.{b.getType()});
+    // Compute (a * grad_out) / (b * b)
+    const positive_grad_b = try builder.createAndAttach("stablehlo.divide", &.{ a_times_grad.getResult(0), b_squared.getResult(0) }, &.{grad_out.getType()});
+    // Negate to get -grad_out * a / (b * b)
+    const grad_b = try builder.createAndAttach("stablehlo.negate", &.{ positive_grad_b.getResult(0) }, &.{grad_out.getType()});
+    try result.append(grad_b.getResult(0));
     
     return result.toOwnedSlice();
 }
@@ -292,21 +340,19 @@ fn divideVJP(
 /// VJP rule for negation: da = -grad_out
 fn negateVJP(
     builder: *MLIRBuilder,
-    op: mlir.Operation,
+    original_op: mlir.Operation,
+    primals: []const mlir.Value,
     adjoints: []const mlir.Value,
 ) ![]mlir.Value {
-    std.debug.assert(adjoints.len == 1);
-    
+    _ = original_op;
+    _ = primals;
     const grad_out = adjoints[0];
-    const a = op.getOperand(0); // Primal 'a'
     
     var result = std.ArrayList(mlir.Value).init(builder.allocator);
+    defer result.deinit();
     
-    // da = -grad_out
-    if (!isValueFromConstantOp(a)) {
-        const grad_a = try builder.createAndAttach("stablehlo.negate", &.{grad_out}, &.{grad_out.getType()});
-        try result.append(grad_a.getResult(0));
-    }
+    const grad_a = try builder.createAndAttach("stablehlo.negate", &.{grad_out}, &.{grad_out.getType()});
+    try result.append(grad_a.getResult(0));
     
     return result.toOwnedSlice();
 }
@@ -314,73 +360,72 @@ fn negateVJP(
 /// VJP rule for transpose: da = transpose(grad_out) with inverse permutation
 fn transposeVJP(
     builder: *MLIRBuilder,
-    op: mlir.Operation,
+    original_op: mlir.Operation,
+    primals: []const mlir.Value,
     adjoints: []const mlir.Value,
 ) ![]mlir.Value {
-    std.debug.assert(adjoints.len == 1);
-    
     const grad_out = adjoints[0];
-    const a = op.getOperand(0); // Primal 'a'
+    const a = primals[0]; // Primal 'a'
     
     var result = std.ArrayList(mlir.Value).init(builder.allocator);
+    defer result.deinit();
     
-    if (!isValueFromConstantOp(a)) {
-        // Get the permutation attribute from the original transpose operation
-        const permutation_attr = c.operationGetAttributeByName(op.handle, "permutation");
+    // Get the permutation attribute from the original transpose operation
+    const permutation_attr = c.operationGetAttributeByName(original_op.handle, "permutation");
         
-        if (@intFromPtr(permutation_attr) != 0) {
-            // Get the rank to know how many elements in permutation
-            const input_type = a.getType().as(mlir.RankedTensorType).?;
-            const rank = input_type.getRank();
-            
-            // For DenseI64ArrayAttr, we need to parse it manually
-            // For now, use a simplified approach - assume common cases
-            var permutation = try builder.allocator.alloc(i64, rank);
-            defer builder.allocator.free(permutation);
-            
-            // Common case: 2D transpose [1, 0]
-            if (rank == 2) {
-                permutation[0] = 1;
-                permutation[1] = 0;
-            } else {
-                // General case: reverse all dimensions  
-                for (0..rank) |i| {
-                    permutation[i] = @intCast(rank - 1 - i);
-                }
-            }
-            
-            // Compute inverse permutation: if perm[i] = j, then inv_perm[j] = i
-            var inv_permutation = try builder.allocator.alloc(i64, rank);
-            defer builder.allocator.free(inv_permutation);
-            
-            for (permutation, 0..) |target_dim, source_dim| {
-                inv_permutation[@intCast(target_dim)] = @intCast(source_dim);
-            }
-            
-            // Create the inverse permutation attribute
-            const inv_perm_attr = c.mlirDenseI64ArrayGet(builder.ctx.handle, @intCast(rank), inv_permutation.ptr);
-            
-            // Create transpose operation with inverse permutation
-            var state = c.operationStateGet("stablehlo.transpose", builder.loc.handle);
-            c.mlirOperationStateAddOperands(&state, 1, @ptrCast(@constCast(&grad_out.handle)));
-            c.mlirOperationStateAddResults(&state, 1, @ptrCast(@constCast(&a.getType().handle)));
-            
-            // Add the permutation attribute
-            const attr_name = c.identifierGet(builder.ctx.handle, "permutation");
-            const named_attr = c.MlirNamedAttribute{ .name = attr_name, .attribute = inv_perm_attr };
-            c.mlirOperationStateAddAttributes(&state, 1, @ptrCast(@constCast(&named_attr)));
-            
-            const transpose_op = c.operationCreate(&state);
-            // CRITICAL FIX: Use the builder's pre-established insertion block instead of accessing module regions directly
-            builder.insertion_block.appendOwnedOperation(mlir.Operation{ .handle = transpose_op });
-            
-            try result.append(mlir.Value{ .handle = c.operationGetResult(transpose_op, 0) });
-        } else {
-            // Fallback: assume simple 2D transpose [1, 0] -> [1, 0] (self-inverse)
-            const grad_a_op = try builder.createAndAttach("stablehlo.transpose", &.{grad_out}, &.{a.getType()});
-            try result.append(grad_a_op.getResult(0));
-        }
+    if (@intFromPtr(permutation_attr) == 0) {
+        return error.MissingPermutationAttribute;
     }
+    
+    // Get the rank to know how many elements in permutation
+    const input_type = a.getType().as(mlir.RankedTensorType).?;
+    const rank = input_type.getRank();
+    
+    // Parse the actual permutation from the DenseI64ArrayAttr
+    // The permutation_attr is a DenseI64ArrayAttr containing the permutation indices
+    if (!c.attributeIsADenseI64Array(permutation_attr)) {
+        return error.InvalidPermutationAttributeType;
+    }
+    
+    const num_elements = c.denseArrayGetNumElements(permutation_attr);
+    
+    if (num_elements != rank) {
+        return error.PermutationRankMismatch;
+    }
+    
+    // Extract the actual permutation from the attribute
+    var permutation = try builder.allocator.alloc(i64, rank);
+    defer builder.allocator.free(permutation);
+    
+    for (0..rank) |i| {
+        permutation[i] = c.denseI64ArrayGetElement(permutation_attr, @intCast(i));
+    }
+    
+    // Compute inverse permutation: if perm[i] = j, then inv_perm[j] = i
+    var inv_permutation = try builder.allocator.alloc(i64, rank);
+    defer builder.allocator.free(inv_permutation);
+    
+    for (permutation, 0..) |target_dim, source_dim| {
+        inv_permutation[@intCast(target_dim)] = @intCast(source_dim);
+    }
+    
+    // Create the inverse permutation attribute
+    const inv_perm_attr = c.mlirDenseI64ArrayGet(builder.ctx.handle, @intCast(rank), inv_permutation.ptr);
+    
+    // Create transpose operation with inverse permutation
+    var state = c.operationStateGet("stablehlo.transpose", builder.loc.handle);
+    c.mlirOperationStateAddOperands(&state, 1, @ptrCast(@constCast(&grad_out.handle)));
+    c.mlirOperationStateAddResults(&state, 1, @ptrCast(@constCast(&a.getType().handle)));
+    
+    // Add the permutation attribute
+    const attr_name = c.identifierGet(builder.ctx.handle, "permutation");
+    const named_attr = c.MlirNamedAttribute{ .name = attr_name, .attribute = inv_perm_attr };
+    c.mlirOperationStateAddAttributes(&state, 1, @ptrCast(@constCast(&named_attr)));
+    
+    const transpose_op = c.operationCreate(&state);
+    builder.insertion_block.appendOwnedOperation(mlir.Operation{ .handle = transpose_op });
+    
+    try result.append(mlir.Value{ .handle = c.operationGetResult(transpose_op, 0) });
     
     return result.toOwnedSlice();
 }
@@ -391,45 +436,71 @@ fn transposeVJP(
 /// - dB = A^T @ dY
 fn matmulVJP(
     builder: *MLIRBuilder,
-    op: mlir.Operation,
+    original_op: mlir.Operation,
+    primals: []const mlir.Value,
     adjoints: []const mlir.Value,
 ) ![]mlir.Value {
-    std.debug.assert(adjoints.len == 1);
-    
     const grad_out = adjoints[0];
-    const a = op.getOperand(0); // Primal 'a'
-    const b = op.getOperand(1); // Primal 'b'
+    const a = primals[0]; // Primal 'a', now valid in grad scope
+    const b = primals[1]; // Primal 'b', now valid in grad scope
     
     var result = std.ArrayList(mlir.Value).init(builder.allocator);
     defer result.deinit();
     
-    // VJP for 'a' (dA = dY @ B^T):
-    // This is a matmul where we contract dimension 1 of grad_out with dimension 1 of b.
-    if (!isValueFromConstantOp(a)) {
-        const grad_a_dot_dims = hlo.DotDimensionNumbersAttribute{
-            .lhs_batching_dimensions = &.{},
-            .rhs_batching_dimensions = &.{},
-            .lhs_contracting_dimensions = &.{1}, // Contract dimension 1 of grad_out
-            .rhs_contracting_dimensions = &.{1}, // with dimension 1 of b
-        };
-        const grad_a_op = hlo.dot_general(builder.ctx, grad_out, b, .{ .dot_dimension_numbers = grad_a_dot_dims });
-        builder.insertion_block.appendOwnedOperation(grad_a_op);
-        try result.append(grad_a_op.getResult(0));
+    // Parse the original operation's dot_dimension_numbers attribute
+    const dot_dim_attr = c.mlirOperationGetAttributeByName(original_op.handle, c.stringRefCreateFromCString("dot_dimension_numbers"));
+    if (@intFromPtr(dot_dim_attr) == 0) {
+        return error.MissingDotDimensionNumbersAttribute;
     }
     
-    // VJP for 'b' (dB = A^T @ dY):
-    // This is a matmul where we contract dimension 0 of a with dimension 0 of grad_out.
-    if (!isValueFromConstantOp(b)) {
-        const grad_b_dot_dims = hlo.DotDimensionNumbersAttribute{
-            .lhs_batching_dimensions = &.{},
-            .rhs_batching_dimensions = &.{},
-            .lhs_contracting_dimensions = &.{0}, // Contract dimension 0 of a
-            .rhs_contracting_dimensions = &.{0}, // with dimension 0 of grad_out
-        };
-        const grad_b_op = hlo.dot_general(builder.ctx, a, grad_out, .{ .dot_dimension_numbers = grad_b_dot_dims });
-        builder.insertion_block.appendOwnedOperation(grad_b_op);
-        try result.append(grad_b_op.getResult(0));
+    // For this implementation, we'll handle the common case of batched matrix multiplication
+    // A @ B where A is [batch..., M, K] and B is [batch..., K, N] -> Y is [batch..., M, N]
+    // The original operation contracts the last dim of A with the second-to-last dim of B
+    
+    // For a more general implementation, we would parse the actual attribute here
+    // For now, we'll assume standard batched matmul: contracting dims are [-1, -2]
+    
+    // Get tensor shapes to determine dimensions
+    const a_type = a.getType().as(mlir.RankedTensorType) orelse return error.NotRankedTensor;
+    const b_type = b.getType().as(mlir.RankedTensorType) orelse return error.NotRankedTensor;
+    const grad_out_type = grad_out.getType().as(mlir.RankedTensorType) orelse return error.NotRankedTensor;
+    
+    const a_rank = a_type.getRank();
+    const b_rank = b_type.getRank();
+    const grad_rank = grad_out_type.getRank();
+    
+    // For batched matmul, batch dimensions are all but the last 2
+    var batch_dims = std.ArrayList(i64).init(builder.allocator);
+    defer batch_dims.deinit();
+    
+    const num_batch_dims = @min(@min(a_rank, b_rank), grad_rank) - 2;
+    for (0..num_batch_dims) |i| {
+        try batch_dims.append(@intCast(i));
     }
+    
+    // VJP for 'a' (dA = dY @ B^T):
+    // Contract the last dimension of grad_out with the last dimension of B
+    const grad_a_dot_dims = hlo.DotDimensionNumbersAttribute{
+        .lhs_batching_dimensions = batch_dims.items,
+        .rhs_batching_dimensions = batch_dims.items,
+        .lhs_contracting_dimensions = &.{@intCast(grad_rank - 1)}, // Last dim of grad_out (N)
+        .rhs_contracting_dimensions = &.{@intCast(b_rank - 1)},    // Last dim of B (N) 
+    };
+    const grad_a_op = hlo.dot_general(builder.ctx, grad_out, b, .{ .dot_dimension_numbers = grad_a_dot_dims });
+    builder.insertion_block.appendOwnedOperation(grad_a_op);
+    try result.append(grad_a_op.getResult(0));
+    
+    // VJP for 'b' (dB = A^T @ dY):
+    // Contract the second-to-last dimension of A with the second-to-last dimension of grad_out
+    const grad_b_dot_dims = hlo.DotDimensionNumbersAttribute{
+        .lhs_batching_dimensions = batch_dims.items,
+        .rhs_batching_dimensions = batch_dims.items,
+        .lhs_contracting_dimensions = &.{@intCast(a_rank - 2)},    // Second-to-last dim of A (M)
+        .rhs_contracting_dimensions = &.{@intCast(grad_rank - 2)}, // Second-to-last dim of grad_out (M)
+    };
+    const grad_b_op = hlo.dot_general(builder.ctx, a, grad_out, .{ .dot_dimension_numbers = grad_b_dot_dims });
+    builder.insertion_block.appendOwnedOperation(grad_b_op);
+    try result.append(grad_b_op.getResult(0));
     
     return result.toOwnedSlice();
 }
@@ -437,25 +508,24 @@ fn matmulVJP(
 /// VJP rule for ReLU (max(x, 0)): gradient flows through only where x > 0
 fn reluVJP(
     builder: *MLIRBuilder,
-    op: mlir.Operation,
+    original_op: mlir.Operation,
+    primals: []const mlir.Value,
     adjoints: []const mlir.Value,
 ) ![]mlir.Value {
-    std.debug.assert(adjoints.len == 1);
-    
+    _ = original_op;
     const grad_out = adjoints[0];
-    const x = op.getOperand(0); // Input to ReLU
+    const x = primals[0]; // Input to ReLU
     
     var result = std.ArrayList(mlir.Value).init(builder.allocator);
+    defer result.deinit();
     
-    if (!isValueFromConstantOp(x)) {
-        // Create mask: x > 0
-        const zero = try builder.scalarConstant(0.0);
-        const mask = try builder.createAndAttach("stablehlo.compare", &.{ x, zero.value }, &.{x.getType()}); // x > 0
-        
-        // Apply mask: grad_out * mask
-        const grad_x = try builder.createAndAttach("stablehlo.select", &.{ mask.getResult(0), grad_out, zero.value }, &.{grad_out.getType()});
-        try result.append(grad_x.getResult(0));
-    }
+    // Create mask: x > 0
+    const zero = try builder.scalarConstant(0.0);
+    const mask = try builder.createAndAttach("stablehlo.compare", &.{ x, zero.value }, &.{x.getType()}); // x > 0
+    
+    // Apply mask: grad_out * mask
+    const grad_x = try builder.createAndAttach("stablehlo.select", &.{ mask.getResult(0), grad_out, zero.value }, &.{grad_out.getType()});
+    try result.append(grad_x.getResult(0));
     
     return result.toOwnedSlice();
 }
@@ -463,11 +533,13 @@ fn reluVJP(
 /// VJP rule for constants: no gradient (constants don't have inputs)
 fn constantVJP(
     builder: *MLIRBuilder,
-    op: mlir.Operation,
+    original_op: mlir.Operation,
+    primals: []const mlir.Value,
     adjoints: []const mlir.Value,
 ) ![]mlir.Value {
+    _ = original_op;
     _ = builder;
-    _ = op;
+    _ = primals;
     _ = adjoints;
     
     // Constants have no inputs, so no gradients to return
@@ -477,24 +549,23 @@ fn constantVJP(
 /// VJP rule for reshape: da = reshape(grad_out, original_shape)
 fn reshapeVJP(
     builder: *MLIRBuilder,
-    op: mlir.Operation,
+    original_op: mlir.Operation,
+    primals: []const mlir.Value,
     adjoints: []const mlir.Value,
 ) ![]mlir.Value {
-    std.debug.assert(adjoints.len == 1);
-    
+    _ = original_op;
     const grad_out = adjoints[0];
-    const input = op.getOperand(0); // Original input to reshape
+    const input = primals[0]; // Original input to reshape
     
     var result = std.ArrayList(mlir.Value).init(builder.allocator);
+    defer result.deinit();
     
-    if (!isValueFromConstantOp(input)) {
-        // Get the original input shape and reshape the gradient back to it
-        const original_shape_type = input.getType();
-        
-        // Create reshape operation to restore original shape
-        const grad_input = try builder.createAndAttach("stablehlo.reshape", &.{grad_out}, &.{original_shape_type});
-        try result.append(grad_input.getResult(0));
-    }
+    // Get the original input shape and reshape the gradient back to it
+    const original_shape_type = input.getType();
+    
+    // Create reshape operation to restore original shape
+    const grad_input = try builder.createAndAttach("stablehlo.reshape", &.{grad_out}, &.{original_shape_type});
+    try result.append(grad_input.getResult(0));
     
     return result.toOwnedSlice();
 }
@@ -502,13 +573,12 @@ fn reshapeVJP(
 /// VJP rule for reduce_sum: da = broadcast(grad_out, original_shape)
 fn reduceSumVJP(
     builder: *MLIRBuilder,
-    op: mlir.Operation,
+    original_op: mlir.Operation,
+    primals: []const mlir.Value,
     adjoints: []const mlir.Value,
 ) ![]mlir.Value {
-    std.debug.assert(adjoints.len == 1);
-    
     const grad_out = adjoints[0];
-    const input = op.getOperand(0); // Original input to reduce_sum
+    const input = primals[0]; // Original input to reduce_sum
     
     var result = std.ArrayList(mlir.Value).init(builder.allocator);
     
@@ -519,7 +589,7 @@ fn reduceSumVJP(
         _ = input_tensor_type; // Suppress unused variable warning
         
         // Get the dimensions attribute from the reduce_sum operation
-        const dimensions_attr = c.operationGetAttributeByName(op.handle, "dimensions");
+        const dimensions_attr = c.operationGetAttributeByName(original_op.handle, "dimensions");
         
         if (@intFromPtr(dimensions_attr) != 0) {
             // Parse the dimensions that were reduced
@@ -577,14 +647,14 @@ fn reduceSumVJP(
 /// VJP rule for gather: da = scatter(grad_out, start_indices, original_shape)
 fn gatherVJP(
     builder: *MLIRBuilder,
-    op: mlir.Operation,
+    original_op: mlir.Operation,
+    primals: []const mlir.Value,
     adjoints: []const mlir.Value,
 ) ![]mlir.Value {
-    std.debug.assert(adjoints.len == 1);
-    
+    _ = original_op;
     const grad_out = adjoints[0];
-    const operand = op.getOperand(0);      // Original operand (e.g., embedding table)
-    const start_indices = op.getOperand(1); // Indices used for gathering
+    const operand = primals[0];      // Original operand (e.g., embedding table)
+    const start_indices = primals[1]; // Indices used for gathering
     
     var result = std.ArrayList(mlir.Value).init(builder.allocator);
     
@@ -624,10 +694,12 @@ fn gatherVJP(
 /// VJP rule for function return: just pass through the gradient
 fn returnVJP(
     builder: *MLIRBuilder,
-    op: mlir.Operation,
+    original_op: mlir.Operation,
+    primals: []const mlir.Value,
     adjoints: []const mlir.Value,
 ) ![]mlir.Value {
-    _ = op;
+    _ = original_op;
+    _ = primals;
     
     // Return operation just passes gradients through to its operand
     return builder.allocator.dupe(mlir.Value, adjoints);
@@ -638,37 +710,62 @@ fn returnVJP(
 /// - grad_input = scatter zeros tensor with grad_out at sliced positions
 fn sliceVJP(
     builder: *MLIRBuilder,
-    op: mlir.Operation,
+    original_op: mlir.Operation,
+    primals: []const mlir.Value,
     adjoints: []const mlir.Value,
 ) ![]mlir.Value {
-    std.debug.assert(adjoints.len == 1);
-    
     const grad_out = adjoints[0];
-    const input = op.getOperand(0);
-    const input_type = input.getType();
-    
+    const input = primals[0];
+
     var result = std.ArrayList(mlir.Value).init(builder.allocator);
-    
-    // For simplicity, we'll implement a basic version that works for our transformer use case
-    // In a full implementation, we'd need to parse the slice attributes for start_indices, etc.
-    
+    defer result.deinit();
+
     if (!isValueFromConstantOp(input)) {
-        // Create a zeros tensor with the same shape as the input
-        const zeros = try builder.createAndAttach("stablehlo.constant", &.{}, &.{input_type});
-        
-        // For now, use a simplified scatter that just passes the gradient through
-        // This assumes the slice operation is simple (e.g., taking first N elements)
-        // A complete implementation would use stablehlo.scatter with proper index computation
-        
-        // Since we don't have access to slice parameters here, we'll use a broadcast approach:
-        // If grad_out is smaller than input, we pad it with zeros to match input shape
-        const grad_input = try builder.createAndAttach("stablehlo.add", &.{zeros.getResult(0), grad_out}, &.{input_type});
-        
-        try result.append(grad_input.getResult(0));
-        
-        std.debug.print("✓ sliceVJP: Created gradient flow for slice operation\n", .{});
+        const input_type = input.getType().as(mlir.RankedTensorType) orelse return error.InvalidTensorType;
+        const input_rank = input_type.getRank();
+
+        // Parse attributes from the original slice operation
+        const start_indices_attr = c.mlirOperationGetAttributeByName(original_op.handle, c.stringRefCreateFromCString("start_indices"));
+        const limit_indices_attr = c.mlirOperationGetAttributeByName(original_op.handle, c.stringRefCreateFromCString("limit_indices"));
+
+        if (@intFromPtr(start_indices_attr) == 0 or @intFromPtr(limit_indices_attr) == 0) {
+            return error.MissingSliceAttribute;
+        }
+
+        // Extract start indices for padding_low
+        var start_indices = try builder.allocator.alloc(i64, input_rank);
+        defer builder.allocator.free(start_indices);
+        for (0..input_rank) |i| {
+            start_indices[i] = c.denseI64ArrayGetElement(start_indices_attr, @intCast(i));
+        }
+
+        // Calculate padding_high = input_shape - limit_indices  
+        var padding_high = try builder.allocator.alloc(i64, input_rank);
+        defer builder.allocator.free(padding_high);
+        for (0..input_rank) |i| {
+            const limit_index = c.denseI64ArrayGetElement(limit_indices_attr, @intCast(i));
+            padding_high[i] = input_type.getDimension(i) - limit_index;
+        }
+
+        // Interior padding is all zeros for the inverse of slice
+        const interior_padding = try builder.allocator.alloc(i64, input_rank);
+        defer builder.allocator.free(interior_padding);
+        @memset(interior_padding, 0);
+
+        // Create a scalar zero for the padding value
+        const zero_scalar_op = hlo.scalarConstant(builder.ctx, 0.0, input_type.getElementType());
+        builder.insertion_block.appendOwnedOperation(zero_scalar_op);
+        const zero_scalar = zero_scalar_op.getResult(0);
+
+        // Create the hlo.pad operation to expand grad_out back to input shape
+        const pad_op = hlo.pad(builder.ctx, grad_out, zero_scalar, start_indices, padding_high, interior_padding, builder.loc);
+        builder.insertion_block.appendOwnedOperation(pad_op);
+
+        try result.append(pad_op.getResult(0));
+
+        std.debug.print("✓ sliceVJP: Created gradient flow using pad operation\n", .{});
     }
-    
+
     return result.toOwnedSlice();
 }
 
@@ -676,13 +773,13 @@ fn sliceVJP(
 /// back into the original, smaller shape.
 fn broadcastInDimVJP(
     builder: *MLIRBuilder,
-    op: mlir.Operation,
+    original_op: mlir.Operation,
+    primals: []const mlir.Value,
     adjoints: []const mlir.Value,
 ) ![]mlir.Value {
-    std.debug.assert(adjoints.len == 1);
-
+    _ = original_op;
     const grad_out = adjoints[0];
-    const input = op.getOperand(0); // The original, smaller tensor
+    const input = primals[0]; // The original, smaller tensor
 
     var result = std.ArrayList(mlir.Value).init(builder.allocator);
     defer result.deinit();
@@ -875,6 +972,23 @@ fn getOperationsInReverseOrder(allocator: Allocator, fn_op: mlir.Operation) ![]m
     
     std.debug.print("  Found {} operations in reverse order\n", .{sorted_ops.items.len});
     return sorted_ops.toOwnedSlice();
+}
+
+fn getOperationsInForwardOrder(allocator: Allocator, fn_op: mlir.Operation) ![]mlir.Operation {
+    var operations = std.ArrayList(mlir.Operation).init(allocator);
+    errdefer operations.deinit();
+    
+    const func_body_region = fn_op.getRegion(0);
+    const func_body_block = func_body_region.getBlock(0);
+    
+    // Simply iterate through operations in forward order
+    var maybe_op = func_body_block.getFirstOp();
+    while (maybe_op) |op| {
+        try operations.append(op);
+        maybe_op = op.getNext();
+    }
+    
+    return operations.toOwnedSlice();
 }
 
 fn getReturnValue(fn_op: mlir.Operation) ?mlir.Value {

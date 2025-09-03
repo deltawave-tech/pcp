@@ -924,3 +924,46 @@ pub fn scatter(
         .location = loc,
     });
 }
+
+/// Creates a stablehlo.pad operation
+pub fn pad(
+    ctx: mlir.Context,
+    operand: mlir.Value,
+    padding_value: mlir.Value,
+    padding_low: []const i64,
+    padding_high: []const i64,
+    interior_padding: []const i64,
+    loc: mlir.Location
+) mlir.Operation {
+    const padding_low_attr = mlir.Attribute.denseI64ArrayAttr(ctx, padding_low);
+    const padding_high_attr = mlir.Attribute.denseI64ArrayAttr(ctx, padding_high);
+    const interior_padding_attr = mlir.Attribute.denseI64ArrayAttr(ctx, interior_padding);
+
+    // Calculate the result type explicitly
+    const operand_type = operand.getType().as(mlir.RankedTensorType) orelse unreachable;
+    const rank = operand_type.getRank();
+    var result_shape = std.ArrayList(i64).init(std.heap.page_allocator);
+    defer result_shape.deinit();
+
+    for (0..rank) |i| {
+        const dim_size = operand_type.getDimension(i);
+        // Result dimension = input_size + padding_low + padding_high + interior_padding * (input_size - 1)
+        const interior_contribution = interior_padding[i] * @max(0, dim_size - 1);
+        const new_dim = dim_size + padding_low[i] + padding_high[i] + interior_contribution;
+        result_shape.append(new_dim) catch unreachable;
+    }
+
+    const result_type = mlir.Type.rankedTensorType(ctx, result_shape.items, operand_type.getElementType());
+
+    return mlir.Operation.create(ctx, "stablehlo.pad", .{
+        .operands = &.{ operand, padding_value },
+        .results = &.{result_type},
+        .attributes = &.{
+            .{ "edge_padding_low", padding_low_attr }, 
+            .{ "edge_padding_high", padding_high_attr }, 
+            .{ "interior_padding", interior_padding_attr }
+        },
+        .location = loc,
+    });
+}
+

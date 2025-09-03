@@ -147,7 +147,7 @@ fn buildAdamUpdateFunction(
     const new_params = try ops.subtract(builder, params, scaled_update);
 
     // 6. Add the return operation
-    _ = try builder.createAndAttach("func.return", &.{ new_params.value, new_m.value, new_v.value }, &.{});
+    _ = try builder.createAndAttach("func.return", &.{ new_params.value, new_m.value, new_v.value }, &.{}, .{});
 
     return func_name;
 }

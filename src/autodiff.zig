@@ -75,11 +75,22 @@ pub fn buildGradientGraph(
 ) !mlir.Operation {
     std.debug.print("Building gradient graph from forward function...\n", .{});
     
+    // Derive the gradient function name from the forward function name
+    const forward_fn_name_attr = c.operationGetAttributeByName(forward_fn.handle, "sym_name");
+    if (@intFromPtr(forward_fn_name_attr) == 0 or !c.attributeIsAString(forward_fn_name_attr)) {
+        return error.MissingOrInvalidSymName;
+    }
+    const string_attr = @as(*c.MlirStringAttribute, @ptrCast(forward_fn_name_attr));
+    const forward_fn_name_ref = c.stringAttributeGetValue(string_attr);
+    const forward_fn_name = c.fromStringRef(forward_fn_name_ref);
+    const grad_fn_name = try std.fmt.allocPrint(allocator, "{s}_grad", .{forward_fn_name});
+    defer allocator.free(grad_fn_name);
+    
     // FIXED: Use the existing builder to maintain single context
     // This ensures gradient graph is built in the same context as forward graph
     
     // 1. Create the gradient function within the existing module/context  
-    const gradient_fn = try createGradientFunction(builder, forward_fn);
+    const gradient_fn = try createGradientFunction(builder, forward_fn, grad_fn_name);
 
     // 2. Create and append the entry block to the gradient function
     const grad_fn_region = gradient_fn.getRegion(0);
@@ -271,7 +282,7 @@ fn subtractVJP(
     
     // db = -grad_out
     if (primals.len > 1) {
-        const neg_grad = try builder.createAndAttach("stablehlo.negate", &.{grad_out}, &.{grad_out.getType()});
+        const neg_grad = try builder.createAndAttach("stablehlo.negate", &.{grad_out}, &.{grad_out.getType()}, .{});
         try result.append(neg_grad.getResult(0));
     }
     
@@ -294,11 +305,11 @@ fn multiplyVJP(
     defer result.deinit();
     
     // da = grad_out * b
-    const grad_a = try builder.createAndAttach("stablehlo.multiply", &.{ grad_out, b }, &.{grad_out.getType()});
+    const grad_a = try builder.createAndAttach("stablehlo.multiply", &.{ grad_out, b }, &.{grad_out.getType()}, .{});
     try result.append(grad_a.getResult(0));
     
     // db = grad_out * a  
-    const grad_b = try builder.createAndAttach("stablehlo.multiply", &.{ grad_out, a }, &.{grad_out.getType()});
+    const grad_b = try builder.createAndAttach("stablehlo.multiply", &.{ grad_out, a }, &.{grad_out.getType()}, .{});
     try result.append(grad_b.getResult(0));
     
     return result.toOwnedSlice();
@@ -320,18 +331,18 @@ fn divideVJP(
     defer result.deinit();
     
     // da = grad_out / b
-    const grad_a = try builder.createAndAttach("stablehlo.divide", &.{ grad_out, b }, &.{grad_out.getType()});
+    const grad_a = try builder.createAndAttach("stablehlo.divide", &.{ grad_out, b }, &.{grad_out.getType()}, .{});
     try result.append(grad_a.getResult(0));
     
     // db = -grad_out * a / (b * b)
     // Compute a * grad_out
-    const a_times_grad = try builder.createAndAttach("stablehlo.multiply", &.{ a, grad_out }, &.{grad_out.getType()});
+    const a_times_grad = try builder.createAndAttach("stablehlo.multiply", &.{ a, grad_out }, &.{grad_out.getType()}, .{});
     // Compute b * b
-    const b_squared = try builder.createAndAttach("stablehlo.multiply", &.{ b, b }, &.{b.getType()});
+    const b_squared = try builder.createAndAttach("stablehlo.multiply", &.{ b, b }, &.{b.getType()}, .{});
     // Compute (a * grad_out) / (b * b)
-    const positive_grad_b = try builder.createAndAttach("stablehlo.divide", &.{ a_times_grad.getResult(0), b_squared.getResult(0) }, &.{grad_out.getType()});
+    const positive_grad_b = try builder.createAndAttach("stablehlo.divide", &.{ a_times_grad.getResult(0), b_squared.getResult(0) }, &.{grad_out.getType()}, .{});
     // Negate to get -grad_out * a / (b * b)
-    const grad_b = try builder.createAndAttach("stablehlo.negate", &.{ positive_grad_b.getResult(0) }, &.{grad_out.getType()});
+    const grad_b = try builder.createAndAttach("stablehlo.negate", &.{ positive_grad_b.getResult(0) }, &.{grad_out.getType()}, .{});
     try result.append(grad_b.getResult(0));
     
     return result.toOwnedSlice();
@@ -351,7 +362,7 @@ fn negateVJP(
     var result = std.ArrayList(mlir.Value).init(builder.allocator);
     defer result.deinit();
     
-    const grad_a = try builder.createAndAttach("stablehlo.negate", &.{grad_out}, &.{grad_out.getType()});
+    const grad_a = try builder.createAndAttach("stablehlo.negate", &.{grad_out}, &.{grad_out.getType()}, .{});
     try result.append(grad_a.getResult(0));
     
     return result.toOwnedSlice();
@@ -521,10 +532,10 @@ fn reluVJP(
     
     // Create mask: x > 0
     const zero = try builder.scalarConstant(0.0);
-    const mask = try builder.createAndAttach("stablehlo.compare", &.{ x, zero.value }, &.{x.getType()}); // x > 0
+    const mask = try builder.createAndAttach("stablehlo.compare", &.{ x, zero.value }, &.{x.getType()}, .{}); // x > 0
     
     // Apply mask: grad_out * mask
-    const grad_x = try builder.createAndAttach("stablehlo.select", &.{ mask.getResult(0), grad_out, zero.value }, &.{grad_out.getType()});
+    const grad_x = try builder.createAndAttach("stablehlo.select", &.{ mask.getResult(0), grad_out, zero.value }, &.{grad_out.getType()}, .{});
     try result.append(grad_x.getResult(0));
     
     return result.toOwnedSlice();
@@ -564,7 +575,7 @@ fn reshapeVJP(
     const original_shape_type = input.getType();
     
     // Create reshape operation to restore original shape
-    const grad_input = try builder.createAndAttach("stablehlo.reshape", &.{grad_out}, &.{original_shape_type});
+    const grad_input = try builder.createAndAttach("stablehlo.reshape", &.{grad_out}, &.{original_shape_type}, .{});
     try result.append(grad_input.getResult(0));
     
     return result.toOwnedSlice();
@@ -607,7 +618,7 @@ fn reduceSumVJP(
             
             if (grad_rank == 0) {
                 // Full reduction to scalar - broadcast_dimensions is empty for scalar broadcast
-                const grad_input = try builder.createAndAttach("stablehlo.broadcast", &.{grad_out}, &.{original_shape_type});
+                const grad_input = try builder.createAndAttach("stablehlo.broadcast", &.{grad_out}, &.{original_shape_type}, .{});
                 try result.append(grad_input.getResult(0));
             } else {
                 // Partial reduction - compute which dimensions remain
@@ -636,7 +647,7 @@ fn reduceSumVJP(
             }
         } else {
             // Fallback: assume full reduction and use simple broadcast
-            const grad_input = try builder.createAndAttach("stablehlo.broadcast", &.{grad_out}, &.{original_shape_type});
+            const grad_input = try builder.createAndAttach("stablehlo.broadcast", &.{grad_out}, &.{original_shape_type}, .{});
             try result.append(grad_input.getResult(0));
         }
     }
@@ -842,7 +853,7 @@ fn broadcastInDimVJP(
 // Helper functions for graph traversal and manipulation
 
 
-fn createGradientFunction(builder: *MLIRBuilder, forward_fn: mlir.Operation) !mlir.Operation {
+fn createGradientFunction(builder: *MLIRBuilder, forward_fn: mlir.Operation, name: []const u8) !mlir.Operation {
     // Get the forward function's block to inspect its arguments
     const forward_region = forward_fn.getRegion(0);
     const forward_block = forward_region.getBlock(0);
@@ -884,7 +895,7 @@ fn createGradientFunction(builder: *MLIRBuilder, forward_fn: mlir.Operation) !ml
     var op_state = c.operationStateGet("func.func", location.handle);
     
     // Add attributes
-    const sym_name_attr = mlir.Attribute.stringAttr(builder.ctx, "gradient_function");
+    const sym_name_attr = mlir.Attribute.stringAttr(builder.ctx, name);
     const function_type_attr = mlir.Attribute.typeAttr(function_type);
     
     const sym_name_id = c.identifierGet(builder.ctx.handle, "sym_name");
@@ -1060,7 +1071,7 @@ fn addInputGradients(
         
         // If a gradient for this operand already exists, add the new one to it.
         if (adjoint_map.get(operand)) |existing_grad| {
-            const sum_op = try builder.createAndAttach("stablehlo.add", &.{ existing_grad, grad }, &.{grad.getType()});
+            const sum_op = try builder.createAndAttach("stablehlo.add", &.{ existing_grad, grad }, &.{grad.getType()}, .{});
             try adjoint_map.put(operand, sum_op.getResult(0));
         } else {
             try adjoint_map.put(operand, grad);

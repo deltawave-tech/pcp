@@ -167,21 +167,35 @@ pub const Worker = struct {
     fn handleInitializeGraph(self: *Self, msg: MessageEnvelope) !void {
         std.log.info("Worker {} received training graph for initialization.", .{self.node_id.?});
 
-
         // De-initialize any old module
         if (self.cached_module) |mod| {
             mod.deinit();
             self.cached_module = null;
         }
 
-        // Payload is just the graph string
-        const graph_str = switch (msg.data) {
+        // Payload is a Base64 encoded graph string
+        const b64_graph_str = switch (msg.data) {
             .string => |s| s,
             else => return error.InvalidMessageFormat,
         };
 
+        // Base64-decode the payload to get the original MLIR data
+        const decoded_len = try std.base64.standard.Decoder.calcSizeForSlice(b64_graph_str);
+        const graph_str = try self.allocator.alloc(u8, decoded_len);
+        defer self.allocator.free(graph_str);
+        try std.base64.standard.Decoder.decode(graph_str, b64_graph_str);
+
         // Deserialize and cache the module using the worker's own context
         const module = try mlir_ctx.deserializeMLIRModule(self.allocator, self.mlir_context.getContext(), graph_str);
+        
+        // Debug: Check if module is valid immediately after deserialization
+        const test_op = module.op();
+        if (@intFromPtr(test_op.handle) == 0) {
+            std.log.err("ERROR: Module operation handle is null immediately after deserialization!", .{});
+            return error.InvalidDeserializedModule;
+        }
+        std.log.info("✓ Module operation handle is valid after deserialization: 0x{x}", .{@intFromPtr(test_op.handle)});
+        
         self.cached_module = module;
 
         std.log.info("Worker {} successfully cached the training graph.", .{self.node_id.?});
@@ -197,6 +211,14 @@ pub const Worker = struct {
             std.log.err("Received StartInnerLoop before graph was initialized.", .{});
             return error.GraphNotInitialized;
         };
+        
+        // Debug: Check module validity before using it
+        const verify_op = module.op();
+        if (@intFromPtr(verify_op.handle) == 0) {
+            std.log.err("ERROR: Cached module operation handle became null! Module may have been corrupted.", .{});
+            return error.CorruptedCachedModule;
+        }
+        std.log.info("✓ Cached module operation handle is valid: 0x{x}", .{@intFromPtr(verify_op.handle)});
 
         // 2. The payload is Base64-encoded Cap'n Proto data
         const b64_encoded_payload = switch (msg.data) {

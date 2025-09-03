@@ -149,7 +149,7 @@ pub fn testMatmulVJP(allocator: Allocator) !void {
     const b = try test_framework.builder.addBlockArgument(matrix_type);
     
     // Create matmul operation using our hlo wrapper
-    const matmul_op = try test_framework.builder.createAndAttach("stablehlo.dot_general", &.{a, b}, &.{matrix_type});
+    const matmul_op = try test_framework.builder.createAndAttach("stablehlo.dot_general", &.{a, b}, &.{matrix_type}, .{});
     
     // Create return operation
     const return_op = mlir.Operation.create(test_framework.builder.ctx, "func.return", .{

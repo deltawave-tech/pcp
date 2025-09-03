@@ -328,32 +328,21 @@ pub const MLIRMetalExecutionEngine = struct {
         _ = self.command_queue orelse return MetalError.CommandQueueCreationFailed;
         const mlir_context = self.mlir_context orelse return MetalError.MLIRCompilationFailed;
         
-        // Step 1: Lower MLIR module through the StableHLO → GPU → SPIR-V pipeline
-        std.debug.print("Lowering MLIR module through StableHLO → GPU → SPIR-V pipeline...\n", .{});
-        _ = try mlir_context.lowerToSPIRV(self.allocator, module);
-        
-        // Step 2: Extract GPU kernel names from the lowered module
-        const kernel_names = try mlir_context.getGpuKernelNames(module);
-        defer {
-            for (kernel_names) |name| {
-                self.allocator.free(name);
-            }
-            self.allocator.free(kernel_names);
-        }
-        
-        // Step 3: Translate SPIR-V to Metal Shading Language (MSL)
-        const spirv_binary = try mlir_context.translateToSPIRV(module);
+        // Step 1: Call the IREE-based lowering pipeline and CAPTURE the resulting binary
+        std.debug.print("Lowering MLIR module through IREE-based pipeline...\n", .{});
+        const spirv_binary = try mlir_context.lowerToSPIRV(self.allocator, module);
         defer self.allocator.free(spirv_binary);
         
+        // Step 2: Translate the CORRECT SPIR-V binary (from IREE) to Metal Shading Language (MSL)
         const msl_code = try mlir_ctx.translateSpirvToMsl(self.allocator, spirv_binary);
         defer self.allocator.free(msl_code);
         
         std.debug.print("Generated MSL code:\n{s}\n", .{msl_code});
         
-        // Step 4: Compile MSL code to Metal library
+        // Step 3: Compile MSL code to Metal library
         const metal_library = try self.compileMSLToMetal(msl_code);
         
-        // Step 5: Extract GPU kernel metadata
+        // Step 4: Extract GPU kernel metadata FROM THE IREE-GENERATED BINARY
         const gpu_kernels = try mlir_ctx.extractGPUKernelInfo(self.allocator, spirv_binary);
         defer {
             for (gpu_kernels) |*kernel| {
@@ -652,7 +641,7 @@ fn metal_materialize(ptr: *anyopaque, t: tensor.Tensor(void)) ![]u8 {
     defer temp_builder.deinit();
     
     // Create a simple function that returns the tensor value
-    const return_op = try temp_builder.createAndAttach("func.return", &.{t.value}, &.{});
+    const return_op = try temp_builder.createAndAttach("func.return", &.{t.value}, &.{}, .{});
     _ = return_op;
 
     // 2. Determine output buffer size from tensor shape

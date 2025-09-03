@@ -361,7 +361,7 @@ pub const DiLoCo = struct {
         std.log.info("buildForwardAndLossFunction: GPT-2 forward pass and loss completed", .{});
 
         // 6. Return the loss
-        _ = try builder.createAndAttach("func.return", &.{outputs.loss.value}, &.{});
+        _ = try builder.createAndAttach("func.return", &.{outputs.loss.value}, &.{}, .{});
 
         std.log.info("buildForwardAndLossFunction: GPT-2 training graph built successfully.", .{});
         return func_op;
@@ -397,10 +397,22 @@ pub const DiLoCo = struct {
 
         // 4. Extract the raw data pointer and size
         const raw_data_ptr = c.mlirDenseElementsAttrGetRawData(value_attr);
-        const num_bytes = t.shape.elemCount() * t.shape.dtype.sizeInBytes();
+        const elem_count = t.shape.elemCount();
+        const dtype_size = t.shape.dtype.sizeInBytes();
+        const num_bytes = elem_count * dtype_size;
+        
+        std.log.info("DEBUG extractTensorData: shape.elemCount()={}, dtype.sizeInBytes()={}, calculated num_bytes={}", .{ elem_count, dtype_size, num_bytes });
+        
+        // Sanity check - if num_bytes is gigantic, there's a bug in the calculation
+        if (num_bytes > 100 * 1024 * 1024) { // 100MB per tensor is way too large
+            std.log.err("ERROR: extractTensorData calculated tensor size {} MB - this is definitely wrong!", .{ num_bytes / (1024 * 1024) });
+            return error.TensorSizeCalculationError;
+        }
+        
         const data_slice: [*]const u8 = @ptrCast(raw_data_ptr);
 
         // 5. Return a duplicate of the data for the caller to own
+        std.log.info("DEBUG extractTensorData: Successfully extracting {} bytes", .{num_bytes});
         return self.allocator.dupe(u8, data_slice[0..num_bytes]);
     }
 
@@ -536,15 +548,15 @@ pub const DiLoCo = struct {
         try forward_operands.append(targets);
 
         // Call the forward function to get the loss
-        const forward_call_op = mlir.Operation.create(builder.ctx, "func.call", .{
-            .operands = forward_operands.items,
-            .results = &.{loss_type},
+        const forward_callee_str = try std.fmt.allocPrint(self.allocator, "@\"{s}\"", .{"gpt2_forward_and_loss"});
+        defer self.allocator.free(forward_callee_str);
+        const forward_callee_attr = try mlir.Attribute.fromParseString(builder.ctx, forward_callee_str);
+
+        const forward_call_op = try builder.createAndAttach("func.call", forward_operands.items, &.{loss_type}, .{
             .attributes = &.{
-                .{ "callee", mlir.Attribute.stringAttr(builder.ctx, "gpt2_forward_and_loss") },
+                .{ "callee", forward_callee_attr },
             },
-            .location = builder.loc,
         });
-        builder.insertion_block.appendOwnedOperation(forward_call_op);
         const loss_val = forward_call_op.getResult(0);
 
         // Call the gradient function to get gradients
@@ -571,15 +583,15 @@ pub const DiLoCo = struct {
         try grad_result_types.append(data_type); // input gradients
         try grad_result_types.append(data_type); // target gradients
 
-        const grad_call_op = mlir.Operation.create(builder.ctx, "func.call", .{
-            .operands = grad_operands.items,
-            .results = grad_result_types.items,
+        const grad_callee_str = try std.fmt.allocPrint(self.allocator, "@\"{s}\"", .{grad_fn_name});
+        defer self.allocator.free(grad_callee_str);
+        const grad_callee_attr = try mlir.Attribute.fromParseString(builder.ctx, grad_callee_str);
+
+        const grad_call_op = try builder.createAndAttach("func.call", grad_operands.items, grad_result_types.items, .{
             .attributes = &.{
-                .{ "callee", mlir.Attribute.stringAttr(builder.ctx, grad_fn_name) },
+                .{ "callee", grad_callee_attr },
             },
-            .location = builder.loc,
         });
-        builder.insertion_block.appendOwnedOperation(grad_call_op);
 
         // Apply gradient descent update to each parameter
         var updated_param_values = ArrayList(mlir.Value).init(self.allocator);
@@ -606,7 +618,7 @@ pub const DiLoCo = struct {
         try updated_param_values.append(loss_val);
 
         // Return all updated parameters + loss from main function
-        _ = try builder.createAndAttach("func.return", updated_param_values.items, &.{});
+        _ = try builder.createAndAttach("func.return", updated_param_values.items, &.{}, .{});
 
         // === Part 4: Debug and serialize the complete module ===
         std.log.info("Complete worker module with {} functions created successfully", .{3}); // forward_fn, grad_fn, main
@@ -624,9 +636,17 @@ pub const DiLoCo = struct {
     fn setupWorkers(self: *Self) !void {
         std.log.info("Broadcasting training graph to workers for setup...", .{});
 
-        const json_payload = std.json.Value{ .string = self.serialized_worker_graph };
+        // Base64 encode the serialized graph for safe JSON transport
+        const b64_len = std.base64.standard.Encoder.calcSize(self.serialized_worker_graph.len);
+        const b64_encoded_graph = try self.allocator.alloc(u8, b64_len);
+        defer self.allocator.free(b64_encoded_graph);
 
-        // Broadcast InitializeGraph message with the graph
+        const encoded_len = std.base64.standard.Encoder.encode(b64_encoded_graph, self.serialized_worker_graph).len;
+
+        // Create JSON payload with the Base64-encoded string
+        const json_payload = std.json.Value{ .string = b64_encoded_graph[0..encoded_len] };
+
+        // Broadcast InitializeGraph message with the encoded graph
         try self.coordinator.broadcastToWorkers(MessageType.INITIALIZE_GRAPH, json_payload);
 
         std.log.info("Training graph sent to {} workers for caching.", .{self.coordinator.getWorkerCount()});
@@ -691,9 +711,13 @@ pub const DiLoCo = struct {
             try total_param_bytes.appendSlice(tensor_data);
         }
 
+        std.log.info("DEBUG: Total raw parameter bytes: {} ({} MB)", .{ total_param_bytes.items.len, total_param_bytes.items.len / (1024 * 1024) });
+
         // Serialize batch data as raw bytes (u32 tokens -> bytes)
         const input_ids_bytes = std.mem.sliceAsBytes(batch.x);
         const targets_bytes = std.mem.sliceAsBytes(batch.y);
+        
+        std.log.info("DEBUG: Batch sizes - input_ids: {} bytes, targets: {} bytes", .{ input_ids_bytes.len, targets_bytes.len });
 
         // Create WorkerPayload with parameters and batch data
         const worker_payload = binary_protocol.WorkerPayload{
@@ -701,8 +725,12 @@ pub const DiLoCo = struct {
             .input_ids = input_ids_bytes,
             .targets = targets_bytes,
         };
+        
+        std.log.info("DEBUG: About to serialize WorkerPayload with Cap'n Proto...", .{});
         const capnp_bytes = try worker_payload.serialize(self.allocator);
         defer self.allocator.free(capnp_bytes);
+        
+        std.log.info("DEBUG: Cap'n Proto serialization result: {} bytes ({} MB)", .{ capnp_bytes.len, capnp_bytes.len / (1024 * 1024) });
 
         // Base64 encode the binary data
         const b64_len = std.base64.standard.Encoder.calcSize(capnp_bytes.len);
@@ -710,6 +738,8 @@ pub const DiLoCo = struct {
         defer self.allocator.free(b64_encoded_payload);
 
         const encoded_len = std.base64.standard.Encoder.encode(b64_encoded_payload, capnp_bytes).len;
+        
+        std.log.info("DEBUG: Base64 encoding result: {} bytes ({} MB)", .{ encoded_len, encoded_len / (1024 * 1024) });
 
         // Create JSON payload with Base64-encoded binary data
         const json_payload = std.json.Value{ .string = b64_encoded_payload[0..encoded_len] };

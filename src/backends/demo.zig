@@ -261,7 +261,7 @@ fn buildDemoTrainingModule(builder: *ops.MLIRBuilder, description: []const u8) !
     const loss = try ops.reduceSum(builder, squared, &.{0}, false);
     
     // Return loss
-    _ = try builder.createAndAttach("func.return", &.{loss.value}, &.{});
+    _ = try builder.createAndAttach("func.return", &.{loss.value}, &.{}, .{});
     
     // Restore insertion block and attach function to module
     builder.setInsertionBlock(original_block);

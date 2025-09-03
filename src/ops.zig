@@ -140,11 +140,14 @@ pub const MLIRBuilder = struct {
         op_name: []const u8,
         operands: []const mlir.Value,
         result_types: []const mlir.Type,
+        options: struct {
+            attributes: []const struct { []const u8, mlir.Attribute } = &.{},
+        },
     ) !mlir.Operation {
         const op = mlir.Operation.create(self.ctx, op_name, .{
             .operands = operands,
             .results = result_types,
-            .attributes = &.{}, // Empty attributes for now
+            .attributes = options.attributes,
             .location = self.loc,
         });
 

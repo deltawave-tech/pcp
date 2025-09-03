@@ -85,7 +85,7 @@ pub fn main() !void {
     std.debug.print("Debug: model.forwardWithLoss completed successfully...\n", .{});
     
     // 7. Create the `func.return` operation
-    _ = try builder.createAndAttach("func.return", &.{outputs.loss.value}, &.{});
+    _ = try builder.createAndAttach("func.return", &.{outputs.loss.value}, &.{}, .{});
 
     // 8. Dump the generated MLIR module for inspection
     std.debug.print("\n--- Generated MLIR for GPT-2 Training Step ---\n", .{});

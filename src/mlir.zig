@@ -111,7 +111,18 @@ pub const Context = struct {
         }
         
         pub fn parse(context: Context, module_str: []const u8) !Self {
+            std.debug.print("Module.parse: About to call moduleParseString with {} bytes\n", .{module_str.len});
+            
             const handle = c.c.moduleParseString(context.handle, module_str);
+            
+            std.debug.print("Module.parse: moduleParseString returned handle: 0x{x}\n", .{@intFromPtr(handle)});
+            
+            if (@intFromPtr(handle) == 0) {
+                std.debug.print("Module.parse: Handle is null - returning MLIRParseError\n", .{});
+                return error.MLIRParseError;
+            }
+            
+            std.debug.print("Module.parse: Handle is valid - returning module\n", .{});
             return Self{ .handle = handle };
         }
         
@@ -495,6 +506,17 @@ pub const Context = struct {
         /// Create a boolean attribute
         pub fn boolAttr(context: Context, value: bool) Self {
             return Self{ .handle = c.c.mlirBoolAttrGet(context.handle, if (value) 1 else 0) };
+        }
+        
+        /// Creates an attribute by parsing its textual representation.
+        pub fn fromParseString(ctx: Context, attr_string: []const u8) !Self {
+            const str_ref = c.c.stringRefFromString(attr_string);
+            const handle = c.c.mlirAttributeParseGet(ctx.handle, str_ref);
+            if (@intFromPtr(handle) == 0) {
+                std.log.err("Failed to parse MLIR attribute from string: {s}", .{attr_string});
+                return error.AttributeParseFailed;
+            }
+            return Self{ .handle = handle };
         }
     };
     

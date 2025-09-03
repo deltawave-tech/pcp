@@ -219,7 +219,7 @@ pub fn train() !void {
         defer loss.deinit();
 
         // 4. Finalize the forward+loss graph with a return
-        const return_op = try train_step_builder.createAndAttach("func.return", &.{loss.value}, &.{});
+        const return_op = try train_step_builder.createAndAttach("func.return", &.{loss.value}, &.{}, .{});
         _ = return_op;
 
         const forward_and_loss_fn = train_step_builder.module.op();

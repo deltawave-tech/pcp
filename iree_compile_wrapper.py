@@ -38,7 +38,7 @@ def main():
             input_file,
             target_backends=[target_backends],
             output_file=output_file,
-            # Dump SPIR-V files to the specified directory using extra_args
+            # Note: --iree-import-public flag doesn't exist. Functions at module level are automatically public.
             extra_args=[f"--iree-hal-dump-executable-files-to={spirv_output_dir}"]
         )
         

@@ -47,6 +47,8 @@ fn getVjpFn(op_name: []const u8) ?VJPFn {
         return gatherVJP;
     } else if (std.mem.eql(u8, op_name, "stablehlo.slice")) {
         return sliceVJP;
+    } else if (std.mem.eql(u8, op_name, "stablehlo.broadcast_in_dim")) {
+        return broadcastInDimVJP;
     } else if (std.mem.eql(u8, op_name, "func.return")) {
         return returnVJP;
     } else {
@@ -399,27 +401,33 @@ fn matmulVJP(
     const b = op.getOperand(1); // Primal 'b'
     
     var result = std.ArrayList(mlir.Value).init(builder.allocator);
+    defer result.deinit();
     
-    _ = a.getType().as(mlir.RankedTensorType).?;
-    _ = b.getType().as(mlir.RankedTensorType).?;
-    
-    // VJP for 'a': grad_out @ transpose(b)
+    // VJP for 'a' (dA = dY @ B^T):
+    // This is a matmul where we contract dimension 1 of grad_out with dimension 1 of b.
     if (!isValueFromConstantOp(a)) {
-        // Create transpose operation for b with permutation [1, 0]
-        const b_transposed_op = try builder.createAndAttach("stablehlo.transpose", &.{b}, &.{b.getType()});
-        
-        // Matmul for dL/dA using dot_general
-        const grad_a_op = try builder.createAndAttach("stablehlo.dot_general", &.{ grad_out, b_transposed_op.getResult(0) }, &.{grad_out.getType()});
+        const grad_a_dot_dims = hlo.DotDimensionNumbersAttribute{
+            .lhs_batching_dimensions = &.{},
+            .rhs_batching_dimensions = &.{},
+            .lhs_contracting_dimensions = &.{1}, // Contract dimension 1 of grad_out
+            .rhs_contracting_dimensions = &.{1}, // with dimension 1 of b
+        };
+        const grad_a_op = hlo.dot_general(builder.ctx, grad_out, b, .{ .dot_dimension_numbers = grad_a_dot_dims });
+        builder.insertion_block.appendOwnedOperation(grad_a_op);
         try result.append(grad_a_op.getResult(0));
     }
     
-    // VJP for 'b': transpose(a) @ grad_out
+    // VJP for 'b' (dB = A^T @ dY):
+    // This is a matmul where we contract dimension 0 of a with dimension 0 of grad_out.
     if (!isValueFromConstantOp(b)) {
-        // Create transpose operation for a with permutation [1, 0]
-        const a_transposed_op = try builder.createAndAttach("stablehlo.transpose", &.{a}, &.{a.getType()});
-        
-        // Matmul for dL/dB using dot_general
-        const grad_b_op = try builder.createAndAttach("stablehlo.dot_general", &.{ a_transposed_op.getResult(0), grad_out }, &.{grad_out.getType()});
+        const grad_b_dot_dims = hlo.DotDimensionNumbersAttribute{
+            .lhs_batching_dimensions = &.{},
+            .rhs_batching_dimensions = &.{},
+            .lhs_contracting_dimensions = &.{0}, // Contract dimension 0 of a
+            .rhs_contracting_dimensions = &.{0}, // with dimension 0 of grad_out
+        };
+        const grad_b_op = hlo.dot_general(builder.ctx, a, grad_out, .{ .dot_dimension_numbers = grad_b_dot_dims });
+        builder.insertion_block.appendOwnedOperation(grad_b_op);
         try result.append(grad_b_op.getResult(0));
     }
     
@@ -661,6 +669,76 @@ fn sliceVJP(
         std.debug.print("✓ sliceVJP: Created gradient flow for slice operation\n", .{});
     }
     
+    return result.toOwnedSlice();
+}
+
+/// VJP rule for broadcast_in_dim: The inverse of broadcasting is to sum the gradients
+/// back into the original, smaller shape.
+fn broadcastInDimVJP(
+    builder: *MLIRBuilder,
+    op: mlir.Operation,
+    adjoints: []const mlir.Value,
+) ![]mlir.Value {
+    std.debug.assert(adjoints.len == 1);
+
+    const grad_out = adjoints[0];
+    const input = op.getOperand(0); // The original, smaller tensor
+
+    var result = std.ArrayList(mlir.Value).init(builder.allocator);
+    defer result.deinit();
+
+    // Only compute gradients for non-constant operands
+    if (!isValueFromConstantOp(input)) {
+        // The gradient of the input is the sum of the output gradients, reduced
+        // along the dimensions that were added by the broadcast.
+
+        const input_type = input.getType().as(mlir.RankedTensorType) orelse return error.InvalidTensorType;
+        const grad_out_type = grad_out.getType().as(mlir.RankedTensorType) orelse return error.InvalidTensorType;
+
+        const input_shape = try input_type.getShape(builder.allocator);
+        defer builder.allocator.free(input_shape);
+        const grad_out_shape = try grad_out_type.getShape(builder.allocator);
+        defer builder.allocator.free(grad_out_shape);
+
+        const input_rank = input_shape.len;
+        const grad_out_rank = grad_out_shape.len;
+
+        // Find the dimensions that need to be reduced. These are all dimensions in the
+        // output shape that are not part of the input shape's broadcast mapping.
+        var dims_to_reduce = std.ArrayList(i64).init(builder.allocator);
+        defer dims_to_reduce.deinit();
+
+        // Simple logic: reduce the leading dimensions that were added by broadcast
+        // This works for cases where broadcast adds dimensions at the front
+        for (0..(grad_out_rank - input_rank)) |i| {
+            try dims_to_reduce.append(@intCast(i));
+        }
+
+        // Also reduce dimensions where the input dimension is 1 but output dimension is larger
+        for (0..input_rank) |i| {
+            const input_dim_idx = (grad_out_rank - input_rank) + i;
+            if (input_shape[i] == 1 and grad_out_shape[input_dim_idx] > 1) {
+                try dims_to_reduce.append(@intCast(input_dim_idx));
+            }
+        }
+
+        // Create a tensor wrapper for grad_out
+        const grad_out_tensor = try builder.newTensor(grad_out);
+        
+        // Create a reduce_sum op to get the gradient of the input
+        var grad_input_tensor: tensor.Tensor(void) = undefined;
+        if (dims_to_reduce.items.len > 0) {
+            grad_input_tensor = try ops.reduceSum(builder, grad_out_tensor, dims_to_reduce.items, false);
+        } else {
+            // If no dimensions to reduce, the gradient passes through unchanged
+            grad_input_tensor = grad_out_tensor;
+        }
+        
+        try result.append(grad_input_tensor.value);
+        
+        std.debug.print("✓ broadcastInDimVJP: Created gradient flow for broadcast_in_dim operation\n", .{});
+    }
+
     return result.toOwnedSlice();
 }
 

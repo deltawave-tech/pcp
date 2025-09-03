@@ -194,7 +194,7 @@ pub const c = struct {
 
     // String attribute functions
     pub const MlirStringAttribute = opaque {};
-    // extern fn mlirStringAttributeGetValue(attr: *MlirStringAttribute) MlirStringRef; // Not available in current MLIR build
+    extern fn mlirStringAttrGetValue(attr: *MlirStringAttribute) MlirStringRef;
 
     // Pass manager operations
     extern fn mlirPassManagerCreate(ctx: *MlirContext) *MlirPassManager;
@@ -682,9 +682,7 @@ pub const c = struct {
     }
 
     pub fn stringAttributeGetValue(attr: *MlirStringAttribute) MlirStringRef {
-        // return mlirStringAttributeGetValue(attr); // Not available in current MLIR build
-        _ = attr;
-        return MlirStringRef{ .data = "placeholder", .length = 11 };
+        return mlirStringAttrGetValue(attr);
     }
 
     // Helper function to convert MlirStringRef to Zig string

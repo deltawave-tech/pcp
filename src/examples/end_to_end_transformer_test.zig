@@ -122,6 +122,56 @@ pub const MLIRExecutionHelper = struct {
     }
 };
 
+/// Helper function to find the @main function operation in a module
+fn findMainFunction(module: mlir.Module) !mlir.Operation {
+    const c = @import("../mlir/c.zig").c;
+    
+    std.debug.print("DEBUG: Looking for main function in module...\n", .{});
+    
+    // Walk through all operations in the module to find the main function
+    const module_op = module.op();
+    const module_region = c.operationGetRegion(module_op.handle, 0);
+    const module_block = c.regionGetFirstBlock(module_region);
+    
+    var current_op = c.blockGetFirstOperation(module_block);
+    var op_count: usize = 0;
+    while (@intFromPtr(current_op) != 0) {
+        op_count += 1;
+        
+        // Get operation name
+        const op_name = c.operationGetName(current_op);
+        const name_str = c.identifierStr(op_name);
+        const name_slice = c.fromStringRef(name_str);
+        
+        std.debug.print("DEBUG: Found operation {}: '{}'\n", .{op_count, std.fmt.fmtSliceEscapeUpper(name_slice)});
+        
+        if (std.mem.eql(u8, name_slice, "func.func")) {
+            std.debug.print("DEBUG: This is a func.func operation, checking sym_name...\n", .{});
+            
+            // Check if this function has the name "main"
+            const sym_name_attr = c.operationGetAttributeByName(current_op, "sym_name");
+            if (@intFromPtr(sym_name_attr) != 0 and c.attributeIsAString(sym_name_attr)) {
+                const string_attr = @as(*c.MlirStringAttribute, @ptrCast(sym_name_attr));
+                const func_name_ref = c.stringAttributeGetValue(string_attr);
+                const func_name = c.fromStringRef(func_name_ref);
+                
+                std.debug.print("DEBUG: Function name is: '{}'\n", .{std.fmt.fmtSliceEscapeUpper(func_name)});
+                
+                if (std.mem.eql(u8, func_name, "main")) {
+                    std.debug.print("DEBUG: Found main function!\n", .{});
+                    return mlir.Operation{ .handle = current_op };
+                }
+            } else {
+                std.debug.print("DEBUG: No sym_name attribute or not a string\n", .{});
+            }
+        }
+        current_op = c.operationGetNextInBlock(current_op);
+    }
+    
+    std.debug.print("DEBUG: Searched {} operations, main function not found\n", .{op_count});
+    return error.MainFunctionNotFound;
+}
+
 /// Simplified Transformer Block Configuration for Testing
 pub const SimpleTransformerConfig = struct {
     n_embd: usize = 8,        // Embedding dimension (small for testing)
@@ -406,16 +456,82 @@ pub const EndToEndTransformerTest = struct {
         const numerical_gradient = (perturbed_loss - base_loss) / epsilon;
         std.debug.print("Numerical gradient: {d:.6}\n", .{numerical_gradient});
         
-        // 5. Generate and execute the analytical gradient (future work)
-        // For now, just test that we can compute numerical gradients correctly
+        // 5. Generate and execute the analytical gradient using autodiff
         std.debug.print("✓ Numerical gradient computed: {d:.6}\n", .{numerical_gradient});
-        std.debug.print("✓ SELF-CONTAINED IREE-COMPLIANT MODULE TEST PASSED!\n", .{});
         
-        // TODO: Add analytical gradient comparison using autodiff
-        // var builder = try MLIRBuilder.init(self.allocator, self.mlir_ctx.getContext());
-        // defer builder.deinit();
-        // const grad_module = try autodiff.buildGradientGraph(self.allocator, &builder, base_module);
-        // const analytical_gradients = try self.execution_helper.executeMlirModule(grad_module, &.{input_data});
+        std.debug.print("Generating analytical gradient using autodiff system...\n", .{});
+        
+        // Create a new builder for the gradient graph
+        var grad_builder = try MLIRBuilder.init(self.allocator, self.mlir_ctx.getContext());
+        defer grad_builder.deinit();
+        
+        // Generate the analytical gradient graph using autodiff
+        // First, we need to extract the main function operation from the base module
+        const main_func_op = try findMainFunction(base_module);
+        
+        const grad_func_op = try autodiff.buildGradientGraph(self.allocator, &grad_builder, main_func_op);
+        _ = grad_func_op; // Mark as used
+        
+        std.debug.print("✓ Analytical gradient graph generated successfully\n", .{});
+        
+        // Create the same input data used for forward pass
+        const batch_size = 1;
+        const seq_len = self.config.seq_len;
+        const n_embd = self.config.n_embd;
+        const input_size = batch_size * seq_len * n_embd;
+        
+        const input_data = try self.allocator.alloc(f32, input_size);
+        defer self.allocator.free(input_data);
+        
+        for (input_data, 0..) |*val, i| {
+            val.* = 0.1 * @sin(@as(f32, @floatFromInt(i)) * 0.1);
+        }
+        
+        // Execute the analytical gradient computation on GPU
+        const grad_inputs = try self.allocator.alloc([]const f32, 1);
+        defer self.allocator.free(grad_inputs);
+        grad_inputs[0] = input_data;
+        
+        std.debug.print("Executing analytical gradient computation on Metal GPU...\n", .{});
+        const analytical_gradients = try self.execution_helper.executeMlirModule(grad_builder.module, grad_inputs);
+        defer self.allocator.free(analytical_gradients);
+        
+        std.debug.print("✓ Analytical gradient executed successfully\n", .{});
+        
+        // Extract the gradient for the specific parameter we're testing
+        const analytical_gradient = if (analytical_gradients.len > param_idx) 
+            analytical_gradients[param_idx] 
+        else 
+            analytical_gradients[0]; // Use first gradient if indexing issue
+        
+        std.debug.print("Analytical gradient: {d:.6}\n", .{analytical_gradient});
+        
+        // 6. Compare numerical vs analytical gradients
+        const gradient_diff = @abs(numerical_gradient - analytical_gradient);
+        const relative_error = if (@abs(numerical_gradient) > 1e-8) 
+            gradient_diff / @abs(numerical_gradient) 
+        else 
+            gradient_diff;
+        
+        std.debug.print("\n=== Gradient Verification Results ===\n", .{});
+        std.debug.print("Numerical gradient:  {d:.8}\n", .{numerical_gradient});
+        std.debug.print("Analytical gradient: {d:.8}\n", .{analytical_gradient});
+        std.debug.print("Absolute difference: {d:.8}\n", .{gradient_diff});
+        std.debug.print("Relative error:      {d:.8}\n", .{relative_error});
+        
+        // Check if gradients match within acceptable tolerance
+        const gradient_tolerance = 1e-4; // Reasonable tolerance for finite differences vs autodiff
+        
+        if (relative_error < gradient_tolerance) {
+            std.debug.print("✅ GRADIENT VERIFICATION SUCCESSFUL!\n", .{});
+            std.debug.print("✅ Autodiff system produces correct analytical gradients!\n", .{});
+        } else {
+            std.debug.print("❌ GRADIENT VERIFICATION FAILED!\n", .{});
+            std.debug.print("   Error {d:.8} exceeds tolerance {d:.8}\n", .{relative_error, gradient_tolerance});
+            return error.GradientVerificationFailed;
+        }
+        
+        std.debug.print("✓ COMPLETE END-TO-END AUTODIFF VERIFICATION PASSED!\n", .{});
     }
 };
 

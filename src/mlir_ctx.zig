@@ -101,24 +101,18 @@ pub const MLIRContext = struct {
         _ = c.dialectHandleLoadDialect(c.getDialectHandleCHLO(), context);
         
         // CRITICAL: Register ALL passes for complete pipeline
-        std.debug.print("Registering complete pass suite for full pipeline...\n", .{});
-        
         // Core passes
         c.registerAllStablehloPasses();     // StableHLO passes
         c.registerCanonicalizerPass();      // canonicalize
         c.registerCSEPass();                // cse
         
         // Complete pass registration via C++ anchor function
-        std.debug.print("Registering all MLIR passes via C++ anchor function...\n", .{});
         c.forceLoadAllRequiredPasses();
-        std.debug.print("✓ All MLIR passes registered successfully\n", .{});
 
         // Verify registration worked
         if (!c.contextIsRegisteredOperation(context, "func.func")) {
-            std.debug.print("ERROR: func dialect registration failed!\n", .{});
             return error.DialectRegistrationFailed;
         }
-        std.debug.print("✓ Dialects registered successfully.\n", .{});
         
         // --- REMOVED ---
         // const pass_manager = try mlir.PassManager.init(...); // <-- Remove this.
@@ -155,45 +149,38 @@ pub const MLIRContext = struct {
     }
     
     /// NEW IREE-based SPIR-V compilation replacing the complex manual pipeline
-    pub fn lowerToSPIRV(_: *Self, allocator: Allocator, module: mlir.Module) ![]const u8 {
-        std.debug.print("=== IREE-based SPIR-V Compilation Pipeline ===\n", .{});
-        
-        std.debug.print("Step 1: About to serialize MLIR module...\n", .{});
+    pub fn lowerToSPIRV(_: *Self, allocator: Allocator, module: mlir.Module, unique_id: u32) ![]const u8 {
         // 1. Serialize MLIR module to file for IREE compilation
         const mlir_source = serializeMLIRModule(allocator, module) catch |err| {
-            std.debug.print("ERROR: Failed to serialize MLIR module: {}\n", .{err});
             return err;
         };
         defer allocator.free(mlir_source);
-        std.debug.print("Step 1 complete: Serialized {} bytes\n", .{mlir_source.len});
         
-        const temp_mlir_path = "temp_graph.mlir";
-        const temp_vmfb_path = "temp_graph.vmfb"; 
-        const spirv_dump_dir = "temp_spirv_dump";
+        // --- START: MODIFICATION ---
+
+        // DEFINITIVE FIX: Use shorter paths and the /tmp directory to avoid filesystem path length limits.
+        // IREE generates very long filenames, so we need shorter base directory names.
+        const temp_mlir_path = try std.fmt.allocPrint(allocator, "/tmp/g{d}.mlir", .{unique_id});
+        defer allocator.free(temp_mlir_path);
+        const temp_vmfb_path = try std.fmt.allocPrint(allocator, "/tmp/g{d}.vmfb", .{unique_id});
+        defer allocator.free(temp_vmfb_path);
+        const spirv_dump_dir = try std.fmt.allocPrint(allocator, "/tmp/spv{d}", .{unique_id});
+        defer allocator.free(spirv_dump_dir);
         
-        std.debug.print("Step 2: About to write MLIR file...\n", .{});
-        // Write MLIR to temporary file
-        std.fs.cwd().writeFile(.{ .sub_path = temp_mlir_path, .data = mlir_source }) catch |err| {
-            std.debug.print("ERROR: Failed to write MLIR file: {}\n", .{err});
-            return err;
-        };
-        std.debug.print("Step 2 complete: Wrote file {s}\n", .{temp_mlir_path});
+        // Write MLIR to temporary file using absolute path
+        var file = try std.fs.createFileAbsolute(temp_mlir_path, .{});
+        defer file.close();
+        try file.writeAll(mlir_source);
         
-        std.debug.print("✓ Saved MLIR module to {s} ({} bytes)\n", .{ temp_mlir_path, mlir_source.len });
-        
-        // Proactively create the SPIR-V dump directory
-        std.fs.cwd().makeDir(spirv_dump_dir) catch |err| switch (err) {
-            error.PathAlreadyExists => {}, // Directory already exists, ignore
-            else => {
-                std.debug.print("ERROR: Failed to create SPIR-V dump directory: {}\n", .{err});
+        std.fs.makeDirAbsolute(spirv_dump_dir) catch |err| {
+            if (err != error.PathAlreadyExists) {
                 return err;
-            },
+            }
         };
-        std.debug.print("✓ Created/verified SPIR-V dump directory: {s}\n", .{spirv_dump_dir});
+        
+        // --- END: MODIFICATION ---
         
         // 2. Call IREE compiler via subprocess
-        std.debug.print("About to execute IREE compiler subprocess...\n", .{});
-        std.debug.print("Command: python3 iree_compile_wrapper.py {s} {s} {s} vulkan-spirv\n", .{ temp_mlir_path, temp_vmfb_path, spirv_dump_dir });
         
         const result = std.process.Child.run(.{
             .allocator = allocator,
@@ -208,6 +195,8 @@ pub const MLIRContext = struct {
         }) catch |err| {
             std.debug.print("ERROR: Failed to run IREE compiler: {}\n", .{err});
             std.debug.print("This might indicate IREE is not installed or python3 is not available\n", .{});
+            std.debug.print("Dumping MLIR module for debugging:\n", .{});
+            module.op().dump();
             
             // Check if we can at least call python3
             const python_test = std.process.Child.run(.{
@@ -221,12 +210,10 @@ pub const MLIRContext = struct {
                 allocator.free(python_test.stdout);
                 allocator.free(python_test.stderr);
             }
-            std.debug.print("Python3 is available: {s}\n", .{python_test.stdout});
             
             return error.IREESubprocessFailed;
         };
         
-        std.debug.print("IREE subprocess completed with term: {?}\n", .{result.term});
         
         defer {
             allocator.free(result.stdout);
@@ -234,17 +221,15 @@ pub const MLIRContext = struct {
         }
         
         if (result.term != .Exited or result.term.Exited != 0) {
-            std.debug.print("IREE compiler failed with exit code: {?}\n", .{result.term});
-            std.debug.print("Stdout: {s}\n", .{result.stdout});
-            std.debug.print("Stderr: {s}\n", .{result.stderr});
+            std.log.err("IREE compilation failed: {s}", .{result.stderr});
+            std.debug.print("Dumping MLIR module for debugging:\n", .{});
+            module.op().dump();
             return error.IREECompilationFailed;
         }
         
-        std.debug.print("✓ IREE compilation successful:\n{s}\n", .{result.stdout});
         
         // 3. Find and read the generated SPIR-V file(s)
-        var spirv_dir = std.fs.cwd().openDir(spirv_dump_dir, .{ .iterate = true }) catch |err| {
-            std.debug.print("ERROR: Could not open SPIR-V dump directory: {}\n", .{err});
+        var spirv_dir = std.fs.openDirAbsolute(spirv_dump_dir, .{ .iterate = true }) catch {
             return error.SPIRVDumpDirNotFound;
         };
         defer spirv_dir.close();
@@ -254,19 +239,15 @@ pub const MLIRContext = struct {
         
         while (try iterator.next()) |entry| {
             if (entry.kind == .file and std.mem.endsWith(u8, entry.name, ".spv")) {
-                std.debug.print("✓ Found SPIR-V file: {s}\n", .{entry.name});
-                
-                const spirv_file_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ spirv_dump_dir, entry.name });
-                defer allocator.free(spirv_file_path);
-                
-                spirv_binary = try std.fs.cwd().readFileAlloc(allocator, spirv_file_path, 10 * 1024 * 1024);
+                spirv_binary = try spirv_dir.readFileAlloc(allocator, entry.name, 10 * 1024 * 1024);
                 break; // Use first SPIR-V file found
             }
         }
         
-        // Clean up temporary files
-        std.fs.cwd().deleteFile(temp_vmfb_path) catch {};
-        std.fs.cwd().deleteTree(spirv_dump_dir) catch {};
+        // Clean up the unique temporary files and directory using absolute paths
+        std.fs.deleteFileAbsolute(temp_mlir_path) catch {};
+        std.fs.deleteFileAbsolute(temp_vmfb_path) catch {};
+        std.fs.deleteDirAbsolute(spirv_dump_dir) catch {};
         
         if (spirv_binary == null) {
             std.debug.print("ERROR: No SPIR-V files were generated by IREE\n", .{});

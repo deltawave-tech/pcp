@@ -255,11 +255,6 @@ pub const MLIRMetalExecutionEngine = struct {
         }
         
         // 7. Print verification information
-        std.debug.print("Execution results: ", .{});
-        for (result_arrays.items, 0..) |result, i| {
-            std.debug.print("output[{}] = {d} ", .{i, result[0]});
-        }
-        std.debug.print("\n", .{});
         
         // Free the temporary output buffers
         for (output_arrays.items) |arr| {
@@ -323,21 +318,23 @@ pub const MLIRMetalExecutionEngine = struct {
         return result;
     }
 
-    pub fn executeMLIRModule(self: *MLIRMetalExecutionEngine, module: mlir.Module, inputs: [][]const f32, outputs: [][]f32) !void {
+    pub fn executeMLIRModule(self: *MLIRMetalExecutionEngine, module: mlir.Module, inputs: [][]const u8, outputs: [][]u8) !void {
         const device = self.device orelse return MetalError.DeviceNotFound;
         _ = self.command_queue orelse return MetalError.CommandQueueCreationFailed;
         const mlir_context = self.mlir_context orelse return MetalError.MLIRCompilationFailed;
         
         // Step 1: Call the IREE-based lowering pipeline and CAPTURE the resulting binary
         std.debug.print("Lowering MLIR module through IREE-based pipeline...\n", .{});
-        const spirv_binary = try mlir_context.lowerToSPIRV(self.allocator, module);
+        // Generate a random ID to ensure compilation paths are unique.
+        var prng = std.Random.DefaultPrng.init(@intCast(std.time.timestamp()));
+        const random_id_for_path = prng.random().int(u32);
+        const spirv_binary = try mlir_context.lowerToSPIRV(self.allocator, module, random_id_for_path);
         defer self.allocator.free(spirv_binary);
         
         // Step 2: Translate the CORRECT SPIR-V binary (from IREE) to Metal Shading Language (MSL)
         const msl_code = try mlir_ctx.translateSpirvToMsl(self.allocator, spirv_binary);
         defer self.allocator.free(msl_code);
         
-        std.debug.print("Generated MSL code:\n{s}\n", .{msl_code});
         
         // Step 3: Compile MSL code to Metal library
         const metal_library = try self.compileMSLToMetal(msl_code);
@@ -358,12 +355,12 @@ pub const MLIRMetalExecutionEngine = struct {
         var output_buffers = std.ArrayList(*MTLBuffer).init(self.allocator);
         defer output_buffers.deinit();
         
-        // Create input buffers
-        for (inputs) |input_data| {
+        // Create input buffers from raw bytes
+        for (inputs) |input_bytes| {
             const buffer = MTLDevice_newBufferWithBytes(
                 device,
-                input_data.ptr,
-                input_data.len * @sizeOf(f32),
+                input_bytes.ptr,
+                input_bytes.len, // Use the byte length directly
                 MTLResourceOptions.StorageModeShared
             ) orelse return MetalError.BufferCreationFailed;
             
@@ -371,31 +368,38 @@ pub const MLIRMetalExecutionEngine = struct {
         }
         
         // Create output buffers
-        for (outputs) |output_data| {
+        for (outputs) |output_bytes| {
             const buffer = MTLDevice_newBufferWithLength(
                 device,
-                output_data.len * @sizeOf(f32),
+                output_bytes.len, // Use the byte length directly
                 MTLResourceOptions.StorageModeShared
             ) orelse return MetalError.BufferCreationFailed;
             
             try output_buffers.append(buffer);
         }
         
-        // Step 7: Execute GPU kernels on Metal
-        try self.executeGPUKernelsFromInfo(gpu_kernels, metal_library, input_buffers.items, output_buffers.items);
+        // --- START: MODIFICATION ---
+
+        // DEFINITIVE FIX: Calculate the total number of elements to process.
+        // Assume the first output buffer (updated parameters) represents the main workload.
+        if (outputs.len == 0) return error.NoOutputBuffers;
+        const total_elements = outputs[0].len / @sizeOf(f32);
+        std.log.info("Total elements for GPU dispatch: {}", .{total_elements});
+
+        // Step 7: Execute GPU kernels on Metal, providing the correct workload size.
+        try self.executeGPUKernelsFromInfo(gpu_kernels, metal_library, input_buffers.items, output_buffers.items, total_elements);
+
+        // --- END: MODIFICATION ---
         
-        // Step 8: Copy results back to output arrays
-        for (outputs, 0..) |output_data, i| {
+        // Step 8: Copy results back to output byte arrays
+        for (outputs, 0..) |output_bytes, i| {
             const buffer = output_buffers.items[i];
             const buffer_contents = MTLBuffer_contents(buffer);
-            const buffer_data: [*]f32 = @ptrCast(@alignCast(buffer_contents));
+            const buffer_data: [*]u8 = @ptrCast(buffer_contents);
             
-            for (output_data, 0..) |*out_val, j| {
-                out_val.* = buffer_data[j];
-            }
+            @memcpy(output_bytes, buffer_data[0..output_bytes.len]);
         }
         
-        std.debug.print("✓ Successfully executed MLIR module on Metal hardware\n", .{});
     }
     
     
@@ -418,7 +422,6 @@ pub const MLIRMetalExecutionEngine = struct {
         // Compile the Metal code
         var compile_error: ?*NSError = null;
         const library = MTLDevice_newLibraryWithSource(device, source, null, &compile_error) orelse {
-            std.debug.print("Failed to compile MSL code\n", .{});
             return MetalError.LibraryCreationFailed;
         };
         
@@ -474,15 +477,13 @@ pub const MLIRMetalExecutionEngine = struct {
             @memcpy(output_data, buffer_data[0..output_data.len]);
         }
 
-        std.debug.print("✓ Successfully executed MSL kernel on Metal hardware\n", .{});
     }
 
     /// Execute GPU kernels on Metal hardware using kernel info from MLIR
-    fn executeGPUKernelsFromInfo(self: *MLIRMetalExecutionEngine, kernels: []const mlir_ctx.GPUKernelInfo, library: *MTLLibrary, input_buffers: []*MTLBuffer, output_buffers: []*MTLBuffer) !void {
+    fn executeGPUKernelsFromInfo(self: *MLIRMetalExecutionEngine, kernels: []const mlir_ctx.GPUKernelInfo, library: *MTLLibrary, input_buffers: []*MTLBuffer, output_buffers: []*MTLBuffer, total_elements: usize) !void {
         const device = self.device orelse return MetalError.DeviceNotFound;
         const command_queue = self.command_queue orelse return MetalError.CommandQueueCreationFailed;
         
-        // Create command buffer
         const command_buffer = MTLCommandQueue_commandBuffer(command_queue) orelse {
             return MetalError.CommandBufferCreationFailed;
         };
@@ -493,7 +494,7 @@ pub const MLIRMetalExecutionEngine = struct {
         
         // Execute each kernel
         for (kernels) |kernel| {
-            try self.executeGPUKernelFromInfo(kernel, library, device, compute_encoder, input_buffers, output_buffers);
+            try self.executeGPUKernelFromInfo(kernel, library, device, compute_encoder, input_buffers, output_buffers, total_elements);
         }
         
         MTLComputeCommandEncoder_endEncoding(compute_encoder);
@@ -502,10 +503,9 @@ pub const MLIRMetalExecutionEngine = struct {
     }
     
     /// Execute a single GPU kernel using MLIR-extracted kernel info
-    fn executeGPUKernelFromInfo(self: *MLIRMetalExecutionEngine, kernel: mlir_ctx.GPUKernelInfo, library: *MTLLibrary, device: *MTLDevice, encoder: *MTLComputeCommandEncoder, input_buffers: []*MTLBuffer, output_buffers: []*MTLBuffer) !void {
+    fn executeGPUKernelFromInfo(self: *MLIRMetalExecutionEngine, kernel: mlir_ctx.GPUKernelInfo, library: *MTLLibrary, device: *MTLDevice, encoder: *MTLComputeCommandEncoder, input_buffers: []*MTLBuffer, output_buffers: []*MTLBuffer, total_elements: usize) !void {
         // Get or create compute pipeline for this kernel
         const pipeline = try self.getOrCreatePipeline(kernel.name, library, device);
-        
         MTLComputeCommandEncoder_setComputePipelineState(encoder, pipeline);
         
         // Bind input buffers
@@ -517,17 +517,19 @@ pub const MLIRMetalExecutionEngine = struct {
         for (output_buffers, 0..) |buffer, i| {
             MTLComputeCommandEncoder_setBuffer(encoder, buffer, 0, input_buffers.len + i);
         }
+
+        // --- START: MODIFICATION ---
+
+        // DEFINITIVE FIX: Dispatch the correct number of threads based on the workload size.
+        const threads_per_group = @min(total_elements, 256); // Use a common threadgroup size, capped by total elements.
         
-        // Calculate proper threading based on IREE kernel analysis
-        // The kernel uses: gl_WorkGroupID.x and gl_LocalInvocationID.x
-        // For 2x2 matrix: we need 2 workgroups, each with 2 threads
-        
-        // Dispatch threads using IREE's expected grid layout
         dispatchThreads(
             encoder,
-            [3]usize{ 4, 1, 1 }, // Total 4 threads across 2 workgroups 
-            [3]usize{ 2, 1, 1 }  // 2 threads per workgroup
+            [3]usize{ total_elements, 1, 1 },         // Total threads to match the number of elements
+            [3]usize{ threads_per_group, 1, 1 }       // Threads per group
         );
+
+        // --- END: MODIFICATION ---
     }
     
     /// Get or create a compute pipeline for a kernel
@@ -566,19 +568,14 @@ var global_metal_engine: ?MLIRMetalExecutionEngine = null;
 pub fn init(allocator: Allocator, context: *MLIRContext) !void {
     if (global_metal_engine != null) return;
 
-    std.debug.print("MLIR-Metal backend: Starting initialization...\n", .{});
 
     // Check if we're on an Apple platform
     if (builtin.os.tag != .macos and builtin.os.tag != .ios) {
-        std.debug.print("MLIR-Metal backend: Unsupported platform! Requires macOS or iOS.\n", .{});
         return MetalError.UnsupportedPlatform;
     }
 
-    std.debug.print("MLIR-Metal backend: Initializing execution engine with shared context...\n", .{});
     global_metal_engine = try MLIRMetalExecutionEngine.init(allocator, context);
     
-    std.debug.print("MLIR-Metal backend: Initialization completed successfully.\n", .{});
-    std.debug.print("MLIR-Metal backend: Ready to execute MLIR graphs on Metal.\n", .{});
 }
 
 // Clean up the Metal backend
@@ -649,13 +646,10 @@ fn metal_materialize(ptr: *anyopaque, t: tensor.Tensor(void)) ![]u8 {
     const byte_count = elem_count * t.shape.dtype.sizeInBytes();
     const output_bytes = try self.allocator.alloc(u8, byte_count);
 
-    // 3. Convert the []u8 to a [][]f32 for the current executeMLIRModule signature
-    const output_f32_slice: []f32 = @alignCast(std.mem.bytesAsSlice(f32, output_bytes));
-
-    // 4. Execute the module through the complete MLIR pipeline
+    // 3. Execute the module through the complete MLIR pipeline
     // Inputs are empty since this tensor represents the final computation result
-    var output_slices = [_][]f32{output_f32_slice};
-    try self.executeMLIRModule(temp_builder.module, &.{}, output_slices[0..]);
+    var output_bytes_array = [_][]u8{output_bytes};
+    try self.executeMLIRModule(temp_builder.module, &.{}, output_bytes_array[0..]);
     
     return output_bytes;
 }
@@ -670,13 +664,10 @@ fn metal_materialize_module(ptr: *anyopaque, module_to_run: mlir.Module) ![]u8 {
     const byte_count = 1000 * 4; // Placeholder for param_count * sizeof(f32)
     const output_bytes = try self.allocator.alloc(u8, byte_count);
 
-    // 2. Convert the []u8 to a [][]f32 for the current executeMLIRModule signature
-    const output_f32_slice: []f32 = @alignCast(std.mem.bytesAsSlice(f32, output_bytes));
-
-    // 3. Execute the module provided by the caller.
+    // 2. Execute the module provided by the caller.
     // Inputs are empty since this tensor represents the final computation result
-    var output_slices = [_][]f32{output_f32_slice};
-    try self.executeMLIRModule(module_to_run, &.{}, output_slices[0..]);
+    var output_bytes_array = [_][]u8{output_bytes};
+    try self.executeMLIRModule(module_to_run, &.{}, output_bytes_array[0..]);
     
     return output_bytes;
 }
@@ -727,11 +718,19 @@ fn metal_execute_training_step(ptr: *anyopaque, mlir_module: mlir.Module, inputs
     }
     
     const params_f32: []const f32 = @alignCast(std.mem.bytesAsSlice(f32, inputs[0]));
-    const data_f32: []const f32 = @alignCast(std.mem.bytesAsSlice(f32, inputs[1]));
-    const targets_f32: []const f32 = @alignCast(std.mem.bytesAsSlice(f32, inputs[2]));
-    
-    // Create a mutable array for the executeMLIRModule call
-    var input_array = [_][]const f32{ params_f32, data_f32, targets_f32 };
+
+    // --- START FIX ---
+    // Correctly cast the integer data. Your DataLoader uses u32.
+    const data_u32: []const u32 = @alignCast(std.mem.bytesAsSlice(u32, inputs[1]));
+    const targets_u32: []const u32 = @alignCast(std.mem.bytesAsSlice(u32, inputs[2]));
+    // --- END FIX ---
+
+    // The executeMLIRModule function now expects raw byte slices.
+    var input_bytes_array = [_][]const u8{
+        std.mem.sliceAsBytes(params_f32),
+        std.mem.sliceAsBytes(data_u32),
+        std.mem.sliceAsBytes(targets_u32),
+    };
 
     // 2. Determine output sizes by finding the 'func.return' operation and inspecting the types of its operands
     const main_fn = findFunctionByName(mlir_module, "main") orelse return error.MainFunctionNotFound;
@@ -748,39 +747,80 @@ fn metal_execute_training_step(ptr: *anyopaque, mlir_module: mlir.Module, inputs
         return error.InvalidTerminator;
     }
 
-    // Calculate the total size of the parameter results from the return op's operands
-    var total_params_bytes: usize = 0;
     const num_results = return_op.getNumOperands();
-    
-    // The last result is always the scalar loss, so we iterate up to num_results - 1
     if (num_results < 1) return error.NoReturnValues;
+
+    // Create a list of output buffers, one for each result
+    var output_buffers = std.ArrayList([]f32).init(self.allocator);
+    defer {
+        for (output_buffers.items) |buf| self.allocator.free(buf);
+        output_buffers.deinit();
+    }
     
+    // Allocate a buffer for each parameter result
     for (0..(num_results - 1)) |i| {
         const result_val = return_op.getOperand(i);
         const result_type = result_val.getType().as(mlir.RankedTensorType) orelse return error.InvalidResultType;
         var shape = try tensor.Shape.fromMLIR(result_type, self.allocator);
         defer shape.deinit();
-        total_params_bytes += shape.elemCount() * shape.dtype.sizeInBytes();
+        const elem_count = shape.elemCount();
+        const param_buffer = try self.allocator.alloc(f32, elem_count);
+        try output_buffers.append(param_buffer);
+    }
+    
+    // Allocate a separate buffer for the final scalar loss
+    const loss_buffer = try self.allocator.alloc(f32, 1);
+    try output_buffers.append(loss_buffer);
+
+    // 3. Convert output buffers to [][]u8 for the call
+    var output_bytes = std.ArrayList([]u8).init(self.allocator);
+    defer {
+        // Note: We don't free the inner slices here because they are owned by output_buffers
+        output_bytes.deinit();
+    }
+    for (output_buffers.items) |buf| {
+        try output_bytes.append(std.mem.sliceAsBytes(buf));
     }
 
-    // Allocate buffers with the CORRECT sizes
-    const updated_params_bytes = try self.allocator.alloc(u8, total_params_bytes);
-    defer self.allocator.free(updated_params_bytes);
-    const loss_bytes = try self.allocator.alloc(u8, 4); // one f32
-    defer self.allocator.free(loss_bytes);
+    // Call the execution engine with the list of correctly sized buffers and raw byte slices
+    try self.executeMLIRModule(mlir_module, &input_bytes_array, output_bytes.items);
 
-    const updated_params_f32: []f32 = @alignCast(std.mem.bytesAsSlice(f32, updated_params_bytes));
-    const loss_f32: []f32 = @alignCast(std.mem.bytesAsSlice(f32, loss_bytes));
-    var output_array = [_][]f32{ updated_params_f32, loss_f32 };
+    // 4. Package the results by concatenating the parameter buffers
+    var total_params_bytes: usize = 0;
+    for (output_buffers.items[0..(num_results - 1)]) |buf| {
+        total_params_bytes += buf.len * @sizeOf(f32);
+    }
+    const final_params_bytes = try self.allocator.alloc(u8, total_params_bytes);
+    var offset: usize = 0;
+    for (output_buffers.items[0..(num_results - 1)]) |buf| {
+        const buf_bytes = std.mem.sliceAsBytes(buf);
+        @memcpy(final_params_bytes[offset..][0..buf_bytes.len], buf_bytes);
+        offset += buf_bytes.len;
+    }
 
-    // 3. Call the *actual* execution engine. This function already contains
-    //    the full pipeline: lowerToSPIRV -> translate -> compile -> execute.
-    try self.executeMLIRModule(mlir_module, input_array[0..], output_array[0..]);
+    const final_loss_bytes = std.mem.sliceAsBytes(loss_buffer);
 
-    // 4. Package the results for the return value.
+    // Debug: Check the concatenated parameter data
+    if (final_params_bytes.len > 0) {
+        const sample_size = @min(16, final_params_bytes.len);
+        std.log.debug("Metal backend output params: {} bytes, first {} bytes: {any}", .{
+            final_params_bytes.len, sample_size, final_params_bytes[0..sample_size]
+        });
+        
+        // Check if data is all zeros (which would become 'A's in Base64)
+        var zero_count: usize = 0;
+        const check_size = @min(1024, final_params_bytes.len);
+        for (final_params_bytes[0..check_size]) |byte| {
+            if (byte == 0) zero_count += 1;
+        }
+        if (zero_count == check_size) {
+            std.log.err("Metal backend returned all-zero parameter data! This will become 'A's in Base64", .{});
+        }
+    }
+
     var results = std.ArrayList([]u8).init(self.allocator);
-    try results.append(try self.allocator.dupe(u8, updated_params_bytes));
-    try results.append(try self.allocator.dupe(u8, loss_bytes));
+    try results.append(final_params_bytes); // The correctly concatenated params
+    try results.append(try self.allocator.dupe(u8, final_loss_bytes)); // The loss
 
     return results.toOwnedSlice();
 

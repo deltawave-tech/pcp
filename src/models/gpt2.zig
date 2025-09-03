@@ -170,40 +170,49 @@ pub fn LayerNorm(comptime DataType: type) type {
             const n_embd_size = x.shape.getDimension(last_dim);
             
             // Step 1: Calculate mean along last dimension
-            // sum = stablehlo.reduce_sum(x, dimension=last_dim, keep_dims=true)
-            const sum_tensor = try ops.reduceSum(builder, x, &[_]i64{@intCast(last_dim)}, true); // keep_dims=true for broadcasting
+            const sum_tensor = try ops.reduceSum(builder, x, &[_]i64{@intCast(last_dim)}, true); // keep_dims=true
             
-            // Create size constant and divide to get mean
+            // Create size and epsilon constants
             const size_const = try ops.constant(builder, @floatFromInt(n_embd_size), &.{}, mlir.Type.f32Type(ctx));
+            const epsilon_const = try ops.constant(builder, self.epsilon, &.{}, mlir.Type.f32Type(ctx));
+
+            // --- START: MODIFICATION ---
+
+            // DEFINITIVE FIX: Add epsilon to the divisor to prevent division by zero
+            // if n_embd_size is ever evaluated as 0 during an MLIR pass.
+            const safe_divisor = try ops.add(builder, size_const, epsilon_const);
+            const mean = try ops.divide(builder, sum_tensor, safe_divisor);
             
-            const mean = try ops.divide(builder, sum_tensor, size_const);
+            // --- END: MODIFICATION ---
             
-            // Step 2: Calculate variance = mean(x^2) - mean(x)^2
-            // x_squared = stablehlo.multiply(x, x)
-            const x_squared = try ops.multiply(builder, x, x);
+            // --- START: MODIFICATION ---
+
+            // Step 2: Calculate variance using the numerically stable formula: mean((x - mean(x))^2)
+            // This avoids floating point issues that can make the result negative.
+
+            // Center x: x_centered = x - mean
+            const x_centered = try ops.subtract(builder, x, mean);
+
+            // Square the centered values: (x - mean(x))^2
+            const x_centered_squared = try ops.multiply(builder, x_centered, x_centered);
+
+            // Calculate the mean of the squared differences to get the variance
+            const sum_x_centered_squared = try ops.reduceSum(builder, x_centered_squared, &[_]i64{@intCast(last_dim)}, true);
             
-            // mean_x_squared = reduce_sum(x_squared) / size
-            const sum_x_squared = try ops.reduceSum(builder, x_squared, &[_]i64{@intCast(last_dim)}, true); // keep_dims=true for shape consistency
-            const mean_x_squared = try ops.divide(builder, sum_x_squared, size_const);
-            
-            // mean_squared = mean * mean
-            const mean_squared = try ops.multiply(builder, mean, mean);
-            
-            // variance = mean_x_squared - mean_squared
-            const variance = try ops.subtract(builder, mean_x_squared, mean_squared);
+            // Re-use the safe divisor for the variance calculation
+            const variance = try ops.divide(builder, sum_x_centered_squared, safe_divisor);
+
+            // --- END: MODIFICATION ---
             
             // Step 3: Apply normalization
             // Add epsilon: variance_eps = variance + epsilon
-            const epsilon_const = try ops.constant(builder, self.epsilon, &.{}, mlir.Type.f32Type(ctx));
             const variance_eps = try ops.add(builder, variance, epsilon_const);
             
             // rsqrt_var = rsqrt(variance_eps)
             const rsqrt_var = try ops.rsqrt(builder, variance_eps);
             
-            // Center x: x_centered = x - mean
-            const x_centered = try ops.subtract(builder, x, mean);
-            
             // Normalize: x_norm = x_centered * rsqrt_var
+            // NOTE: We re-use the 'x_centered' from the stable variance calculation
             const x_norm = try ops.multiply(builder, x_centered, rsqrt_var);
             
             // Step 4: Apply scale and shift

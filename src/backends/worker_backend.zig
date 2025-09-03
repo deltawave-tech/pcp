@@ -20,6 +20,9 @@ pub const WorkerBackend = struct {
             inputs: [][]const u8,
         ) anyerror![][]u8,
         
+        /// Get the MLIR context from the backend
+        getContext: *const fn(ptr: *anyopaque) mlir.Context,
+        
         /// Clean up backend resources
         deinit: *const fn(ptr: *anyopaque) void,
     };
@@ -27,6 +30,11 @@ pub const WorkerBackend = struct {
     /// Execute a training step with the given MLIR module and inputs
     pub fn executeTrainingStep(self: WorkerBackend, mod: mlir.Module, inputs: [][]const u8) ![][]u8 {
         return self.vtable.executeTrainingStep(self.ptr, mod, inputs);
+    }
+    
+    /// Get the MLIR context from the backend
+    pub fn getContext(self: WorkerBackend) mlir.Context {
+        return self.vtable.getContext(self.ptr);
     }
     
     /// Clean up backend resources

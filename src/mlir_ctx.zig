@@ -38,7 +38,7 @@ const GPU_MAPPING_SCRIPT =
 pub const MLIRContext = struct {
     allocator: Allocator,
     context: *c.MlirContext,
-    registry: *c.MlirDialectRegistry,
+    registry: ?*c.MlirDialectRegistry,
     
     // --- REMOVED ---
     // pass_manager: mlir.PassManager, // <-- This field is the source of the state bug. Remove it.
@@ -131,10 +131,27 @@ pub const MLIRContext = struct {
         };
     }
     
+    /// Create an MLIRContext wrapper from an existing MLIR context
+    /// This avoids double initialization when sharing contexts between components
+    pub fn fromContext(context: mlir.Context) Self {
+        // Create a minimal wrapper that doesn't own the context
+        // The registry is set to null since we're not managing it
+        return Self{
+            .allocator = std.heap.page_allocator, // Dummy allocator since we're not managing resources
+            .context = context.handle,
+            .registry = null, // Not managing the registry
+        };
+    }
+    
     pub fn deinit(self: *Self) void {
         // self.pass_manager.deinit(); // <-- Remove this.
-        c.dialectRegistryDestroy(self.registry);
-        c.contextDestroy(self.context);
+        if (self.registry) |registry| {
+            c.dialectRegistryDestroy(registry);
+        }
+        // Only destroy context if we own it (registry is not null)
+        if (self.registry != null) {
+            c.contextDestroy(self.context);
+        }
     }
     
     /// NEW IREE-based SPIR-V compilation replacing the complex manual pipeline

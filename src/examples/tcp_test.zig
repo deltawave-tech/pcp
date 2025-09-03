@@ -61,11 +61,10 @@ fn testClientFunction(allocator: std.mem.Allocator, host: []const u8, port: u16)
     std.log.debug("Client sent test message");
     
     // Receive response
-    const response = try client.receive();
-    defer {
-        // Clean up JSON parsed data
-        // Note: This is a simplified cleanup - in practice you'd need more careful memory management
-    }
+    const parsed_response = try client.receive();
+    defer parsed_response.deinit();
+    
+    const response = parsed_response.value;
     
     std.log.debug("Client received response: type={s}", .{response.msg_type});
     

@@ -19,6 +19,9 @@ pub const TcpStreamManager = struct {
         defer json_buffer.deinit();
         
         const json_data = json_buffer.items;
+        
+        std.log.debug("Worker is about to send JSON payload: {s}", .{json_data});
+        
         const data_length: u32 = @intCast(json_data.len);
         
         // Send length prefix first (4 bytes for u32)
@@ -38,25 +41,30 @@ pub const TcpStreamManager = struct {
 
     /// Receive a MessageEnvelope from a TCP stream
     /// Reads length prefix first, then exactly that many bytes
-    pub fn receive(stream: net.Stream, allocator: Allocator) !MessageEnvelope {
+    pub fn receive(stream: net.Stream, allocator: Allocator) !std.json.Parsed(MessageEnvelope) {
         // Read the length prefix (4 bytes for u32)
         var length_bytes: [4]u8 = undefined;
         _ = try stream.readAll(&length_bytes);
         const data_length = std.mem.readInt(u32, &length_bytes, .little);
         
         // Sanity check - prevent excessive memory allocation
-        if (data_length > 1024 * 1024) { // 1MB limit
+        // Note: GPT-2 model parameters can be 40MB+ raw, 53MB+ after encoding
+        if (data_length > 100 * 1024 * 1024) { // 100MB limit for large model parameters
+            std.log.warn("Message exceeds size limit: {} MB", .{data_length / (1024 * 1024)});
             return error.MessageTooLarge;
+        }
+        
+        // Log large messages for monitoring
+        if (data_length > 10 * 1024 * 1024) {
+            std.log.info("Large message detected: {} MB", .{data_length / (1024 * 1024)});
         }
         
         // Read exactly data_length bytes
         const json_data = try allocator.alloc(u8, data_length);
-        defer allocator.free(json_data);
         _ = try stream.readAll(json_data);
         
         // Parse JSON back to MessageEnvelope
         const parsed = try MessageEnvelope.fromJsonString(json_data, allocator);
-        // Note: caller is responsible for calling parsed.deinit()
         
         std.log.debug("Received message: type={s}, length={}, from_node={}, from_service={s}", .{
             parsed.value.msg_type,
@@ -65,11 +73,11 @@ pub const TcpStreamManager = struct {
             parsed.value.sender_service,
         });
         
-        return parsed.value;
+        return parsed;
     }
     
     /// Receive a MessageEnvelope with a timeout
-    pub fn receiveWithTimeout(stream: net.Stream, allocator: Allocator, timeout_ms: u64) !MessageEnvelope {
+    pub fn receiveWithTimeout(stream: net.Stream, allocator: Allocator, timeout_ms: u64) !std.json.Parsed(MessageEnvelope) {
         // For now, just call receive - timeout implementation would require more complex handling
         _ = timeout_ms;
         return try receive(stream, allocator);
@@ -158,7 +166,7 @@ pub const TcpClient = struct {
     }
     
     /// Receive a message using the TcpStreamManager
-    pub fn receive(self: Self) !MessageEnvelope {
+    pub fn receive(self: Self) !std.json.Parsed(MessageEnvelope) {
         const stream = try self.getStream();
         return try TcpStreamManager.receive(stream, self.allocator);
     }

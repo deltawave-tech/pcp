@@ -201,7 +201,8 @@ fn runWorker(allocator: Allocator, args: Args) !void {
     const backend = if (args.demo_execution) backend_selection.Backend.demo else backend_selection.Backend.selectDefault();
     const worker_backend = try backend_selection.createWorkerBackend(allocator, backend);
     
-    var worker_instance = try Worker.init(allocator, worker_backend);
+    // Create worker without initializing its own MLIR context
+    var worker_instance = try Worker.initWithBackend(allocator, worker_backend);
     defer worker_instance.deinit();
     
     // Connect to shepherd

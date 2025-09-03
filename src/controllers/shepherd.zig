@@ -117,10 +117,25 @@ pub const Shepherd = struct {
         defer stream.close();
         
         // Wait for JoinRequest from worker
-        const join_msg = TcpStreamManager.receive(stream, self.allocator) catch |err| {
+        const parsed_join_msg = TcpStreamManager.receive(stream, self.allocator) catch |err| {
             std.log.err("Failed to receive join message: {}", .{err});
             return;
         };
+        defer parsed_join_msg.deinit();
+        
+        const join_msg = parsed_join_msg.value;
+        
+        // Debug: Log the received message details
+        std.log.info("DEBUG: Received message details:", .{});
+        std.log.info("  msg_type: '{s}' (length: {})", .{ join_msg.msg_type, join_msg.msg_type.len });
+        std.log.info("  msg_id: {}", .{join_msg.msg_id});
+        std.log.info("  sender_node: {}", .{join_msg.sender_node});
+        std.log.info("  sender_service: {s}", .{join_msg.sender_service});
+        std.log.info("  Expected: '{s}' (length: {})", .{ MessageType.JOIN_REQUEST, MessageType.JOIN_REQUEST.len });
+        
+        // Print raw bytes of msg_type for debugging
+        std.log.info("  msg_type raw bytes: {any}", .{join_msg.msg_type});
+        std.log.info("  JOIN_REQUEST raw bytes: {any}", .{MessageType.JOIN_REQUEST});
         
         // Validate it's a JoinRequest
         if (!std.mem.eql(u8, join_msg.msg_type, MessageType.JOIN_REQUEST)) {
@@ -142,6 +157,10 @@ pub const Shepherd = struct {
         std.log.info("Worker {} connected from {}", .{ assigned_node_id, stream });
         
         // Send JoinAccept response
+        std.log.info("DEBUG: Creating empty JSON object for JOIN_ACCEPT", .{});
+        const empty_obj = std.json.Value{ .object = std.json.ObjectMap.init(self.allocator) };
+        
+        std.log.info("DEBUG: Creating JOIN_ACCEPT message", .{});
         const join_accept = tcp_stream.createMessage(
             0, // coordinator node_id
             "shepherd", // coordinator service
@@ -149,8 +168,20 @@ pub const Shepherd = struct {
             "worker", // worker service
             MessageType.JOIN_ACCEPT,
             join_msg.msg_id + 1,
-            std.json.Value{ .object = std.json.ObjectMap.init(self.allocator) }, // Empty object for now
+            empty_obj,
         );
+        
+        std.log.info("DEBUG: Serializing JOIN_ACCEPT message to JSON", .{});
+        const json_buffer = join_accept.asJsonString(self.allocator) catch |err| {
+            std.log.err("Failed to serialize JOIN_ACCEPT message: {}", .{err});
+            return;
+        };
+        defer json_buffer.deinit();
+        
+        std.log.info("DEBUG: JOIN_ACCEPT JSON size: {} bytes", .{json_buffer.items.len});
+        if (json_buffer.items.len > 1000) {
+            std.log.warn("JOIN_ACCEPT message is unexpectedly large! First 500 chars: {s}", .{json_buffer.items[0..@min(500, json_buffer.items.len)]});
+        }
         
         TcpStreamManager.send(stream, join_accept, self.allocator) catch |err| {
             std.log.err("Failed to send join accept: {}", .{err});
@@ -166,13 +197,16 @@ pub const Shepherd = struct {
     /// Handle ongoing messages from a worker
     fn handleWorkerMessages(self: *Self, worker_id: NodeId, stream: net.Stream) !void {
         while (self.is_running) {
-            const msg = TcpStreamManager.receive(stream, self.allocator) catch |err| {
+            const parsed_msg = TcpStreamManager.receive(stream, self.allocator) catch |err| {
                 std.log.warn("Worker {} disconnected: {}", .{ worker_id, err });
                 self.removeWorker(worker_id);
                 // Update monitoring after worker removal
                 monitoring.setWorkerCount(self.worker_pool.items.len);
                 return;
             };
+            defer parsed_msg.deinit();
+            
+            const msg = parsed_msg.value;
             
             // Handle different message types
             if (std.mem.eql(u8, msg.msg_type, MessageType.HEARTBEAT)) {

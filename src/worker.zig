@@ -61,6 +61,21 @@ pub const Worker = struct {
         };
     }
     
+    pub fn initWithBackend(allocator: Allocator, backend: WorkerBackend) !Self {
+        // Get the MLIR context from the backend instead of creating a new one
+        const backend_context = backend.getContext();
+        return Self{
+            .allocator = allocator,
+            .client = TcpClient.init(allocator),
+            .node_id = null,
+            .state = .disconnected,
+            .is_running = false,
+            .backend = backend,
+            .mlir_context = mlir_ctx.MLIRContext.fromContext(backend_context),
+            .cached_module = null,
+        };
+    }
+    
     pub fn deinit(self: *Self) void {
         // Cleanup cached module if it exists
         if (self.cached_module) |mod| {
@@ -96,10 +111,10 @@ pub const Worker = struct {
         std.log.debug("Sent JoinRequest to Shepherd", .{});
         
         // Wait for JoinAccept
-        const join_accept = try self.client.receive();
-        defer {
-            // TODO: Proper cleanup of parsed JSON
-        }
+        const parsed_join_accept = try self.client.receive();
+        defer parsed_join_accept.deinit();
+        
+        const join_accept = parsed_join_accept.value;
         
         if (!std.mem.eql(u8, join_accept.msg_type, MessageType.JOIN_ACCEPT)) {
             return error.UnexpectedMessage;
@@ -123,11 +138,14 @@ pub const Worker = struct {
         
         while (self.is_running) {
             // Receive command from Shepherd
-            const msg = self.client.receive() catch |err| {
+            const parsed_msg = self.client.receive() catch |err| {
                 std.log.err("Failed to receive message from Shepherd: {}", .{err});
                 self.state = .disconnected;
                 return;
             };
+            defer parsed_msg.deinit();
+            
+            const msg = parsed_msg.value;
             
             // Handle different message types
             if (std.mem.eql(u8, msg.msg_type, MessageType.INITIALIZE_GRAPH)) {

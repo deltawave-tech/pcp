@@ -58,6 +58,7 @@ pub const DemoBackend = struct {
             .ptr = self,
             .vtable = &.{
                 .executeTrainingStep = executeTrainingStep,
+                .getContext = getContextInterface,
                 .deinit = deinitInterface,
             },
         };
@@ -142,6 +143,10 @@ pub const DemoBackend = struct {
         std.mem.writeInt(u32, loss_bytes[0..4], @bitCast(loss), .little);
         
         return loss_bytes;
+    }
+    
+    fn getContextInterface(ptr: *anyopaque) mlir.Context {
+        return demoGetContext(ptr);
     }
     
     fn deinitInterface(ptr: *anyopaque) void {

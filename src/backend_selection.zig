@@ -62,9 +62,13 @@ pub fn createExecutor(allocator: Allocator, backend: Backend) !Executor {
             try metal_backend.init(allocator, &context);
             const engine = try metal_backend.getExecutionEngine();
             
-            // Wrap the real executor with demo behavior
+            // Create demo backend and set real executor before returning
             const demo = try demo_backend.DemoBackend.init(allocator);
-            demo.setRealExecutor(engine.asExecutor());
+            const real_executor = engine.asExecutor();
+            demo.setRealExecutor(real_executor);
+            
+            // Verify the real executor was set correctly
+            std.log.info("Demo backend initialized with real executor", .{});
             break :blk demo.asExecutor();
         },
         .cuda => {

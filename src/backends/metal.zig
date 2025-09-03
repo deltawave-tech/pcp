@@ -195,6 +195,7 @@ pub const MLIRMetalExecutionEngine = struct {
             .ptr = self,
             .vtable = &.{
                 .executeTrainingStep = metal_execute_training_step,
+                .getContext = metal_get_context,
                 .deinit = metal_worker_backend_deinit,
             },
         };

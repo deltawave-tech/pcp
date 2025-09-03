@@ -253,7 +253,7 @@ fn buildDemoTrainingModule(builder: *ops.MLIRBuilder, description: []const u8) !
     // MSE loss: (prediction - target)^2
     const diff = try ops.subtract(builder, prediction, target_flat);
     const squared = try ops.multiply(builder, diff, diff);
-    const loss = try ops.reduceSum(builder, squared, &.{0});
+    const loss = try ops.reduceSum(builder, squared, &.{0}, false);
     
     // Return loss
     _ = try builder.createAndAttach("func.return", &.{loss.value}, &.{});

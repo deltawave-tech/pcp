@@ -48,13 +48,18 @@ pub fn createExecutor(allocator: Allocator, backend: Backend) !Executor {
     return switch (backend) {
         .metal => blk: {
             // Initialize Metal backend and return its Executor interface
-            try metal_backend.init(allocator);
+            // Note: We need to create an MLIR context for Metal backend
+            const mlir_ctx = @import("mlir_ctx.zig");
+            var context = try mlir_ctx.MLIRContext.init(allocator);
+            try metal_backend.init(allocator, &context);
             const engine = try metal_backend.getExecutionEngine();
             break :blk engine.asExecutor();
         },
         .demo => blk: {
             // Demo backend uses the real Metal MLIR context but simulated execution
-            try metal_backend.init(allocator);
+            const mlir_ctx = @import("mlir_ctx.zig");
+            var context = try mlir_ctx.MLIRContext.init(allocator);
+            try metal_backend.init(allocator, &context);
             const engine = try metal_backend.getExecutionEngine();
             
             // Wrap the real executor with demo behavior
@@ -80,7 +85,9 @@ pub fn createWorkerBackend(allocator: Allocator, backend: Backend) !WorkerBacken
     return switch (backend) {
         .metal => blk: {
             // Initialize Metal backend and return its WorkerBackend interface
-            try metal_backend.init(allocator);
+            const mlir_ctx = @import("mlir_ctx.zig");
+            var context = try mlir_ctx.MLIRContext.init(allocator);
+            try metal_backend.init(allocator, &context);
             const engine = try metal_backend.getExecutionEngine();
             break :blk engine.asWorkerBackend();
         },

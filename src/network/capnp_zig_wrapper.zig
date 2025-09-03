@@ -8,11 +8,15 @@ const c = @cImport({
 
 pub const WorkerPayload = struct {
     params: []const u8,
+    input_ids: []const u8,
+    targets: []const u8,
 
     pub fn serialize(self: @This(), allocator: Allocator) ![]u8 {
         const builder = c.new_worker_payload_builder();
         defer c.free_builder(builder);
         c.set_worker_payload_params(builder, self.params.ptr, self.params.len);
+        c.set_worker_payload_input_ids(builder, self.input_ids.ptr, self.input_ids.len);
+        c.set_worker_payload_targets(builder, self.targets.ptr, self.targets.len);
 
         const size = c.get_message_size(builder);
         const buffer = try allocator.alloc(u8, size);
@@ -38,6 +42,24 @@ pub const WorkerPayload = struct {
             var data_ptr: [*c]const u8 = undefined;
             var size: usize = undefined;
             if (c.get_worker_payload_params(self.reader_ptr, &data_ptr, &size) == 0) {
+                return error.DeserializationFailed;
+            }
+            return data_ptr[0..size];
+        }
+
+        pub fn getInputIds(self: Reader) ![]const u8 {
+            var data_ptr: [*c]const u8 = undefined;
+            var size: usize = undefined;
+            if (c.get_worker_payload_input_ids(self.reader_ptr, &data_ptr, &size) == 0) {
+                return error.DeserializationFailed;
+            }
+            return data_ptr[0..size];
+        }
+
+        pub fn getTargets(self: Reader) ![]const u8 {
+            var data_ptr: [*c]const u8 = undefined;
+            var size: usize = undefined;
+            if (c.get_worker_payload_targets(self.reader_ptr, &data_ptr, &size) == 0) {
                 return error.DeserializationFailed;
             }
             return data_ptr[0..size];

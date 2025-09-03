@@ -4,6 +4,8 @@
 # Message from Shepherd to Worker for starting the inner loop
 struct WorkerPayload {
     params @0 :Data;
+    inputIds @1 :Data;    # Serialized input token IDs
+    targets @2 :Data;     # Serialized target token IDs
 }
 
 # Message from Worker back to Shepherd after inner loop completion

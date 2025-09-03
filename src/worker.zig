@@ -198,21 +198,15 @@ pub const Worker = struct {
         const reader = try binary_protocol.WorkerPayload.Reader.init(capnp_bytes);
         defer reader.deinit();
         const params_bytes = try reader.getParams();
+        const input_ids_bytes = try reader.getInputIds();
+        const targets_bytes = try reader.getTargets();
 
-        // 5. Generate RANDOM data for this test run on the worker
-        // This simulates having a local dataset shard.
-        const batch_size = 4;
-        const seq_length = 12;
-        const data_size_bytes = batch_size * seq_length * 4; // 4 bytes/f32
-
-        const random_data = try self.allocator.alloc(u8, data_size_bytes);
-        defer self.allocator.free(random_data);
-        // In a real scenario, you'd fill this with actual token IDs.
-        // For now, zeros are fine for testing the execution pipeline.
-        @memset(random_data, 0);
+        std.log.info("Worker received: {} param bytes, {} input_ids bytes, {} targets bytes", .{
+            params_bytes.len, input_ids_bytes.len, targets_bytes.len
+        });
 
         // 6. Package inputs for the backend: [master_params, input_ids, targets]
-        var inputs_array = [_][]const u8{ params_bytes, random_data, random_data };
+        var inputs_array = [_][]const u8{ params_bytes, input_ids_bytes, targets_bytes };
         const inputs: [][]const u8 = &inputs_array;
 
         // 7. Execute using the CACHED module.

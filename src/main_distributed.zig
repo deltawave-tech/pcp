@@ -147,11 +147,17 @@ fn runShepherd(allocator: Allocator, args: Args) !void {
     // Now use system.shepherd instead of a local variable
     const shepherd_controller = &system.shepherd;
     
+    // Initialize the DataLoader for real training data
+    print("Loading Tiny Shakespeare dataset...\n", .{});
+    var data_loader = try @import("data_loader.zig").DataLoader.init(allocator, "tiny_shakespeare.txt");
+    defer data_loader.deinit();
+    print("🌙 Dataset loaded with {} tokens\n", .{data_loader.tokens.len});
+    
     const diloco_config = DiLoCoConfig.default();
     
     // Pass the single MLIRBuilder instance to the algorithm.
     print("Initializing DiLoCo algorithm...\n", .{});
-    var diloco_algo = try DiLoCo.init(allocator, shepherd_controller, diloco_config, system.executor, &mlir_builder);
+    var diloco_algo = try DiLoCo.init(allocator, shepherd_controller, diloco_config, system.executor, &mlir_builder, &data_loader);
     defer diloco_algo.deinit();
     print("🌙 DiLoCo algorithm initialized successfully\n", .{});
     

@@ -33,7 +33,7 @@ struct WorkerPayload {
   class Pipeline;
 
   struct _capnpPrivate {
-    CAPNP_DECLARE_STRUCT_HEADER(c564aa5e439c8ad0, 0, 1)
+    CAPNP_DECLARE_STRUCT_HEADER(c564aa5e439c8ad0, 0, 3)
     #if !CAPNP_LITE
     static constexpr ::capnp::_::RawBrandedSchema const* brand() { return &schema->defaultBrand; }
     #endif  // !CAPNP_LITE
@@ -77,6 +77,12 @@ public:
   inline bool hasParams() const;
   inline  ::capnp::Data::Reader getParams() const;
 
+  inline bool hasInputIds() const;
+  inline  ::capnp::Data::Reader getInputIds() const;
+
+  inline bool hasTargets() const;
+  inline  ::capnp::Data::Reader getTargets() const;
+
 private:
   ::capnp::_::StructReader _reader;
   template <typename, ::capnp::Kind>
@@ -111,6 +117,20 @@ public:
   inline  ::capnp::Data::Builder initParams(unsigned int size);
   inline void adoptParams(::capnp::Orphan< ::capnp::Data>&& value);
   inline ::capnp::Orphan< ::capnp::Data> disownParams();
+
+  inline bool hasInputIds();
+  inline  ::capnp::Data::Builder getInputIds();
+  inline void setInputIds( ::capnp::Data::Reader value);
+  inline  ::capnp::Data::Builder initInputIds(unsigned int size);
+  inline void adoptInputIds(::capnp::Orphan< ::capnp::Data>&& value);
+  inline ::capnp::Orphan< ::capnp::Data> disownInputIds();
+
+  inline bool hasTargets();
+  inline  ::capnp::Data::Builder getTargets();
+  inline void setTargets( ::capnp::Data::Reader value);
+  inline  ::capnp::Data::Builder initTargets(unsigned int size);
+  inline void adoptTargets(::capnp::Orphan< ::capnp::Data>&& value);
+  inline ::capnp::Orphan< ::capnp::Data> disownTargets();
 
 private:
   ::capnp::_::StructBuilder _builder;
@@ -258,6 +278,74 @@ inline void WorkerPayload::Builder::adoptParams(
 inline ::capnp::Orphan< ::capnp::Data> WorkerPayload::Builder::disownParams() {
   return ::capnp::_::PointerHelpers< ::capnp::Data>::disown(_builder.getPointerField(
       ::capnp::bounded<0>() * ::capnp::POINTERS));
+}
+
+inline bool WorkerPayload::Reader::hasInputIds() const {
+  return !_reader.getPointerField(
+      ::capnp::bounded<1>() * ::capnp::POINTERS).isNull();
+}
+inline bool WorkerPayload::Builder::hasInputIds() {
+  return !_builder.getPointerField(
+      ::capnp::bounded<1>() * ::capnp::POINTERS).isNull();
+}
+inline  ::capnp::Data::Reader WorkerPayload::Reader::getInputIds() const {
+  return ::capnp::_::PointerHelpers< ::capnp::Data>::get(_reader.getPointerField(
+      ::capnp::bounded<1>() * ::capnp::POINTERS));
+}
+inline  ::capnp::Data::Builder WorkerPayload::Builder::getInputIds() {
+  return ::capnp::_::PointerHelpers< ::capnp::Data>::get(_builder.getPointerField(
+      ::capnp::bounded<1>() * ::capnp::POINTERS));
+}
+inline void WorkerPayload::Builder::setInputIds( ::capnp::Data::Reader value) {
+  ::capnp::_::PointerHelpers< ::capnp::Data>::set(_builder.getPointerField(
+      ::capnp::bounded<1>() * ::capnp::POINTERS), value);
+}
+inline  ::capnp::Data::Builder WorkerPayload::Builder::initInputIds(unsigned int size) {
+  return ::capnp::_::PointerHelpers< ::capnp::Data>::init(_builder.getPointerField(
+      ::capnp::bounded<1>() * ::capnp::POINTERS), size);
+}
+inline void WorkerPayload::Builder::adoptInputIds(
+    ::capnp::Orphan< ::capnp::Data>&& value) {
+  ::capnp::_::PointerHelpers< ::capnp::Data>::adopt(_builder.getPointerField(
+      ::capnp::bounded<1>() * ::capnp::POINTERS), kj::mv(value));
+}
+inline ::capnp::Orphan< ::capnp::Data> WorkerPayload::Builder::disownInputIds() {
+  return ::capnp::_::PointerHelpers< ::capnp::Data>::disown(_builder.getPointerField(
+      ::capnp::bounded<1>() * ::capnp::POINTERS));
+}
+
+inline bool WorkerPayload::Reader::hasTargets() const {
+  return !_reader.getPointerField(
+      ::capnp::bounded<2>() * ::capnp::POINTERS).isNull();
+}
+inline bool WorkerPayload::Builder::hasTargets() {
+  return !_builder.getPointerField(
+      ::capnp::bounded<2>() * ::capnp::POINTERS).isNull();
+}
+inline  ::capnp::Data::Reader WorkerPayload::Reader::getTargets() const {
+  return ::capnp::_::PointerHelpers< ::capnp::Data>::get(_reader.getPointerField(
+      ::capnp::bounded<2>() * ::capnp::POINTERS));
+}
+inline  ::capnp::Data::Builder WorkerPayload::Builder::getTargets() {
+  return ::capnp::_::PointerHelpers< ::capnp::Data>::get(_builder.getPointerField(
+      ::capnp::bounded<2>() * ::capnp::POINTERS));
+}
+inline void WorkerPayload::Builder::setTargets( ::capnp::Data::Reader value) {
+  ::capnp::_::PointerHelpers< ::capnp::Data>::set(_builder.getPointerField(
+      ::capnp::bounded<2>() * ::capnp::POINTERS), value);
+}
+inline  ::capnp::Data::Builder WorkerPayload::Builder::initTargets(unsigned int size) {
+  return ::capnp::_::PointerHelpers< ::capnp::Data>::init(_builder.getPointerField(
+      ::capnp::bounded<2>() * ::capnp::POINTERS), size);
+}
+inline void WorkerPayload::Builder::adoptTargets(
+    ::capnp::Orphan< ::capnp::Data>&& value) {
+  ::capnp::_::PointerHelpers< ::capnp::Data>::adopt(_builder.getPointerField(
+      ::capnp::bounded<2>() * ::capnp::POINTERS), kj::mv(value));
+}
+inline ::capnp::Orphan< ::capnp::Data> WorkerPayload::Builder::disownTargets() {
+  return ::capnp::_::PointerHelpers< ::capnp::Data>::disown(_builder.getPointerField(
+      ::capnp::bounded<2>() * ::capnp::POINTERS));
 }
 
 inline bool ShepherdPayload::Reader::hasUpdatedParams() const {

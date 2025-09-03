@@ -1,6 +1,11 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
+pub const Batch = struct {
+    x: []u32,
+    y: []u32,
+};
+
 pub const CharTokenizer = struct {
     allocator: Allocator,
     char_to_int: std.AutoHashMap(u8, u32),
@@ -86,7 +91,7 @@ pub const DataLoader = struct {
     }
     
     // Gets a single random batch of (inputs, targets)
-    pub fn getBatch(self: *DataLoader, batch_size: usize, block_size: usize) !struct { x: []u32, y: []u32 } {
+    pub fn getBatch(self: *DataLoader, batch_size: usize, block_size: usize) !Batch {
         const x = try self.allocator.alloc(u32, batch_size * block_size);
         const y = try self.allocator.alloc(u32, batch_size * block_size);
         
@@ -102,6 +107,6 @@ pub const DataLoader = struct {
             @memcpy(y[i * block_size .. (i+1) * block_size], target_slice);
         }
 
-        return .{ .x = x, .y = y };
+        return Batch{ .x = x, .y = y };
     }
 };

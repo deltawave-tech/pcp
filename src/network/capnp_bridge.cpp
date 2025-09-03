@@ -31,6 +31,16 @@ void set_worker_payload_params(CapnpMessageBuilder* builder, const uint8_t* data
     root.setParams(kj::ArrayPtr<const kj::byte>(data, size));
 }
 
+void set_worker_payload_input_ids(CapnpMessageBuilder* builder, const uint8_t* data, size_t size) {
+    auto root = builder->builder.getRoot<WorkerPayload>();
+    root.setInputIds(kj::ArrayPtr<const kj::byte>(data, size));
+}
+
+void set_worker_payload_targets(CapnpMessageBuilder* builder, const uint8_t* data, size_t size) {
+    auto root = builder->builder.getRoot<WorkerPayload>();
+    root.setTargets(kj::ArrayPtr<const kj::byte>(data, size));
+}
+
 // --- ShepherdPayload ---
 CapnpMessageBuilder* new_shepherd_payload_builder() {
     auto cpp_builder = new CapnpMessageBuilder();
@@ -84,6 +94,22 @@ int get_worker_payload_params(CapnpMessageReader* reader, const uint8_t** data, 
     auto params = payload.getParams();
     *data = params.begin();
     *size = params.size();
+    return 1;
+}
+
+int get_worker_payload_input_ids(CapnpMessageReader* reader, const uint8_t** data, size_t* size) {
+    auto payload = reader->reader.getRoot<WorkerPayload>();
+    auto input_ids = payload.getInputIds();
+    *data = input_ids.begin();
+    *size = input_ids.size();
+    return 1;
+}
+
+int get_worker_payload_targets(CapnpMessageReader* reader, const uint8_t** data, size_t* size) {
+    auto payload = reader->reader.getRoot<WorkerPayload>();
+    auto targets = payload.getTargets();
+    *data = targets.begin();
+    *size = targets.size();
     return 1;
 }
 

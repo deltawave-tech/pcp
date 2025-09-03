@@ -15,6 +15,7 @@ const tensor = @import("../tensor.zig");
 const execution = @import("../execution.zig");
 const monitoring = @import("../monitoring.zig");
 const gpt2 = @import("../models/gpt2.zig");
+const data_loader = @import("../data_loader.zig");
 
 // GPT-2 model imports for easier access
 const GPT2Config = gpt2.GPT2Config;
@@ -31,6 +32,7 @@ const NesterovMLIR = nesterov_mlir.NesterovMLIR(f32);
 const MLIRBuilder = ops.MLIRBuilder;
 const Tensor = tensor.Tensor(void);
 const Executor = execution.Executor; // NEW: Generic executor interface
+const DataLoader = data_loader.DataLoader;
 
 /// DiLoCo algorithm configuration
 pub const DiLoCoConfig = struct {
@@ -76,10 +78,13 @@ pub const DiLoCo = struct {
     // NEW: Cached serialized worker graph for one-time initialization
     serialized_worker_graph: []u8,
 
+    // Data loading for real training batches
+    data_loader: *DataLoader,
+
     const Self = @This();
 
-    // Change the init signature to accept the generic executor
-    pub fn init(allocator: Allocator, coordinator: *Shepherd, config: DiLoCoConfig, executor: Executor, mlir_builder: *MLIRBuilder) !Self {
+    // Change the init signature to accept the generic executor and DataLoader
+    pub fn init(allocator: Allocator, coordinator: *Shepherd, config: DiLoCoConfig, executor: Executor, mlir_builder: *MLIRBuilder, dataset: *DataLoader) !Self {
         std.log.info("DiLoCo.init: Starting initialization...", .{});
         
         // The MLIRBuilder is now passed in, ensuring a single context.
@@ -124,6 +129,7 @@ pub const DiLoCo = struct {
             .parameter_shapes = parameter_shapes,
             .executor = executor,
             .serialized_worker_graph = undefined, // Will be set below
+            .data_loader = dataset,
         };
 
         // Build the worker graph ONCE during initialization using the safe function builder
@@ -146,6 +152,7 @@ pub const DiLoCo = struct {
             .parameter_shapes = parameter_shapes,
             .executor = executor, // Store the generic executor
             .serialized_worker_graph = graph, // Store the pre-built graph
+            .data_loader = dataset,
         };
     }
 
@@ -217,8 +224,16 @@ pub const DiLoCo = struct {
             const start_time = std.time.milliTimestamp();
             std.log.info("DiLoCo outer loop step {}/{}", .{ outer_step + 1, self.config.base_config.outer_loop_steps });
 
-            // Phase 1: Broadcast master parameters to all workers
-            try self.broadcastMasterParameters();
+            // Phase 0: Get a fresh batch of training data
+            const batch_size = 4;
+            const block_size = 8;
+            const batch = try self.data_loader.getBatch(batch_size, block_size);
+            defer self.allocator.free(batch.x);
+            defer self.allocator.free(batch.y);
+            std.log.info("Loaded batch with {} input tokens and {} target tokens", .{ batch.x.len, batch.y.len });
+
+            // Phase 1: Broadcast master parameters and data batch to all workers
+            try self.broadcastMasterParametersAndBatch(batch);
 
             // Phase 2: Collect results from workers after inner loop
             const worker_results = try self.collectWorkerResults();
@@ -656,6 +671,58 @@ pub const DiLoCo = struct {
         try self.coordinator.broadcastToWorkers(MessageType.START_INNER_LOOP, json_payload);
 
         std.log.debug("Broadcasted Cap'n Proto encoded parameters ({} tensors) to {} workers", .{ param_tensors.len, self.coordinator.getWorkerCount() });
+    }
+
+    /// Broadcast master parameters and data batch to all workers using Cap'n Proto
+    fn broadcastMasterParametersAndBatch(self: *Self, batch: data_loader.Batch) !void {
+        if (self.master_parameters == null) {
+            return error.ParametersNotInitialized;
+        }
+
+        const param_tensors = self.master_parameters.?;
+        
+        // Extract and concatenate all parameter tensor data
+        var total_param_bytes = ArrayList(u8).init(self.allocator);
+        defer total_param_bytes.deinit();
+        
+        for (param_tensors) |param_tensor| {
+            const tensor_data = try self.extractTensorData(param_tensor);
+            defer self.allocator.free(tensor_data);
+            try total_param_bytes.appendSlice(tensor_data);
+        }
+
+        // Serialize batch data as raw bytes (u32 tokens -> bytes)
+        const input_ids_bytes = std.mem.sliceAsBytes(batch.x);
+        const targets_bytes = std.mem.sliceAsBytes(batch.y);
+
+        // Create WorkerPayload with parameters and batch data
+        const worker_payload = binary_protocol.WorkerPayload{
+            .params = total_param_bytes.items,
+            .input_ids = input_ids_bytes,
+            .targets = targets_bytes,
+        };
+        const capnp_bytes = try worker_payload.serialize(self.allocator);
+        defer self.allocator.free(capnp_bytes);
+
+        // Base64 encode the binary data
+        const b64_len = std.base64.standard.Encoder.calcSize(capnp_bytes.len);
+        const b64_encoded_payload = try self.allocator.alloc(u8, b64_len);
+        defer self.allocator.free(b64_encoded_payload);
+
+        const encoded_len = std.base64.standard.Encoder.encode(b64_encoded_payload, capnp_bytes).len;
+
+        // Create JSON payload with Base64-encoded binary data
+        const json_payload = std.json.Value{ .string = b64_encoded_payload[0..encoded_len] };
+
+        // Broadcast StartInnerLoop message with Cap'n Proto
+        try self.coordinator.broadcastToWorkers(MessageType.START_INNER_LOOP, json_payload);
+
+        std.log.debug("Broadcasted parameters ({} tensors) + batch ({} inputs, {} targets) to {} workers", .{ 
+            param_tensors.len, 
+            batch.x.len, 
+            batch.y.len, 
+            self.coordinator.getWorkerCount() 
+        });
     }
 
     /// Collect results from workers after inner loop using Cap'n Proto

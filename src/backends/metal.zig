@@ -693,6 +693,26 @@ fn metal_executor_deinit(ptr: *anyopaque) void {
     self.deinit();
 }
 
+// Helper function to find a function by name in a module
+fn findFunctionByName(module: mlir.Module, name: []const u8) ?mlir.Operation {
+    var op = module.op().getRegion(0).getBlock(0).getFirstOp();
+    while (op) |current_op| {
+        if (std.mem.eql(u8, current_op.getName(), "func.func")) {
+            const sym_name_attr = c.operationGetAttributeByName(current_op.handle, "sym_name");
+            if (@intFromPtr(sym_name_attr) != 0 and c.attributeIsAString(sym_name_attr)) {
+                const string_attr = @as(*c.MlirStringAttribute, @ptrCast(sym_name_attr));
+                const func_name_ref = c.stringAttributeGetValue(string_attr);
+                const func_name = c.fromStringRef(func_name_ref);
+                if (std.mem.eql(u8, func_name, name)) {
+                    return current_op;
+                }
+            }
+        }
+        op = current_op.getNext();
+    }
+    return null;
+}
+
 // WorkerBackend interface implementation functions
 /// Execute a training step defined by an MLIR module
 fn metal_execute_training_step(ptr: *anyopaque, mlir_module: mlir.Module, inputs: [][]const u8) ![][]u8 {
@@ -713,9 +733,38 @@ fn metal_execute_training_step(ptr: *anyopaque, mlir_module: mlir.Module, inputs
     // Create a mutable array for the executeMLIRModule call
     var input_array = [_][]const f32{ params_f32, data_f32, targets_f32 };
 
-    // 2. Determine output sizes from the module's 'main' function return type.
-    //    For now, we can hardcode based on the known graph structure.
-    const updated_params_bytes = try self.allocator.alloc(u8, inputs[0].len);
+    // 2. Determine output sizes by finding the 'func.return' operation and inspecting the types of its operands
+    const main_fn = findFunctionByName(mlir_module, "main") orelse return error.MainFunctionNotFound;
+    
+    // Get the block inside the main function's body
+    const main_fn_block = main_fn.getRegion(0).getBlock(0);
+    
+    // Find the terminator operation of the block
+    const return_op = main_fn_block.getLastOp() orelse return error.TerminatorNotFound;
+
+    // Verify it's a 'func.return'
+    if (!std.mem.eql(u8, return_op.getName(), "func.return")) {
+        std.log.err("Expected 'func.return' as terminator, but found '{s}'", .{return_op.getName()});
+        return error.InvalidTerminator;
+    }
+
+    // Calculate the total size of the parameter results from the return op's operands
+    var total_params_bytes: usize = 0;
+    const num_results = return_op.getNumOperands();
+    
+    // The last result is always the scalar loss, so we iterate up to num_results - 1
+    if (num_results < 1) return error.NoReturnValues;
+    
+    for (0..(num_results - 1)) |i| {
+        const result_val = return_op.getOperand(i);
+        const result_type = result_val.getType().as(mlir.RankedTensorType) orelse return error.InvalidResultType;
+        var shape = try tensor.Shape.fromMLIR(result_type, self.allocator);
+        defer shape.deinit();
+        total_params_bytes += shape.elemCount() * shape.dtype.sizeInBytes();
+    }
+
+    // Allocate buffers with the CORRECT sizes
+    const updated_params_bytes = try self.allocator.alloc(u8, total_params_bytes);
     defer self.allocator.free(updated_params_bytes);
     const loss_bytes = try self.allocator.alloc(u8, 4); // one f32
     defer self.allocator.free(loss_bytes);

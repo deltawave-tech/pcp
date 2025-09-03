@@ -181,6 +181,16 @@ pub const MLIRContext = struct {
         
         std.debug.print("✓ Saved MLIR module to {s} ({} bytes)\n", .{ temp_mlir_path, mlir_source.len });
         
+        // Proactively create the SPIR-V dump directory
+        std.fs.cwd().makeDir(spirv_dump_dir) catch |err| switch (err) {
+            error.PathAlreadyExists => {}, // Directory already exists, ignore
+            else => {
+                std.debug.print("ERROR: Failed to create SPIR-V dump directory: {}\n", .{err});
+                return err;
+            },
+        };
+        std.debug.print("✓ Created/verified SPIR-V dump directory: {s}\n", .{spirv_dump_dir});
+        
         // 2. Call IREE compiler via subprocess
         std.debug.print("About to execute IREE compiler subprocess...\n", .{});
         std.debug.print("Command: python3 iree_compile_wrapper.py {s} {s} {s} vulkan-spirv\n", .{ temp_mlir_path, temp_vmfb_path, spirv_dump_dir });

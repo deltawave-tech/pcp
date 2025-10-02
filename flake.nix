@@ -45,14 +45,14 @@
 
         # We use zig from nixpkgs. Alternatively:
         #
-        # zig = zig-overlay.packages.${system}."0.14.0";
+        zig = zig-overlay.packages.${system}."0.14.0";
         #
         # zig = zig-overlay.packages.${system}.master;
-        zig = pkgs.zig;
+        # zig = pkgs.zig;
         # zls from nixpkgs lines up nicely with the zig "default" compiler in nixpkgs. If working on
         # bleeding edge:
         #
-        # zls = zlspkgs.zls
+        # zls = pkgs.zlspkgs.zls;
         zls = pkgs.zls;
 
         # Shortcuts for llvm
@@ -81,8 +81,9 @@
             hash = "sha256-OH6Nz4b5sR8sPII59p6AaHXY7VlUS3pJM5ejdrri4iw=";
           };
           outputs = [ "out" "dev" ];
-          nativeBuildInputs = [ mlirPkg mlirPkg.dev libllvm tblgen ]
-            ++ (with pkgs; [ cmake gtest libffi libxml2 ninja pkg-config ]);
+          nativeBuildInputs = [ mlirPkg.dev tblgen ]
+            ++ (with pkgs; [ cmake gtest ninja pkg-config ]);
+          buildInputs = [ mlirPkg libllvm ] ++ (with pkgs; [ libffi libxml2 ]);
           cmakeFlags = [
             (lib.cmakeBool "LLVM_ENABLE_LDD" true)
             (lib.cmakeFeature "CMAKE_BUILD_TYPE" "Release")
@@ -118,22 +119,32 @@
             find stablehlo/ -name '*.h.inc' -exec cp -v --parents {} $dev/include/ \;
           '';
         };
-        packages.pcp = pkgs.stdenvNoCC.mkDerivation {
+        packages.pcp = llvmPkg.stdenv.mkDerivation {
           name = "pcp";
           version = "main";
           src = ./.;
           nativeBuildInputs = [
-            pkgs.capnproto
             llvmPkg.libllvm.dev
-            llvmPkg.libllvm
-            mlirPkg
             mlirPkg.dev
-            pkgs.spirv-cross
             zig
-            packages.stablehlo
             packages.stablehlo.dev
             pkgs.pkg-config
+            pkgs.spirv-cross
+            llvmPkg.lld
+            llvmPkg.clang-tools
+            llvmPkg.bintools
           ];
+          buildInputs = [
+            llvmPkg.libcxx
+            llvmPkg.clang-tools
+            packages.stablehlo
+            llvmPkg.libllvm
+            llvmPkg.mlir-tools
+            mlirPkg
+            pkgs.spirv-cross
+            pkgs.capnproto
+          ];
+
           dontConfigure = true;
           dontInstall = true;
           doCheck = true;
@@ -165,6 +176,7 @@
             echo "Zig version: $(zig version)"
             echo "ZLS version: $(zls --version)"
             echo "${packages.stablehlo.dev}"
+            export CAPNP_DIR="${pkgs.capnproto}"
           '';
         };
         checks.pcp = packages.pcp;

@@ -425,6 +425,7 @@ pub fn build(b: *std.Build) void {
         // Add SPIRV-Cross include paths
         spirv_bridge_lib.?.addIncludePath(.{ .cwd_relative = "SPIRV-Cross" });
         spirv_bridge_lib.?.addIncludePath(.{ .cwd_relative = "SPIRV-Cross/include" });
+        spirv_bridge_lib.?.linkSystemLibrary2("spirv-cross-c", .{});
         // Add our local MLIR library directory FIRST  
         if (mlir_config.lib_dir) |lib_dir| {
             spirv_bridge_lib.?.addLibraryPath(.{ .cwd_relative = lib_dir });

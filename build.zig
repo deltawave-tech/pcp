@@ -255,7 +255,7 @@ fn addMLIRSupport(target: *std.Build.Step.Compile, mlir_config: MLIRConfig) void
         "MLIRIR", "MLIRSupport", "MLIRAnalysis", "MLIRDialect", "MLIRParser", "MLIRAsmParser", "MLIRPass", "MLIRTransforms", "MLIRRewrite", "MLIRTransformUtils",
         "MLIRBytecodeReader", "MLIRBytecodeWriter", "MLIRCAPIIR", "MLIRCAPIFunc", "MLIRCAPIArith", "MLIRCAPILinalg", "MLIRCAPIGPU", "MLIRCAPISPIRV", "MLIRCAPISCF", "MLIRCAPIConversion", "MLIRCAPITransforms", "MLIRCAPIAsync", "MLIRCAPITensor", "MLIRCAPITransformDialect", "MLIRCAPITransformDialectTransforms",
         // Test/Debug libraries for MLIR
-        "MLIRLinalgTestPasses",
+        // "MLIRLinalgTestPasses",
 
         // StableHLO & CHLO (C-API and Implementation)
         "StablehloCAPI", "ChloCAPI", "StablehloOps", "ChloOps", "StablehloBase", "StablehloPasses", "StablehloTypeInference", "StablehloAssemblyFormat", "StablehloBroadcastUtils", "StablehloLinalgTransforms", "StablehloPassUtils", "StablehloOptimizationPasses", "StablehloTypeConversion",
@@ -270,10 +270,12 @@ fn addMLIRSupport(target: *std.Build.Step.Compile, mlir_config: MLIRConfig) void
         "MLIRPresburger", "MLIRAffineAnalysis", "MLIRAffineUtils", "MLIRDialectUtils", "MLIRArithUtils", "MLIRLinalgUtils", "MLIRSCFUtils", "MLIRTensorUtils", "MLIRTensorTilingInterfaceImpl", "MLIRMemRefUtils", "MLIRVectorUtils", "MLIRInferIntRangeCommon",
 
         // GPU & SPIR-V Pipeline Dialects
-        "MLIRGPUDialect", "MLIRSPIRVDialect", "MLIRSPIRVSerialization", "MLIRSPIRVTarget", "MLIRSPIRVImageInterfaces", "MLIRSPIRVTransforms", "MLIRSPIRVUtils", "MLIRLLVMDialect", "MLIRMeshDialect",
+        "MLIRGPUDialect", "MLIRSPIRVDialect", "MLIRSPIRVSerialization", "MLIRSPIRVTarget", "MLIRSPIRVImageInterfaces", "MLIRSPIRVTransforms", "MLIRSPIRVUtils", "MLIRLLVMDialect",
+        // "MLIRMeshDialect",
 
         // Dialect Extensions (Critical for BufferizableOpInterface)
-        "MLIRFuncAllExtensions", "MLIRTensorAllExtensions", "MLIRFuncInlinerExtension", "MLIRFuncMeshShardingExtensions",
+        "MLIRFuncAllExtensions", "MLIRTensorAllExtensions", "MLIRFuncInlinerExtension",
+        // "MLIRFuncMeshShardingExtensions",
 
         // Core Transforms & Conversion
         "MLIRFuncTransforms", "MLIRLinalgTransforms", "MLIRSCFTransforms", "MLIRGPUTransforms", "MLIRSPIRVConversion", "MLIRBufferizationTransforms", "MLIRBufferizationPipelines", "MLIRMemRefTransforms", "MLIRVectorTransforms", "MLIRArithTransforms", "MLIRAsyncTransforms", "MLIRAffineTransforms", "MLIRAsyncToLLVM", "MLIRTensorTransforms", "MLIRTensorTransformOps", "MLIRReconcileUnrealizedCasts",

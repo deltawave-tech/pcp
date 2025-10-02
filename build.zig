@@ -247,13 +247,6 @@ fn addMLIRSupport(target: *std.Build.Step.Compile, mlir_config: MLIRConfig) void
         target.addLibraryPath(.{ .cwd_relative = lib_dir });
     }
 
-    // Add SPIRV-Cross library path if it exists
-    if (std.fs.cwd().access("SPIRV-Cross/build", .{})) |_| {
-        target.addLibraryPath(.{ .cwd_relative = "SPIRV-Cross/build" });
-    } else |_| {
-        // SPIRV-Cross not built, skip adding library path
-    }
-
     // --- Master List of All MLIR/LLVM Libraries ---
     // This list is the consolidation of all libraries from the old addMLIRSupport,
     // m3_pipeline_test, and pass_registration_test.
@@ -464,26 +457,7 @@ pub fn build(b: *std.Build) void {
         }
         std.debug.print("    -> Core SPIRV libraries linked successfully\n", .{});
         
-        // Add SPIRV-Cross libraries if they're built
-        const spirv_cross_build_dir = std.fs.path.join(b.allocator, &[_][]const u8{ "SPIRV-Cross", "build" }) catch {
-            std.debug.print("Failed to construct SPIRV-Cross build path\n", .{});
-            return;
-        };
-        defer b.allocator.free(spirv_cross_build_dir);
-        
-        std.fs.cwd().access(spirv_cross_build_dir, .{}) catch |err| switch (err) {
-            error.FileNotFound => {
-                std.debug.print("Warning: SPIRV-Cross not built. Some features may be unavailable.\n", .{});
-                std.debug.print("To build SPIRV-Cross: cd SPIRV-Cross && mkdir -p build && cd build && cmake .. && make\n", .{});
-                return;
-            },
-            else => {
-                std.debug.print("Warning: Cannot access SPIRV-Cross build directory: {}\n", .{err});
-                return;
-            },
-        };
-        
-        // Add SPIRV-Cross library path and libraries (optional)
+        // Add SPIRV-Cross library path and libraries
         spirv_bridge_lib.?.addLibraryPath(.{ .cwd_relative = "SPIRV-Cross/build" });
         
         const spirv_cross_libs = [_][]const u8{

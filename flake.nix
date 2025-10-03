@@ -55,8 +55,13 @@
         # zls = pkgs.zlspkgs.zls;
         zls = pkgs.zls;
 
-        # Shortcuts for llvm
-        llvmPkg = pkgs.llvmPackages_git;
+        # Shortcuts for llvm -- as we have to link from Zig (clang) to LLVM we need an LLVM which is
+        # itself based on LLVM. This is the default on Darwin/MacOS. On Linux we have to use
+        # `pkgs.pkgsLLVM` instead. Sadly, this involves some compilation. 
+        llvmPkg = (if pkgs.stdenv.isLinux then
+          pkgs.pkgsLLVM
+        else
+          pkgs).llvmPackages_git;
         # The default 'mlir' package does not expose `mlir-pdll`
         mlirPkg = llvmPkg.mlir.overrideAttrs (old: {
           postInstall = (old.postInstall or "") + ''
@@ -71,7 +76,7 @@
         packages.stablehlo = let
           libllvm = llvmPkg.libllvm;
           tblgen = llvmPkg.tblgen;
-        in pkgs.stdenv.mkDerivation rec {
+        in llvmPkg.stdenv.mkDerivation rec {
           name = "stablehlo";
           version = "1.13.0";
           src = pkgs.fetchFromGitHub {
@@ -135,6 +140,7 @@
             llvmPkg.bintools
           ];
           buildInputs = [
+            llvmPkg.libcxx.dev
             llvmPkg.libcxx
             llvmPkg.clang-tools
             packages.stablehlo
@@ -170,6 +176,7 @@
             # claude-code is taken from the overlay defined above
             claude-code
             lldb
+            shfmt
           ]) ++ [ zig zls ];
           shellHook = ''
             echo "Zig development environment loaded"
@@ -177,6 +184,8 @@
             echo "ZLS version: $(zls --version)"
             echo "${packages.stablehlo.dev}"
             export CAPNP_DIR="${pkgs.capnproto}"
+            echo "libcxx=${llvmPkg.libcxx}"
+            echo "cc=${pkgs.stdenv.cc.cc}"
           '';
         };
         checks.pcp = packages.pcp;

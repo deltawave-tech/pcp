@@ -57,17 +57,25 @@
 
         # Shortcuts for llvm -- as we have to link from Zig (clang) to LLVM we need an LLVM which is
         # itself based on LLVM. This is the default on Darwin/MacOS. On Linux we have to use
-        # `pkgs.pkgsLLVM` instead. Sadly, this involves some compilation. 
-        llvmPkg = (if pkgs.stdenv.isLinux then
-          pkgs.pkgsLLVM
-        else
-          pkgs).llvmPackages_git;
+        # `pkgs.pkgsLLVM` instead. Sadly, this involves some compilation.
+        pkgsLLVM = if pkgs.stdenv.isLinux then pkgs.pkgsLLVM else pkgs;
+        llvmPkg = pkgsLLVM.llvmPackages_git;
         # The default 'mlir' package does not expose `mlir-pdll`
         mlirPkg = llvmPkg.mlir.overrideAttrs (old: {
           postInstall = (old.postInstall or "") + ''
             echo "Installing mlir-pdll"
             cp -v bin/mlir-pdll $out/bin
           '';
+        });
+
+        spirvCrossPkg = pkgsLLVM.spirv-cross.overrideAttrs (old: rec {
+          version = "1.4.321.0";
+          src = pkgs.fetchFromGitHub {
+            owner = "KhronosGroup";
+            repo = "SPIRV-Cross";
+            rev = "vulkan-sdk-${version}";
+            hash = "sha256-qmJK29PtjDE4+6uF8Mj6noAcRoeM3rHWRbUvcr6JzI0=";
+          };
         });
 
       in rec {
@@ -124,6 +132,7 @@
             find stablehlo/ -name '*.h.inc' -exec cp -v --parents {} $dev/include/ \;
           '';
         };
+
         packages.pcp = llvmPkg.stdenv.mkDerivation {
           name = "pcp";
           version = "main";
@@ -131,10 +140,10 @@
           nativeBuildInputs = [
             llvmPkg.libllvm.dev
             mlirPkg.dev
-            zig
             packages.stablehlo.dev
+            spirvCrossPkg
+            zig
             pkgs.pkg-config
-            pkgs.spirv-cross
             llvmPkg.lld
             llvmPkg.clang-tools
             llvmPkg.bintools
@@ -147,8 +156,8 @@
             llvmPkg.libllvm
             llvmPkg.mlir-tools
             mlirPkg
-            pkgs.spirv-cross
-            pkgs.capnproto
+            pkgsLLVM.spirv-cross
+            pkgsLLVM.capnproto
           ];
 
           dontConfigure = true;

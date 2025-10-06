@@ -179,7 +179,13 @@
           #  zig build install --verbose --global-cache-dir $(pwd)/.cache -Dcpu=baseline -Doptimize=ReleaseSafe --prefix $out
           #'';
           checkPhase = let
-            targets = [ "run-mlir-verification" ];
+            targets = [
+              "run-mlir-verification"
+              # run-demo works, but is too slow to run it as a normal check
+              # "run-demo"
+              "test-data-pipeline"
+
+            ];
             buildCmd = target:
               "zig build ${target} --color off --global-cache-dir $(pwd)/.cache -Dcpu=baseline";
           in builtins.concatStringsSep "\n" (map buildCmd targets);

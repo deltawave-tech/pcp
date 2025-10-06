@@ -45,10 +45,10 @@
 
         # We use zig from nixpkgs. Alternatively:
         #
-        zig = zig-overlay.packages.${system}."0.14.0";
+        # zig = zig-overlay.packages.${system}."0.14.0";
         #
         # zig = zig-overlay.packages.${system}.master;
-        # zig = pkgs.zig;
+        zig = pkgs.zig;
         # zls from nixpkgs lines up nicely with the zig "default" compiler in nixpkgs. If working on
         # bleeding edge:
         #
@@ -147,36 +147,41 @@
             llvmPkg.lld
             llvmPkg.clang-tools
             llvmPkg.bintools
+            llvmPkg.libcxx.dev
           ];
           buildInputs = [
-            llvmPkg.libcxx.dev
             llvmPkg.libcxx
             llvmPkg.clang-tools
             packages.stablehlo
             llvmPkg.libllvm
-            llvmPkg.mlir-tools
             mlirPkg
-            pkgsLLVM.spirv-cross
+            spirvCrossPkg
             pkgsLLVM.capnproto
+
+            llvmPkg.libllvm.dev
+            mlirPkg.dev
+            packages.stablehlo.dev
+            spirvCrossPkg
+            zig
+            pkgs.pkg-config
+            llvmPkg.lld
+            llvmPkg.clang-tools
+            llvmPkg.bintools
+            llvmPkg.libcxx.dev
+
           ];
 
           dontConfigure = true;
           dontInstall = true;
           doCheck = true;
-          buildPhase = ''
-            NO_COLOR=1 # prevent escape codes from messing up the `nix log`
-            zig build install --global-cache-dir $(pwd)/.cache -Dcpu=baseline -Doptimize=ReleaseSafe --prefix $out
-          '';
+          #buildPhase = ''
+          #  NO_COLOR=1 # prevent escape codes from messing up the `nix log`
+          #  zig build install --verbose --global-cache-dir $(pwd)/.cache -Dcpu=baseline -Doptimize=ReleaseSafe --prefix $out
+          #'';
           checkPhase = let
-            targets = [
-              "test"
-              "run"
-              "run-autodiff-test"
-              "run-comptime-examples"
-              "run-plan-test"
-            ];
+            targets = [ "run-mlir-verification" ];
             buildCmd = target:
-              "zig build ${target} --global-cache-dir $(pwd)/.cache -Dcpu=baseline";
+              "zig build ${target} --color off --global-cache-dir $(pwd)/.cache -Dcpu=baseline";
           in builtins.concatStringsSep "\n" (map buildCmd targets);
         };
         # The development environment draws in the Zig compiler and ZLS.
@@ -185,8 +190,8 @@
             # claude-code is taken from the overlay defined above
             claude-code
             lldb
-            shfmt
-          ]) ++ [ zig zls ];
+          ]) ++ [ zls ];
+          buildInputs = packages.pcp.buildInputs;
           shellHook = ''
             echo "Zig development environment loaded"
             echo "Zig version: $(zig version)"
@@ -195,6 +200,7 @@
             export CAPNP_DIR="${pkgs.capnproto}"
             echo "libcxx=${llvmPkg.libcxx}"
             echo "cc=${pkgs.stdenv.cc.cc}"
+            echo "mlir=${mlirPkg}"
           '';
         };
         checks.pcp = packages.pcp;

@@ -572,7 +572,7 @@ pub fn build(b: *std.Build) void {
     addPCPDependencies(gpt2_example, spirv_bridge_lib, metal_bridge_lib);
 
     // Install the executables
-    b.installArtifact(gpt2_example);
+    //b.installArtifact(gpt2_example);
 
     // Run step for GPT-2 example (default)
     const run_gpt2_cmd = b.addRunArtifact(gpt2_example);
@@ -600,7 +600,7 @@ pub fn build(b: *std.Build) void {
     addPCPDependencies(mlir_verification_test, spirv_bridge_lib, metal_bridge_lib);
 
     // Install the test executable
-    b.installArtifact(mlir_verification_test);
+    //b.installArtifact(mlir_verification_test);
 
     // Run step for comprehensive MLIR verification
     const run_mlir_verification_cmd = b.addRunArtifact(mlir_verification_test);
@@ -770,7 +770,7 @@ pub fn build(b: *std.Build) void {
     
 
     // Install the executable
-    b.installArtifact(mlir_test);
+    //b.installArtifact(mlir_test);
 
     // Run step for MLIR test
     const run_mlir_test_cmd = b.addRunArtifact(mlir_test);
@@ -827,7 +827,7 @@ pub fn build(b: *std.Build) void {
 
 
     // Install the test executable
-    b.installArtifact(spirv_test);
+    //b.installArtifact(spirv_test);
 
     // Run step for SPIR-V test
     const run_spirv_test_cmd = b.addRunArtifact(spirv_test);
@@ -906,7 +906,7 @@ pub fn build(b: *std.Build) void {
     }
 
     // Install the distributed training executable
-    b.installArtifact(main_distributed);
+    //b.installArtifact(main_distributed);
 
     // Run step for distributed training
     const run_main_distributed_cmd = b.addRunArtifact(main_distributed);
@@ -978,7 +978,7 @@ pub fn build(b: *std.Build) void {
     addPCPDependencies(gpt2_model_test, spirv_bridge_lib, metal_bridge_lib);
 
     // Install the executable
-    b.installArtifact(gpt2_model_test);
+    //b.installArtifact(gpt2_model_test);
 
     // Run step for GPT-2 model test
     const run_gpt2_model_test_cmd = b.addRunArtifact(gpt2_model_test);
@@ -1005,7 +1005,7 @@ pub fn build(b: *std.Build) void {
     addPCPDependencies(isolated_vjp_tests, spirv_bridge_lib, metal_bridge_lib);
 
     // Install the test executable
-    b.installArtifact(isolated_vjp_tests);
+    //b.installArtifact(isolated_vjp_tests);
 
     // Run step for isolated VJP tests
     const run_isolated_vjp_tests_cmd = b.addRunArtifact(isolated_vjp_tests);
@@ -1032,7 +1032,7 @@ pub fn build(b: *std.Build) void {
     addPCPDependencies(end_to_end_transformer_test, spirv_bridge_lib, metal_bridge_lib);
 
     // Install the test executable
-    b.installArtifact(end_to_end_transformer_test);
+    //b.installArtifact(end_to_end_transformer_test);
 
     // Run step for end-to-end transformer test
     const run_end_to_end_transformer_test_cmd = b.addRunArtifact(end_to_end_transformer_test);

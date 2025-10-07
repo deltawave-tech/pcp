@@ -280,7 +280,7 @@ fn addMLIRSupport(target: *std.Build.Step.Compile, mlir_config: MLIRConfig) void
         // Core Transforms & Conversion
         "MLIRFuncTransforms", "MLIRLinalgTransforms", "MLIRSCFTransforms", "MLIRGPUTransforms", "MLIRSPIRVConversion", "MLIRBufferizationTransforms", "MLIRBufferizationPipelines", "MLIRMemRefTransforms", "MLIRVectorTransforms", "MLIRArithTransforms", "MLIRAsyncTransforms", "MLIRAffineTransforms", "MLIRAsyncToLLVM", "MLIRTensorTransforms", "MLIRTensorTransformOps", "MLIRReconcileUnrealizedCasts",
         "MLIRSCFToSPIRV", "MLIRSCFToGPU", "MLIRSCFToControlFlow", "MLIRFuncToSPIRV", "MLIRMemRefToSPIRV", "MLIRVectorToSPIRV", "MLIRArithToSPIRV", "MLIRIndexToSPIRV",
-        "MLIRLinalgToStandard", "MLIRConvertToLLVMPass", "MLIRConvertToLLVMInterface", "MLIRFuncToLLVM", "MLIRGPUToLLVMSPV", "MLIRLLVMCommonConversion", "MLIRArithToLLVM", "MLIRComplexToLLVM", "MLIRControlFlowToLLVM", "MLIRIndexToLLVM", "MLIRMathToLLVM", "MLIRMemRefToLLVM", "MLIRUBToLLVM", "MLIRVectorToLLVM", "MLIRAffineToStandard",
+        "MLIRLinalgToStandard", "MLIRConvertToLLVMPass", "MLIRConvertToLLVMInterface", "MLIRFuncToLLVM", "MLIRGPUToLLVMSPV", "MLIRLLVMCommonConversion", "MLIRArithToLLVM", "MLIRComplexToLLVM", "MLIRControlFlowToLLVM", "MLIRIndexToLLVM", "MLIRMathToLLVM", "MLIRMemRefToLLVM", "MLIRUBToLLVM", "MLIRVectorToLLVM", "MLIRAffineToStandard", "MLIRIndexingMapOpInterface",
 
         // GPU Pipeline Passes & Utilities  
         "MLIRGPUPipelines", "MLIRGPUToGPURuntimeTransforms", "MLIRGPUToSPIRV", "MLIRGPUUtils", "MLIRGPUToNVVMTransforms", "MLIRGPUToROCDLTransforms",

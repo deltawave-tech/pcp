@@ -125,11 +125,12 @@
           # See https://github.com/openxla/stablehlo/issues/2811 -- StableHLO does not install
           # header files.  The header files need a couple of '*.h.inc' files.
           postInstall = ''
+            env | sort
             mkdir -p $dev/include/
-            cd /build/source/
-            find stablehlo/ -name '*.h' -exec cp -v --parents {} $dev/include/ \;
-            cd /build
             find stablehlo/ -name '*.h.inc' -exec cp -v --parents {} $dev/include/ \;
+
+            cd $src
+            find stablehlo/ -name '*.h' -exec cp -v --parents {} $dev/include/ \;
           '';
         };
 
@@ -148,6 +149,7 @@
             llvmPkg.clang-tools
             llvmPkg.bintools
             llvmPkg.libcxx.dev
+            pkgs.zig.hook
           ];
           buildInputs = [
             llvmPkg.libcxx
@@ -172,27 +174,18 @@
           ];
 
           dontConfigure = true;
-          dontInstall = true;
           doCheck = true;
-          #buildPhase = ''
-          #  NO_COLOR=1 # prevent escape codes from messing up the `nix log`
-          #  zig build install --verbose --global-cache-dir $(pwd)/.cache -Dcpu=baseline -Doptimize=ReleaseSafe --prefix $out
-          #'';
-          checkPhase = let
-            targets = [
-              "run-mlir-verification"
-              # run-demo works, but is too slow to run it as a normal check
-              # "run-demo"
-              "test-data-pipeline"
+          zigBuildFlags = [ "--verbose" "--color" "off" ];
+          zigCheckFlags = [ "--verbose" "--color" "off" ];
+          zigInstallFlags = [ "--verbose" "--color" "off" ];
 
-            ];
-            buildCmd = target:
-              "zig build ${target} --color off --global-cache-dir $(pwd)/.cache -Dcpu=baseline";
-          in builtins.concatStringsSep "\n" (map buildCmd targets);
+          # TODO properly integrate this via pkg-config
+          CAPNP_DIR = "${pkgs.capnproto}";
         };
         # The development environment draws in the Zig compiler and ZLS.
         devShells.default = pkgs.mkShell {
           nativeBuildInputs = packages.pcp.nativeBuildInputs ++ (with pkgs; [
+            cachix
             # claude-code is taken from the overlay defined above
             claude-code
             lldb
@@ -202,11 +195,12 @@
             echo "Zig development environment loaded"
             echo "Zig version: $(zig version)"
             echo "ZLS version: $(zls --version)"
-            echo "${packages.stablehlo.dev}"
-            export CAPNP_DIR="${pkgs.capnproto}"
-            echo "libcxx=${llvmPkg.libcxx}"
-            echo "cc=${pkgs.stdenv.cc.cc}"
-            echo "mlir=${mlirPkg}"
+
+            ZIG_GLOBAL_CACHE_DIR="$(pwd)/.zig-cache"
+            export ZIG_GLOBAL_CACHE_DIR
+
+            CAPNP_DIR="${pkgs.capnproto}"
+            export CAPNP_DIR
           '';
         };
         checks.pcp = packages.pcp;

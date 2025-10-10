@@ -518,7 +518,6 @@ pub fn build(b: *std.Build) void {
             "src/tensor.zig",
             "src/autodiff.zig",
             "src/ops.zig",
-            "src/optimizers/adam.zig",
             "src/network/message.zig",
         };
         // Add unit tests

@@ -1,0 +1,17 @@
+---
+name: "Test"
+
+on:
+  pull_request:
+  push:
+
+jobs:
+  nix-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: cachix/install-nix-action@v30
+      - uses: cachix/cachix-action@v16
+        with:
+          name: pcp
+      - run: nix build -L '.#pcp'

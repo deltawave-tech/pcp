@@ -14,4 +14,5 @@ jobs:
       - uses: cachix/cachix-action@v16
         with:
           name: pcp
+          authToken: "${{ secrets.CACHIX_AUTH_TOKEN }}"
       - run: nix build -L ".#pcp"

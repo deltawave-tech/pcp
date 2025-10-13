@@ -189,6 +189,8 @@
             # claude-code is taken from the overlay defined above
             claude-code
             lldb
+            # act is for local work on GitHub Actions.  We also use it to settle cachix.
+            act
           ]) ++ [ zls ];
           buildInputs = packages.pcp.buildInputs;
           shellHook = ''

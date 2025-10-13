@@ -10,10 +10,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
-      - uses: cachix/install-nix-action@v30
+      - uses: cachix/install-nix-action@v31
       - uses: cachix/cachix-action@v16
         with:
           name: pcp
-      - run: nix show-config
-      - run: nix build --dry-run '.#pcp'
-      # - run: nix build -L '.#pcp'
+      # - run: nix config show
+      - run: nix build -L ".#pcp" --dry-run

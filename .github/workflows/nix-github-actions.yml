@@ -14,5 +14,4 @@ jobs:
       - uses: cachix/cachix-action@v16
         with:
           name: pcp
-      # - run: nix config show
-      - run: nix build -L ".#pcp" --dry-run
+      - run: nix build -L ".#pcp"

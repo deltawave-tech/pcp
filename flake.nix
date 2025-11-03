@@ -150,6 +150,8 @@
             llvmPkg.bintools
             llvmPkg.libcxx.dev
             pkgs.zig.hook
+          ] ++ lib.optionals pkgs.stdenv.isDarwin [
+            pkgs.apple-sdk_15
           ];
           buildInputs = [
             llvmPkg.libcxx
@@ -203,6 +205,10 @@
 
             CAPNP_DIR="${pkgs.capnproto}"
             export CAPNP_DIR
+
+            ${lib.optionalString pkgs.stdenv.isDarwin ''
+              export MACOSX_DEPLOYMENT_TARGET="11.0"
+            ''}
           '';
         };
         checks.pcp = packages.pcp;

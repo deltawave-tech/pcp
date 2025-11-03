@@ -231,7 +231,7 @@ fn getCommandOutput(b: *std.Build, argv: []const []const u8) ![]const u8 {
 }
 
 // Enhanced MLIR support function with consolidated library linking
-fn addMLIRSupport(target: *std.Build.Step.Compile, mlir_config: MLIRConfig) void {
+fn addMLIRSupport(b: *std.Build, target: *std.Build.Step.Compile, mlir_config: MLIRConfig) void {
     if (!mlir_config.enabled or mlir_config.llvm_config_path == null) {
         std.debug.print("==> Skipping MLIR support for '{s}': MLIR not enabled/found.\n", .{target.name});
         return;
@@ -311,6 +311,21 @@ fn addMLIRSupport(target: *std.Build.Step.Compile, mlir_config: MLIRConfig) void
 
     // Platform-specific linking for Metal
     if (target.root_module.resolved_target.?.result.os.tag == .macos) {
+        // Get SDK root from the environment variable set by the Nix shell.
+        const sdk_root = std.process.getEnvVarOwned(b.allocator, "SDKROOT") catch |err| {
+            std.debug.print("FATAL: SDKROOT not set. This requires the Nix env. Error: {}\n", .{err});
+            @panic("SDKROOT not found");
+        };
+        defer b.allocator.free(sdk_root);
+
+        // Construct the path to the frameworks directory inside the SDK.
+        const framework_path = std.fmt.allocPrint(b.allocator, "{s}/System/Library/Frameworks", .{sdk_root}) catch @panic("OOM");
+        defer b.allocator.free(framework_path);
+
+        // **FIX:** Explicitly tell the executable's linker where to find frameworks.
+        target.addFrameworkPath(.{ .cwd_relative = framework_path });
+
+        // Link the required frameworks.
         target.linkFramework("Foundation");
         target.linkFramework("Metal");
     }
@@ -359,12 +374,31 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         });
 
+        // Get SDK root from the environment variable set by our correct Nix shell.
+        const sdk_root = std.process.getEnvVarOwned(b.allocator, "SDKROOT") catch |err| {
+            std.debug.print("FATAL: SDKROOT not set. This build requires the Nix environment. Error: {}\n", .{err});
+            @panic("SDKROOT not found");
+        };
+        defer b.allocator.free(sdk_root);
+
+        // Explicitly construct the path to the frameworks directory inside the SDK.
+        const framework_path = std.fmt.allocPrint(b.allocator, "{s}/System/Library/Frameworks", .{sdk_root}) catch @panic("OOM");
+        defer b.allocator.free(framework_path);
+
+        // Pass compiler flags for finding system headers.
         metal_bridge_lib.?.addCSourceFile(.{
             .file = b.path("src/backends/metal_bridge.m"),
-            .flags = &[_][]const u8{"-fobjc-arc"},
+            .flags = &[_][]const u8{
+                "-fobjc-arc",
+                "-isysroot", // Tell the compiler the root for all system headers.
+                sdk_root,
+            },
         });
 
-        // Add frameworks for macOS
+        // **FIX:** Explicitly tell the LINKER where to find frameworks using the correct API.
+        metal_bridge_lib.?.addFrameworkPath(.{ .cwd_relative = framework_path });
+
+        // Tell the linker which frameworks to link.
         metal_bridge_lib.?.linkFramework("Foundation");
         metal_bridge_lib.?.linkFramework("Metal");
     }
@@ -542,7 +576,7 @@ pub fn build(b: *std.Build) void {
     });
     
     // SINGLE CALL for all MLIR/LLVM/Metal libraries
-    addMLIRSupport(dialect_test, mlir_config);
+    addMLIRSupport(b, dialect_test, mlir_config);
 
     // SINGLE CALL for your project's bridge libraries
     addPCPDependencies(dialect_test, spirv_bridge_lib, metal_bridge_lib);
@@ -565,7 +599,7 @@ pub fn build(b: *std.Build) void {
     gpt2_example.root_module.addImport("gpt2", gpt2_module);
     
     // SINGLE CALL for all MLIR/LLVM/Metal libraries
-    addMLIRSupport(gpt2_example, mlir_config);
+    addMLIRSupport(b, gpt2_example, mlir_config);
 
     // SINGLE CALL for your project's bridge libraries
     addPCPDependencies(gpt2_example, spirv_bridge_lib, metal_bridge_lib);
@@ -593,7 +627,7 @@ pub fn build(b: *std.Build) void {
     mlir_verification_test.root_module.addImport("pcp", pcp_module);
     
     // SINGLE CALL for all MLIR/LLVM/Metal libraries
-    addMLIRSupport(mlir_verification_test, mlir_config);
+    addMLIRSupport(b, mlir_verification_test, mlir_config);
 
     // SINGLE CALL for your project's bridge libraries
     addPCPDependencies(mlir_verification_test, spirv_bridge_lib, metal_bridge_lib);
@@ -620,7 +654,7 @@ pub fn build(b: *std.Build) void {
     comptime_examples.root_module.addImport("pcp", pcp_module);
     
     // SINGLE CALL for all MLIR/LLVM/Metal libraries
-    addMLIRSupport(comptime_examples, mlir_config);
+    addMLIRSupport(b, comptime_examples, mlir_config);
 
     // SINGLE CALL for your project's bridge libraries
     addPCPDependencies(comptime_examples, spirv_bridge_lib, metal_bridge_lib);
@@ -649,7 +683,7 @@ pub fn build(b: *std.Build) void {
     metal_test.root_module.addImport("pcp", pcp_module);
     
     // SINGLE CALL for all MLIR/LLVM/Metal libraries
-    addMLIRSupport(metal_test, mlir_config);
+    addMLIRSupport(b, metal_test, mlir_config);
 
     // SINGLE CALL for your project's bridge libraries
     addPCPDependencies(metal_test, spirv_bridge_lib, metal_bridge_lib);
@@ -679,7 +713,7 @@ pub fn build(b: *std.Build) void {
     pass_test.root_module.addImport("pcp", pcp_module);
 
     // SINGLE CALL for all MLIR/LLVM/Metal libraries
-    addMLIRSupport(pass_test, mlir_config);
+    addMLIRSupport(b, pass_test, mlir_config);
 
     // SINGLE CALL for your project's bridge libraries
     addPCPDependencies(pass_test, spirv_bridge_lib, metal_bridge_lib);
@@ -702,20 +736,12 @@ pub fn build(b: *std.Build) void {
     metal_benchmark.root_module.addImport("pcp", pcp_module);
     
     // SINGLE CALL for all MLIR/LLVM/Metal libraries
-    addMLIRSupport(metal_benchmark, mlir_config);
+    addMLIRSupport(b, metal_benchmark, mlir_config);
 
     // SINGLE CALL for your project's bridge libraries
     addPCPDependencies(metal_benchmark, spirv_bridge_lib, metal_bridge_lib);
     
 
-    // Special case: metal_benchmark needs additional Metal source file
-    if (builtin.os.tag == .macos) {
-        // Set dynamic link flags to ensure visibility of Metal symbols
-        metal_benchmark.addCSourceFile(.{
-            .file = b.path("src/backends/metal_bridge.m"),
-            .flags = &[_][]const u8{"-fobjc-arc"},
-        });
-    }
 
     // Install the executable
     // Install disabled - failing example  
@@ -738,7 +764,7 @@ pub fn build(b: *std.Build) void {
     m3_pipeline_test.root_module.addImport("pcp", pcp_module);
 
     // SINGLE CALL for all MLIR/LLVM/Metal libraries
-    addMLIRSupport(m3_pipeline_test, mlir_config);
+    addMLIRSupport(b, m3_pipeline_test, mlir_config);
 
     // SINGLE CALL for your project's bridge libraries
     addPCPDependencies(m3_pipeline_test, spirv_bridge_lib, metal_bridge_lib);
@@ -762,7 +788,7 @@ pub fn build(b: *std.Build) void {
     mlir_test.root_module.addImport("pcp", pcp_module);
     
     // SINGLE CALL for all MLIR/LLVM/Metal libraries
-    addMLIRSupport(mlir_test, mlir_config);
+    addMLIRSupport(b, mlir_test, mlir_config);
 
     // SINGLE CALL for your project's bridge libraries
     addPCPDependencies(mlir_test, spirv_bridge_lib, metal_bridge_lib);
@@ -790,7 +816,7 @@ pub fn build(b: *std.Build) void {
     tensor_mlir_test.root_module.addImport("pcp", pcp_module);
     
     // SINGLE CALL for all MLIR/LLVM/Metal libraries
-    addMLIRSupport(tensor_mlir_test, mlir_config);
+    addMLIRSupport(b, tensor_mlir_test, mlir_config);
 
     // SINGLE CALL for your project's bridge libraries
     addPCPDependencies(tensor_mlir_test, spirv_bridge_lib, metal_bridge_lib);
@@ -819,7 +845,7 @@ pub fn build(b: *std.Build) void {
     spirv_test.root_module.addImport("pcp", pcp_module);
     
     // SINGLE CALL for all MLIR/LLVM/Metal libraries
-    addMLIRSupport(spirv_test, mlir_config);
+    addMLIRSupport(b, spirv_test, mlir_config);
 
     // SINGLE CALL for your project's bridge libraries
     addPCPDependencies(spirv_test, spirv_bridge_lib, metal_bridge_lib);
@@ -846,7 +872,7 @@ pub fn build(b: *std.Build) void {
     main_distributed.root_module.addImport("pcp", pcp_module);
 
     // SINGLE CALL for all MLIR/LLVM/Metal libraries
-    addMLIRSupport(main_distributed, mlir_config);
+    addMLIRSupport(b, main_distributed, mlir_config);
 
     // SINGLE CALL for your project's bridge libraries
     addPCPDependencies(main_distributed, spirv_bridge_lib, metal_bridge_lib);
@@ -971,7 +997,7 @@ pub fn build(b: *std.Build) void {
     gpt2_model_test.root_module.addImport("pcp", pcp_module);
     
     // SINGLE CALL for all MLIR/LLVM/Metal libraries
-    addMLIRSupport(gpt2_model_test, mlir_config);
+    addMLIRSupport(b, gpt2_model_test, mlir_config);
 
     // SINGLE CALL for your project's bridge libraries
     addPCPDependencies(gpt2_model_test, spirv_bridge_lib, metal_bridge_lib);
@@ -998,7 +1024,7 @@ pub fn build(b: *std.Build) void {
     isolated_vjp_tests.root_module.addImport("pcp", pcp_module);
     
     // SINGLE CALL for all MLIR/LLVM/Metal libraries
-    addMLIRSupport(isolated_vjp_tests, mlir_config);
+    addMLIRSupport(b, isolated_vjp_tests, mlir_config);
 
     // SINGLE CALL for your project's bridge libraries
     addPCPDependencies(isolated_vjp_tests, spirv_bridge_lib, metal_bridge_lib);
@@ -1025,7 +1051,7 @@ pub fn build(b: *std.Build) void {
     end_to_end_transformer_test.root_module.addImport("pcp", pcp_module);
     
     // SINGLE CALL for all MLIR/LLVM/Metal libraries
-    addMLIRSupport(end_to_end_transformer_test, mlir_config);
+    addMLIRSupport(b, end_to_end_transformer_test, mlir_config);
 
     // SINGLE CALL for your project's bridge libraries
     addPCPDependencies(end_to_end_transformer_test, spirv_bridge_lib, metal_bridge_lib);

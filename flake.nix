@@ -14,9 +14,14 @@
       inputs.zig-overlay.follows = "zig-overlay";
     };
     flake-utils.url = "github:numtide/flake-utils";
+    nix-github-actions = {
+      url = "github:nix-community/nix-github-actions";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
   };
 
-  outputs = { self, nixpkgs, zig-overlay, zls, flake-utils }@inputs:
+  outputs =
+    { self, nixpkgs, zig-overlay, zls, flake-utils, nix-github-actions }@inputs:
     let
       # Inject zig-overlay and zls into the package tree
       overlays = [
@@ -206,5 +211,8 @@
           '';
         };
         checks.pcp = packages.pcp;
-      });
+      }) // {
+        githubActions =
+          nix-github-actions.lib.mkGithubMatrix { inherit (self) checks; };
+      };
 }

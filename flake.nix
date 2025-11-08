@@ -12,32 +12,39 @@
       overlays = [
         (final: prev: {
           zigpkgs = inputs.zig-overlay.packages.${prev.system};
-          zlspkgs = let orig = zls.packages.${prev.system}; in orig // {
+          zlspkgs = let orig = zls.packages.${prev.system};
+          in orig // {
             zls = orig.zls.overrideAttrs (old: {
-              doCheck = false;  # Disable tests to bypass failures (likely due to emulation timeouts or env issues)
+              doCheck =
+                false; # Disable tests to bypass failures (likely due to emulation timeouts or env issues)
             });
           };
           claude-code = prev.claude-code.overrideAttrs (old: rec {
-            version = "1.0.85";
+            version = "2.0.36";
             src = prev.fetchzip {
               url =
                 "https://registry.npmjs.org/@anthropic-ai/claude-code/-/claude-code-${version}.tgz";
-              hash = "sha256-CLqvcolG94JBC5VFlsfybZ9OXe81gJBzKU6Xgr7CGWo=";
+              hash = "sha256-6tbbCaF1HIgdk1vpbgQnBKWghaKKphGIGZoXtmnhY2I=";
             };
           });
           gdbm = prev.gdbm.overrideAttrs (old: {
-            doCheck = false;  # Disable tests to bypass failures under emulation
+            doCheck = false; # Disable tests to bypass failures under emulation
           });
           meson = prev.meson.overrideAttrs (old: {
-            doCheck = false;  # Disable tests to bypass the failing "215 source set realistic example" test under emulation
+            doCheck =
+              false; # Disable tests to bypass the failing "215 source set realistic example" test under emulation
           });
           libxml2 = prev.libxml2.overrideAttrs (old: {
-            doCheck = false;  # Disable tests to bypass "Illegal instruction" error in runxmlconf under QEMU emulation
+            doCheck =
+              false; # Disable tests to bypass "Illegal instruction" error in runxmlconf under QEMU emulation
           });
         })
       ];
-    in
-    flake-utils.lib.eachSystem [ "x86_64-linux" "aarch64-darwin" "x86_64-darwin" ] (system:
+    in flake-utils.lib.eachSystem [
+      "x86_64-linux"
+      "aarch64-darwin"
+      "x86_64-darwin"
+    ] (system:
       let
         pkgs = import nixpkgs {
           inherit system overlays;
@@ -70,9 +77,8 @@
             "-DIREE_BUILD_COMPILER=ON"
             "-DIREE_BUILD_SAMPLES=OFF"
             "-DIREE_BUILD_TESTS=OFF"
-          ] ++ (lib.optionals pkgs.stdenv.isDarwin [
-            "-DCMAKE_OSX_ARCHITECTURES=arm64"
-          ]);
+          ] ++ (lib.optionals pkgs.stdenv.isDarwin
+            [ "-DCMAKE_OSX_ARCHITECTURES=arm64" ]);
           installPhase = ''
             cmake --install . --prefix $out
           '';
@@ -150,9 +156,7 @@
             llvmPkg.bintools
             llvmPkg.libcxx.dev
             pkgs.zig.hook
-          ] ++ lib.optionals pkgs.stdenv.isDarwin [
-            pkgs.apple-sdk_15
-          ];
+          ] ++ lib.optionals pkgs.stdenv.isDarwin [ pkgs.apple-sdk_15 ];
           buildInputs = [
             llvmPkg.libcxx
             llvmPkg.clang-tools
@@ -171,13 +175,8 @@
           IREE_SDK_DIR = "${iree-sdk}";
         };
         devShells.default = pkgs.mkShell {
-          nativeBuildInputs = packages.pcp.nativeBuildInputs ++ [
-            pkgs.cachix
-            pkgs.claude-code
-            pkgs.lldb
-            pkgs.act
-            zls
-          ];
+          nativeBuildInputs = packages.pcp.nativeBuildInputs
+            ++ [ pkgs.cachix pkgs.claude-code pkgs.lldb pkgs.act zls ];
           buildInputs = packages.pcp.buildInputs;
           shellHook = ''
             echo "Zig development environment loaded"

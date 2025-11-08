@@ -71,59 +71,69 @@ This architecture is implemented through several key components:
 
 ## Building the Project
 
-### Prerequisites
+The project uses [Nix](https://nixos.org/download/) as a build system.  It is possible to compile
+dependencies locally, but that requires a considerable amount of manual work and compilation time.
+We cache build and runtime dependencies and the builds themselves via
+[cachix](https://app.cachix.org/cache/pcp).
 
-Make sure you have the following tools installed:
+### Install Nix and enable flakes
 
-* **macOS:** `brew install git cmake ninja capnp`
-* **Ubuntu/Debian:** `sudo apt install build-essential git cmake ninja capnproto libcapnp-dev`
+Follow one of the methodes presented in <https://nixos.org/download/>. For example:
 
-### Step 1: Clone the Repository
-
-Clone the repository and all its submodules (`llvm-project`, `stablehlo`, etc.).
-
-```sh
-git clone --recursive <your-repo-url>
-cd <your-repo-name>
+```shell
+# The following performs a single-user installation
+$ sh <(curl --proto '=https' --tlsv1.2 -L https://nixos.org/nix/install) --daemon
 ```
 
-### Step 2: Build C++ Dependencies (One-Time, ~1 Hour)
+You probably have to logout and login again, or source the init-scripts of your shell. On Ubuntu
+using bash:
 
-We provide a script that compiles LLVM, MLIR, and StableHLO. This is a long process that runs in the background.
-
-```sh
-./build_llvm_with_stablehlo.sh
+```shell
+source /etc/bash.bashrc
 ```
 
-This script will create a local `llvm-build/` directory containing the libraries and headers our project needs.
+You have to enable flakes. On a new installation do the following:
 
-### Step 3: Set Environment Variables (Optional)
-
-For better control over dependency detection, you can set environment variables:
-
-```sh
-# LLVM/MLIR location
-export LLVM_DIR=/path/to/your/llvm-build
-
-# Cap'n Proto location (if not in standard system paths)
-export CAPNP_DIR=/path/to/your/capnp-installation
+```shell
+mkdir -p ~/.config/nix/
+echo 'experimental-features = nix-command flakes' >> ~/.config/nix/nix.conf
 ```
 
-If not set, the build system will auto-detect dependencies in common locations:
-- **LLVM:** `llvm-build/bin/llvm-config` (project-local), system installations via Homebrew, package managers, etc.
-- **Cap'n Proto:** System installations via Homebrew (`/opt/homebrew`), package managers (`/usr`, `/usr/local`)
+### Install final Builds
 
-### Step 4: Build the Project
+If you just want to grap the final build, you can add cachix manually:
+
+```shell
+cat << EOF >> ~/.config/nix/nix.conf
+substituters = https://cache.nixos.org https://pcp.cachix.org
+trusted-public-keys = cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY= pcp.cachix.org-1:D/JYXqFAnVLlvVUJEBOWoGLmJKwKW58SxPD0+m/HXZk=
+```
+
+Now, install pcp using
+
+```shell
+nix profile add github:deltawave-tech/pcp
+```
+
+### Install a build environment
+
+Install cachix and enable the relevant cache:
+```shell
+nix-env -iA nixpkgs.cachix
+cachix use pcp 
+```
+
+#### Build the Project
 ```sh
 zig build
 ```
 
-### Step 5: Run Tests
+#### Run Tests
 ```sh
 zig build test
 ```
 
-## Building and Running
+#### Building and Running
 
 Build everything:
 ```sh

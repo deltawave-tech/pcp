@@ -29,12 +29,11 @@
           zigpkgs = inputs.zig-overlay.packages.${prev.system};
           zlspkgs = inputs.zls.packages.${prev.system};
           claude-code = prev.claude-code.overrideAttrs (old: rec {
-            version = "1.0.85";
+            version = "2.0.36";
             src = prev.fetchzip {
               url =
                 "https://registry.npmjs.org/@anthropic-ai/claude-code/-/claude-code-${version}.tgz";
-              hash = "sha256-CLqvcolG94JBC5VFlsfybZ9OXe81gJBzKU6Xgr7CGWo=";
-
+              hash = "sha256-6tbbCaF1HIgdk1vpbgQnBKWghaKKphGIGZoXtmnhY2I=";
             };
           });
         })

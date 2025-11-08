@@ -66,6 +66,9 @@ pub const DiLoCo = struct {
     // GPT-2 master parameters as multiple MLIR tensors
     master_parameters: ?[]Tensor,
     parameter_shapes: [][]i64, // Multiple parameter shapes for GPT-2
+    
+    // NEW: Data input shapes for worker buffer creation
+    data_input_shapes: [][]i64, // Shapes for input_ids, targets, etc.
 
     // NEW: Generic executor - replaces direct backend knowledge
     executor: Executor,
@@ -144,6 +147,22 @@ pub const DiLoCo = struct {
         const parameter_shapes = try introspected_shapes.toOwnedSlice();
         std.debug.print("✓ Introspection complete. Found {} trainable parameter tensors.\n", .{parameter_shapes.len});
 
+        // Extract data input shapes (the last num_data_inputs)
+        var data_shapes = std.ArrayList([]i64).init(allocator);
+        errdefer {
+            for (data_shapes.items) |s| allocator.free(s);
+            data_shapes.deinit();
+        }
+        
+        for (num_params..func_type.getNumInputs()) |i| {
+            const input_type = func_type.getInput(i);
+            const ranked_type = input_type.as(mlir.RankedTensorType) orelse return error.DataInputIsNotATensor;
+            const shape = try ranked_type.getShape(allocator);
+            try data_shapes.append(shape);
+        }
+        const data_input_shapes = try data_shapes.toOwnedSlice();
+        std.debug.print("✓ Found {} data input shapes.\n", .{data_input_shapes.len});
+
         // === END NEW SECTION ===
 
         // Configure and create Nesterov optimizer
@@ -168,6 +187,7 @@ pub const DiLoCo = struct {
             .element_type = element_type,
             .master_parameters = null,
             .parameter_shapes = parameter_shapes,
+            .data_input_shapes = data_input_shapes,
             .executor = executor,
             .worker_graph_mlir_source = undefined, // Will be set below
             .data_loader = dataset,
@@ -188,6 +208,7 @@ pub const DiLoCo = struct {
             .element_type = element_type,
             .master_parameters = null,
             .parameter_shapes = parameter_shapes,
+            .data_input_shapes = data_input_shapes,
             .executor = executor, // Store the generic executor
             .worker_graph_mlir_source = graph, // Store the MLIR source
             .data_loader = dataset,
@@ -215,6 +236,12 @@ pub const DiLoCo = struct {
             self.allocator.free(shape);
         }
         self.allocator.free(self.parameter_shapes);
+
+        // Free data input shapes
+        for (self.data_input_shapes) |shape| {
+            self.allocator.free(shape);
+        }
+        self.allocator.free(self.data_input_shapes);
     }
 
     /// Get TrainingAlgorithm interface
@@ -289,8 +316,20 @@ pub const DiLoCo = struct {
             try compiled_artifacts.put(backend, vmfb_bytes);
         }
         
-        // 4. Distribute the correct compiled artifact to each worker (replaces setupWorkers)
-        std.log.info("Distributing compiled artifacts to workers...", .{});
+        // 4. Create the JSON payload for the data input shapes
+        var shape_array = std.json.Array.init(self.allocator);
+        defer shape_array.deinit();
+        for (self.data_input_shapes) |shape_slice| {
+            var dim_array = std.json.Array.init(self.allocator);
+            for (shape_slice) |dim| {
+                try dim_array.append(std.json.Value{ .integer = dim });
+            }
+            try shape_array.append(std.json.Value{ .array = dim_array });
+        }
+        const shapes_json = std.json.Value{ .array = shape_array };
+
+        // 5. Distribute the compiled artifacts AND the data input shapes
+        std.log.info("Distributing compiled artifacts and input shapes to workers...", .{});
         for (self.coordinator.worker_pool.items) |worker| {
             const vmfb_bytes = compiled_artifacts.get(worker.backend).?;
 
@@ -299,10 +338,15 @@ pub const DiLoCo = struct {
             defer self.allocator.free(b64_encoded_vmfb);
 
             const encoded_len = std.base64.standard.Encoder.encode(b64_encoded_vmfb, vmfb_bytes).len;
-            const json_payload = std.json.Value{ .string = b64_encoded_vmfb[0..encoded_len] };
 
-            // Send a TARGETED message to this specific worker
-            try self.coordinator.sendToWorker(worker.node_id, MessageType.INITIALIZE_GRAPH, json_payload);
+            // Create a JSON object containing BOTH the vmfb and the shapes
+            var payload = std.json.ObjectMap.init(self.allocator);
+            defer payload.deinit();
+            try payload.put("vmfb", std.json.Value{ .string = b64_encoded_vmfb[0..encoded_len] });
+            try payload.put("data_input_shapes", shapes_json);
+
+            // Send the combined payload in a single message
+            try self.coordinator.sendToWorker(worker.node_id, MessageType.INITIALIZE_GRAPH, .{ .object = payload });
         }
         
         // The old setupWorkers() is now fully replaced. We can delete it.

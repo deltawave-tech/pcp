@@ -41,6 +41,7 @@ pub const Worker = struct {
     
     // NEW: Cached VMFB binary from graph initialization
     cached_vmfb: ?[]u8,
+    cached_data_input_shapes: ?[][]i64, // NEW FIELD
     
     const Self = @This();
     
@@ -53,6 +54,7 @@ pub const Worker = struct {
             .is_running = false,
             .backend = backend,
             .cached_vmfb = null,
+            .cached_data_input_shapes = null,
         };
     }
     
@@ -61,6 +63,10 @@ pub const Worker = struct {
         // Cleanup cached VMFB if it exists
         if (self.cached_vmfb) |vmfb| {
             self.allocator.free(vmfb);
+        }
+        if (self.cached_data_input_shapes) |shapes| {
+            for (shapes) |s| self.allocator.free(s);
+            self.allocator.free(shapes);
         }
         
         self.client.deinit();
@@ -152,29 +158,67 @@ pub const Worker = struct {
         std.log.info("Worker {} exiting main loop", .{self.node_id.?});
     }
     
-    /// Handles the one-time setup message, caching the VMFB binary
+    /// Handles the one-time setup message, caching the VMFB binary and data input shapes
     fn handleInitializeGraph(self: *Self, msg: MessageEnvelope) !void {
-        // Free any existing cached VMFB
+        // Free any old data
         if (self.cached_vmfb) |vmfb| {
             self.allocator.free(vmfb);
             self.cached_vmfb = null;
         }
+        if (self.cached_data_input_shapes) |shapes| {
+            for (shapes) |s| self.allocator.free(s);
+            self.cached_data_input_shapes = null;
+        }
 
-        // Payload is a Base64 encoded VMFB binary
-        const b64_vmfb_str = switch (msg.data) {
-            .string => |s| s,
+        // 1. Parse the JSON payload object
+        const payload = switch (msg.data) {
+            .object => |obj| obj,
             else => return error.InvalidMessageFormat,
         };
-
-        // Base64-decode the payload to get the VMFB bytes
-        const decoded_len = try std.base64.standard.Decoder.calcSizeForSlice(b64_vmfb_str);
+        
+        // 2. Decode and cache the VMFB
+        const b64_vmfb_str = payload.get("vmfb") orelse return error.MissingVmfbField;
+        const vmfb_string = switch (b64_vmfb_str.*) {
+            .string => |s| s,
+            else => return error.InvalidVmfbFormat,
+        };
+        
+        const decoded_len = try std.base64.standard.Decoder.calcSizeForSlice(vmfb_string);
         const vmfb_bytes = try self.allocator.alloc(u8, decoded_len);
-        try std.base64.standard.Decoder.decode(vmfb_bytes, b64_vmfb_str);
-
-        // Cache the binary artifact directly. No parsing needed.
+        try std.base64.standard.Decoder.decode(vmfb_bytes, vmfb_string);
         self.cached_vmfb = vmfb_bytes;
+        
+        // 3. Parse and cache the data input shapes
+        const shapes_json = payload.get("data_input_shapes") orelse return error.MissingShapesField;
+        const shapes_array = switch (shapes_json.*) {
+            .array => |arr| arr,
+            else => return error.InvalidShapesFormat,
+        };
+        
+        var shapes_list = std.ArrayList([]i64).init(self.allocator);
+        errdefer {
+            for (shapes_list.items) |s| self.allocator.free(s);
+            shapes_list.deinit();
+        }
+        
+        for (shapes_array.items) |shape_val| {
+            const dim_array = switch (shape_val) {
+                .array => |arr| arr,
+                else => return error.InvalidShapeFormat,
+            };
+            var dim_list = std.ArrayList(i64).init(self.allocator);
+            for (dim_array.items) |dim_val| {
+                const dim = switch (dim_val) {
+                    .integer => |i| i,
+                    else => return error.InvalidDimensionFormat,
+                };
+                try dim_list.append(dim);
+            }
+            try shapes_list.append(try dim_list.toOwnedSlice());
+        }
+        self.cached_data_input_shapes = try shapes_list.toOwnedSlice();
 
-        std.log.info("Worker {} initialized and cached compiled VMFB artifact ({} bytes).", .{ self.node_id.?, vmfb_bytes.len });
+        std.log.info("Worker {} cached VMFB and {} data input shapes.", .{ self.node_id.?, self.cached_data_input_shapes.?.len });
     }
     
     /// Handle StartInnerLoop command from Shepherd using Cap'n Proto
@@ -185,6 +229,10 @@ pub const Worker = struct {
         const vmfb = self.cached_vmfb orelse {
             std.log.err("Received StartInnerLoop before graph was initialized.", .{});
             return error.GraphNotInitialized;
+        };
+        const shapes = self.cached_data_input_shapes orelse {
+            std.log.err("Received StartInnerLoop before shapes were initialized.", .{});
+            return error.ShapesNotInitialized;
         };
 
         // 2. The payload is Base64-encoded Cap'n Proto data
@@ -231,8 +279,8 @@ pub const Worker = struct {
         const inputs: [][]const u8 = &inputs_array;
 
         // 7. Execute using the backend. The backend's vtable now points to
-        //    a function that expects the VMFB bytes.
-        const outputs = try self.backend.executeTrainingStep(vmfb, inputs);
+        //    a function that expects the VMFB bytes and shapes.
+        const outputs = try self.backend.executeTrainingStep(vmfb, inputs, shapes);
         defer {
             for (outputs) |o| self.allocator.free(o);
             self.allocator.free(outputs);
@@ -351,10 +399,11 @@ pub fn testWorker(allocator: Allocator) !void {
 }
 
 // Mock functions for testing
-fn mockExecuteTrainingStep(ptr: *anyopaque, compiled_artifact: []const u8, inputs: [][]const u8) ![][]u8 {
+fn mockExecuteTrainingStep(ptr: *anyopaque, compiled_artifact: []const u8, inputs_data: [][]const u8, input_shapes: [][]const i64) ![][]u8 {
     _ = ptr;
     _ = compiled_artifact;
-    _ = inputs;
+    _ = inputs_data;
+    _ = input_shapes;
     return &[_][]u8{};
 }
 

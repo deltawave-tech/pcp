@@ -76,9 +76,8 @@ pub const IreeBackend = struct {
         self.allocator.destroy(self);
     }
 
-    /// Execute a training step with pre-compiled VMFB bytecode
-    /// This is the real implementation that will be called by the Worker
-    pub fn execute(self: *Self, vmfb_bytes: []const u8, inputs: [][]const u8) ![][]u8 {
+    /// Execute a training step with a pre-compiled VMFB artifact.
+    pub fn execute(self: *Self, vmfb_bytes: []const u8, inputs_data: [][]const u8, input_shapes: [][]const i64) ![][]u8 {
         // 1. Load the .vmfb module into the session
         // NOTE: In a real app, you would load this once and cache it. For now, we load it on every call.
         var policy: c.iree_runtime_module_policy_t = undefined;
@@ -94,11 +93,10 @@ pub const IreeBackend = struct {
         try ireeCheck(c.iree_runtime_call_initialize_by_name(self.session, main_fn_name, &call));
         defer c.iree_runtime_call_deinitialize(&call);
 
-        // 3. Wrap Zig input slices into IREE buffer views and push them to the call
-        for (inputs) |input_slice| {
-            // NOTE: This is a simplified implementation. A real implementation needs to get the
-            // expected shape/dtype from the function signature. For now, we assume f32 tensors.
-            
+        // 3. Wrap Zig input slices into IREE buffer views using the provided shapes.
+        std.debug.assert(inputs_data.len == input_shapes.len);
+        
+        for (inputs_data, input_shapes) |input_slice, shape_slice| {
             // Create a host buffer that wraps our input data
             var host_buffer: *c.iree_hal_buffer_t = undefined;
             const buffer_size = input_slice.len;
@@ -125,18 +123,27 @@ pub const IreeBackend = struct {
             @memcpy(mapped_memory.contents.data[0..buffer_size], input_slice);
             c.iree_hal_buffer_unmap_range(&mapped_memory);
 
-            // Create buffer view - assuming 1D f32 tensor for simplicity
+            // Create a buffer view that wraps the host (CPU) data.
+            // IREE's HAL will handle uploading this to the device as needed.
             var buffer_view: *c.iree_hal_buffer_view_t = undefined;
-            const shape: [1]c.iree_hal_dim_t = .{@intCast(input_slice.len / 4)}; // Assuming f32
-            try ireeCheck(c.iree_hal_buffer_view_create(
-                host_buffer,
-                shape.ptr,
-                1, // rank
-                c.IREE_HAL_ELEMENT_TYPE_FLOAT_32,
+            
+            var iree_shape = try self.allocator.alloc(c.iree_hal_dim_t, shape_slice.len);
+            defer self.allocator.free(iree_shape);
+            for (shape_slice, 0..) |dim, i| {
+                iree_shape[i] = @intCast(dim);
+            }
+
+            try ireeCheck(c.iree_hal_buffer_view_wrap_bytes(
+                c.iree_runtime_session_device_allocator(self.session),
+                iree_shape.ptr,
+                shape_slice.len,
+                c.IREE_HAL_ELEMENT_TYPE_FLOAT_32, // Assuming f32 for now
                 c.IREE_HAL_ENCODING_TYPE_DENSE_ROW_MAJOR,
-                c.iree_runtime_session_host_allocator(self.session),
+                .{ .data = input_slice.ptr, .data_length = input_slice.len },
+                c.iree_allocator_null(), // IREE will manage the copy
                 &buffer_view,
             ));
+            defer c.iree_hal_buffer_view_release(buffer_view);
             
             try ireeCheck(c.iree_runtime_call_inputs_push_back_buffer_view(&call, buffer_view));
             c.iree_hal_buffer_view_release(buffer_view);
@@ -145,8 +152,12 @@ pub const IreeBackend = struct {
         // 4. Invoke the function
         try ireeCheck(c.iree_runtime_session_call(self.session, &call));
 
-        // 5. Get the outputs
+        // 5. Get the outputs from the call.
         var outputs_list = std.ArrayList([]u8).init(self.allocator);
+        errdefer {
+            for (outputs_list.items) |o| self.allocator.free(o);
+            outputs_list.deinit();
+        }
         
         const output_count = c.iree_runtime_call_outputs_size(&call);
         for (0..@intCast(output_count)) |_| {
@@ -154,24 +165,27 @@ pub const IreeBackend = struct {
             try ireeCheck(c.iree_runtime_call_outputs_pop_front_buffer_view(&call, &output_buffer_view));
             defer c.iree_hal_buffer_view_release(output_buffer_view);
 
-            // Get buffer from buffer view
+            // Get the buffer from the view.
             const output_buffer = c.iree_hal_buffer_view_buffer(output_buffer_view);
             const buffer_byte_length = c.iree_hal_buffer_byte_length(output_buffer);
 
-            // Map and copy output data
-            var output_mapped_memory: c.iree_hal_buffer_mapping_t = undefined;
+            // Map the device buffer into host-readable memory.
+            var mapped_memory: c.iree_hal_buffer_mapping_t = undefined;
             try ireeCheck(c.iree_hal_buffer_map_range(
                 output_buffer,
                 c.IREE_HAL_MAPPING_MODE_SCOPED,
                 c.IREE_HAL_MEMORY_ACCESS_READ,
                 0,
                 c.IREE_WHOLE_BUFFER,
-                &output_mapped_memory,
+                &mapped_memory,
             ));
             
+            // Allocate a Zig-owned slice and copy the data into it.
             const output_data = try self.allocator.alloc(u8, @intCast(buffer_byte_length));
-            @memcpy(output_data, output_mapped_memory.contents.data[0..@intCast(buffer_byte_length)]);
-            c.iree_hal_buffer_unmap_range(&output_mapped_memory);
+            @memcpy(output_data, mapped_memory.contents.data[0..@intCast(buffer_byte_length)]);
+            
+            // Unmap the memory.
+            c.iree_hal_buffer_unmap_range(&mapped_memory);
             
             try outputs_list.append(output_data);
         }
@@ -191,10 +205,9 @@ pub const IreeBackend = struct {
         };
     }
 
-    // Interface implementations
-    fn executeTrainingStepInterface(ptr: *anyopaque, artifact: []const u8, inputs: [][]const u8) anyerror![][]u8 {
+    fn executeTrainingStepInterface(ptr: *anyopaque, artifact: []const u8, data: [][]const u8, shapes: [][]const i64) anyerror![][]u8 {
         const self: *Self = @ptrCast(@alignCast(ptr));
-        return self.execute(artifact, inputs);
+        return self.execute(artifact, data, shapes);
     }
 
     fn deinitInterface(ptr: *anyopaque) void {

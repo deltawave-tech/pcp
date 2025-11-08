@@ -68,15 +68,55 @@
           '';
         });
 
-        spirvCrossPkg = pkgsLLVM.spirv-cross.overrideAttrs (old: rec {
-          version = "1.4.321.0";
-          src = pkgs.fetchFromGitHub {
-            owner = "KhronosGroup";
-            repo = "SPIRV-Cross";
-            rev = "vulkan-sdk-${version}";
-            hash = "sha256-qmJK29PtjDE4+6uF8Mj6noAcRoeM3rHWRbUvcr6JzI0=";
+
+        # NEW: IREE SDK from pre-built binaries (with CORRECTED URLs and naming)
+        iree-sdk-srcs = {
+          # For Linux
+          x86_64-linux = {
+            url = "https://github.com/openxla/iree/releases/download/20240415.156/iree-sdk-linux-x86_64-20240415.156.tar.gz";
+            hash = "sha256-Wl3Yg4xZtOI0nRQjwSDy4y6Lq89L2g8KjB/9a/m8v9o=";
           };
-        });
+          # For Apple Silicon
+          aarch64-darwin = {
+            url = "https://github.com/openxla/iree/releases/download/20240415.156/iree-sdk-macos-arm64-20240415.156.tar.gz";
+            hash = "sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="; #<-- Placeholder, see below
+          };
+          # For Intel Mac
+          x86_64-darwin = {
+            url = "https://github.com/openxla/iree/releases/download/20240415.156/iree-sdk-macos-x86_64-20240415.156.tar.gz";
+            hash = "sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="; #<-- Placeholder, see below
+          };
+        };
+
+        # Create the iree-sdk package
+        iree-sdk = pkgs.stdenv.mkDerivation {
+          pname = "iree-sdk";
+          version = "20240415.156"; # Match the release version
+
+          src = pkgs.fetchurl {
+            url = iree-sdk-srcs.${system}.url;
+            hash = iree-sdk-srcs.${system}.hash;
+          };
+          
+          # This phase is now simpler as the new archives have a clear structure
+          installPhase = ''
+            mkdir -p $out
+            cp -r tools $out/tools
+            cp -r lib $out/lib
+            cp -r include $out/include
+            
+            # Make sure binaries in tools are executable
+            chmod +x $out/tools/iree-compile
+            chmod +x $out/tools/iree-run-module
+          '';
+          
+          # Add metadata
+          meta = with lib; {
+            description = "IREE (Intermediate Representation Execution Environment) SDK";
+            homepage = "https://iree.dev/";
+            platforms = [ "x86_64-linux" "aarch64-darwin" "x86_64-darwin" ];
+          };
+        };
 
       in rec {
         packages.default = packages.pcp;
@@ -142,7 +182,7 @@
             llvmPkg.libllvm.dev
             mlirPkg.dev
             packages.stablehlo.dev
-            spirvCrossPkg
+            iree-sdk # <-- ADD THE SDK HERE
             zig
             pkgs.pkg-config
             llvmPkg.lld
@@ -159,13 +199,12 @@
             packages.stablehlo
             llvmPkg.libllvm
             mlirPkg
-            spirvCrossPkg
             pkgsLLVM.capnproto
+            iree-sdk # <-- AND HERE
 
             llvmPkg.libllvm.dev
             mlirPkg.dev
             packages.stablehlo.dev
-            spirvCrossPkg
             zig
             pkgs.pkg-config
             llvmPkg.lld
@@ -183,6 +222,10 @@
 
           # TODO properly integrate this via pkg-config
           CAPNP_DIR = "${pkgs.capnproto}";
+          
+          # NEW: Pass the path to the SDK as an environment variable
+          # so `build.zig` can find it easily.
+          IREE_SDK_DIR = "${iree-sdk}";
         };
         # The development environment draws in the Zig compiler and ZLS.
         devShells.default = pkgs.mkShell {
@@ -205,6 +248,9 @@
 
             CAPNP_DIR="${pkgs.capnproto}"
             export CAPNP_DIR
+
+            # Also export it in the development shell for local builds
+            export IREE_SDK_DIR="${iree-sdk}"
 
             ${lib.optionalString pkgs.stdenv.isDarwin ''
               export MACOSX_DEPLOYMENT_TARGET="11.0"

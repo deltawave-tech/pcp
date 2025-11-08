@@ -8,8 +8,6 @@ const tcp_stream = @import("network/tcp_stream.zig");
 const message = @import("network/message.zig");
 const binary_protocol = @import("network/capnp_zig_wrapper.zig");
 const worker_backend = @import("backends/worker_backend.zig");
-const mlir = @import("mlir.zig");
-const mlir_ctx = @import("mlir_ctx.zig");
 const backend_selection = @import("backend_selection.zig");
 
 const TcpClient = tcp_stream.TcpClient;
@@ -41,11 +39,8 @@ pub const Worker = struct {
     // Backend abstraction - handles all MLIR compilation and execution
     backend: WorkerBackend,
     
-    // MLIR context for deserializing modules
-    mlir_context: mlir_ctx.MLIRContext,
-    
-    // NEW: Cached MLIR module from graph initialization
-    cached_module: ?mlir.Module,
+    // NEW: Cached VMFB binary from graph initialization
+    cached_vmfb: ?[]u8,
     
     const Self = @This();
     
@@ -57,37 +52,19 @@ pub const Worker = struct {
             .state = .disconnected,
             .is_running = false,
             .backend = backend,
-            .mlir_context = try mlir_ctx.MLIRContext.init(allocator),
-            .cached_module = null,
+            .cached_vmfb = null,
         };
     }
     
-    pub fn initWithBackend(allocator: Allocator, backend: WorkerBackend) !Self {
-        // Get the MLIR context from the backend instead of creating a new one
-        const backend_context = backend.getContext();
-        return Self{
-            .allocator = allocator,
-            .client = TcpClient.init(allocator),
-            .node_id = null,
-            .state = .disconnected,
-            .is_running = false,
-            .backend = backend,
-            .mlir_context = mlir_ctx.MLIRContext.fromContext(backend_context),
-            .cached_module = null,
-        };
-    }
     
     pub fn deinit(self: *Self) void {
-        // Cleanup cached module if it exists
-        if (self.cached_module) |mod| {
-            mod.deinit();
-            self.cached_module = null; // Prevent double-free
+        // Cleanup cached VMFB if it exists
+        if (self.cached_vmfb) |vmfb| {
+            self.allocator.free(vmfb);
         }
         
         self.client.deinit();
         self.backend.deinit();
-        
-        self.mlir_context.deinit();
     }
     
     /// Connect to the Shepherd coordinator
@@ -175,70 +152,40 @@ pub const Worker = struct {
         std.log.info("Worker {} exiting main loop", .{self.node_id.?});
     }
     
-    /// Handles the one-time setup message, deserializing and caching the MLIR module
+    /// Handles the one-time setup message, caching the VMFB binary
     fn handleInitializeGraph(self: *Self, msg: MessageEnvelope) !void {
-
-        // De-initialize any old module
-        if (self.cached_module) |mod| {
-            mod.deinit();
-            self.cached_module = null;
+        // Free any existing cached VMFB
+        if (self.cached_vmfb) |vmfb| {
+            self.allocator.free(vmfb);
+            self.cached_vmfb = null;
         }
 
-        // Payload is a Base64 encoded graph string
-        const b64_graph_str = switch (msg.data) {
+        // Payload is a Base64 encoded VMFB binary
+        const b64_vmfb_str = switch (msg.data) {
             .string => |s| s,
             else => return error.InvalidMessageFormat,
         };
 
-        // Base64-decode the payload to get the original MLIR data
-        const decoded_len = try std.base64.standard.Decoder.calcSizeForSlice(b64_graph_str);
-        const graph_str = try self.allocator.alloc(u8, decoded_len);
-        defer self.allocator.free(graph_str);
-        try std.base64.standard.Decoder.decode(graph_str, b64_graph_str);
+        // Base64-decode the payload to get the VMFB bytes
+        const decoded_len = try std.base64.standard.Decoder.calcSizeForSlice(b64_vmfb_str);
+        const vmfb_bytes = try self.allocator.alloc(u8, decoded_len);
+        try std.base64.standard.Decoder.decode(vmfb_bytes, b64_vmfb_str);
 
-        // Deserialize and cache the module using the worker's own context
-        const module = try mlir_ctx.deserializeMLIRModule(self.allocator, self.mlir_context.getContext(), graph_str);
-        errdefer module.deinit(); // Cleanup on error to prevent leak
-        
-        // Validate deserialized module
-        const test_op = module.op();
-        if (@intFromPtr(test_op.handle) == 0) {
-            std.log.err("Invalid deserialized module", .{});
-            return error.InvalidDeserializedModule;
-        }
-        
-        // Verify the module is well-formed
-        const verification_result = test_op.verify();
-        if (!verification_result) {
-            std.log.err("Deserialized MLIR module failed verification", .{});
-            std.debug.print("Dumping invalid module for debugging:\n", .{});
-            test_op.dump();
-            return error.ModuleVerificationFailed;
-        }
-        
-        // Successfully validated, cache the module
-        self.cached_module = module;
+        // Cache the binary artifact directly. No parsing needed.
+        self.cached_vmfb = vmfb_bytes;
 
-        std.log.info("Worker {} initialized training graph", .{self.node_id.?});
-        // No response is needed. The worker is now ready for START_INNER_LOOP.
+        std.log.info("Worker {} initialized and cached compiled VMFB artifact ({} bytes).", .{ self.node_id.?, vmfb_bytes.len });
     }
     
     /// Handle StartInnerLoop command from Shepherd using Cap'n Proto
     fn handleStartInnerLoop(self: *Self, msg: MessageEnvelope) !void {
         self.state = .training;
 
-        // 1. Ensure the graph has been initialized and cached.
-        const module = self.cached_module orelse {
+        // 1. Ensure the VMFB has been cached.
+        const vmfb = self.cached_vmfb orelse {
             std.log.err("Received StartInnerLoop before graph was initialized.", .{});
             return error.GraphNotInitialized;
         };
-        
-        // Validate cached module
-        const verify_op = module.op();
-        if (@intFromPtr(verify_op.handle) == 0) {
-            std.log.err("Cached module corrupted", .{});
-            return error.CorruptedCachedModule;
-        }
 
         // 2. The payload is Base64-encoded Cap'n Proto data
         const b64_encoded_payload = switch (msg.data) {
@@ -283,8 +230,9 @@ pub const Worker = struct {
         var inputs_array = [_][]const u8{ params_bytes, input_ids_bytes, targets_bytes };
         const inputs: [][]const u8 = &inputs_array;
 
-        // 7. Execute using the CACHED module.
-        const outputs = try self.backend.executeTrainingStep(module, inputs);
+        // 7. Execute using the backend. The backend's vtable now points to
+        //    a function that expects the VMFB bytes.
+        const outputs = try self.backend.executeTrainingStep(vmfb, inputs);
         defer {
             for (outputs) |o| self.allocator.free(o);
             self.allocator.free(outputs);
@@ -403,9 +351,9 @@ pub fn testWorker(allocator: Allocator) !void {
 }
 
 // Mock functions for testing
-fn mockExecuteTrainingStep(ptr: *anyopaque, mlir_module: mlir.Module, inputs: [][]const u8) ![][]u8 {
+fn mockExecuteTrainingStep(ptr: *anyopaque, compiled_artifact: []const u8, inputs: [][]const u8) ![][]u8 {
     _ = ptr;
-    _ = mlir_module;
+    _ = compiled_artifact;
     _ = inputs;
     return &[_][]u8{};
 }

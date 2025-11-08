@@ -1,5 +1,4 @@
 const std = @import("std");
-const mlir = @import("../mlir.zig");
 
 /// Generic worker backend interface for executing training steps.
 /// This interface is responsible for executing MLIR modules received from the Shepherd.
@@ -9,32 +8,25 @@ pub const WorkerBackend = struct {
     vtable: *const VTable,
 
     const VTable = struct {
-        /// Executes a full training step defined by the MLIR module.
+        /// Executes a full training step with pre-compiled artifact.
         /// Takes model parameters as input, returns updated parameters and loss.
         /// 
+        /// compiled_artifact: Pre-compiled binary artifact (e.g., VMFB)
         /// inputs: Array of input byte arrays (parameters, data, etc.)
         /// returns: Array of output byte arrays (updated parameters, loss, etc.)
         executeTrainingStep: *const fn(
             ptr: *anyopaque,
-            mlir_module: mlir.Module,
+            compiled_artifact: []const u8,
             inputs: [][]const u8,
         ) anyerror![][]u8,
-        
-        /// Get the MLIR context from the backend
-        getContext: *const fn(ptr: *anyopaque) mlir.Context,
         
         /// Clean up backend resources
         deinit: *const fn(ptr: *anyopaque) void,
     };
 
-    /// Execute a training step with the given MLIR module and inputs
-    pub fn executeTrainingStep(self: WorkerBackend, mod: mlir.Module, inputs: [][]const u8) ![][]u8 {
-        return self.vtable.executeTrainingStep(self.ptr, mod, inputs);
-    }
-    
-    /// Get the MLIR context from the backend
-    pub fn getContext(self: WorkerBackend) mlir.Context {
-        return self.vtable.getContext(self.ptr);
+    /// Execute a training step with the given compiled artifact and inputs
+    pub fn executeTrainingStep(self: WorkerBackend, artifact: []const u8, inputs: [][]const u8) ![][]u8 {
+        return self.vtable.executeTrainingStep(self.ptr, artifact, inputs);
     }
     
     /// Clean up backend resources

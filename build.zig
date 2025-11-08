@@ -212,6 +212,11 @@ fn detectCapnp(b: *std.Build) CapnpConfig {
     return config;
 }
 
+// Attempt to find IREE SDK installation
+fn detectIree(b: *std.Build) ?[]const u8 {
+    return std.process.getEnvVarOwned(b.allocator, "IREE_SDK_DIR") catch null;
+}
+
 // Helper function to execute a command and capture its output
 fn getCommandOutput(b: *std.Build, argv: []const []const u8) ![]const u8 {
     const result = std.process.Child.run(.{
@@ -331,17 +336,30 @@ fn addMLIRSupport(b: *std.Build, target: *std.Build.Step.Compile, mlir_config: M
     }
 }
 
-// Helper function to link project's own C++/Objective-C bridge libraries
-fn addPCPDependencies(target: *std.Build.Step.Compile, spirv_bridge_lib: ?*std.Build.Step.Compile, metal_bridge_lib: ?*std.Build.Step.Compile) void {
-    // Link the core SPIR-V to C++ bridge library
-    if (spirv_bridge_lib) |lib| {
-        target.linkLibrary(lib);
-    }
-    // On macOS, also link the Objective-C Metal bridge library
-    if (target.root_module.resolved_target.?.result.os.tag == .macos) {
-        if (metal_bridge_lib) |lib| {
-            target.linkLibrary(lib);
-        }
+
+// Helper function to add IREE support to an executable
+fn addIreeSupport(b: *std.Build, target: *std.Build.Step.Compile, iree_sdk_dir: ?[]const u8) void {
+    if (iree_sdk_dir) |dir| {
+        // 1. Add the include path for `iree/runtime/api.h`
+        const include_path = std.fs.path.join(b.allocator, &.{dir, "include"}) catch {
+            std.debug.print("Failed to construct IREE include path\n", .{});
+            return;
+        };
+        target.addIncludePath(.{ .cwd_relative = include_path });
+        
+        // 2. Add the library path
+        const lib_path = std.fs.path.join(b.allocator, &.{dir, "lib"}) catch {
+            std.debug.print("Failed to construct IREE lib path\n", .{});
+            return;
+        };
+        target.addLibraryPath(.{ .cwd_relative = lib_path });
+        
+        // 3. Link the core IREE runtime library
+        target.linkSystemLibrary("iree_runtime_all_sync");
+        
+        std.debug.print("Added IREE support: include={s}, lib={s}\n", .{include_path, lib_path});
+    } else {
+        std.debug.print("IREE SDK not found, skipping IREE support\n", .{});
     }
 }
 
@@ -364,171 +382,16 @@ pub fn build(b: *std.Build) void {
         capnp_config.lib_dir orelse "null"
     });
 
-    // Create the Metal bridge object file if on macOS
-    std.debug.print("==> Creating Metal bridge library\n", .{});
-    var metal_bridge_lib: ?*std.Build.Step.Compile = null;
-    if (builtin.os.tag == .macos) {
-        metal_bridge_lib = b.addStaticLibrary(.{
-            .name = "metal_bridge",
-            .target = target,
-            .optimize = optimize,
-        });
+    // Detect IREE SDK availability
+    std.debug.print("==> Detecting IREE SDK configuration\n", .{});
+    const iree_sdk_dir = detectIree(b);
+    std.debug.print("==> IREE SDK detected: path={s}\n", .{iree_sdk_dir orelse "null"});
 
-        // Get SDK root from the environment variable set by our correct Nix shell.
-        const sdk_root = std.process.getEnvVarOwned(b.allocator, "SDKROOT") catch |err| {
-            std.debug.print("FATAL: SDKROOT not set. This build requires the Nix environment. Error: {}\n", .{err});
-            @panic("SDKROOT not found");
-        };
-        defer b.allocator.free(sdk_root);
+    // Metal bridge library removed - workers now use IREE runtime directly
+    std.debug.print("==> Metal bridge library removed, using IREE runtime\n", .{});
 
-        // Explicitly construct the path to the frameworks directory inside the SDK.
-        const framework_path = std.fmt.allocPrint(b.allocator, "{s}/System/Library/Frameworks", .{sdk_root}) catch @panic("OOM");
-        defer b.allocator.free(framework_path);
-
-        // Pass compiler flags for finding system headers.
-        metal_bridge_lib.?.addCSourceFile(.{
-            .file = b.path("src/backends/metal_bridge.m"),
-            .flags = &[_][]const u8{
-                "-fobjc-arc",
-                "-isysroot", // Tell the compiler the root for all system headers.
-                sdk_root,
-            },
-        });
-
-        // **FIX:** Explicitly tell the LINKER where to find frameworks using the correct API.
-        metal_bridge_lib.?.addFrameworkPath(.{ .cwd_relative = framework_path });
-
-        // Tell the linker which frameworks to link.
-        metal_bridge_lib.?.linkFramework("Foundation");
-        metal_bridge_lib.?.linkFramework("Metal");
-    }
-
-    // Create SPIR-V bridge library if MLIR is available
-    std.debug.print("==> Creating SPIRV bridge library (MLIR enabled: {})\n", .{mlir_config.enabled});
-    var spirv_bridge_lib: ?*std.Build.Step.Compile = null;
-    if (mlir_config.enabled) {
-        std.debug.print("    -> Adding SPIRV bridge static library\n", .{});
-        spirv_bridge_lib = b.addStaticLibrary(.{
-            .name = "spirv_bridge",
-            .target = target,
-            .optimize = optimize,
-        });
-        std.debug.print("    -> SPIRV bridge library created\n", .{});
-
-        std.debug.print("    -> Adding SPIRV bridge source files\n", .{});
-        spirv_bridge_lib.?.addCSourceFile(.{
-            .file = b.path("src/mlir/spirv_bridge.cpp"),
-            .flags = &[_][]const u8{"-std=c++17"},
-        });
-        std.debug.print("    -> Added spirv_bridge.cpp\n", .{});
-
-        // Add SPIRV-Cross bridge for real SPIR-V → MSL translation
-        std.debug.print("    -> Adding SPIRV-Cross bridge\n", .{});
-        spirv_bridge_lib.?.addCSourceFile(.{
-            .file = b.path("src/mlir/spirv_cross_bridge.cpp"),
-            .flags = &[_][]const u8{"-std=c++17"},
-        });
-        std.debug.print("    -> Added spirv_cross_bridge.cpp\n", .{});
-
-        // Add pass anchors bridge to force-load pass libraries
-        std.debug.print("    -> Adding pass anchors bridge\n", .{});
-        spirv_bridge_lib.?.addCSourceFile(.{
-            .file = b.path("src/mlir/pass_anchors.cpp"),
-            .flags = &[_][]const u8{
-                "-std=c++17",
-                "-Istablehlo",
-                "-Illvm-build/include",
-                "-Illvm-build/tools/stablehlo",
-            },
-        });
-        std.debug.print("    -> Added pass_anchors.cpp\n", .{});
-
-        std.debug.print("    -> Adding include paths\n", .{});
-        if (mlir_config.include_dir) |include_dir| {
-            spirv_bridge_lib.?.addIncludePath(.{ .cwd_relative = include_dir });
-        }
-        
-        // Add MLIR and LLVM include directories
-        spirv_bridge_lib.?.addIncludePath(.{ .cwd_relative = "llvm-project/llvm/include" }); // LLVM headers
-        spirv_bridge_lib.?.addIncludePath(.{ .cwd_relative = "llvm-project/mlir/include" }); // MLIR headers
-        spirv_bridge_lib.?.addIncludePath(.{ .cwd_relative = "llvm-build/tools/mlir/include" });
-        spirv_bridge_lib.?.addIncludePath(.{ .cwd_relative = "llvm-build/include" });
-        
-        // NEW: Add StableHLO include paths
-        spirv_bridge_lib.?.addIncludePath(.{ .cwd_relative = "stablehlo" });
-        spirv_bridge_lib.?.addIncludePath(.{ .cwd_relative = "llvm-build/tools/stablehlo" });
-        
-        // Add SPIRV-Cross include paths
-        spirv_bridge_lib.?.addIncludePath(.{ .cwd_relative = "SPIRV-Cross" });
-        spirv_bridge_lib.?.addIncludePath(.{ .cwd_relative = "SPIRV-Cross/include" });
-        spirv_bridge_lib.?.linkSystemLibrary2("spirv-cross-c", .{});
-        // Add our local MLIR library directory FIRST  
-        if (mlir_config.lib_dir) |lib_dir| {
-            spirv_bridge_lib.?.addLibraryPath(.{ .cwd_relative = lib_dir });
-            std.debug.print("    -> Added MLIR library path: {s}\n", .{lib_dir});
-        } else {
-            // Fallback to project-relative MLIR build directory
-            spirv_bridge_lib.?.addLibraryPath(.{ .cwd_relative = "llvm-build/lib" });
-            std.debug.print("    -> Added fallback MLIR library path: llvm-build/lib\n", .{});
-        }
-        
-        std.debug.print("    -> Adding MLIR libraries\n", .{});
-        // Core MLIR/LLVM libraries (always required)
-        const core_spirv_libs = [_][]const u8{
-            "MLIRCAPIIR",
-            "MLIRIR",
-            "MLIRSPIRVDialect",
-            "MLIRSPIRVSerialization",
-            "MLIRSPIRVBinaryUtils",
-            "MLIRSPIRVTransforms",
-            "MLIRSPIRVUtils",
-            "MLIRSupport",
-            "LLVMSupport",
-            "LLVMCore",
-        };
-        
-        std.debug.print("    -> Linking core SPIRV libraries ({} libraries)\n", .{core_spirv_libs.len});
-        for (core_spirv_libs) |lib| {
-            std.debug.print("      -> Linking: {s}\n", .{lib});
-            spirv_bridge_lib.?.linkSystemLibrary(lib);
-        }
-        std.debug.print("    -> Core SPIRV libraries linked successfully\n", .{});
-        
-        // Add SPIRV-Cross library path and libraries
-        spirv_bridge_lib.?.addLibraryPath(.{ .cwd_relative = "SPIRV-Cross/build" });
-        
-        const spirv_cross_libs = [_][]const u8{
-            "spirv-cross-msl",
-            "spirv-cross-glsl",        // MSL depends on GLSL
-            "spirv-cross-hlsl",        // C API uses HLSL compiler
-            "spirv-cross-cpp",         // C API uses CPP compiler  
-            "spirv-cross-reflect",     // C API uses reflection
-            "spirv-cross-core",
-            "spirv-cross-c",
-        };
-        
-        std.debug.print("    -> Linking SPIRV-Cross libraries...\n", .{});
-        
-        // Only link SPIRV-Cross libraries if the build directory exists
-        if (std.fs.cwd().access("SPIRV-Cross/build", .{})) |_| {
-            std.debug.print("    -> SPIRV-Cross build found, linking libraries\n", .{});
-            for (spirv_cross_libs) |lib| {
-                spirv_bridge_lib.?.linkSystemLibrary(lib);
-            }
-            std.debug.print("    -> Successfully linked SPIRV-Cross libraries\n", .{});
-        } else |err| switch (err) {
-            error.FileNotFound => {
-                std.debug.print("    -> SPIRV-Cross not built, skipping library linking\n", .{});
-            },
-            else => {
-                std.debug.print("    -> Error accessing SPIRV-Cross directory: {}\n", .{err});
-            },
-        }
-        
-        spirv_bridge_lib.?.linkLibCpp();
-        std.debug.print("    -> SPIRV bridge library configuration completed\n", .{});
-    }
-    std.debug.print("==> SPIRV bridge section completed\n", .{});
+    // SPIRV bridge library removed - workers now use IREE runtime directly
+    std.debug.print("==> SPIRV bridge library removed, using IREE runtime\n", .{});
 
 
     // Create the main PCP module
@@ -578,8 +441,6 @@ pub fn build(b: *std.Build) void {
     // SINGLE CALL for all MLIR/LLVM/Metal libraries
     addMLIRSupport(b, dialect_test, mlir_config);
 
-    // SINGLE CALL for your project's bridge libraries
-    addPCPDependencies(dialect_test, spirv_bridge_lib, metal_bridge_lib);
     
     const run_dialect_test = b.addRunArtifact(dialect_test);
     const dialect_test_step = b.step("test-dialects", "Test MLIR dialect wrappers");
@@ -601,8 +462,6 @@ pub fn build(b: *std.Build) void {
     // SINGLE CALL for all MLIR/LLVM/Metal libraries
     addMLIRSupport(b, gpt2_example, mlir_config);
 
-    // SINGLE CALL for your project's bridge libraries
-    addPCPDependencies(gpt2_example, spirv_bridge_lib, metal_bridge_lib);
 
     // Install the executables
     //b.installArtifact(gpt2_example);
@@ -630,7 +489,6 @@ pub fn build(b: *std.Build) void {
     addMLIRSupport(b, mlir_verification_test, mlir_config);
 
     // SINGLE CALL for your project's bridge libraries
-    addPCPDependencies(mlir_verification_test, spirv_bridge_lib, metal_bridge_lib);
 
     // Install the test executable
     //b.installArtifact(mlir_verification_test);
@@ -657,7 +515,6 @@ pub fn build(b: *std.Build) void {
     addMLIRSupport(b, comptime_examples, mlir_config);
 
     // SINGLE CALL for your project's bridge libraries
-    addPCPDependencies(comptime_examples, spirv_bridge_lib, metal_bridge_lib);
     
 
     // Install the executable
@@ -686,7 +543,6 @@ pub fn build(b: *std.Build) void {
     addMLIRSupport(b, metal_test, mlir_config);
 
     // SINGLE CALL for your project's bridge libraries
-    addPCPDependencies(metal_test, spirv_bridge_lib, metal_bridge_lib);
     
 
 
@@ -716,7 +572,6 @@ pub fn build(b: *std.Build) void {
     addMLIRSupport(b, pass_test, mlir_config);
 
     // SINGLE CALL for your project's bridge libraries
-    addPCPDependencies(pass_test, spirv_bridge_lib, metal_bridge_lib);
 
     const run_pass_test_cmd = b.addRunArtifact(pass_test);
     run_pass_test_cmd.step.dependOn(&pass_test.step);
@@ -739,7 +594,6 @@ pub fn build(b: *std.Build) void {
     addMLIRSupport(b, metal_benchmark, mlir_config);
 
     // SINGLE CALL for your project's bridge libraries
-    addPCPDependencies(metal_benchmark, spirv_bridge_lib, metal_bridge_lib);
     
 
 
@@ -767,7 +621,6 @@ pub fn build(b: *std.Build) void {
     addMLIRSupport(b, m3_pipeline_test, mlir_config);
 
     // SINGLE CALL for your project's bridge libraries
-    addPCPDependencies(m3_pipeline_test, spirv_bridge_lib, metal_bridge_lib);
 
     const run_m3_pipeline_test_cmd = b.addRunArtifact(m3_pipeline_test);
     run_m3_pipeline_test_cmd.step.dependOn(&m3_pipeline_test.step);
@@ -791,7 +644,6 @@ pub fn build(b: *std.Build) void {
     addMLIRSupport(b, mlir_test, mlir_config);
 
     // SINGLE CALL for your project's bridge libraries
-    addPCPDependencies(mlir_test, spirv_bridge_lib, metal_bridge_lib);
     
 
     // Install the executable
@@ -819,7 +671,6 @@ pub fn build(b: *std.Build) void {
     addMLIRSupport(b, tensor_mlir_test, mlir_config);
 
     // SINGLE CALL for your project's bridge libraries
-    addPCPDependencies(tensor_mlir_test, spirv_bridge_lib, metal_bridge_lib);
     
 
     // Install the executable
@@ -848,7 +699,6 @@ pub fn build(b: *std.Build) void {
     addMLIRSupport(b, spirv_test, mlir_config);
 
     // SINGLE CALL for your project's bridge libraries
-    addPCPDependencies(spirv_test, spirv_bridge_lib, metal_bridge_lib);
 
 
     // Install the test executable
@@ -873,9 +723,11 @@ pub fn build(b: *std.Build) void {
 
     // SINGLE CALL for all MLIR/LLVM/Metal libraries
     addMLIRSupport(b, main_distributed, mlir_config);
+    
+    // Add IREE support for runtime execution
+    addIreeSupport(b, main_distributed, iree_sdk_dir);
 
     // SINGLE CALL for your project's bridge libraries
-    addPCPDependencies(main_distributed, spirv_bridge_lib, metal_bridge_lib);
 
     // Cap'n Proto bridge linking (specific to this target)
     if (!capnp_config.enabled) {
@@ -1000,7 +852,6 @@ pub fn build(b: *std.Build) void {
     addMLIRSupport(b, gpt2_model_test, mlir_config);
 
     // SINGLE CALL for your project's bridge libraries
-    addPCPDependencies(gpt2_model_test, spirv_bridge_lib, metal_bridge_lib);
 
     // Install the executable
     //b.installArtifact(gpt2_model_test);
@@ -1027,7 +878,6 @@ pub fn build(b: *std.Build) void {
     addMLIRSupport(b, isolated_vjp_tests, mlir_config);
 
     // SINGLE CALL for your project's bridge libraries
-    addPCPDependencies(isolated_vjp_tests, spirv_bridge_lib, metal_bridge_lib);
 
     // Install the test executable
     //b.installArtifact(isolated_vjp_tests);
@@ -1054,7 +904,6 @@ pub fn build(b: *std.Build) void {
     addMLIRSupport(b, end_to_end_transformer_test, mlir_config);
 
     // SINGLE CALL for your project's bridge libraries
-    addPCPDependencies(end_to_end_transformer_test, spirv_bridge_lib, metal_bridge_lib);
 
     // Install the test executable
     //b.installArtifact(end_to_end_transformer_test);

@@ -15,10 +15,8 @@ const shepherd = @import("controllers/shepherd.zig");
 const worker = @import("worker.zig");
 
 // Backend implementations
-const metal_backend = @import("backends/metal.zig");
 const demo_backend = @import("backends/demo.zig");
-// const cuda_backend = @import("backends/cuda.zig");  // Future
-// const cpu_backend = @import("backends/cpu.zig");    // Future
+const iree_backend = @import("backends/iree.zig");
 
 const Executor = execution.Executor;
 const WorkerBackend = worker_backend.WorkerBackend;
@@ -51,44 +49,32 @@ pub const Backend = enum {
             .demo => "demo",
         };
     }
+
+    /// Convert backend to IREE driver name
+    pub fn toIreeDriverName(self: Backend) []const u8 {
+        return switch (self) {
+            .metal => "metal",
+            .cuda => "cuda",
+            .cpu => "local-sync", // IREE's CPU driver name
+            .demo => "local-sync", // Use CPU for demo
+        };
+    }
 };
 
 /// Create an Executor for the specified backend
+/// NOTE: This function is now primarily for Shepherd execution
 pub fn createExecutor(allocator: Allocator, backend: Backend) !Executor {
     return switch (backend) {
-        .metal => blk: {
-            // Initialize Metal backend and return its Executor interface
-            // Note: We need to create an MLIR context for Metal backend
-            const mlir_ctx = @import("mlir_ctx.zig");
-            var context = try mlir_ctx.MLIRContext.init(allocator);
-            try metal_backend.init(allocator, &context);
-            const engine = try metal_backend.getExecutionEngine();
-            break :blk engine.asExecutor();
-        },
         .demo => blk: {
-            // Demo backend uses the real Metal MLIR context but simulated execution
-            const mlir_ctx = @import("mlir_ctx.zig");
-            var context = try mlir_ctx.MLIRContext.init(allocator);
-            try metal_backend.init(allocator, &context);
-            const engine = try metal_backend.getExecutionEngine();
-            
-            // Create demo backend and set real executor before returning
+            // Demo backend for simulated execution
             const demo = try demo_backend.DemoBackend.init(allocator);
-            const real_executor = engine.asExecutor();
-            demo.setRealExecutor(real_executor);
-            
-            // Verify the real executor was set correctly
-            std.log.info("Demo backend initialized with real executor", .{});
+            std.log.info("Demo backend initialized", .{});
             break :blk demo.asExecutor();
         },
-        .cuda => {
-            // TODO: Implement CUDA backend
-            std.log.err("CUDA backend not implemented yet", .{});
-            return error.BackendNotImplemented;
-        },
-        .cpu => {
-            // TODO: Implement CPU backend  
-            std.log.err("CPU backend not implemented yet", .{});
+        .metal, .cuda, .cpu => {
+            // For actual hardware backends, the Shepherd would use IREE compilation
+            // but this createExecutor function is deprecated for worker use
+            std.log.err("{s} backend execution should use IREE WorkerBackend directly", .{backend.toString()});
             return error.BackendNotImplemented;
         },
     };
@@ -97,29 +83,17 @@ pub fn createExecutor(allocator: Allocator, backend: Backend) !Executor {
 /// Create a WorkerBackend for the specified backend
 pub fn createWorkerBackend(allocator: Allocator, backend: Backend) !WorkerBackend {
     return switch (backend) {
-        .metal => blk: {
-            // Initialize Metal backend and return its WorkerBackend interface
-            const mlir_ctx = @import("mlir_ctx.zig");
-            var context = try mlir_ctx.MLIRContext.init(allocator);
-            try metal_backend.init(allocator, &context);
-            const engine = try metal_backend.getExecutionEngine();
-            break :blk engine.asWorkerBackend();
+        .metal, .cuda, .cpu => blk: {
+            // Use IREE backend for all hardware accelerators
+            std.log.info("Using IREE backend for {s} execution", .{backend.toString()});
+            const iree = try iree_backend.IreeBackend.init(allocator, backend);
+            break :blk iree.asWorkerBackend();
         },
         .demo => blk: {
             // Demo backend for demonstration purposes
             std.log.info("Using demo worker backend for simulated execution", .{});
             const demo = try demo_backend.DemoBackend.init(allocator);
             break :blk demo.asWorkerBackend();
-        },
-        .cuda => {
-            // TODO: Implement CUDA backend
-            std.log.err("CUDA WorkerBackend not implemented yet", .{});
-            return error.BackendNotImplemented;
-        },
-        .cpu => {
-            // TODO: Implement CPU backend
-            std.log.err("CPU WorkerBackend not implemented yet", .{});
-            return error.BackendNotImplemented;
         },
     };
 }

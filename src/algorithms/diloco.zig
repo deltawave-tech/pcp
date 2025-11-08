@@ -14,13 +14,7 @@ const mlir = @import("../mlir.zig");
 const tensor = @import("../tensor.zig");
 const execution = @import("../execution.zig");
 const monitoring = @import("../monitoring.zig");
-const gpt2 = @import("../models/gpt2.zig");
 const data_loader = @import("../data_loader.zig");
-
-// GPT-2 model imports for easier access
-const GPT2Config = gpt2.GPT2Config;
-const GPT2Model = gpt2.GPT2(f32);
-const getParameterShapes = gpt2.getParameterShapes;
 
 const TrainingAlgorithm = training_algorithm.TrainingAlgorithm;
 const TrainingStatus = training_algorithm.TrainingStatus;
@@ -40,7 +34,7 @@ pub const DiLoCoConfig = struct {
     tau: usize, // Inner loop steps
     nesterov_momentum: f32,
     parameter_averaging: bool,
-    gpt2_config: GPT2Config, // GPT-2 model configuration
+    model_mlir_path: []const u8, // Path to the model MLIR file
 
     pub fn default() DiLoCoConfig {
         return DiLoCoConfig{
@@ -48,7 +42,7 @@ pub const DiLoCoConfig = struct {
             .tau = 10, // Default inner loop steps
             .nesterov_momentum = 0.9,
             .parameter_averaging = true,
-            .gpt2_config = GPT2Config.nano(), // Use nano config by default
+            .model_mlir_path = "src/models/nanogpt_forward.mlir", // Default path
         };
     }
 };
@@ -83,10 +77,73 @@ pub const DiLoCo = struct {
 
     const Self = @This();
 
+    /// Helper function to find a func.func operation by its string name
+    fn findFunctionByName(module: mlir.Module, name: []const u8) !mlir.Operation {
+        const c = @import("../mlir/c.zig").c;
+
+        const module_body = module.op().getRegion(0).getBlock(0);
+
+        var maybe_op = module_body.getFirstOp();
+        while (maybe_op) |op| {
+            if (std.mem.eql(u8, op.getName(), "func.func")) {
+                // It's a function, check its name
+                const sym_name_attr = c.operationGetAttributeByName(op.handle, "sym_name");
+                if (@intFromPtr(sym_name_attr) != 0 and c.attributeIsAString(sym_name_attr)) {
+                    const string_attr = @as(*c.MlirStringAttribute, @ptrCast(sym_name_attr));
+                    const func_name_ref = c.stringAttributeGetValue(string_attr);
+                    const func_name = c.fromStringRef(func_name_ref);
+                    if (std.mem.eql(u8, func_name, name)) {
+                        return op; // Found it!
+                    }
+                }
+            }
+            maybe_op = op.getNext();
+        }
+
+        return error.FunctionNotFound;
+    }
+
     // Change the init signature to accept the generic executor and DataLoader
     pub fn init(allocator: Allocator, coordinator: *Shepherd, config: DiLoCoConfig, executor: Executor, mlir_builder: *MLIRBuilder, dataset: *DataLoader) !Self {
         // The MLIRBuilder is now passed in, ensuring a single context.
         const element_type = mlir.Type.f32Type(mlir_builder.ctx);
+
+        // === NEW: INTROSPECT MODEL SHAPES FROM .MLIR FILE ===
+        std.debug.print("Introspecting model parameters from: {s}\n", .{config.model_mlir_path});
+        const forward_pass_mlir_source = try std.fs.cwd().readFileAlloc(allocator, config.model_mlir_path, 10 * 1024 * 1024);
+        defer allocator.free(forward_pass_mlir_source);
+
+        const temp_module = try mlir.Module.parse(mlir_builder.ctx, forward_pass_mlir_source);
+        defer temp_module.deinit();
+
+        const forward_fn = try findFunctionByName(temp_module, "main");
+        const func_type = forward_fn.getType().as(mlir.FunctionType) orelse return error.NotAFunctionType;
+
+        var introspected_shapes = std.ArrayList([]i64).init(allocator);
+        errdefer {
+            for (introspected_shapes.items) |s| allocator.free(s);
+            introspected_shapes.deinit();
+        }
+
+        // ASSUMPTION: The trainable parameters are the first N inputs to the function.
+        // The final inputs are the data batches (e.g., input_ids, targets).
+        // Let's assume for now that all but the last 2 inputs are trainable parameters.
+        const num_data_inputs = 2; // e.g., input_ids, targets
+        if (func_type.getNumInputs() <= num_data_inputs) {
+            return error.NotEnoughInputsInModel;
+        }
+        const num_params = func_type.getNumInputs() - num_data_inputs;
+
+        for (0..num_params) |i| {
+            const input_type = func_type.getInput(i);
+            const ranked_type = input_type.as(mlir.RankedTensorType) orelse return error.ParameterIsNotATensor;
+            const shape = try ranked_type.getShape(allocator);
+            try introspected_shapes.append(shape);
+        }
+        const parameter_shapes = try introspected_shapes.toOwnedSlice();
+        std.debug.print("✓ Introspection complete. Found {} trainable parameter tensors.\n", .{parameter_shapes.len});
+
+        // === END NEW SECTION ===
 
         // Configure and create Nesterov optimizer
         const nesterov_config = nesterov_mlir.NesterovMLIRConfiguration(f32){
@@ -96,9 +153,6 @@ pub const DiLoCo = struct {
 
         const nesterov_optimizer = try allocator.create(NesterovMLIR);
         nesterov_optimizer.* = try NesterovMLIR.init(allocator, mlir_builder, nesterov_config, element_type);
-
-        // Set up parameter shapes for GPT-2 model
-        const parameter_shapes = try getParameterShapes(allocator, config.gpt2_config);
 
         // Create a partial instance to build the worker graph
         var partial_self = Self{
@@ -179,12 +233,18 @@ pub const DiLoCo = struct {
     pub fn run(ptr: *anyopaque) !void {
         const self: *Self = @ptrCast(@alignCast(ptr));
 
-
         self.status = .initializing;
         monitoring.setStatus(.initializing);
-        
-        // Calculate total parameter count from GPT-2 config
-        const total_param_count = gpt2.countTotalParameters(self.config.gpt2_config);
+
+        // Calculate total parameter count from introspected shapes
+        var total_param_count: usize = 0;
+        for (self.parameter_shapes) |shape| {
+            var element_count: usize = 1;
+            for (shape) |dim| {
+                element_count *= @intCast(dim);
+            }
+            total_param_count += element_count;
+        }
         monitoring.setModelInfo(total_param_count, self.config.base_config.learning_rate);
 
         // Initialize master parameters
@@ -237,9 +297,8 @@ pub const DiLoCo = struct {
         monitoring.setStatus(.completed);
     }
 
-    /// Initialize master parameters using MLIR for GPT-2 model
+    /// Initialize master parameters using MLIR for the loaded model
     fn initializeMasterParameters(self: *Self) !void {
-        _ = gpt2.countTotalParameters(self.config.gpt2_config);
 
         // Allocate array for master parameter tensors
         const param_tensors = try self.allocator.alloc(Tensor, self.parameter_shapes.len);
@@ -248,13 +307,12 @@ pub const DiLoCo = struct {
         // Initialize each parameter tensor with appropriate shape
         for (param_tensors, 0..) |*param_tensor, i| {
             const shape = self.parameter_shapes[i];
-            
+
             // Calculate element count for this tensor
             var element_count: usize = 1;
             for (shape) |dim| {
                 element_count *= @intCast(dim);
             }
-
 
             // Create parameter data with Xavier initialization
             const param_data = try self.allocator.alloc(f32, element_count);
@@ -270,68 +328,6 @@ pub const DiLoCo = struct {
         }
 
         self.master_parameters = param_tensors;
-    }
-
-    /// Create a dedicated forward+loss function that will be differentiated
-    /// This is a well-formed func.func operation that autodiff can process
-    /// Now builds the complete GPT-2 training graph: forward pass + cross entropy loss
-    fn buildForwardAndLossFunction(self: *Self, builder: *ops.MLIRBuilder) !mlir.Operation {
-        const config = self.config.gpt2_config;
-        const f32_type = mlir.Type.f32Type(builder.ctx);
-        const i32_type = mlir.Type.i32Type(builder.ctx);
-
-        // Define batch and sequence sizes for training
-        const batch_size = 4;
-        const block_size = 8;
-
-        // 1. Create input types: all GPT-2 parameters + input_ids + targets
-        var func_input_types = ArrayList(mlir.Type).init(self.allocator);
-        defer func_input_types.deinit();
-
-        // Add types for all trainable parameters (same order as getParameterShapes)
-        for (self.parameter_shapes) |shape| {
-            try func_input_types.append(mlir.Type.rankedTensorType(builder.ctx, shape, f32_type));
-        }
-
-        // Add types for input data (x) and targets (y)
-        const data_shape = &[_]i64{ batch_size, block_size };
-        try func_input_types.append(mlir.Type.rankedTensorType(builder.ctx, data_shape, i32_type));
-        try func_input_types.append(mlir.Type.rankedTensorType(builder.ctx, data_shape, i32_type));
-
-        // Define the function's output types (just the scalar loss)
-        const scalar_f32_type = mlir.Type.rankedTensorType(builder.ctx, &.{}, f32_type);
-        const func_output_types = &[_]mlir.Type{scalar_f32_type};
-
-        const func_type = mlir.Type.functionType(builder.ctx, func_input_types.items, func_output_types);
-
-        // 2. Create the function and get its entry block
-        const result = try builder.createFunction("gpt2_forward_and_loss", func_type);
-        const func_op = result.func_op;
-        const entry_block = result.entry_block;
-
-        // 3. Set the insertion point to inside our new function
-        const original_insertion_block = builder.getInsertionBlock();
-        builder.setInsertionBlock(entry_block);
-        defer builder.setInsertionBlock(original_insertion_block);
-
-        // 4. Get all arguments (parameters, x, y)
-        var all_func_args = try entry_block.getArguments(self.allocator);
-        defer self.allocator.free(all_func_args);
-        var params_slice = all_func_args[0..self.parameter_shapes.len];
-        const x = try builder.newTensor(all_func_args[self.parameter_shapes.len]);
-        const y = try builder.newTensor(all_func_args[self.parameter_shapes.len + 1]);
-
-
-        // 5. Instantiate the GPT-2 model and build the graph
-        var model = try GPT2Model.init(self.allocator, config, builder, &params_slice);
-        defer model.deinit();
-        const outputs = try model.forwardWithLoss(x, y, builder);
-
-
-        // 6. Return the loss
-        _ = try builder.createAndAttach("func.return", &.{outputs.loss.value}, &.{}, .{});
-
-        return func_op;
     }
 
     /// Extract raw byte data from a tensor defined by a stablehlo.constant operation.
@@ -367,29 +363,25 @@ pub const DiLoCo = struct {
         const elem_count = t.shape.elemCount();
         const dtype_size = t.shape.dtype.sizeInBytes();
         const num_bytes = elem_count * dtype_size;
-        
+
         // Debug: Log extraction details
-        std.log.debug("Extracting tensor data: elements={}, dtype_size={}, total_bytes={}", .{
-            elem_count, dtype_size, num_bytes
-        });
-        
+        std.log.debug("Extracting tensor data: elements={}, dtype_size={}, total_bytes={}", .{ elem_count, dtype_size, num_bytes });
+
         // Sanity check - if num_bytes is gigantic, there's a bug in the calculation
         if (num_bytes > 100 * 1024 * 1024) { // 100MB per tensor is way too large
-            std.log.err("Tensor size calculation error: {} bytes (elements={}, dtype_size={})", .{
-                num_bytes, elem_count, dtype_size
-            });
+            std.log.err("Tensor size calculation error: {} bytes (elements={}, dtype_size={})", .{ num_bytes, elem_count, dtype_size });
             return error.TensorSizeCalculationError;
         }
-        
+
         // Check if raw data pointer is valid
         if (@intFromPtr(raw_data_ptr) == 0) {
             std.log.err("MLIR returned null pointer for tensor raw data", .{});
             return error.InvalidRawDataPointer;
         }
-        
+
         const data_slice: [*]const u8 = @ptrCast(raw_data_ptr);
         const result = self.allocator.dupe(u8, data_slice[0..num_bytes]);
-        
+
         // Debug: Check for patterns in the extracted data
         if (num_bytes > 0) {
             const sample_size = @min(16, num_bytes);
@@ -400,179 +392,141 @@ pub const DiLoCo = struct {
         return result;
     }
 
-    /// Build the complete worker training graph as MLIR module using Function-as-a-Unit pattern
-    /// This creates: forward_fn -> autodiff -> main_fn that orchestrates the full training step
+    /// Build the complete worker training graph as MLIR module using loaded .mlir file
+    /// This loads a .mlir file, clones the forward function, and creates the complete training pipeline
     fn buildWorkerTrainingGraph(self: *Self, builder: *MLIRBuilder) ![]u8 {
+        // === PHASE 1: LOAD AND PARSE THE FORWARD PASS MODULE ===
+        std.debug.print("Loading and parsing forward pass from {s}...\n", .{self.config.model_mlir_path});
 
-        // === Part 1: Create the forward+loss function to be differentiated ===
-        const forward_fn_op = try self.buildForwardAndLossFunction(builder);
-        // NOTE: Function is already automatically attached to module by createFunction
+        // 1. Read the .mlir file from disk using the path from config
+        const forward_pass_mlir_source = try std.fs.cwd().readFileAlloc(self.allocator, self.config.model_mlir_path, // Use the config path
+            10 * 1024 * 1024 // 10MB limit
+        );
+        defer self.allocator.free(forward_pass_mlir_source);
 
-        // === Part 2: Differentiate the forward function ===
-        
-        // Verify function structure before calling autodiff
-        const func_region = forward_fn_op.getRegion(0);
-        const func_block = func_region.getBlock(0);
-        
-        const maybe_terminator = func_block.getLastOp();
-        const maybe_last_op = func_block.getLastOpGeneric();
-        if (maybe_terminator == null or maybe_last_op == null) {
-            return error.MalformedFunction;
-        }
-        
-        // The autodiff function will add its own generated function to the module.
-        _ = try autodiff.buildGradientGraph(self.allocator, builder, forward_fn_op);
+        // 2. Parse the text file into a *temporary* MLIR module object.
+        //    We use the builder's context to ensure compatibility.
+        const forward_pass_module = try mlir.Module.parse(builder.ctx, forward_pass_mlir_source);
+        defer forward_pass_module.deinit();
 
-        // The autodiff system will name the gradient function predictably
-        // Updated for GPT-2 function name
-        const grad_fn_name = "gpt2_forward_and_loss_grad";
+        std.debug.print("✓ Forward pass MLIR parsed successfully.\n", .{});
 
-        // === Part 3: Create the main worker function that orchestrates everything ===
+        // === PHASE 2: CLONE FORWARD PASS INTO OUR MAIN MODULE ===
 
-        // Define types for main function - now with all GPT-2 parameters
-        const f32_type = mlir.Type.f32Type(builder.ctx);
-        const i32_type = mlir.Type.i32Type(builder.ctx);
-        const loss_type = mlir.Type.rankedTensorType(builder.ctx, &.{}, f32_type);
-        const data_shape = &[_]i64{ 4, 8 }; // batch=4, seq_len=8 for nano config
-        const data_type = mlir.Type.rankedTensorType(builder.ctx, data_shape, i32_type);
+        // 3. Find the main forward function in the parsed module.
+        const forward_fn_to_clone = try findFunctionByName(forward_pass_module, "main");
 
-        // Create input types: all GPT-2 parameters + inputs + targets
-        var main_input_types = ArrayList(mlir.Type).init(self.allocator);
+        // 4. Clone the function into our builder's module. This makes it available for our graph.
+        const c = @import("../mlir/c.zig").c;
+        const cloned_forward_fn = mlir.Operation{ .handle = c.operationClone(forward_fn_to_clone.handle) };
+
+        // 5. IMPORTANT: Change the name to avoid conflicts (e.g., with our future 'main' orchestrator)
+        const new_fn_name = "model_forward_pass";
+        const new_name_attr = mlir.Attribute.stringAttr(builder.ctx, new_fn_name);
+        c.operationSetAttributeByName(cloned_forward_fn.handle, "sym_name", new_name_attr.handle);
+
+        // 6. Add the cloned function to our main module.
+        builder.module_body.appendOwnedOperation(cloned_forward_fn);
+
+        std.debug.print("✓ Cloned forward function into main module as '{s}'.\n", .{new_fn_name});
+
+        // === PHASE 3: APPLY AUTODIFF AND BUILD THE ORCHESTRATOR ===
+        std.debug.print("Building gradient graph from the cloned forward function...\n", .{});
+
+        const grad_fn_op = try autodiff.buildGradientGraph(self.allocator, builder, cloned_forward_fn);
+        const grad_fn_name = "model_forward_pass_grad"; // Name given by autodiff
+
+        // === PHASE 4: CREATE THE MAIN ORCHESTRATOR FUNCTION ===
+        std.debug.print("Building the 'main' orchestrator function...\n", .{});
+
+        // 4.1: INTROSPECT the forward function to define our main function's signature
+        const forward_fn_type = cloned_forward_fn.getType().as(mlir.FunctionType) orelse return error.NotAFunctionType;
+        const num_forward_inputs = forward_fn_type.getNumInputs();
+
+        var main_input_types = std.ArrayList(mlir.Type).init(self.allocator);
         defer main_input_types.deinit();
-        
-        // Add all parameter types
-        for (self.parameter_shapes) |shape| {
-            try main_input_types.append(mlir.Type.rankedTensorType(builder.ctx, shape, f32_type));
+
+        // Main inputs = all inputs of the forward function (params, data, etc.)
+        for (0..num_forward_inputs) |i| {
+            try main_input_types.append(forward_fn_type.getInput(i));
         }
-        // Add input data and targets
-        try main_input_types.append(data_type);
-        try main_input_types.append(data_type);
 
-        // Create output types: all updated parameters + loss
-        var main_result_types = ArrayList(mlir.Type).init(self.allocator);
-        defer main_result_types.deinit();
-        
-        // Add all parameter types (updated parameters)
-        for (self.parameter_shapes) |shape| {
-            try main_result_types.append(mlir.Type.rankedTensorType(builder.ctx, shape, f32_type));
+        // Main outputs = all gradients of the forward function's inputs + the final loss
+        const grad_fn_type = grad_fn_op.getType().as(mlir.FunctionType) orelse return error.NotAFunctionType;
+        var main_output_types = std.ArrayList(mlir.Type).init(self.allocator);
+        defer main_output_types.deinit();
+
+        // Add gradient types for each of the forward function's inputs
+        for (0..(grad_fn_type.getNumResults())) |i| {
+            try main_output_types.append(grad_fn_type.getResult(i));
         }
-        // Add loss
-        try main_result_types.append(loss_type);
+        // Add the loss type (the single output of the forward function)
+        try main_output_types.append(forward_fn_type.getResult(0));
 
-        const main_func_type = mlir.Type.functionType(builder.ctx, main_input_types.items, main_result_types.items);
+        const main_func_type = mlir.Type.functionType(builder.ctx, main_input_types.items, main_output_types.items);
 
-        // --- REFACTORED MAIN FUNCTION CREATION ---
-        // Use the safe helper to create the main function
+        // 4.2: Create the 'main' function
         const main_result = try builder.createFunction("main", main_func_type);
         const main_block = main_result.entry_block;
+        builder.setInsertionBlock(main_block); // Set insertion point to 'main'
 
-        // NOTE: Function is already automatically attached to module by createFunction
-
-        // CRITICAL: Set the insertion point to the main function's body.
-        const original_insertion_block = builder.getInsertionBlock();
-        builder.setInsertionBlock(main_block);
-        defer builder.setInsertionBlock(original_insertion_block);
-
-        // Get main function arguments (all GPT-2 parameters + inputs + targets)
-        var main_func_args = try main_block.getArguments(self.allocator);
+        // 4.3: Get all arguments for 'main'
+        const main_func_args = try main_block.getArguments(self.allocator);
         defer self.allocator.free(main_func_args);
-        
-        const param_count = self.parameter_shapes.len;
-        const initial_params = main_func_args[0..param_count];
-        const inputs = main_func_args[param_count];
-        const targets = main_func_args[param_count + 1];
-        // --- END REFACTORED MAIN FUNCTION CREATION ---
 
-        // Build forward call operands: all parameters + inputs + targets
-        var forward_operands = ArrayList(mlir.Value).init(self.allocator);
-        defer forward_operands.deinit();
-        
-        for (initial_params) |param| {
-            try forward_operands.append(param);
-        }
-        try forward_operands.append(inputs);
-        try forward_operands.append(targets);
-
-        // Call the forward function to get the loss
-        const forward_callee_str = try std.fmt.allocPrint(self.allocator, "@\"{s}\"", .{"gpt2_forward_and_loss"});
-        defer self.allocator.free(forward_callee_str);
-        const forward_callee_attr = try mlir.Attribute.fromParseString(builder.ctx, forward_callee_str);
-
-        const forward_call_op = try builder.createAndAttach("func.call", forward_operands.items, &.{loss_type}, .{
-            .attributes = &.{
-                .{ "callee", forward_callee_attr },
-            },
+        // 4.4: Call the forward function to get the loss
+        const forward_callee_attr = mlir.Attribute.symbolRefAttr(builder.ctx, new_fn_name);
+        const forward_call_op = try builder.createAndAttach("func.call", main_func_args, &.{forward_fn_type.getResult(0)}, .{
+            .attributes = &.{.{ "callee", forward_callee_attr }},
         });
         const loss_val = forward_call_op.getResult(0);
 
-        // Call the gradient function to get gradients
-        const one = try ops.constant(builder, 1.0, &.{}, f32_type); // Scalar 1.0 for loss gradient seed
-        
-        // Build gradient call operands: all parameters + inputs + targets + loss_grad
-        var grad_operands = ArrayList(mlir.Value).init(self.allocator);
+        // 4.5: Call the gradient function to get gradients
+        var grad_operands = std.ArrayList(mlir.Value).init(self.allocator);
         defer grad_operands.deinit();
-        
-        for (initial_params) |param| {
-            try grad_operands.append(param);
-        }
-        try grad_operands.append(inputs);
-        try grad_operands.append(targets);
+
+        // Grad func inputs = forward func inputs + gradient of the output (loss)
+        try grad_operands.appendSlice(main_func_args);
+        const one = try ops.constant(builder, 1.0, &.{}, loss_val.getType().as(mlir.RankedTensorType).?.getElementType());
         try grad_operands.append(one.value);
 
-        // Build gradient result types: gradients for all parameters + data + targets
-        var grad_result_types = ArrayList(mlir.Type).init(self.allocator);
+        // Prepare grad function result types
+        var grad_result_types = std.ArrayList(mlir.Type).init(self.allocator);
         defer grad_result_types.deinit();
-        
-        for (self.parameter_shapes) |shape| {
-            try grad_result_types.append(mlir.Type.rankedTensorType(builder.ctx, shape, f32_type));
+        for (0..grad_fn_type.getNumResults()) |i| {
+            try grad_result_types.append(grad_fn_type.getResult(i));
         }
-        try grad_result_types.append(data_type); // input gradients
-        try grad_result_types.append(data_type); // target gradients
 
-        const grad_callee_str = try std.fmt.allocPrint(self.allocator, "@\"{s}\"", .{grad_fn_name});
-        defer self.allocator.free(grad_callee_str);
-        const grad_callee_attr = try mlir.Attribute.fromParseString(builder.ctx, grad_callee_str);
-
+        const grad_callee_attr = mlir.Attribute.symbolRefAttr(builder.ctx, grad_fn_name);
         const grad_call_op = try builder.createAndAttach("func.call", grad_operands.items, grad_result_types.items, .{
-            .attributes = &.{
-                .{ "callee", grad_callee_attr },
-            },
+            .attributes = &.{.{ "callee", grad_callee_attr }},
         });
 
-        // Apply gradient descent update to each parameter
-        var updated_param_values = ArrayList(mlir.Value).init(self.allocator);
-        defer updated_param_values.deinit();
-        
-        const learning_rate_scalar = try ops.constant(builder, 0.01, &.{}, f32_type);
-        
-        for (initial_params, 0..) |param, i| {
-            const param_grad = grad_call_op.getResult(i);
-            
-            // Broadcast learning rate to parameter shape if needed
-            const param_tensor = try builder.newTensor(param);
-            const grad_tensor = try builder.newTensor(param_grad);
-            
-            // Scale gradient: lr * grad
-            const grad_scaled = try ops.multiply(builder, grad_tensor, learning_rate_scalar);
-            
-            // Update parameter: param - lr * grad
-            const updated_param = try ops.subtract(builder, param_tensor, grad_scaled);
-            try updated_param_values.append(updated_param.value);
+        // 4.6: Return all gradients and the loss from 'main'
+        var final_return_values = std.ArrayList(mlir.Value).init(self.allocator);
+        defer final_return_values.deinit();
+
+        // Add all results from the grad call
+        for (0..grad_call_op.getNumResults()) |i| {
+            try final_return_values.append(grad_call_op.getResult(i));
         }
+        // Add the loss
+        try final_return_values.append(loss_val);
 
-        // Add loss to return values
-        try updated_param_values.append(loss_val);
+        _ = try builder.createAndAttach("func.return", final_return_values.items, &.{}, .{});
 
-        // Return all updated parameters + loss from main function
-        _ = try builder.createAndAttach("func.return", updated_param_values.items, &.{}, .{});
+        // === PHASE 5: FINALIZE AND SERIALIZE ===
+        std.debug.print("✓ Final worker graph constructed successfully.\n", .{});
 
-        // === Part 4: Debug and serialize the complete module ===
+        // VERIFY the final module before serializing. This is a critical debugging step.
+        if (!builder.module.op().verify()) {
+            std.log.err("FINAL MODULE VERIFICATION FAILED. Dumping module:", .{});
+            builder.module.op().dump();
+            return error.ModuleVerificationFailed;
+        }
+        std.log.info("✓ Final module verification successful!", .{});
 
-        // Module built successfully
-
-        const serialized = try @import("../mlir_ctx.zig").serializeMLIRModule(self.allocator, builder.module);
-
-        return serialized;
+        return try @import("../mlir_ctx.zig").serializeMLIRModule(self.allocator, builder.module);
     }
 
     /// Broadcasts the pre-built training graph to all workers for initialization
@@ -601,11 +555,11 @@ pub const DiLoCo = struct {
         }
 
         const param_tensors = self.master_parameters.?;
-        
+
         // Extract and concatenate all parameter tensor data
         var total_param_bytes = ArrayList(u8).init(self.allocator);
         defer total_param_bytes.deinit();
-        
+
         for (param_tensors) |param_tensor| {
             const tensor_data = try self.extractTensorData(param_tensor);
             defer self.allocator.free(tensor_data);
@@ -631,7 +585,6 @@ pub const DiLoCo = struct {
 
         // Broadcast StartInnerLoop message with Cap'n Proto
         try self.coordinator.broadcastToWorkers(MessageType.START_INNER_LOOP, json_payload);
-
     }
 
     /// Broadcast master parameters and data batch to all workers using Cap'n Proto
@@ -641,22 +594,21 @@ pub const DiLoCo = struct {
         }
 
         const param_tensors = self.master_parameters.?;
-        
+
         // Extract and concatenate all parameter tensor data
         var total_param_bytes = ArrayList(u8).init(self.allocator);
         defer total_param_bytes.deinit();
-        
+
         for (param_tensors) |param_tensor| {
             const tensor_data = try self.extractTensorData(param_tensor);
             defer self.allocator.free(tensor_data);
             try total_param_bytes.appendSlice(tensor_data);
         }
 
-
         // Serialize batch data as raw bytes (u32 tokens -> bytes)
         const input_ids_bytes = std.mem.sliceAsBytes(batch.x);
         const targets_bytes = std.mem.sliceAsBytes(batch.y);
-        
+
         // VALIDATION: Check that we have valid data before serialization
         if (total_param_bytes.items.len == 0) {
             std.log.err("Empty parameters detected in broadcastMasterParametersAndBatch", .{});
@@ -670,10 +622,8 @@ pub const DiLoCo = struct {
             std.log.err("Empty targets detected in broadcastMasterParametersAndBatch", .{});
             return error.EmptyTargets;
         }
-        
-        std.log.info("Broadcasting params: {} bytes, input_ids: {} bytes, targets: {} bytes", .{
-            total_param_bytes.items.len, input_ids_bytes.len, targets_bytes.len
-        });
+
+        std.log.info("Broadcasting params: {} bytes, input_ids: {} bytes, targets: {} bytes", .{ total_param_bytes.items.len, input_ids_bytes.len, targets_bytes.len });
 
         // Create WorkerPayload with parameters and batch data
         const worker_payload = binary_protocol.WorkerPayload{
@@ -681,27 +631,24 @@ pub const DiLoCo = struct {
             .input_ids = input_ids_bytes,
             .targets = targets_bytes,
         };
-        
+
         const capnp_bytes = try worker_payload.serialize(self.allocator);
         defer self.allocator.free(capnp_bytes);
-        
+
         // Debug: Check Cap'n Proto serialization output
         std.log.info("Cap'n Proto serialized to {} bytes", .{capnp_bytes.len});
         if (capnp_bytes.len > 0) {
             const sample_size = @min(32, capnp_bytes.len);
             std.log.info("Cap'n Proto first {} bytes: {any}", .{ sample_size, capnp_bytes[0..sample_size] });
-            
+
             // Check if data is mostly zeros (which would become 'A's in Base64)
             var zero_count: usize = 0;
             const check_size = @min(1024, capnp_bytes.len);
             for (capnp_bytes[0..check_size]) |byte| {
                 if (byte == 0) zero_count += 1;
             }
-            std.log.info("Cap'n Proto zero density: {}/{} ({d:.1}%)", .{
-                zero_count, check_size, (@as(f32, @floatFromInt(zero_count)) / @as(f32, @floatFromInt(check_size))) * 100.0
-            });
+            std.log.info("Cap'n Proto zero density: {}/{} ({d:.1}%)", .{ zero_count, check_size, (@as(f32, @floatFromInt(zero_count)) / @as(f32, @floatFromInt(check_size))) * 100.0 });
         }
-        
 
         // Base64 encode the binary data
         const b64_len = std.base64.standard.Encoder.calcSize(capnp_bytes.len);
@@ -709,14 +656,12 @@ pub const DiLoCo = struct {
         defer self.allocator.free(b64_encoded_payload);
 
         const encoded_len = std.base64.standard.Encoder.encode(b64_encoded_payload, capnp_bytes).len;
-        
 
         // Create JSON payload with Base64-encoded binary data
         const json_payload = std.json.Value{ .string = b64_encoded_payload[0..encoded_len] };
 
         // Broadcast StartInnerLoop message with Cap'n Proto
         try self.coordinator.broadcastToWorkers(MessageType.START_INNER_LOOP, json_payload);
-
     }
 
     /// Collect results from workers after inner loop using Cap'n Proto
@@ -767,29 +712,28 @@ pub const DiLoCo = struct {
             return error.NoWorkerResults;
         }
 
-
         const param_tensors = self.master_parameters.?;
 
         // Split averaged worker parameters back into individual tensors and update each
         const averaged_params_bytes = try self.averageWorkerParameterBytes(worker_results);
         defer self.allocator.free(averaged_params_bytes);
-        
+
         // Convert concatenated bytes back to individual parameter tensors
         var byte_offset: usize = 0;
         for (param_tensors, 0..) |*param_tensor, i| {
             const shape = self.parameter_shapes[i];
-            
+
             // Calculate size for this parameter tensor
             var element_count: usize = 1;
             for (shape) |dim| {
                 element_count *= @intCast(dim);
             }
             const tensor_bytes = element_count * @sizeOf(f32);
-            
+
             // Extract this tensor's data
-            const tensor_data_bytes = averaged_params_bytes[byte_offset..byte_offset + tensor_bytes];
+            const tensor_data_bytes = averaged_params_bytes[byte_offset .. byte_offset + tensor_bytes];
             const param_slice: []const f32 = @alignCast(std.mem.bytesAsSlice(f32, tensor_data_bytes));
-            
+
             // Create averaged tensor for this parameter
             const averaged_tensor = try self.createTensorFromArrayWithShape(param_slice, shape);
             defer averaged_tensor.deinit();
@@ -804,7 +748,7 @@ pub const DiLoCo = struct {
             // Replace this parameter with updated one
             param_tensor.deinit();
             param_tensor.* = updated_param;
-            
+
             byte_offset += tensor_bytes;
         }
 
@@ -816,8 +760,15 @@ pub const DiLoCo = struct {
 
     /// Average parameters from all workers (new byte-based version)
     fn averageWorkerParameterBytes(self: *Self, worker_results: ArrayList(WorkerResult)) ![]u8 {
-        // Calculate total parameter count from GPT-2 config
-        const total_param_count = gpt2.countTotalParameters(self.config.gpt2_config);
+        // Calculate total parameter count from introspected shapes
+        var total_param_count: usize = 0;
+        for (self.parameter_shapes) |shape| {
+            var element_count: usize = 1;
+            for (shape) |dim| {
+                element_count *= @intCast(dim);
+            }
+            total_param_count += element_count;
+        }
         const averaged = try self.allocator.alloc(f32, total_param_count);
         defer self.allocator.free(averaged);
 
@@ -873,48 +824,6 @@ pub const DiLoCo = struct {
         return try self.mlir_builder.newTensor(value);
     }
 
-    /// Create MLIR tensor from parameter array (legacy method, kept for compatibility)
-    fn createTensorFromArray(self: *Self, array: []const f32) !Tensor {
-        if (self.parameter_shapes.len == 0) return error.NoParameterShapes;
-        return self.createTensorFromArrayWithShape(array, self.parameter_shapes[0]);
-    }
-
-
-    /// Serialize parameters to string
-    fn serializeParameters(self: *Self, params: []const f32) ![]u8 {
-        var buffer = ArrayList(u8).init(self.allocator);
-        defer buffer.deinit();
-
-        // Simple binary serialization
-        try buffer.appendSlice(std.mem.asBytes(&params.len));
-        for (params) |param| {
-            try buffer.appendSlice(std.mem.asBytes(&param));
-        }
-
-        return try self.allocator.dupe(u8, buffer.items);
-    }
-
-    /// Deserialize parameters from string
-    fn deserializeParameters(self: *Self, data: []const u8) ![]f32 {
-        if (data.len < @sizeOf(usize)) {
-            return error.InvalidData;
-        }
-
-        const param_count = std.mem.readInt(usize, data[0..@sizeOf(usize)], .little);
-        const params = try self.allocator.alloc(f32, param_count);
-
-        var offset: usize = @sizeOf(usize);
-        for (params) |*param| {
-            if (offset + @sizeOf(f32) > data.len) {
-                return error.InvalidData;
-            }
-            param.* = @bitCast(std.mem.readInt(u32, data[offset .. offset + @sizeOf(f32)][0..4], .little));
-            offset += @sizeOf(f32);
-        }
-
-        return params;
-    }
-
     /// Clean up worker results
     fn cleanupWorkerResults(self: *Self, worker_results: ArrayList(WorkerResult)) void {
         for (worker_results.items) |result| {
@@ -960,27 +869,3 @@ const WorkerResult = struct {
     loss: f32,
     steps_completed: usize,
 };
-
-/// Test function for DiLoCo algorithm
-pub fn testDiLoCo(allocator: Allocator) !void {
-    std.log.info("Testing DiLoCo algorithm with MLIR optimizers...");
-
-    // Create a mock coordinator
-    var mock_coordinator = shepherd.Shepherd.init(allocator);
-    defer mock_coordinator.deinit();
-
-    // Create DiLoCo algorithm
-    const config = DiLoCoConfig.default();
-    var diloco = try DiLoCo.init(allocator, &mock_coordinator, config);
-    defer diloco.deinit();
-
-    // Test initialization
-    try std.testing.expectEqual(TrainingStatus.not_started, diloco.status);
-    try std.testing.expectEqual(@as(usize, 0), diloco.current_epoch);
-    
-    // Test GPT-2 configuration
-    _ = gpt2.countTotalParameters(config.gpt2_config);
-    _ = diloco.parameter_shapes.len;
-
-    std.log.info("✓ DiLoCo MLIR algorithm test completed");
-}

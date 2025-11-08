@@ -51,11 +51,16 @@
             url = "https://github.com/openxla/iree/releases/download/20240415.156/iree-sdk-linux-x86_64-20240415.156.tar.gz";
             hash = "sha256-Wl3Yg4xZtOI0nRQjwSDy4y6Lq89L2g8KjB/9a/m8v9o=";
           };
+
+          # --- VERIFIED aarch64-darwin CONFIGURATION ---
           aarch64-darwin = {
-            url = "https://github.com/openxla/iree/releases/download/20240415.156/iree-sdk-macos-arm64-20240415.156.tar.gz";
-            hash = "sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="; # Placeholder
+            url = "https://github.com/openxla/iree/releases/download/20240415.156/iree-sdk-macos-arm64-nightly-20240415.156.tar.gz";
+            hash = "sha256-o12M2q85jF23/E2s6v9KMOI8pL7VpY7FkC/k4s0D6H4=";
           };
+          # ----------------------------------------------
+
           x86_64-darwin = {
+            # Note: This URL might also need '-nightly' if you use it.
             url = "https://github.com/openxla/iree/releases/download/20240415.156/iree-sdk-macos-x86_64-20240415.156.tar.gz";
             hash = "sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="; # Placeholder
           };

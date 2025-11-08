@@ -15,6 +15,7 @@ const tensor = @import("../tensor.zig");
 const execution = @import("../execution.zig");
 const monitoring = @import("../monitoring.zig");
 const data_loader = @import("../data_loader.zig");
+const backend_selection = @import("../backend_selection.zig");
 
 const TrainingAlgorithm = training_algorithm.TrainingAlgorithm;
 const TrainingStatus = training_algorithm.TrainingStatus;
@@ -69,8 +70,8 @@ pub const DiLoCo = struct {
     // NEW: Generic executor - replaces direct backend knowledge
     executor: Executor,
 
-    // NEW: Cached serialized worker graph for one-time initialization
-    serialized_worker_graph: []u8,
+    // NEW: MLIR source for on-demand compilation
+    worker_graph_mlir_source: []u8,
 
     // Data loading for real training batches
     data_loader: *DataLoader,
@@ -168,7 +169,7 @@ pub const DiLoCo = struct {
             .master_parameters = null,
             .parameter_shapes = parameter_shapes,
             .executor = executor,
-            .serialized_worker_graph = undefined, // Will be set below
+            .worker_graph_mlir_source = undefined, // Will be set below
             .data_loader = dataset,
         };
 
@@ -188,7 +189,7 @@ pub const DiLoCo = struct {
             .master_parameters = null,
             .parameter_shapes = parameter_shapes,
             .executor = executor, // Store the generic executor
-            .serialized_worker_graph = graph, // Store the pre-built graph
+            .worker_graph_mlir_source = graph, // Store the MLIR source
             .data_loader = dataset,
         };
     }
@@ -206,8 +207,8 @@ pub const DiLoCo = struct {
 
         // We no longer deinit the builder, as we don't own it.
 
-        // Free the stored serialized graph
-        self.allocator.free(self.serialized_worker_graph);
+        // Free the stored MLIR source
+        self.allocator.free(self.worker_graph_mlir_source);
 
         // Free parameter shapes
         for (self.parameter_shapes) |shape| {
@@ -250,8 +251,62 @@ pub const DiLoCo = struct {
         // Initialize master parameters
         try self.initializeMasterParameters();
 
-        // PHASE 0: SETUP WORKERS (ONE-TIME)
-        try self.setupWorkers();
+        // --- NEW COMPILE & DISTRIBUTE LOGIC ---
+        // This happens AFTER workers have connected but BEFORE training starts.
+
+        // 1. Wait for workers to connect (this logic is in Shepherd.startTraining,
+        //    which calls this run() function. So by the time we are here, workers are present.)
+        
+        // 2. Identify unique backends in the connected worker pool
+        var backend_set = std.AutoHashMap(backend_selection.Backend, void).init(self.allocator);
+        defer backend_set.deinit();
+
+        for (self.coordinator.worker_pool.items) |worker| {
+            try backend_set.put(worker.backend, {});
+        }
+
+        // 3. Compile the MLIR source once for EACH unique backend
+        var compiled_artifacts = std.AutoHashMap(backend_selection.Backend, []const u8).init(self.allocator);
+        defer {
+            var it = compiled_artifacts.iterator();
+            while (it.next()) |entry| self.allocator.free(entry.value_ptr.*);
+            compiled_artifacts.deinit();
+        }
+        
+        var temp_mlir_ctx = try @import("../mlir_ctx.zig").MLIRContext.init(self.allocator);
+        defer temp_mlir_ctx.deinit();
+
+        var backend_it = backend_set.keyIterator();
+        while (backend_it.next()) |backend_ptr| {
+            const backend = backend_ptr.*;
+            std.log.info("Compiling worker graph for backend: {s}", .{backend.toString()});
+
+            const vmfb_bytes = try temp_mlir_ctx.compileToVMFB(
+                self.allocator,
+                self.worker_graph_mlir_source,
+                backend.toString(),
+            );
+            try compiled_artifacts.put(backend, vmfb_bytes);
+        }
+        
+        // 4. Distribute the correct compiled artifact to each worker (replaces setupWorkers)
+        std.log.info("Distributing compiled artifacts to workers...", .{});
+        for (self.coordinator.worker_pool.items) |worker| {
+            const vmfb_bytes = compiled_artifacts.get(worker.backend).?;
+
+            const b64_len = std.base64.standard.Encoder.calcSize(vmfb_bytes.len);
+            const b64_encoded_vmfb = try self.allocator.alloc(u8, b64_len);
+            defer self.allocator.free(b64_encoded_vmfb);
+
+            const encoded_len = std.base64.standard.Encoder.encode(b64_encoded_vmfb, vmfb_bytes).len;
+            const json_payload = std.json.Value{ .string = b64_encoded_vmfb[0..encoded_len] };
+
+            // Send a TARGETED message to this specific worker
+            try self.coordinator.sendToWorker(worker.node_id, MessageType.INITIALIZE_GRAPH, json_payload);
+        }
+        
+        // The old setupWorkers() is now fully replaced. We can delete it.
+        // --- END NEW LOGIC ---
 
         self.status = .running;
         monitoring.setStatus(.running);
@@ -529,24 +584,6 @@ pub const DiLoCo = struct {
         return try @import("../mlir_ctx.zig").serializeMLIRModule(self.allocator, builder.module);
     }
 
-    /// Broadcasts the pre-built training graph to all workers for initialization
-    fn setupWorkers(self: *Self) !void {
-
-        // Base64 encode the serialized graph for safe JSON transport
-        const b64_len = std.base64.standard.Encoder.calcSize(self.serialized_worker_graph.len);
-        const b64_encoded_graph = try self.allocator.alloc(u8, b64_len);
-        defer self.allocator.free(b64_encoded_graph);
-
-        const encoded_len = std.base64.standard.Encoder.encode(b64_encoded_graph, self.serialized_worker_graph).len;
-
-        // Create JSON payload with the Base64-encoded string
-        const json_payload = std.json.Value{ .string = b64_encoded_graph[0..encoded_len] };
-
-        // Broadcast InitializeGraph message with the encoded graph
-        try self.coordinator.broadcastToWorkers(MessageType.INITIALIZE_GRAPH, json_payload);
-
-        std.log.info("Training graph sent to {} workers", .{self.coordinator.getWorkerCount()});
-    }
 
     /// Broadcast master parameters to all workers using Cap'n Proto
     fn broadcastMasterParameters(self: *Self) !void {

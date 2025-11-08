@@ -10,6 +10,7 @@ const message = @import("../network/message.zig");
 const training_algorithm = @import("../algorithms/training_algorithm.zig");
 const execution = @import("../execution.zig");
 const monitoring = @import("../monitoring.zig");
+const backend_selection = @import("../backend_selection.zig");
 
 const TcpServer = tcp_stream.TcpServer;
 const TcpStreamManager = tcp_stream.TcpStreamManager;
@@ -23,14 +24,16 @@ pub const WorkerConnection = struct {
     node_id: NodeId,
     stream: net.Stream,
     last_heartbeat: i64, // timestamp
+    backend: backend_selection.Backend, // NEW FIELD
     
     const Self = @This();
     
-    pub fn init(node_id: NodeId, stream: net.Stream) Self {
+    pub fn init(node_id: NodeId, stream: net.Stream, backend: backend_selection.Backend) Self {
         return Self{
             .node_id = node_id,
             .stream = stream,
             .last_heartbeat = std.time.timestamp(),
+            .backend = backend,
         };
     }
     
@@ -132,13 +135,24 @@ pub const Shepherd = struct {
             std.log.err("Expected JoinRequest, got: {s}", .{join_msg.msg_type});
             return;
         }
+
+        // NEW: Parse the backend from the join request's data payload
+        const data_obj = join_msg.data.object;
+        const backend_str = data_obj.get("backend").?.string;
+        
+        const worker_backend = if (std.mem.eql(u8, backend_str, "cuda")) backend_selection.Backend.cuda
+            else if (std.mem.eql(u8, backend_str, "rocm")) backend_selection.Backend.rocm
+            else if (std.mem.eql(u8, backend_str, "metal")) backend_selection.Backend.metal
+            else .cpu; // Default to cpu
+
+        std.log.info("Worker connecting with backend: {s}", .{worker_backend.toString()});
         
         // Assign new NodeId
         const assigned_node_id = self.next_node_id;
         self.next_node_id += 1;
         
-        // Add worker to pool
-        const worker = WorkerConnection.init(assigned_node_id, stream);
+        // Add worker to pool, now including its backend
+        const worker = WorkerConnection.init(assigned_node_id, stream, worker_backend);
         try self.worker_pool.append(worker);
         
         // Update monitoring
@@ -291,6 +305,27 @@ pub const Shepherd = struct {
             msg_id += 1;
         }
         
+    }
+
+    /// Send a message to a specific worker by its NodeId
+    pub fn sendToWorker(self: *Self, node_id: NodeId, msg_type: []const u8, data: std.json.Value) !void {
+        for (self.worker_pool.items) |worker| {
+            if (worker.node_id == node_id) {
+                const msg = tcp_stream.createMessage(
+                    0, "shepherd",
+                    worker.node_id, "worker",
+                    msg_type,
+                    1, // message id can be improved later
+                    data,
+                );
+                
+                TcpStreamManager.send(worker.stream, msg, self.allocator) catch |err| {
+                    std.log.err("Failed to send message to worker {}: {}", .{ worker.node_id, err });
+                };
+                return;
+            }
+        }
+        return error.WorkerNotFound;
     }
     
     /// Collect responses from all workers

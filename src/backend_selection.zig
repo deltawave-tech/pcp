@@ -41,6 +41,16 @@ pub const Backend = enum {
             else => .cpu,
         };
     }
+
+    /// Convert backend to string representation
+    pub fn toString(self: Backend) []const u8 {
+        return switch (self) {
+            .metal => "metal",
+            .cuda => "cuda",
+            .cpu => "cpu", 
+            .demo => "demo",
+        };
+    }
 };
 
 /// Create an Executor for the specified backend

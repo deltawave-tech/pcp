@@ -10,6 +10,7 @@ const binary_protocol = @import("network/capnp_zig_wrapper.zig");
 const worker_backend = @import("backends/worker_backend.zig");
 const mlir = @import("mlir.zig");
 const mlir_ctx = @import("mlir_ctx.zig");
+const backend_selection = @import("backend_selection.zig");
 
 const TcpClient = tcp_stream.TcpClient;
 const TcpStreamManager = tcp_stream.TcpStreamManager;
@@ -97,7 +98,15 @@ pub const Worker = struct {
         try self.client.connect(master_host, master_port);
         std.log.info("Connected to Shepherd at {s}:{}", .{ master_host, master_port });
         
-        // Send JoinRequest
+        // NEW: Determine our backend type at compile time
+        const my_backend = backend_selection.Backend.selectDefault();
+
+        // NEW: Create a JSON object for the payload
+        var payload_map = std.json.ObjectMap.init(self.allocator);
+        try payload_map.put("backend", std.json.Value{ .string = my_backend.toString() });
+        const payload = std.json.Value{ .object = payload_map };
+
+        // Send JoinRequest with the backend information in the payload
         const join_request = tcp_stream.createMessage(
             0, // temporary node_id, will be assigned by shepherd
             "worker", // our service name
@@ -105,7 +114,7 @@ pub const Worker = struct {
             "shepherd", // shepherd service
             MessageType.JOIN_REQUEST,
             1, // message id
-            std.json.Value{ .object = std.json.ObjectMap.init(self.allocator) }, // Empty object
+            payload, // Use the new payload
         );
         
         try self.client.send(join_request);

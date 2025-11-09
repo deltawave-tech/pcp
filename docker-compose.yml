@@ -1,0 +1,12 @@
+services:
+  dev:
+    build: .
+    image: pcp-dev
+    tty: true
+    stdin_open: true
+    platform: linux/amd64 # Emulate x86_64 to match flake system support (avoids aarch64 attribute error)
+    # Mount your project code into a subdirectory of the dev user's home
+    volumes:
+      - .:/home/dev/app
+    # Set the working directory to where the code is mounted
+    working_dir: /home/dev/app

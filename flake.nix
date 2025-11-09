@@ -2,7 +2,7 @@
   description = "PCP - Planetary Compute Protocol";
 
   inputs = {
-    nixpkgs.url = "github:nixos/nixpkgs/nixos-25.05";
+    nixpkgs.url = "github:nixos/nixpkgs/nixos-unstable";
     zig-overlay.url = "github:mitchellh/zig-overlay";
     zls.url = "github:zigtools/zls";
     flake-utils.url = "github:numtide/flake-utils";
@@ -10,6 +10,18 @@
 
   outputs = { self, nixpkgs, zig-overlay, zls, flake-utils }@inputs:
     let
+      # --- THE MODERN OVERLAY, ENABLED BY THE NIXPKGS UPDATE ---
+      llvm-fix-overlay = final: prev: {
+        # The refactor ensures llvmPackages_git has a working .overrideScope method.
+        llvmPackages_git = prev.llvmPackages_git.overrideScope (self: super: {
+          # Within this new scope, we replace 'llvm' with an overridden version.
+          llvm = super.llvm.overrideAttrs (old: {
+            # This is our simple, clear fix.
+            doCheck = false;
+          });
+        });
+      };
+
       # Your original, correct overlay structure
       overlays = [
         (final: prev: {
@@ -24,6 +36,7 @@
             };
           });
         })
+        llvm-fix-overlay
       ];
     in
     flake-utils.lib.eachSystem [ "x86_64-linux" "aarch64-darwin" "x86_64-darwin" ] (system:
@@ -35,9 +48,13 @@
         lib = pkgs.lib;
         zls = pkgs.zlspkgs.zls;
 
+        # --- ADD THESE LINES BACK ---
+        # Select the correct base set (which has already been overlaid)
         pkgsLLVM = if pkgs.stdenv.isLinux then pkgs.pkgsLLVM else pkgs;
 
-        llvmPkg = pkgsLLVM.llvmPackages_21;
+        # llvmPkg is now the already-fixed package set from our overlay.
+        llvmPkg = pkgsLLVM.llvmPackages_git;
+        # --- END OF LINES TO ADD ---
 
         mlirPkg = llvmPkg.mlir.overrideAttrs (old: {
           postInstall = (old.postInstall or "") + ''

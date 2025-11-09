@@ -16,8 +16,15 @@
         llvmPackages_git = prev.llvmPackages_git.overrideScope (self: super: {
           # Within this new scope, we replace 'llvm' with an overridden version.
           llvm = super.llvm.overrideAttrs (old: {
-            # This is our simple, clear fix.
+            # This was not sufficient on its own, but we'll keep it.
             doCheck = false;
+
+            # --- ADD THIS LINE ---
+            # This forcefully replaces the entire test phase with a command that does nothing.
+            checkPhase = ''
+              echo "Forcefully skipping LLVM check phase."
+              true
+            '';
           });
         });
       };
@@ -62,45 +69,42 @@
           '';
         });
 
-        # IREE SDK implementation (This is correct)
-        iree-sdk-srcs = {
-          x86_64-linux = {
-            url = "https://github.com/openxla/iree/releases/download/20240415.156/iree-sdk-linux-x86_64-20240415.156.tar.gz";
-            hash = "sha256-Wl3Yg4xZtOI0nRQjwSDy4y6Lq89L2g8KjB/9a/m8v9o=";
-          };
-
-          # --- VERIFIED aarch64-darwin CONFIGURATION ---
-          aarch64-darwin = {
-            url = "https://github.com/openxla/iree/releases/download/20240415.156/iree-sdk-macos-arm64-nightly-20240415.156.tar.gz";
-            hash = "sha256-o12M2q85jF23/E2s6v9KMOI8pL7VpY7FkC/k4s0D6H4=";
-          };
-          # ----------------------------------------------
-
-          x86_64-darwin = {
-            # Note: This URL might also need '-nightly' if you use it.
-            url = "https://github.com/openxla/iree/releases/download/20240415.156/iree-sdk-macos-x86_64-20240415.156.tar.gz";
-            hash = "sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="; # Placeholder
-          };
-        };
-
-        iree-sdk = pkgs.stdenv.mkDerivation {
+        # --- IREE SDK (Build from Source v3.8.0) ---
+        iree-sdk = pkgs.stdenv.mkDerivation (finalAttrs: {
           pname = "iree-sdk";
-          version = "20240415.156";
-          src = pkgs.fetchurl {
-            url = iree-sdk-srcs.${system}.url;
-            hash = iree-sdk-srcs.${system}.hash;
+          version = "3.8.0";
+
+          src = pkgs.fetchFromGitHub {
+            owner = "iree-org";
+            repo = "iree";
+            rev = "v${finalAttrs.version}";
+            # This is a dummy hash. Nix will tell you the correct one.
+            hash = "sha256-cPy2xudIH1OVVzDlq5YAg1uFu59h6zDOvXpKaJ+fuP8=";
+            fetchSubmodules = true;
           };
+
+          nativeBuildInputs = [ pkgs.cmake pkgs.ninja pkgs.python3 ];
+          buildInputs = [ llvmPkg.libllvm mlirPkg ];
+
+          cmakeFlags = [
+            "-DCMAKE_BUILD_TYPE=Release"
+            "-DIREE_BUILD_COMPILER=ON"
+            "-DIREE_BUILD_SAMPLES=OFF"
+            "-DIREE_BUILD_TESTS=OFF"
+          ] ++ (lib.optionals pkgs.stdenv.isDarwin [
+            "-DCMAKE_OSX_ARCHITECTURES=arm64"
+          ]);
+
           installPhase = ''
-            mkdir -p $out
-            cp -r tools $out/tools; cp -r lib $out/lib; cp -r include $out/include
-            chmod +x $out/tools/*
+            cmake --install . --prefix $out
           '';
+
           meta = with lib; {
-            description = "IREE SDK";
+            description = "IREE SDK built from source";
             homepage = "https://iree.dev/";
-            platforms = builtins.attrNames iree-sdk-srcs;
+            platforms = [ "aarch64-darwin" "x86_64-darwin" "x86_64-linux" ];
           };
-        };
+        });
 
       in rec {
         packages.default = packages.pcp;

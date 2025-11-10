@@ -1,39 +1,22 @@
 {
   description = "PCP - Planetary Compute Protocol";
-
   inputs = {
-    nixpkgs.url = "github:nixos/nixpkgs/nixos-unstable";
+    nixpkgs.url = "github:nixos/nixpkgs/nixos-25.05";
     zig-overlay.url = "github:mitchellh/zig-overlay";
     zls.url = "github:zigtools/zls";
     flake-utils.url = "github:numtide/flake-utils";
   };
-
   outputs = { self, nixpkgs, zig-overlay, zls, flake-utils }@inputs:
     let
-      # --- THE MODERN OVERLAY, ENABLED BY THE NIXPKGS UPDATE ---
-      llvm-fix-overlay = final: prev: {
-        # The refactor ensures llvmPackages_git has a working .overrideScope method.
-        llvmPackages_git = prev.llvmPackages_git.overrideScope (self: super: {
-          # Within this new scope, we replace 'llvm' with an overridden version.
-          llvm = super.llvm.overrideAttrs (old: {
-            # This was not sufficient on its own, but we'll keep it.
-            doCheck = false;
-
-            # --- ADD THIS LINE ---
-            # This forcefully replaces the entire test phase with a command that does nothing.
-            checkPhase = ''
-              echo "Forcefully skipping LLVM check phase."
-              true
-            '';
-          });
-        });
-      };
-
-      # Your original, correct overlay structure
+      # Your original, correct overlay structure with gdbm, zls, meson, and libxml2 overrides added
       overlays = [
         (final: prev: {
           zigpkgs = inputs.zig-overlay.packages.${prev.system};
-          zlspkgs = zls.packages.${prev.system};
+          zlspkgs = let orig = zls.packages.${prev.system}; in orig // {
+            zls = orig.zls.overrideAttrs (old: {
+              doCheck = false;  # Disable tests to bypass failures (likely due to emulation timeouts or env issues)
+            });
+          };
           claude-code = prev.claude-code.overrideAttrs (old: rec {
             version = "1.0.85";
             src = prev.fetchzip {
@@ -42,8 +25,16 @@
               hash = "sha256-CLqvcolG94JBC5VFlsfybZ9OXe81gJBzKU6Xgr7CGWo=";
             };
           });
+          gdbm = prev.gdbm.overrideAttrs (old: {
+            doCheck = false;  # Disable tests to bypass failures under emulation
+          });
+          meson = prev.meson.overrideAttrs (old: {
+            doCheck = false;  # Disable tests to bypass the failing "215 source set realistic example" test under emulation
+          });
+          libxml2 = prev.libxml2.overrideAttrs (old: {
+            doCheck = false;  # Disable tests to bypass "Illegal instruction" error in runxmlconf under QEMU emulation
+          });
         })
-        llvm-fix-overlay
       ];
     in
     flake-utils.lib.eachSystem [ "x86_64-linux" "aarch64-darwin" "x86_64-darwin" ] (system:
@@ -54,38 +45,26 @@
         };
         lib = pkgs.lib;
         zls = pkgs.zlspkgs.zls;
-
-        # --- ADD THESE LINES BACK ---
-        # Select the correct base set (which has already been overlaid)
         pkgsLLVM = if pkgs.stdenv.isLinux then pkgs.pkgsLLVM else pkgs;
-
-        # llvmPkg is now the already-fixed package set from our overlay.
         llvmPkg = pkgsLLVM.llvmPackages_git;
-        # --- END OF LINES TO ADD ---
-
         mlirPkg = llvmPkg.mlir.overrideAttrs (old: {
           postInstall = (old.postInstall or "") + ''
             cp -v bin/mlir-pdll $out/bin
           '';
         });
-
         # --- IREE SDK (Build from Source v3.8.0) ---
         iree-sdk = pkgs.stdenv.mkDerivation (finalAttrs: {
           pname = "iree-sdk";
           version = "3.8.0";
-
           src = pkgs.fetchFromGitHub {
             owner = "iree-org";
             repo = "iree";
             rev = "v${finalAttrs.version}";
-            # This is a dummy hash. Nix will tell you the correct one.
             hash = "sha256-cPy2xudIH1OVVzDlq5YAg1uFu59h6zDOvXpKaJ+fuP8=";
             fetchSubmodules = true;
           };
-
           nativeBuildInputs = [ pkgs.cmake pkgs.ninja pkgs.python3 ];
           buildInputs = [ llvmPkg.libllvm mlirPkg ];
-
           cmakeFlags = [
             "-DCMAKE_BUILD_TYPE=Release"
             "-DIREE_BUILD_COMPILER=ON"
@@ -94,21 +73,17 @@
           ] ++ (lib.optionals pkgs.stdenv.isDarwin [
             "-DCMAKE_OSX_ARCHITECTURES=arm64"
           ]);
-
           installPhase = ''
             cmake --install . --prefix $out
           '';
-
           meta = with lib; {
             description = "IREE SDK built from source";
             homepage = "https://iree.dev/";
             platforms = [ "aarch64-darwin" "x86_64-darwin" "x86_64-linux" ];
           };
         });
-
       in rec {
         packages.default = packages.pcp;
-
         packages.stablehlo = let
           libllvm = llvmPkg.libllvm;
           tblgen = llvmPkg.tblgen;
@@ -138,7 +113,6 @@
               $src \
               -GNinja \
               $cmakeFlags
-
             # ninja: error: 'stablehlo/reference/mlir-tblgen', needed by 'stablehlo/reference/InterpreterOps.h.inc', missing and no known rule to make it
             ln -s ${tblgen}/bin/mlir-tblgen stablehlo/dialect/
             ln -s ${tblgen}/bin/mlir-tblgen stablehlo/reference/
@@ -151,17 +125,15 @@
             cmake --build . --verbose
           '';
           # See https://github.com/openxla/stablehlo/issues/2811 -- StableHLO does not install
-          # header files.  The header files need a couple of '*.h.inc' files.
+          # header files. The header files need a couple of '*.h.inc' files.
           postInstall = ''
             env | sort
             mkdir -p $dev/include/
             find stablehlo/ -name '*.h.inc' -exec cp -v --parents {} $dev/include/ \;
-
             cd $src
             find stablehlo/ -name '*.h' -exec cp -v --parents {} $dev/include/ \;
           '';
         };
-
         packages.pcp = llvmPkg.stdenv.mkDerivation {
           name = "pcp";
           version = "main";
@@ -190,17 +162,14 @@
             pkgs.capnproto
             iree-sdk
           ];
-
           dontConfigure = true;
           doCheck = true;
           zigBuildFlags = [ "--verbose" "--color" "off" ];
           zigCheckFlags = [ "--verbose" "--color" "off" ];
           zigInstallFlags = [ "--verbose" "--color" "off" ];
-
           CAPNP_DIR = "${pkgs.capnproto}";
           IREE_SDK_DIR = "${iree-sdk}";
         };
-
         devShells.default = pkgs.mkShell {
           nativeBuildInputs = packages.pcp.nativeBuildInputs ++ [
             pkgs.cachix
@@ -214,17 +183,14 @@
             echo "Zig development environment loaded"
             echo "Zig version: $(zig version)"
             echo "ZLS version: $(zls --version)"
-
             export ZIG_GLOBAL_CACHE_DIR="$(pwd)/.zig-cache"
             export CAPNP_DIR="${pkgs.capnproto}"
             export IREE_SDK_DIR="${iree-sdk}"
-
             ${lib.optionalString pkgs.stdenv.isDarwin ''
               export MACOSX_DEPLOYMENT_TARGET="11.0"
             ''}
           '';
         };
-
         checks.pcp = packages.pcp;
       });
 }

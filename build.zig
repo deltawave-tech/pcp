@@ -90,33 +90,42 @@ fn detectCapnp(b: *std.Build) CapnpConfig {
     return config;
 }
 
-// Add IREE dependencies and linking configuration
-fn addIreeDependencies(target: *std.Build.Step.Compile, b: *std.Build) void {
-    std.debug.print("==> Configuring IREE dependencies for '{s}'\n", .{target.name});
-
-    // 1. Define your absolute base path.
+// Add IREE include paths to a module
+fn addIreeIncludes(mod: *std.Build.Module, b: *std.Build) void {
     const absolute_workshop_path = "/Users/philipp/_projects/workshop";
-
-    // 2. Build full absolute paths at runtime.
     const iree_source_path = b.fmt("{s}/iree", .{absolute_workshop_path});
     const iree_build_include_path = b.fmt("{s}/iree-build/include", .{absolute_workshop_path});
     const iree_runtime_src_path = b.fmt("{s}/iree/runtime/src", .{absolute_workshop_path});
+    mod.addIncludePath(.{ .cwd_relative = iree_source_path });
+    mod.addIncludePath(.{ .cwd_relative = iree_build_include_path });
+    mod.addIncludePath(.{ .cwd_relative = iree_runtime_src_path });
+}
+
+fn addIreeDependencies(target: *std.Build.Step.Compile, b: *std.Build) void {
+    std.debug.print("==> Configuring IREE dependencies for '{s}'\n", .{target.name});
+    const absolute_workshop_path = "/Users/philipp/_projects/workshop";
+
+    // --- Path Definitions ---
     const iree_lib_path = b.fmt("{s}/iree-build/lib", .{absolute_workshop_path});
     const iree_runtime_lib_path = b.fmt("{s}/iree-build/runtime/src/iree/runtime", .{absolute_workshop_path});
+    const flatcc_lib_path = b.fmt("{s}/iree-build/build_tools/third_party/flatcc", .{absolute_workshop_path});
 
-    // 3. Add the include and library paths.
-    target.addIncludePath(.{ .cwd_relative = iree_source_path });
-    target.addIncludePath(.{ .cwd_relative = iree_build_include_path });
-    target.addIncludePath(.{ .cwd_relative = iree_runtime_src_path });
+    // --- Library Paths ---
     target.addLibraryPath(.{ .cwd_relative = iree_lib_path });
     target.addLibraryPath(.{ .cwd_relative = iree_runtime_lib_path });
+    target.addLibraryPath(.{ .cwd_relative = flatcc_lib_path });
 
-    // 4. Link libraries.
+    // --- Link All Required Libraries ---
     target.linkLibCpp();
+    
+    // Core IREE Libraries
     target.linkSystemLibrary("IREECompiler");
     target.linkSystemLibrary("iree_runtime_unified");
-
-    // 5. Link macOS frameworks.
+    
+    // Category 1: FlatCC Dependency for the runtime
+    target.linkSystemLibrary("flatcc_parsing");
+    
+    // macOS Frameworks
     if (target.root_module.resolved_target.?.result.os.tag == .macos) {
         target.linkFramework("Foundation");
         target.linkFramework("Metal");
@@ -145,6 +154,7 @@ pub fn build(b: *std.Build) void {
     const pcp_module = b.addModule("pcp", .{
         .root_source_file = b.path("src/main.zig"),
     });
+    addIreeIncludes(pcp_module, b);
     std.debug.print("==> PCP module created successfully\n", .{});
 
     // Create the GPT-2 module

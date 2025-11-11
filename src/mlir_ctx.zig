@@ -46,82 +46,27 @@ pub const MLIRContext = struct {
     const Self = @This();
     
     pub fn init(allocator: Allocator) !Self {
-        std.debug.print("MLIRContext.init: Creating MLIR context...\n", .{});
+        std.debug.print("MLIRContext.init: Creating IREE-backed MLIR context...\n", .{});
         const context = c.contextCreate();
+        
+        // Allow unregistered dialects for flexibility during graph construction.
         c.contextSetAllowUnregisteredDialects(context, true);
 
-        // 1. EXPLICIT DIALECT REGISTRATION
-        // Using dialect handles forces the linker to include the dialect's
-        // static library, which in turn runs the necessary static initializers.
-        std.debug.print("MLIRContext.init: Registering dialects explicitly...\n", .{});
-        const registry = c.dialectRegistryCreate();
-        
-        // Insert dialect handles into registry
-        c.dialectHandleInsertDialect(c.getDialectHandleFunc(), registry);
-        c.dialectHandleInsertDialect(c.getDialectHandleArith(), registry);
-        c.dialectHandleInsertDialect(c.getDialectHandleLinalg(), registry);
-        c.dialectHandleInsertDialect(c.getDialectHandleTensor(), registry);
-        c.dialectHandleInsertDialect(c.getDialectHandleTransform(), registry);
-        c.dialectHandleInsertDialect(c.getDialectHandleGPU(), registry);
-        c.dialectHandleInsertDialect(c.getDialectHandleSPIRV(), registry);
-        c.dialectHandleInsertDialect(c.getDialectHandleSCF(), registry);
-        // ADD THE ASYNC DIALECT HANDLE
-        c.dialectHandleInsertDialect(c.getDialectHandleAsync(), registry);
-        // StableHLO dialect registration - NOW ENABLED!
-        c.dialectHandleInsertDialect(c.getDialectHandleStableHLO(), registry);
-        c.dialectHandleInsertDialect(c.getDialectHandleCHLO(), registry);
-        
-        // Register BufferizableOpInterface implementations before appending registry to context
-        std.debug.print("Registering BufferizableOpInterface implementations...\n", .{});
-        c.registerBufferizationInterfaces(registry);
-        
-        // CRITICAL: Register Transform dialect extensions (for transform.structured.* ops)
-        std.debug.print("Registering Transform dialect extensions...\n", .{});
-        c.registerTransformExtensions(registry);
+        // CRITICAL: Load all dialects that libIREECompiler.a knows about.
+        // This is the correct, IREE-native way to make dialects like 'stablehlo' available.
+        // This replaces all the manual mlirGetDialectHandle__* calls.
+        c.contextLoadAllAvailableDialects(context);
 
-        // Append registry to context
-        c.contextAppendDialectRegistry(context, registry);
-
-        // Actually load the dialects into the context
-        std.debug.print("Loading dialects into context...\n", .{});
-        _ = c.dialectHandleLoadDialect(c.getDialectHandleFunc(), context);
-        _ = c.dialectHandleLoadDialect(c.getDialectHandleArith(), context);
-        _ = c.dialectHandleLoadDialect(c.getDialectHandleLinalg(), context);
-        std.debug.print("Loading tensor dialect into context...\n", .{});
-        _ = c.dialectHandleLoadDialect(c.getDialectHandleTensor(), context);
-        std.debug.print("✓ Tensor dialect loaded successfully\n", .{});
-        _ = c.dialectHandleLoadDialect(c.getDialectHandleTransform(), context);
-        std.debug.print("✓ Transform dialect loaded successfully\n", .{});
-        _ = c.dialectHandleLoadDialect(c.getDialectHandleGPU(), context);
-        _ = c.dialectHandleLoadDialect(c.getDialectHandleSPIRV(), context);
-        _ = c.dialectHandleLoadDialect(c.getDialectHandleSCF(), context);
-        // LOAD THE ASYNC DIALECT
-        _ = c.dialectHandleLoadDialect(c.getDialectHandleAsync(), context);
-        _ = c.dialectHandleLoadDialect(c.getDialectHandleStableHLO(), context);
-        _ = c.dialectHandleLoadDialect(c.getDialectHandleCHLO(), context);
-        
-        // CRITICAL: Register ALL passes for complete pipeline
-        // Core passes
-        c.registerAllStablehloPasses();     // StableHLO passes
-        c.registerCanonicalizerPass();      // canonicalize
-        c.registerCSEPass();                // cse
-        
-        // Complete pass registration via C++ anchor function
-        c.forceLoadAllRequiredPasses();
-
-        // Verify registration worked
-        if (!c.contextIsRegisteredOperation(context, "func.func")) {
+        // Verify a key dialect loaded to be sure.
+        if (!c.contextIsRegisteredOperation(context, "stablehlo.constant")) {
+            std.log.err("FATAL: Stablehlo dialect not registered. Check IREE build and linking.", .{});
             return error.DialectRegistrationFailed;
         }
-        
-        // --- REMOVED ---
-        // const pass_manager = try mlir.PassManager.init(...); // <-- Remove this.
         
         return Self{
             .allocator = allocator,
             .context = context,
-            .registry = registry,
-            // pass_manager = pass_manager, // <-- Remove this.
+            .registry = null, // We are no longer managing a separate registry.
         };
     }
     

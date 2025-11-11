@@ -10,134 +10,12 @@ const test_targets = [_]std.Target.Query{
     .{ .cpu_arch = .x86_64, .os_tag = .windows },
 };
 
-// MLIR configuration
-const MLIRConfig = struct {
-    enabled: bool = false,
-    llvm_config_path: ?[]const u8 = null,
-    lib_dir: ?[]const u8 = null,
-    include_dir: ?[]const u8 = null,
-};
-
 // Cap'n Proto configuration
 const CapnpConfig = struct {
     enabled: bool = false,
     include_dir: ?[]const u8 = null,
     lib_dir: ?[]const u8 = null,
 };
-
-// Attempt to find LLVM/MLIR installation
-fn detectMLIR(b: *std.Build) MLIRConfig {
-    var config = MLIRConfig{};
-
-    // 1. Prioritize an environment variable for the LLVM build directory
-    if (std.process.getEnvVarOwned(b.allocator, "LLVM_DIR")) |llvm_dir| {
-        defer b.allocator.free(llvm_dir);
-        const llvm_config_path = std.fs.path.join(b.allocator, &[_][]const u8{ llvm_dir, "bin", "llvm-config" }) catch {
-            std.debug.print("Failed to construct llvm-config path from LLVM_DIR\n", .{});
-            return config;
-        };
-        defer b.allocator.free(llvm_config_path);
-        
-        // Test if this llvm-config works
-        const result = std.process.Child.run(.{
-            .allocator = b.allocator,
-            .argv = &[_][]const u8{ llvm_config_path, "--version" },
-        }) catch |err| {
-            std.debug.print("LLVM_DIR llvm-config test failed: {}\n", .{err});
-            return config;
-        };
-        defer b.allocator.free(result.stdout);
-        defer b.allocator.free(result.stderr);
-        
-        if (result.term == .Exited and result.term.Exited == 0) {
-            config.enabled = true;
-            config.llvm_config_path = b.dupe(llvm_config_path);
-            std.debug.print("Found LLVM via LLVM_DIR at: {s}\n", .{llvm_config_path});
-            return config;
-        }
-    } else |_| {
-        // Environment variable not set, continue with auto-detection
-    }
-
-    // 2. If no environment variable, proceed with auto-detection
-    const llvm_config_candidates = [_][]const u8{
-        // Local build paths (relative to project root)
-        "llvm-build/bin/llvm-config",
-        "./llvm-build/bin/llvm-config",
-        // System llvm-config
-        "llvm-config",
-        "llvm-config-18",
-        "llvm-config-17",
-        "llvm-config-16",
-        // Common system installation paths
-        "/usr/local/bin/llvm-config",
-        "/opt/homebrew/bin/llvm-config",
-        "/opt/homebrew/opt/llvm/bin/llvm-config", // Homebrew keg-only install
-        "/usr/bin/llvm-config",
-    };
-    
-    for (llvm_config_candidates) |candidate| {
-        const result = std.process.Child.run(.{
-            .allocator = b.allocator,
-            .argv = &[_][]const u8{ candidate, "--version" },
-        }) catch continue;
-        defer b.allocator.free(result.stdout);
-        defer b.allocator.free(result.stderr);
-        
-        if (result.term == .Exited and result.term.Exited == 0) {
-            config.enabled = true;
-            config.llvm_config_path = b.dupe(candidate);
-            std.debug.print("Found LLVM at: {s}\n", .{candidate});
-            break;
-        }
-    }
-    
-    if (config.enabled and config.llvm_config_path != null) {
-        // Get library directory
-        const lib_result = std.process.Child.run(.{
-            .allocator = b.allocator,
-            .argv = &[_][]const u8{ config.llvm_config_path.?, "--libdir" },
-        }) catch {
-            config.enabled = false;
-            return config;
-        };
-        defer b.allocator.free(lib_result.stdout);
-        defer b.allocator.free(lib_result.stderr);
-        
-        if (lib_result.term == .Exited and lib_result.term.Exited == 0) {
-            const lib_dir = std.mem.trim(u8, lib_result.stdout, " \n\r\t");
-            config.lib_dir = b.dupe(lib_dir);
-        }
-        
-        // Get include directory
-        const inc_result = std.process.Child.run(.{
-            .allocator = b.allocator,
-            .argv = &[_][]const u8{ config.llvm_config_path.?, "--includedir" },
-        }) catch {
-            config.enabled = false;
-            return config;
-        };
-        defer b.allocator.free(inc_result.stdout);
-        defer b.allocator.free(inc_result.stderr);
-        
-        if (inc_result.term == .Exited and inc_result.term.Exited == 0) {
-            const inc_dir = std.mem.trim(u8, inc_result.stdout, " \n\r\t");
-            config.include_dir = b.dupe(inc_dir);
-        }
-        
-        std.debug.print("MLIR Configuration:\n", .{});
-        std.debug.print("  Library directory: {s}\n", .{config.lib_dir orelse "unknown"});
-        std.debug.print("  Include directory: {s}\n", .{config.include_dir orelse "unknown"});
-    } else {
-        std.debug.print("LLVM/MLIR not found. MLIR features will be disabled.\n", .{});
-        std.debug.print("To enable MLIR support, install LLVM with MLIR enabled:\n", .{});
-        std.debug.print("  macOS: brew install llvm\n", .{});
-        std.debug.print("  Ubuntu: apt install llvm-dev libmlir-dev\n", .{});
-        std.debug.print("  Or build from source with -DLLVM_ENABLE_PROJECTS=mlir\n", .{});
-    }
-    
-    return config;
-}
 
 // Attempt to find Cap'n Proto installation
 fn detectCapnp(b: *std.Build) CapnpConfig {
@@ -212,34 +90,41 @@ fn detectCapnp(b: *std.Build) CapnpConfig {
     return config;
 }
 
-// IREE configuration struct
+// NEW: A single config to hold all paths from the IREE build.
 const IreeConfig = struct {
     enabled: bool = false,
-    source_dir: ?[]const u8 = null, // For headers
-    build_dir: ?[]const u8 = null, // For libraries
+    // Path to the root of the cloned 'iree' repo for top-level headers.
+    source_dir: ?[]const u8 = null,
+    // Path to the 'include' dir inside 'iree-build' for generated headers.
+    build_include_dir: ?[]const u8 = null,
+    // Path to the 'lib' dir inside 'iree-build' for all .a/.dylib files.
+    lib_dir: ?[]const u8 = null,
 };
 
-// NEW: Detect IREE based on the sibling directory structure
+// NEW: This is now the ONLY detection function we need for IREE/MLIR/LLVM.
 fn detectIree(b: *std.Build) IreeConfig {
     var config: IreeConfig = .{};
-    // These paths are relative to your project root ('pcp')
     const iree_source_path = "../iree";
-    const iree_build_path = "../iree-build"; // Assumes the build folder is also a sibling
+    const iree_build_path = "../iree-build";
 
-    // Check if both directories actually exist
-    if (std.fs.cwd().access(iree_source_path, .{})) |_| {
-        if (std.fs.cwd().access(iree_build_path, .{})) |_| {
-            std.debug.print("Found IREE source at: {s}\n", .{iree_source_path});
-            std.debug.print("Found IREE build at: {s}\n", .{iree_build_path});
-            config.enabled = true;
-            config.source_dir = iree_source_path;
-            config.build_dir = iree_build_path;
-        } else {
-            std.debug.print("IREE source found, but build dir '{s}' not found. IREE linking disabled.\n", .{iree_build_path});
-        }
-    } else {
-        std.debug.print("IREE source dir '{s}' not found. IREE linking disabled.\n", .{iree_source_path});
-    }
+    // Check that the core directories exist.
+    std.fs.cwd().access(iree_source_path, .{}) catch return config;
+    std.fs.cwd().access(iree_build_path, .{}) catch return config;
+
+    // Construct the final paths we need for linking.
+    const build_include_path = std.fs.path.join(b.allocator, &.{ iree_build_path, "include" }) catch @panic("OOM");
+    const lib_path = std.fs.path.join(b.allocator, &.{ iree_build_path, "lib" }) catch @panic("OOM");
+
+    // All checks passed.
+    std.debug.print("Unified IREE/MLIR/LLVM dependencies located:\n", .{});
+    std.debug.print("  Source Headers:  {s}\n", .{iree_source_path});
+    std.debug.print("  Build Headers:   {s}\n", .{build_include_path});
+    std.debug.print("  Libraries:       {s}\n", .{lib_path});
+
+    config.enabled = true;
+    config.source_dir = iree_source_path;
+    config.build_include_dir = b.dupe(build_include_path);
+    config.lib_dir = b.dupe(lib_path);
     return config;
 }
 
@@ -261,135 +146,38 @@ fn getCommandOutput(b: *std.Build, argv: []const []const u8) ![]const u8 {
     return b.allocator.dupe(u8, std.mem.trim(u8, result.stdout, " \n\r\t"));
 }
 
-// Enhanced MLIR support function with consolidated library linking
-fn addMLIRSupport(b: *std.Build, target: *std.Build.Step.Compile, mlir_config: MLIRConfig) void {
-    if (!mlir_config.enabled or mlir_config.llvm_config_path == null) {
-        std.debug.print("==> Skipping MLIR support for '{s}': MLIR not enabled/found.\n", .{target.name});
-        return;
-    }
+// NEW: Single function to link against the IREE SDK.
+// This provides IREE, MLIR, StableHLO, and LLVM.
+fn addIreeDependencies(target: *std.Build.Step.Compile, config: IreeConfig) void {
+    if (!config.enabled) return;
 
-    std.debug.print("==> Configuring full MLIR support for '{s}'\n", .{target.name});
+    std.debug.print("==> Configuring IREE dependencies for '{s}'\n", .{target.name});
 
-    // Add include and library paths from mlir_config
-    if (mlir_config.include_dir) |inc_dir| {
-        target.addIncludePath(.{ .cwd_relative = inc_dir });
-    }
-    if (mlir_config.lib_dir) |lib_dir| {
-        target.addLibraryPath(.{ .cwd_relative = lib_dir });
-    }
+    // Add all necessary include paths.
+    target.addIncludePath(.{ .cwd_relative = config.source_dir.? });
+    target.addIncludePath(.{ .cwd_relative = config.build_include_dir.? });
 
-    // --- Master List of All MLIR/LLVM Libraries ---
-    // This list is the consolidation of all libraries from the old addMLIRSupport,
-    // m3_pipeline_test, and pass_registration_test.
-    const all_mlir_libs = [_][]const u8{
-        // Core MLIR & C-API
-        "MLIRIR", "MLIRSupport", "MLIRAnalysis", "MLIRDialect", "MLIRParser", "MLIRAsmParser", "MLIRPass", "MLIRTransforms", "MLIRRewrite", "MLIRTransformUtils",
-        "MLIRBytecodeReader", "MLIRBytecodeWriter", "MLIRCAPIIR", "MLIRCAPIFunc", "MLIRCAPIArith", "MLIRCAPILinalg", "MLIRCAPIGPU", "MLIRCAPISPIRV", "MLIRCAPISCF", "MLIRCAPIConversion", "MLIRCAPITransforms", "MLIRCAPIAsync", "MLIRCAPITensor", "MLIRCAPITransformDialect", "MLIRCAPITransformDialectTransforms",
-        // Test/Debug libraries for MLIR
-        // "MLIRLinalgTestPasses",
+    // Add library paths for both main lib directory and runtime subdirectory
+    target.addLibraryPath(.{ .cwd_relative = config.lib_dir.? });
+    // Add runtime library path
+    const runtime_lib_path = std.fs.path.join(target.step.owner.allocator, &.{ config.source_dir.?, "../iree-build/runtime/src/iree/runtime" }) catch @panic("OOM");
+    target.addLibraryPath(.{ .cwd_relative = runtime_lib_path });
 
-        // StableHLO & CHLO (C-API and Implementation)
-        "StablehloCAPI", "ChloCAPI", "StablehloOps", "ChloOps", "StablehloBase", "StablehloPasses", "StablehloTypeInference", "StablehloAssemblyFormat", "StablehloBroadcastUtils", "StablehloLinalgTransforms", "StablehloPassUtils", "StablehloOptimizationPasses", "StablehloTypeConversion",
-
-        // VHLO
-        "VhloOps", "VhloTypes", "Version",
-
-        // Core Dialects for Pipelines
-        "MLIRFuncDialect", "MLIRArithDialect", "MLIRMathDialect", "MLIRMemRefDialect", "MLIRLinalgDialect", "MLIRTensorDialect", "MLIRSCFDialect", "MLIRVectorDialect", "MLIRAffineDialect", "MLIRBufferizationDialect", "MLIRControlFlowDialect", "MLIRAsyncDialect", "MLIRIndexDialect", "MLIRComplexDialect", "MLIRQuantDialect", "MLIRShapeDialect", "MLIRDLTIDialect", "MLIRSparseTensorDialect", "MLIRUBDialect",
-
-        // Analysis Libraries (Critical for constraint solving)
-        "MLIRPresburger", "MLIRAffineAnalysis", "MLIRAffineUtils", "MLIRDialectUtils", "MLIRArithUtils", "MLIRLinalgUtils", "MLIRSCFUtils", "MLIRTensorUtils", "MLIRTensorTilingInterfaceImpl", "MLIRMemRefUtils", "MLIRVectorUtils", "MLIRInferIntRangeCommon",
-
-        // GPU & SPIR-V Pipeline Dialects
-        "MLIRGPUDialect", "MLIRSPIRVDialect", "MLIRSPIRVSerialization", "MLIRSPIRVTarget", "MLIRSPIRVImageInterfaces", "MLIRSPIRVTransforms", "MLIRSPIRVUtils", "MLIRLLVMDialect",
-        // "MLIRMeshDialect",
-
-        // Dialect Extensions (Critical for BufferizableOpInterface)
-        "MLIRFuncAllExtensions", "MLIRTensorAllExtensions", "MLIRFuncInlinerExtension",
-        // "MLIRFuncMeshShardingExtensions",
-
-        // Core Transforms & Conversion
-        "MLIRFuncTransforms", "MLIRLinalgTransforms", "MLIRSCFTransforms", "MLIRGPUTransforms", "MLIRSPIRVConversion", "MLIRBufferizationTransforms", "MLIRBufferizationPipelines", "MLIRMemRefTransforms", "MLIRVectorTransforms", "MLIRArithTransforms", "MLIRAsyncTransforms", "MLIRAffineTransforms", "MLIRAsyncToLLVM", "MLIRTensorTransforms", "MLIRTensorTransformOps", "MLIRReconcileUnrealizedCasts",
-        "MLIRSCFToSPIRV", "MLIRSCFToGPU", "MLIRSCFToControlFlow", "MLIRFuncToSPIRV", "MLIRMemRefToSPIRV", "MLIRVectorToSPIRV", "MLIRArithToSPIRV", "MLIRIndexToSPIRV",
-        "MLIRLinalgToStandard", "MLIRConvertToLLVMPass", "MLIRConvertToLLVMInterface", "MLIRFuncToLLVM", "MLIRGPUToLLVMSPV", "MLIRLLVMCommonConversion", "MLIRArithToLLVM", "MLIRComplexToLLVM", "MLIRControlFlowToLLVM", "MLIRIndexToLLVM", "MLIRMathToLLVM", "MLIRMemRefToLLVM", "MLIRUBToLLVM", "MLIRVectorToLLVM", "MLIRAffineToStandard", "MLIRIndexingMapOpInterface",
-
-        // GPU Pipeline Passes & Utilities  
-        "MLIRGPUPipelines", "MLIRGPUToGPURuntimeTransforms", "MLIRGPUToSPIRV", "MLIRGPUUtils", "MLIRGPUToNVVMTransforms", "MLIRGPUToROCDLTransforms",
-        
-        // GPU Target Dialects & Translation
-        "MLIRNVVMDialect", "MLIRROCDLDialect", "MLIRAMDGPUDialect", "MLIRAMDGPUUtils", "MLIRTargetLLVMIRExport", "MLIRTargetLLVMIRImport",
-
-        // Transform Dialect for Production Tiling
-        "MLIRTransformDialect", "MLIRTransformDialectTransforms", "MLIRTransformDialectUtils", "MLIRTransformDialectInterfaces", "MLIRTransformUtils", "MLIRLinalgTransformOps", "MLIRGPUTransformOps",
-
-        // Interfaces (for vtables and dynamic dispatch) - Only actual existing libraries
-        "MLIRSideEffectInterfaces", "MLIRLoopLikeInterface", "MLIRControlFlowInterfaces", "MLIRFunctionInterfaces", "MLIRShapedOpInterfaces", "MLIRViewLikeInterface", "MLIRTilingInterface", "MLIRParallelCombiningOpInterface", "MLIRDestinationStyleOpInterface", "MLIRCallInterfaces", "MLIRShardingInterface", "MLIRInferTypeOpInterface", "MLIRDataLayoutInterfaces", "MLIRCastInterfaces", "MLIRValueBoundsOpInterface", "MLIRMemorySlotInterfaces", "MLIRVectorInterfaces", "MLIRMaskableOpInterface", "MLIRMaskingOpInterface", "MLIRRuntimeVerifiableOpInterface", "MLIRSubsetOpInterface", "MLIRBytecodeOpInterface", "MLIRDerivedAttributeOpInterface", "MLIRCopyOpInterface", "MLIRInferIntRangeInterface",
-
-        // PDL Infrastructure
-        "MLIRPDLDialect", "MLIRPDLInterpDialect", "MLIRPDLToPDLInterp", "MLIRRewritePDL", "MLIRPDLLAST", "MLIRPDLLCodeGen", "MLIRTransformPDLExtension",
-
-        // LLVM & System Libraries (Comprehensive list from your original build file)
-        "LLVMWindowsManifest", "LLVMXRay", "LLVMLibDriver", "LLVMDlltoolDriver", "LLVMTelemetry", "LLVMTextAPIBinaryReader", "LLVMCoverage", "LLVMLineEditor", "LLVMAArch64Disassembler", "LLVMAArch64AsmParser", "LLVMAArch64CodeGen", "LLVMAArch64Desc", "LLVMAArch64Utils", "LLVMAArch64Info", "LLVMX86TargetMCA", "LLVMX86Disassembler", "LLVMX86AsmParser", "LLVMX86CodeGen", "LLVMX86Desc", "LLVMX86Info", "LLVMOrcDebugging", "LLVMOrcJIT", "LLVMWindowsDriver", "LLVMMCJIT", "LLVMJITLink", "LLVMInterpreter", "LLVMExecutionEngine", "LLVMRuntimeDyld", "LLVMOrcTargetProcess", "LLVMOrcShared", "LLVMDWP", "LLVMDebugInfoLogicalView", "LLVMOption", "LLVMObjCopy", "LLVMMCA", "LLVMMCDisassembler", "LLVMLTO", "LLVMPasses", "LLVMHipStdPar", "LLVMCFGuard", "LLVMCoroutines", "LLVMipo", "LLVMVectorize", "LLVMSandboxIR", "LLVMLinker", "LLVMFrontendOpenMP", "LLVMFrontendOffloading", "LLVMObjectYAML", "LLVMFrontendOpenACC", "LLVMFrontendHLSL", "LLVMFrontendDriver", "LLVMInstrumentation", "LLVMFrontendDirective", "LLVMFrontendAtomic", "LLVMExtensions", "LLVMDWARFLinkerParallel", "LLVMDWARFLinkerClassic", "LLVMDWARFLinker", "LLVMGlobalISel", "LLVMMIRParser", "LLVMAsmPrinter", "LLVMSelectionDAG", "LLVMCodeGen", "LLVMTarget", "LLVMObjCARCOpts", "LLVMCodeGenTypes", "LLVMCGData", "LLVMIRPrinter", "LLVMInterfaceStub", "LLVMFileCheck", "LLVMFuzzMutate", "LLVMScalarOpts", "LLVMInstCombine", "LLVMAggressiveInstCombine", "LLVMTransformUtils", "LLVMBitWriter", "LLVMAnalysis", "LLVMProfileData", "LLVMSymbolize", "LLVMDebugInfoBTF", "LLVMDebugInfoPDB", "LLVMDebugInfoMSF", "LLVMDebugInfoCodeView", "LLVMDebugInfoGSYM", "LLVMDebugInfoDWARF", "LLVMObject", "LLVMTextAPI", "LLVMMCParser", "LLVMIRReader", "LLVMAsmParser", "LLVMMC", "LLVMBitReader", "LLVMFuzzerCLI", "LLVMCore", "LLVMRemarks", "LLVMBitstreamReader", "LLVMBinaryFormat", "LLVMTargetParser", "LLVMTableGen", "LLVMSupport", "LLVMDemangle",
-    };
-
-    // Link C++ standard library first
+    // Link C++ standard library.
     target.linkLibCpp();
 
-    // Link all required MLIR/LLVM libraries
-    for (all_mlir_libs) |lib| {
-        target.linkSystemLibrary(lib);
-    }
+    // Link the high-level IREE libraries. These will pull in all the
+    // required MLIR, LLVM, and StableHLO dependencies automatically.
+    // This REPLACES the old giant list.
+    target.linkSystemLibrary("IREECompiler");
+    target.linkSystemLibrary("iree_runtime_unified");
 
-    // Platform-specific linking for Metal
+    // On macOS, we still need the system frameworks for Metal.
     if (target.root_module.resolved_target.?.result.os.tag == .macos) {
-        // Get SDK root from the environment variable set by the Nix shell.
-        const sdk_root = std.process.getEnvVarOwned(b.allocator, "SDKROOT") catch |err| {
-            std.debug.print("FATAL: SDKROOT not set. This requires the Nix env. Error: {}\n", .{err});
-            @panic("SDKROOT not found");
-        };
-        defer b.allocator.free(sdk_root);
-
-        // Construct the path to the frameworks directory inside the SDK.
-        const framework_path = std.fmt.allocPrint(b.allocator, "{s}/System/Library/Frameworks", .{sdk_root}) catch @panic("OOM");
-        defer b.allocator.free(framework_path);
-
-        // **FIX:** Explicitly tell the executable's linker where to find frameworks.
-        target.addFrameworkPath(.{ .cwd_relative = framework_path });
-
-        // Link the required frameworks.
         target.linkFramework("Foundation");
         target.linkFramework("Metal");
+        target.linkFramework("CoreGraphics"); // Often needed alongside Metal
     }
-}
-
-
-// REVISED: Add IREE support for both COMPILER and RUNTIME
-fn addIreeSupport(target: *std.Build.Step.Compile, b: *std.Build, config: IreeConfig) void {
-    if (!config.enabled) {
-        std.debug.print("Skipping IREE support for '{s}': IREE not found.\n", .{target.name});
-        return;
-    }
-    std.debug.print("==> Configuring IREE support for '{s}'\n", .{target.name});
-
-    const source_dir = config.source_dir.?;
-    const build_dir = config.build_dir.?;
-
-    // 1. Add include path for all IREE headers (compiler and runtime)
-    // This path should point to the root of the cloned 'iree' repo.
-    target.addIncludePath(.{ .cwd_relative = source_dir });
-
-    // 2. Add library path from your IREE build directory
-    const lib_path = std.fs.path.join(b.allocator, &.{ build_dir, "lib" }) catch @panic("OOM");
-    target.addLibraryPath(.{ .cwd_relative = lib_path });
-
-    // 3. Link the necessary IREE libraries
-    target.linkLibCpp(); // IREE is a C++ project
-    
-    // For using the COMPILER C API (iree_compiler_session_create, etc.)
-    target.linkSystemLibrary("IREECompiler");
-
-    // For using the RUNTIME C API (iree_runtime_instance_create, etc.)
-    target.linkSystemLibrary("iree_runtime_all_sync");
 }
 
 pub fn build(b: *std.Build) void {
@@ -397,24 +185,22 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
     
-    // Detect MLIR availability
-    std.debug.print("==> Detecting MLIR configuration\n", .{});
-    const mlir_config = detectMLIR(b);
-    std.debug.print("==> MLIR detected: enabled={}, path={s}\n", .{mlir_config.enabled, mlir_config.llvm_config_path orelse "null"});
+    // === START OF CHANGES ===
 
-    // Detect Cap'n Proto availability
-    std.debug.print("==> Detecting Cap'n Proto configuration\n", .{});
+    // REMOVE all the old detection logic.
+    // const mlir_config = detectMLIR(b);
+    // const iree_sdk_dir = detectIree(b);
+
+    // ADD the new unified detection.
+    const iree_config = detectIree(b);
+
+    // Keep capnp detection as it's separate.
     const capnp_config = detectCapnp(b);
     std.debug.print("==> Cap'n Proto detected: enabled={}, include={s}, lib={s}\n", .{
         capnp_config.enabled, 
         capnp_config.include_dir orelse "null", 
         capnp_config.lib_dir orelse "null"
     });
-
-    // === CHANGE #1: Call the new detectIree function ===
-    std.debug.print("==> Detecting IREE configuration\n", .{});
-    const iree_config = detectIree(b);
-    std.debug.print("==> IREE detected: enabled={}\n", .{iree_config.enabled});
 
     // Metal bridge library removed - workers now use IREE runtime directly
     std.debug.print("==> Metal bridge library removed, using IREE runtime\n", .{});
@@ -467,8 +253,8 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     
-    // SINGLE CALL for all MLIR/LLVM/Metal libraries
-    addMLIRSupport(b, dialect_test, mlir_config);
+    // NEW WAY: Single call for IREE dependencies
+    addIreeDependencies(dialect_test, iree_config);
 
     
     const run_dialect_test = b.addRunArtifact(dialect_test);
@@ -488,8 +274,8 @@ pub fn build(b: *std.Build) void {
     gpt2_example.root_module.addImport("pcp", pcp_module);
     gpt2_example.root_module.addImport("gpt2", gpt2_module);
     
-    // SINGLE CALL for all MLIR/LLVM/Metal libraries
-    addMLIRSupport(b, gpt2_example, mlir_config);
+    // NEW WAY: Single call for IREE dependencies
+    addIreeDependencies(gpt2_example, iree_config);
 
 
     // Install the executables
@@ -514,8 +300,8 @@ pub fn build(b: *std.Build) void {
     // Add module dependencies
     mlir_verification_test.root_module.addImport("pcp", pcp_module);
     
-    // SINGLE CALL for all MLIR/LLVM/Metal libraries
-    addMLIRSupport(b, mlir_verification_test, mlir_config);
+    // NEW WAY: Single call for IREE dependencies
+    addIreeDependencies(mlir_verification_test, iree_config);
 
     // SINGLE CALL for your project's bridge libraries
 
@@ -540,8 +326,8 @@ pub fn build(b: *std.Build) void {
     // Add module dependencies for comptime examples
     comptime_examples.root_module.addImport("pcp", pcp_module);
     
-    // SINGLE CALL for all MLIR/LLVM/Metal libraries
-    addMLIRSupport(b, comptime_examples, mlir_config);
+    // NEW WAY: Single call for IREE dependencies
+    addIreeDependencies(comptime_examples, iree_config);
 
     // SINGLE CALL for your project's bridge libraries
     
@@ -568,8 +354,8 @@ pub fn build(b: *std.Build) void {
     // Add module dependencies for Metal test
     metal_test.root_module.addImport("pcp", pcp_module);
     
-    // SINGLE CALL for all MLIR/LLVM/Metal libraries
-    addMLIRSupport(b, metal_test, mlir_config);
+    // NEW WAY: Single call for IREE dependencies
+    addIreeDependencies(metal_test, iree_config);
 
     // SINGLE CALL for your project's bridge libraries
     
@@ -597,8 +383,8 @@ pub fn build(b: *std.Build) void {
     // Add module dependencies
     pass_test.root_module.addImport("pcp", pcp_module);
 
-    // SINGLE CALL for all MLIR/LLVM/Metal libraries
-    addMLIRSupport(b, pass_test, mlir_config);
+    // NEW WAY: Single call for IREE dependencies
+    addIreeDependencies(pass_test, iree_config);
 
     // SINGLE CALL for your project's bridge libraries
 
@@ -619,8 +405,8 @@ pub fn build(b: *std.Build) void {
     // Add module dependencies for Metal benchmark
     metal_benchmark.root_module.addImport("pcp", pcp_module);
     
-    // SINGLE CALL for all MLIR/LLVM/Metal libraries
-    addMLIRSupport(b, metal_benchmark, mlir_config);
+    // NEW WAY: Single call for IREE dependencies
+    addIreeDependencies(metal_benchmark, iree_config);
 
     // SINGLE CALL for your project's bridge libraries
     
@@ -646,8 +432,8 @@ pub fn build(b: *std.Build) void {
     });
     m3_pipeline_test.root_module.addImport("pcp", pcp_module);
 
-    // SINGLE CALL for all MLIR/LLVM/Metal libraries
-    addMLIRSupport(b, m3_pipeline_test, mlir_config);
+    // NEW WAY: Single call for IREE dependencies
+    addIreeDependencies(m3_pipeline_test, iree_config);
 
     // SINGLE CALL for your project's bridge libraries
 
@@ -669,8 +455,8 @@ pub fn build(b: *std.Build) void {
     // Add module dependencies for MLIR test
     mlir_test.root_module.addImport("pcp", pcp_module);
     
-    // SINGLE CALL for all MLIR/LLVM/Metal libraries
-    addMLIRSupport(b, mlir_test, mlir_config);
+    // NEW WAY: Single call for IREE dependencies
+    addIreeDependencies(mlir_test, iree_config);
 
     // SINGLE CALL for your project's bridge libraries
     
@@ -696,8 +482,8 @@ pub fn build(b: *std.Build) void {
     // Add module dependencies for tensor MLIR test
     tensor_mlir_test.root_module.addImport("pcp", pcp_module);
     
-    // SINGLE CALL for all MLIR/LLVM/Metal libraries
-    addMLIRSupport(b, tensor_mlir_test, mlir_config);
+    // NEW WAY: Single call for IREE dependencies
+    addIreeDependencies(tensor_mlir_test, iree_config);
 
     // SINGLE CALL for your project's bridge libraries
     
@@ -724,8 +510,8 @@ pub fn build(b: *std.Build) void {
     // Add module dependencies for SPIR-V test
     spirv_test.root_module.addImport("pcp", pcp_module);
     
-    // SINGLE CALL for all MLIR/LLVM/Metal libraries
-    addMLIRSupport(b, spirv_test, mlir_config);
+    // NEW WAY: Single call for IREE dependencies
+    addIreeDependencies(spirv_test, iree_config);
 
     // SINGLE CALL for your project's bridge libraries
 
@@ -750,13 +536,10 @@ pub fn build(b: *std.Build) void {
     });
     main_distributed.root_module.addImport("pcp", pcp_module);
 
-    // SINGLE CALL for all MLIR/LLVM/Metal libraries
-    addMLIRSupport(b, main_distributed, mlir_config);
+    // NEW WAY: Single call for IREE dependencies
+    addIreeDependencies(main_distributed, iree_config);
     
-    // === CHANGE #2: Update this function call ===
-    // OLD: addIreeSupport(b, main_distributed, iree_sdk_dir);
-    // NEW:
-    addIreeSupport(main_distributed, b, iree_config);
+    // IREE dependencies already added above with addIreeDependencies
 
     // SINGLE CALL for your project's bridge libraries
 
@@ -879,8 +662,8 @@ pub fn build(b: *std.Build) void {
     // Add module dependencies for GPT-2 model test
     gpt2_model_test.root_module.addImport("pcp", pcp_module);
     
-    // SINGLE CALL for all MLIR/LLVM/Metal libraries
-    addMLIRSupport(b, gpt2_model_test, mlir_config);
+    // NEW WAY: Single call for IREE dependencies
+    addIreeDependencies(gpt2_model_test, iree_config);
 
     // SINGLE CALL for your project's bridge libraries
 
@@ -905,8 +688,8 @@ pub fn build(b: *std.Build) void {
     // Add module dependencies
     isolated_vjp_tests.root_module.addImport("pcp", pcp_module);
     
-    // SINGLE CALL for all MLIR/LLVM/Metal libraries
-    addMLIRSupport(b, isolated_vjp_tests, mlir_config);
+    // NEW WAY: Single call for IREE dependencies
+    addIreeDependencies(isolated_vjp_tests, iree_config);
 
     // SINGLE CALL for your project's bridge libraries
 
@@ -931,8 +714,8 @@ pub fn build(b: *std.Build) void {
     // Add module dependencies for end-to-end transformer test
     end_to_end_transformer_test.root_module.addImport("pcp", pcp_module);
     
-    // SINGLE CALL for all MLIR/LLVM/Metal libraries
-    addMLIRSupport(b, end_to_end_transformer_test, mlir_config);
+    // NEW WAY: Single call for IREE dependencies
+    addIreeDependencies(end_to_end_transformer_test, iree_config);
 
     // SINGLE CALL for your project's bridge libraries
 

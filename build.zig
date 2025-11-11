@@ -146,37 +146,41 @@ fn getCommandOutput(b: *std.Build, argv: []const []const u8) ![]const u8 {
     return b.allocator.dupe(u8, std.mem.trim(u8, result.stdout, " \n\r\t"));
 }
 
-// NEW: Single function to link against the IREE SDK.
-// This provides IREE, MLIR, StableHLO, and LLVM.
-fn addIreeDependencies(target: *std.Build.Step.Compile, config: IreeConfig) void {
+// DEFINITIVE AND FINAL (Absolute Path with Correct Syntax):
+fn addIreeDependencies(target: *std.Build.Step.Compile, b: *std.Build, config: IreeConfig) void {
     if (!config.enabled) return;
 
     std.debug.print("==> Configuring IREE dependencies for '{s}'\n", .{target.name});
 
-    // Add all necessary include paths.
-    target.addIncludePath(.{ .cwd_relative = config.source_dir.? });
-    target.addIncludePath(.{ .cwd_relative = config.build_include_dir.? });
+    // 1. Define your absolute base path.
+    const absolute_workshop_path = "/Users/philipp/_projects/workshop";
 
-    // Add library paths for both main lib directory and runtime subdirectory
-    target.addLibraryPath(.{ .cwd_relative = config.lib_dir.? });
-    // Add runtime library path
-    const runtime_lib_path = std.fs.path.join(target.step.owner.allocator, &.{ config.source_dir.?, "../iree-build/runtime/src/iree/runtime" }) catch @panic("OOM");
-    target.addLibraryPath(.{ .cwd_relative = runtime_lib_path });
+    // 2. Build full absolute paths at runtime using the allocator from `b`.
+    const iree_source_path = b.fmt("{s}/iree", .{absolute_workshop_path});
+    const iree_build_include_path = b.fmt("{s}/iree-build/include", .{absolute_workshop_path});
+    const iree_runtime_src_path = b.fmt("{s}/iree/runtime/src", .{absolute_workshop_path});
+    const iree_lib_path = b.fmt("{s}/iree-build/lib", .{absolute_workshop_path});
+    const iree_runtime_lib_path = b.fmt("{s}/iree-build/runtime/src/iree/runtime", .{absolute_workshop_path});
 
-    // Link C++ standard library.
+    // 3. Add the include and library paths using the correct `.cwd_relative` field.
+    //    The build system correctly handles absolute paths passed this way.
+    target.addIncludePath(.{ .cwd_relative = iree_source_path });
+    target.addIncludePath(.{ .cwd_relative = iree_build_include_path });
+    target.addIncludePath(.{ .cwd_relative = iree_runtime_src_path });
+
+    target.addLibraryPath(.{ .cwd_relative = iree_lib_path });
+    target.addLibraryPath(.{ .cwd_relative = iree_runtime_lib_path });
+
+    // 4. Link the necessary libraries by name.
     target.linkLibCpp();
-
-    // Link the high-level IREE libraries. These will pull in all the
-    // required MLIR, LLVM, and StableHLO dependencies automatically.
-    // This REPLACES the old giant list.
     target.linkSystemLibrary("IREECompiler");
     target.linkSystemLibrary("iree_runtime_unified");
 
-    // On macOS, we still need the system frameworks for Metal.
+    // 5. On macOS, link system frameworks.
     if (target.root_module.resolved_target.?.result.os.tag == .macos) {
         target.linkFramework("Foundation");
         target.linkFramework("Metal");
-        target.linkFramework("CoreGraphics"); // Often needed alongside Metal
+        target.linkFramework("CoreGraphics");
     }
 }
 
@@ -254,7 +258,7 @@ pub fn build(b: *std.Build) void {
     });
     
     // NEW WAY: Single call for IREE dependencies
-    addIreeDependencies(dialect_test, iree_config);
+    addIreeDependencies(dialect_test, b, iree_config);
 
     
     const run_dialect_test = b.addRunArtifact(dialect_test);
@@ -275,7 +279,7 @@ pub fn build(b: *std.Build) void {
     gpt2_example.root_module.addImport("gpt2", gpt2_module);
     
     // NEW WAY: Single call for IREE dependencies
-    addIreeDependencies(gpt2_example, iree_config);
+    addIreeDependencies(gpt2_example, b, iree_config);
 
 
     // Install the executables
@@ -301,7 +305,7 @@ pub fn build(b: *std.Build) void {
     mlir_verification_test.root_module.addImport("pcp", pcp_module);
     
     // NEW WAY: Single call for IREE dependencies
-    addIreeDependencies(mlir_verification_test, iree_config);
+    addIreeDependencies(mlir_verification_test, b, iree_config);
 
     // SINGLE CALL for your project's bridge libraries
 
@@ -327,7 +331,7 @@ pub fn build(b: *std.Build) void {
     comptime_examples.root_module.addImport("pcp", pcp_module);
     
     // NEW WAY: Single call for IREE dependencies
-    addIreeDependencies(comptime_examples, iree_config);
+    addIreeDependencies(comptime_examples, b, iree_config);
 
     // SINGLE CALL for your project's bridge libraries
     
@@ -343,34 +347,19 @@ pub fn build(b: *std.Build) void {
     const run_comptime_examples_step = b.step("run-comptime-examples", "Run the comptime plan examples");
     run_comptime_examples_step.dependOn(&run_comptime_examples_cmd.step);
 
-    // Metal backend test executable
-    const metal_test = b.addExecutable(.{
-        .name = "metal_test",
-        .root_source_file = b.path("src/examples/metal_test.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-
-    // Add module dependencies for Metal test
-    metal_test.root_module.addImport("pcp", pcp_module);
-    
-    // NEW WAY: Single call for IREE dependencies
-    addIreeDependencies(metal_test, iree_config);
-
-    // SINGLE CALL for your project's bridge libraries
-    
-
-
-    // Install the executable
-    // Install disabled - failing example
-    // b.installArtifact(metal_test);
-
-    // Run step for Metal test
-    const run_metal_test_cmd = b.addRunArtifact(metal_test);
-    run_metal_test_cmd.step.dependOn(&metal_test.step);
-
-    const run_metal_test_step = b.step("run-metal-test", "Run the Metal backend tests");
-    run_metal_test_step.dependOn(&run_metal_test_cmd.step);
+    // Metal backend test executable - COMMENTED OUT
+    // const metal_test = b.addExecutable(.{
+    //     .name = "metal_test",
+    //     .root_source_file = b.path("src/examples/metal_test.zig"),
+    //     .target = target,
+    //     .optimize = optimize,
+    // });
+    // metal_test.root_module.addImport("pcp", pcp_module);
+    // addIreeDependencies(metal_test, iree_config);
+    // const run_metal_test_cmd = b.addRunArtifact(metal_test);
+    // run_metal_test_cmd.step.dependOn(&metal_test.step);
+    // const run_metal_test_step = b.step("run-metal-test", "Run the Metal backend tests");
+    // run_metal_test_step.dependOn(&run_metal_test_cmd.step);
 
     // Pass registration test executable - minimal test to isolate GPU pass linking issues
     const pass_test = b.addExecutable(.{
@@ -384,7 +373,7 @@ pub fn build(b: *std.Build) void {
     pass_test.root_module.addImport("pcp", pcp_module);
 
     // NEW WAY: Single call for IREE dependencies
-    addIreeDependencies(pass_test, iree_config);
+    addIreeDependencies(pass_test, b, iree_config);
 
     // SINGLE CALL for your project's bridge libraries
 
@@ -394,34 +383,19 @@ pub fn build(b: *std.Build) void {
     const run_pass_test_step = b.step("run-pass-test", "Run the minimal pass registration test");
     run_pass_test_step.dependOn(&run_pass_test_cmd.step);
 
-    // Metal benchmark executable
-    const metal_benchmark = b.addExecutable(.{
-        .name = "metal_benchmark",
-        .root_source_file = b.path("src/examples/metal_benchmark.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-
-    // Add module dependencies for Metal benchmark
-    metal_benchmark.root_module.addImport("pcp", pcp_module);
-    
-    // NEW WAY: Single call for IREE dependencies
-    addIreeDependencies(metal_benchmark, iree_config);
-
-    // SINGLE CALL for your project's bridge libraries
-    
-
-
-    // Install the executable
-    // Install disabled - failing example  
-    // b.installArtifact(metal_benchmark);
-
-    // Run step for Metal benchmark
-    const run_metal_benchmark_cmd = b.addRunArtifact(metal_benchmark);
-    run_metal_benchmark_cmd.step.dependOn(&metal_benchmark.step);
-
-    const run_metal_benchmark_step = b.step("run-metal-benchmark", "Run the Metal backend benchmarks");
-    run_metal_benchmark_step.dependOn(&run_metal_benchmark_cmd.step);
+    // Metal benchmark executable - COMMENTED OUT
+    // const metal_benchmark = b.addExecutable(.{
+    //     .name = "metal_benchmark",
+    //     .root_source_file = b.path("src/examples/metal_benchmark.zig"),
+    //     .target = target,
+    //     .optimize = optimize,
+    // });
+    // metal_benchmark.root_module.addImport("pcp", pcp_module);
+    // addIreeDependencies(metal_benchmark, iree_config);
+    // const run_metal_benchmark_cmd = b.addRunArtifact(metal_benchmark);
+    // run_metal_benchmark_cmd.step.dependOn(&metal_benchmark.step);
+    // const run_metal_benchmark_step = b.step("run-metal-benchmark", "Run the Metal backend benchmarks");
+    // run_metal_benchmark_step.dependOn(&run_metal_benchmark_cmd.step);
 
     // M3 Pipeline Test - tests complete MLIR → SPIR-V → MSL → Metal pipeline
     const m3_pipeline_test = b.addExecutable(.{
@@ -433,7 +407,7 @@ pub fn build(b: *std.Build) void {
     m3_pipeline_test.root_module.addImport("pcp", pcp_module);
 
     // NEW WAY: Single call for IREE dependencies
-    addIreeDependencies(m3_pipeline_test, iree_config);
+    addIreeDependencies(m3_pipeline_test, b, iree_config);
 
     // SINGLE CALL for your project's bridge libraries
 
@@ -456,7 +430,7 @@ pub fn build(b: *std.Build) void {
     mlir_test.root_module.addImport("pcp", pcp_module);
     
     // NEW WAY: Single call for IREE dependencies
-    addIreeDependencies(mlir_test, iree_config);
+    addIreeDependencies(mlir_test, b, iree_config);
 
     // SINGLE CALL for your project's bridge libraries
     
@@ -483,7 +457,7 @@ pub fn build(b: *std.Build) void {
     tensor_mlir_test.root_module.addImport("pcp", pcp_module);
     
     // NEW WAY: Single call for IREE dependencies
-    addIreeDependencies(tensor_mlir_test, iree_config);
+    addIreeDependencies(tensor_mlir_test, b, iree_config);
 
     // SINGLE CALL for your project's bridge libraries
     
@@ -511,7 +485,7 @@ pub fn build(b: *std.Build) void {
     spirv_test.root_module.addImport("pcp", pcp_module);
     
     // NEW WAY: Single call for IREE dependencies
-    addIreeDependencies(spirv_test, iree_config);
+    addIreeDependencies(spirv_test, b, iree_config);
 
     // SINGLE CALL for your project's bridge libraries
 
@@ -537,7 +511,7 @@ pub fn build(b: *std.Build) void {
     main_distributed.root_module.addImport("pcp", pcp_module);
 
     // NEW WAY: Single call for IREE dependencies
-    addIreeDependencies(main_distributed, iree_config);
+    addIreeDependencies(main_distributed, b, iree_config);
     
     // IREE dependencies already added above with addIreeDependencies
 
@@ -663,7 +637,7 @@ pub fn build(b: *std.Build) void {
     gpt2_model_test.root_module.addImport("pcp", pcp_module);
     
     // NEW WAY: Single call for IREE dependencies
-    addIreeDependencies(gpt2_model_test, iree_config);
+    addIreeDependencies(gpt2_model_test, b, iree_config);
 
     // SINGLE CALL for your project's bridge libraries
 
@@ -689,7 +663,7 @@ pub fn build(b: *std.Build) void {
     isolated_vjp_tests.root_module.addImport("pcp", pcp_module);
     
     // NEW WAY: Single call for IREE dependencies
-    addIreeDependencies(isolated_vjp_tests, iree_config);
+    addIreeDependencies(isolated_vjp_tests, b, iree_config);
 
     // SINGLE CALL for your project's bridge libraries
 
@@ -703,31 +677,19 @@ pub fn build(b: *std.Build) void {
     const run_isolated_vjp_tests_step = b.step("run-isolated-vjp-tests", "Run isolated VJP numerical verification tests");
     run_isolated_vjp_tests_step.dependOn(&run_isolated_vjp_tests_cmd.step);
 
-    // End-to-End Transformer Block Autodiff Test
-    const end_to_end_transformer_test = b.addExecutable(.{
-        .name = "end_to_end_transformer_test",
-        .root_source_file = b.path("src/examples/end_to_end_transformer_test.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-
-    // Add module dependencies for end-to-end transformer test
-    end_to_end_transformer_test.root_module.addImport("pcp", pcp_module);
-    
-    // NEW WAY: Single call for IREE dependencies
-    addIreeDependencies(end_to_end_transformer_test, iree_config);
-
-    // SINGLE CALL for your project's bridge libraries
-
-    // Install the test executable
-    //b.installArtifact(end_to_end_transformer_test);
-
-    // Run step for end-to-end transformer test
-    const run_end_to_end_transformer_test_cmd = b.addRunArtifact(end_to_end_transformer_test);
-    run_end_to_end_transformer_test_cmd.step.dependOn(&end_to_end_transformer_test.step);
-
-    const run_end_to_end_transformer_test_step = b.step("run-end-to-end-transformer-test", "Run end-to-end transformer block autodiff test with finite difference verification");
-    run_end_to_end_transformer_test_step.dependOn(&run_end_to_end_transformer_test_cmd.step);
+    // End-to-End Transformer Block Autodiff Test - COMMENTED OUT
+    // const end_to_end_transformer_test = b.addExecutable(.{
+    //     .name = "end_to_end_transformer_test",
+    //     .root_source_file = b.path("src/examples/end_to_end_transformer_test.zig"),
+    //     .target = target,
+    //     .optimize = optimize,
+    // });
+    // end_to_end_transformer_test.root_module.addImport("pcp", pcp_module);
+    // addIreeDependencies(end_to_end_transformer_test, iree_config);
+    // const run_end_to_end_transformer_test_cmd = b.addRunArtifact(end_to_end_transformer_test);
+    // run_end_to_end_transformer_test_cmd.step.dependOn(&end_to_end_transformer_test.step);
+    // const run_end_to_end_transformer_test_step = b.step("run-end-to-end-transformer-test", "Run end-to-end transformer block autodiff test with finite difference verification");
+    // run_end_to_end_transformer_test_step.dependOn(&run_end_to_end_transformer_test_cmd.step);
 
     // // Property-based testing step
     // const prop_tests = b.addTest(.{

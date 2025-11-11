@@ -7,6 +7,12 @@ pub const ops = @import("ops.zig");
 pub const mlir = @import("mlir.zig");
 pub const mlir_ctx = @import("mlir_ctx.zig");
 
+// Backend selection and implementations
+pub const backend_selection = @import("backend_selection.zig");
+pub const backends = struct {
+    pub const iree = @import("backends/iree.zig");
+};
+
 // Data loading and processing
 pub const data_loader = @import("data_loader.zig");
 
@@ -17,10 +23,8 @@ pub const models = struct {
 
 // Legacy systems (will be phased out)
 pub const autodiff = @import("autodiff.zig");
-pub const metal = @import("backends/metal.zig");
 
-pub const optimizers = struct {
-};
+pub const optimizers = struct {};
 
 test {
     // Import all tests from modules

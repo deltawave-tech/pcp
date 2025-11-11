@@ -148,6 +148,66 @@ pub const MLIRContext = struct {
         }
     }
     
+    /// Compiles an MLIR module to a VMFB artifact using the IREE compiler.
+    pub fn compileToVMFB(self: *Self, allocator: Allocator, module: mlir.Module, iree_target: []const u8) ![]u8 {
+        _ = self; // Not using self directly, but good practice for a method
+
+        // 1. Serialize MLIR module to a string
+        const mlir_source = try serializeMLIRModule(allocator, module);
+        defer allocator.free(mlir_source);
+
+        // 2. Create unique temporary file paths to avoid race conditions
+        const timestamp = std.time.timestamp();
+        const temp_mlir_path = try std.fmt.allocPrint(allocator, "/tmp/pcp_module_{d}.mlir", .{timestamp});
+        defer allocator.free(temp_mlir_path);
+        const temp_vmfb_path = try std.fmt.allocPrint(allocator, "/tmp/pcp_module_{d}.vmfb", .{timestamp});
+        defer allocator.free(temp_vmfb_path);
+        
+        // Defer cleanup of temp files
+        defer std.fs.deleteFileAbsolute(temp_mlir_path) catch {};
+        defer std.fs.deleteFileAbsolute(temp_vmfb_path) catch {};
+
+        // 3. Write MLIR to temporary file
+        try std.fs.cwd().writeFile(.{ .sub_path = temp_mlir_path, .data = mlir_source });
+
+        // 4. Call the IREE compiler as a subprocess
+        // This path assumes your `pcp` project and `iree-build` directory are siblings.
+        const iree_compile_path = "../iree-build/tools/iree-compile";
+
+        // FIX: Build the target argument string at runtime
+        const target_arg = try std.fmt.allocPrint(allocator, "--iree-hal-target-backends={s}", .{iree_target});
+        defer allocator.free(target_arg);
+
+        const result = std.process.Child.run(.{
+            .allocator = allocator,
+            .argv = &.{
+                iree_compile_path,
+                temp_mlir_path,
+                target_arg,
+                "-o",
+                temp_vmfb_path,
+            },
+        }) catch |err| {
+            std.log.err("Failed to execute `iree-compile`: {s}", .{@errorName(err)});
+            std.log.err("Ensure IREE is built correctly in the ../iree-build directory.", .{});
+            return err;
+        };
+        defer allocator.free(result.stdout);
+        defer allocator.free(result.stderr);
+
+        if (result.term != .Exited or result.term.Exited != 0) {
+            std.log.err("IREE compilation failed with stdout:\n{s}", .{result.stdout});
+            std.log.err("IREE compilation failed with stderr:\n{s}", .{result.stderr});
+            std.log.err("Problematic MLIR source was written to: {s}", .{temp_mlir_path});
+            // Note: We don't delete the file on error so you can inspect it.
+            return error.IREECompilationFailed;
+        }
+
+        // 5. Read the compiled VMFB artifact back into memory
+        const vmfb_binary = try std.fs.cwd().readFileAlloc(allocator, temp_vmfb_path, 50 * 1024 * 1024); // 50MB limit
+        return vmfb_binary;
+    }
+    
     /// NEW IREE-based SPIR-V compilation replacing the complex manual pipeline
     pub fn lowerToSPIRV(_: *Self, allocator: Allocator, module: mlir.Module, unique_id: u32) ![]const u8 {
         // 1. Serialize MLIR module to file for IREE compilation
@@ -575,177 +635,3 @@ pub fn extractGPUKernelInfo(allocator: Allocator, spirv_binary: []const u8) ![]G
     return kernels;
 }
 
-// Test function to verify the complete StableHLO → GPU → SPIR-V → Metal pipeline
-pub fn testMLIRGPUPipeline(allocator: std.mem.Allocator) !void {
-    std.debug.print("\n=== Testing MLIR StableHLO → GPU → SPIR-V → Metal Pipeline ===\n", .{});
-    
-    // Define our input data for simple 2x2 matrix multiplication
-    const input_a_data = [_]f32{ 1.0, 2.0, 3.0, 4.0 }; // 2x2 matrix
-    const input_b_data = [_]f32{ 5.0, 6.0, 7.0, 8.0 }; // 2x2 matrix
-
-    // Manually calculate the expected "golden" result for verification
-    // C = A @ B
-    // C[0,0] = 1*5 + 2*7 = 19
-    // C[0,1] = 1*6 + 2*8 = 22  
-    // C[1,0] = 3*5 + 4*7 = 43
-    // C[1,1] = 3*6 + 4*8 = 50
-    const expected_output_data = [_]f32{ 19.0, 22.0, 43.0, 50.0 };
-    
-    // 1. Initialize MLIR context with GPU pipeline
-    var mlir_ctx = try MLIRContext.init(allocator);
-    defer mlir_ctx.deinit();
-    
-    // 2. Create a StableHLO module with simple 2x2 matrix multiplication for easier verification
-    const stablehlo_module_str =
-        \\module {
-        \\  func.func @main(%arg0: tensor<2x2xf32>, %arg1: tensor<2x2xf32>) -> tensor<2x2xf32> {
-        \\    %0 = stablehlo.dot_general %arg0, %arg1, contracting_dims = [1] x [0] : (tensor<2x2xf32>, tensor<2x2xf32>) -> tensor<2x2xf32>
-        \\    return %0 : tensor<2x2xf32>
-        \\  }
-        \\}
-    ;
-    
-    const context = mlir_ctx.getContext();
-    std.debug.print("Creating StableHLO module from string...\n", .{});
-    const module = mlir.Module.parse(context, stablehlo_module_str) catch |err| {
-        std.debug.print("ERROR parsing StableHLO module: {}\n", .{err});
-        return err;
-    };
-    defer module.deinit();
-    
-    std.debug.print("✓ Created StableHLO module\n", .{});
-    
-    // 3. Lower StableHLO → GPU → SPIR-V using IREE
-    std.debug.print("About to call lowerToSPIRV via IREE...\n", .{});
-    const spirv_binary = mlir_ctx.lowerToSPIRV(allocator, module) catch |err| {
-        std.debug.print("ERROR in IREE lowerToSPIRV: {}\n", .{err});
-        return err;
-    };
-    defer allocator.free(spirv_binary);
-    
-    // 4. Extract GPU kernel names from SPIR-V binary
-    const kernel_names = try extractKernelNamesFromSPIRV(allocator, spirv_binary);
-    defer {
-        for (kernel_names) |name| {
-            allocator.free(name);
-        }
-        allocator.free(kernel_names);
-    }
-    
-    // 5. Translate SPIR-V to MSL  
-    const msl_source = try translateSpirvToMsl(allocator, spirv_binary);
-    defer allocator.free(msl_source);
-    
-    // 6. EXTRACT KERNEL INFO FROM THE CORRECT SOURCE: THE SPIR-V BINARY
-    const kernel_info = try extractGPUKernelInfo(allocator, spirv_binary);
-    defer {
-        for (kernel_info) |*info| {
-            info.deinit(allocator);
-        }
-        allocator.free(kernel_info);
-    }
-    
-    std.debug.print("\n=== Verifying Metal Compilation Success ===\n", .{});
-
-    // 7. Verify the MSL source contains expected kernel function
-    const msl_contains_kernel = std.mem.indexOf(u8, msl_source, "kernel void") != null or
-                                std.mem.indexOf(u8, msl_source, "kernel float") != null or  
-                                std.mem.indexOf(u8, msl_source, "main_dispatch") != null;
-    
-    if (msl_contains_kernel) {
-        std.debug.print("🌙 MSL contains GPU kernel function\n", .{});
-    } else {
-        std.debug.print("⚠ MSL may not contain expected kernel function\n", .{});
-    }
-
-    // 8. Verify kernel name extraction worked
-    if (kernel_info.len > 0) {
-        std.debug.print("🌙 Successfully extracted kernel: {s}\n", .{kernel_info[0].name});
-        
-        // 9. Verify the mathematical correctness (CPU verification)
-        std.debug.print("Verifying mathematical correctness (CPU calculation)...\n", .{});
-        std.debug.print("   Input A: {any}\n", .{input_a_data});
-        std.debug.print("   Input B: {any}\n", .{input_b_data});
-        std.debug.print("   Expected Result: {any}\n", .{expected_output_data});
-        
-        // CPU verification of matrix multiplication
-        var cpu_result = [_]f32{0.0} ** 4;
-        // A @ B for 2x2 matrices
-        cpu_result[0] = input_a_data[0] * input_b_data[0] + input_a_data[1] * input_b_data[2]; // C[0,0]
-        cpu_result[1] = input_a_data[0] * input_b_data[1] + input_a_data[1] * input_b_data[3]; // C[0,1]
-        cpu_result[2] = input_a_data[2] * input_b_data[0] + input_a_data[3] * input_b_data[2]; // C[1,0]
-        cpu_result[3] = input_a_data[2] * input_b_data[1] + input_a_data[3] * input_b_data[3]; // C[1,1]
-        
-        std.debug.print("   CPU Verification: {any}\n", .{cpu_result});
-        
-        const tolerance = 1e-6;
-        for (cpu_result, expected_output_data) |cpu_val, expected_val| {
-            if (@abs(cpu_val - expected_val) > tolerance) {
-                std.debug.print("💣 CPU verification failed! Computed: {}, Expected: {}\n", .{ cpu_val, expected_val });
-                return error.CPUVerificationFailed;
-            }
-        }
-        
-        std.debug.print("🌙 CPU verification successful! Math is correct.\n", .{});
-    }
-
-    // --- START: NEW EXECUTION AND VERIFICATION SECTION ---
-
-    std.debug.print("\n=== Verifying Execution on Metal GPU ===\n", .{});
-
-    // 1. Initialize the Metal Backend, PASSING IN our existing MLIR context
-    const metal = @import("backends/metal.zig");
-    try metal.init(allocator, &mlir_ctx);
-    defer metal.deinit();
-    
-    const engine = try metal.getExecutionEngine();
-
-    // 2. Prepare inputs and outputs for the execution engine
-    var input_array = [_][]const f32{ input_a_data[0..], input_b_data[0..] };
-    var actual_gpu_output = [_]f32{ 0.0, 0.0, 0.0, 0.0 };
-    var output_array = [_][]f32{ actual_gpu_output[0..] };
-
-    // 3. Execute the pre-compiled MSL on the GPU
-    // This is the step that actually runs code on the M3.
-    // Now you should see a spike in `mactop`!
-    std.debug.print("👻 Dispatching kernel to M3 GPU for execution...\n", .{});
-    try engine.executeMSL(msl_source, kernel_info, input_array[0..], output_array[0..]);
-    std.debug.print("🌙 GPU execution finished.\n", .{});
-
-    // 4. Verify the result read back from the GPU
-    std.debug.print("Verifying GPU output against expected result...\n", .{});
-    std.debug.print("   GPU Result: {any}\n", .{actual_gpu_output});
-    std.debug.print("   Expected:   {any}\n", .{expected_output_data});
-
-    const tolerance = 1e-6;
-    for (actual_gpu_output, expected_output_data) |gpu_val, expected_val| {
-        if (@abs(gpu_val - expected_val) > tolerance) {
-            std.debug.print("💣 GPU verification failed! Computed: {}, Expected: {}\n", .{ gpu_val, expected_val });
-            return error.GPUVerificationFailed;
-        }
-    }
-    std.debug.print("🌙 Verification successful! The result from the GPU is correct.\n", .{});
-
-    // --- END: NEW EXECUTION AND VERIFICATION SECTION ---
-
-    // 10. Save the generated MSL for inspection
-    std.debug.print("\n=== Generated Metal Shading Language ===\n", .{});
-    try std.fs.cwd().writeFile(.{ .sub_path = "generated_kernel.metal", .data = msl_source });
-    std.debug.print("✓ Saved MSL source to generated_kernel.metal for inspection\n", .{});
-    
-    // Show a snippet of the MSL
-    const msl_preview_len = @min(400, msl_source.len);
-    std.debug.print("MSL Preview ({} bytes shown):\n", .{msl_preview_len});
-    std.debug.print("{s}\n", .{msl_source[0..msl_preview_len]});
-    if (msl_source.len > msl_preview_len) {
-        std.debug.print("... (truncated, see generated_kernel.metal for full source)\n", .{});
-    }
-
-    std.debug.print("✓ Complete MLIR GPU pipeline test completed successfully!\n", .{});
-    std.debug.print("  Generated {} kernels\n", .{kernel_info.len});
-    for (kernel_info) |ki| {
-        std.debug.print("    - Kernel Name: {s}\n", .{ki.name});
-    }
-    std.debug.print("  SPIR-V binary: {} bytes\n", .{spirv_binary.len});
-    std.debug.print("  MSL source: {} bytes\n", .{msl_source.len});
-}

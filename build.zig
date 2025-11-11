@@ -212,9 +212,35 @@ fn detectCapnp(b: *std.Build) CapnpConfig {
     return config;
 }
 
-// Attempt to find IREE SDK installation
-fn detectIree(b: *std.Build) ?[]const u8 {
-    return std.process.getEnvVarOwned(b.allocator, "IREE_SDK_DIR") catch null;
+// IREE configuration struct
+const IreeConfig = struct {
+    enabled: bool = false,
+    source_dir: ?[]const u8 = null, // For headers
+    build_dir: ?[]const u8 = null, // For libraries
+};
+
+// NEW: Detect IREE based on the sibling directory structure
+fn detectIree(b: *std.Build) IreeConfig {
+    var config: IreeConfig = .{};
+    // These paths are relative to your project root ('pcp')
+    const iree_source_path = "../iree";
+    const iree_build_path = "../iree-build"; // Assumes the build folder is also a sibling
+
+    // Check if both directories actually exist
+    if (std.fs.cwd().access(iree_source_path, .{})) |_| {
+        if (std.fs.cwd().access(iree_build_path, .{})) |_| {
+            std.debug.print("Found IREE source at: {s}\n", .{iree_source_path});
+            std.debug.print("Found IREE build at: {s}\n", .{iree_build_path});
+            config.enabled = true;
+            config.source_dir = iree_source_path;
+            config.build_dir = iree_build_path;
+        } else {
+            std.debug.print("IREE source found, but build dir '{s}' not found. IREE linking disabled.\n", .{iree_build_path});
+        }
+    } else {
+        std.debug.print("IREE source dir '{s}' not found. IREE linking disabled.\n", .{iree_source_path});
+    }
+    return config;
 }
 
 // Helper function to execute a command and capture its output
@@ -337,30 +363,33 @@ fn addMLIRSupport(b: *std.Build, target: *std.Build.Step.Compile, mlir_config: M
 }
 
 
-// Helper function to add IREE support to an executable
-fn addIreeSupport(b: *std.Build, target: *std.Build.Step.Compile, iree_sdk_dir: ?[]const u8) void {
-    if (iree_sdk_dir) |dir| {
-        // 1. Add the include path for `iree/runtime/api.h`
-        const include_path = std.fs.path.join(b.allocator, &.{dir, "include"}) catch {
-            std.debug.print("Failed to construct IREE include path\n", .{});
-            return;
-        };
-        target.addIncludePath(.{ .cwd_relative = include_path });
-        
-        // 2. Add the library path
-        const lib_path = std.fs.path.join(b.allocator, &.{dir, "lib"}) catch {
-            std.debug.print("Failed to construct IREE lib path\n", .{});
-            return;
-        };
-        target.addLibraryPath(.{ .cwd_relative = lib_path });
-        
-        // 3. Link the core IREE runtime library
-        target.linkSystemLibrary("iree_runtime_all_sync");
-        
-        std.debug.print("Added IREE support: include={s}, lib={s}\n", .{include_path, lib_path});
-    } else {
-        std.debug.print("IREE SDK not found, skipping IREE support\n", .{});
+// REVISED: Add IREE support for both COMPILER and RUNTIME
+fn addIreeSupport(target: *std.Build.Step.Compile, b: *std.Build, config: IreeConfig) void {
+    if (!config.enabled) {
+        std.debug.print("Skipping IREE support for '{s}': IREE not found.\n", .{target.name});
+        return;
     }
+    std.debug.print("==> Configuring IREE support for '{s}'\n", .{target.name});
+
+    const source_dir = config.source_dir.?;
+    const build_dir = config.build_dir.?;
+
+    // 1. Add include path for all IREE headers (compiler and runtime)
+    // This path should point to the root of the cloned 'iree' repo.
+    target.addIncludePath(.{ .cwd_relative = source_dir });
+
+    // 2. Add library path from your IREE build directory
+    const lib_path = std.fs.path.join(b.allocator, &.{ build_dir, "lib" }) catch @panic("OOM");
+    target.addLibraryPath(.{ .cwd_relative = lib_path });
+
+    // 3. Link the necessary IREE libraries
+    target.linkLibCpp(); // IREE is a C++ project
+    
+    // For using the COMPILER C API (iree_compiler_session_create, etc.)
+    target.linkSystemLibrary("IREECompiler");
+
+    // For using the RUNTIME C API (iree_runtime_instance_create, etc.)
+    target.linkSystemLibrary("iree_runtime_all_sync");
 }
 
 pub fn build(b: *std.Build) void {
@@ -382,10 +411,10 @@ pub fn build(b: *std.Build) void {
         capnp_config.lib_dir orelse "null"
     });
 
-    // Detect IREE SDK availability
-    std.debug.print("==> Detecting IREE SDK configuration\n", .{});
-    const iree_sdk_dir = detectIree(b);
-    std.debug.print("==> IREE SDK detected: path={s}\n", .{iree_sdk_dir orelse "null"});
+    // === CHANGE #1: Call the new detectIree function ===
+    std.debug.print("==> Detecting IREE configuration\n", .{});
+    const iree_config = detectIree(b);
+    std.debug.print("==> IREE detected: enabled={}\n", .{iree_config.enabled});
 
     // Metal bridge library removed - workers now use IREE runtime directly
     std.debug.print("==> Metal bridge library removed, using IREE runtime\n", .{});
@@ -724,8 +753,10 @@ pub fn build(b: *std.Build) void {
     // SINGLE CALL for all MLIR/LLVM/Metal libraries
     addMLIRSupport(b, main_distributed, mlir_config);
     
-    // Add IREE support for runtime execution
-    addIreeSupport(b, main_distributed, iree_sdk_dir);
+    // === CHANGE #2: Update this function call ===
+    // OLD: addIreeSupport(b, main_distributed, iree_sdk_dir);
+    // NEW:
+    addIreeSupport(main_distributed, b, iree_config);
 
     // SINGLE CALL for your project's bridge libraries
 

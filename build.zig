@@ -470,4 +470,25 @@ pub fn build(b: *std.Build) void {
 
     const run_mlir_optimizer_tests_step = b.step("run-mlir-optimizer-tests", "Run MLIR optimizer numerical verification tests");
     run_mlir_optimizer_tests_step.dependOn(&run_mlir_optimizer_tests_cmd.step);
+
+    // Distributed Nano-Transformer Training Demo
+    const distributed_transformer_test = b.addExecutable(.{
+        .name = "distributed_transformer_test",
+        .root_source_file = b.path("src/examples/distributed_transformer_test.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    // Add module dependencies
+    distributed_transformer_test.root_module.addImport("pcp", pcp_module);
+
+    // IREE dependencies
+    addIreeDependencies(distributed_transformer_test, b);
+
+    // Run step for distributed transformer test
+    const run_distributed_transformer_test_cmd = b.addRunArtifact(distributed_transformer_test);
+    run_distributed_transformer_test_cmd.step.dependOn(&distributed_transformer_test.step);
+
+    const run_distributed_transformer_test_step = b.step("run-distributed-transformer-demo", "Run distributed nano-transformer training demo");
+    run_distributed_transformer_test_step.dependOn(&run_distributed_transformer_test_cmd.step);
 }

@@ -11,10 +11,20 @@ pub const mlir_ctx = @import("mlir_ctx.zig");
 pub const backend_selection = @import("backend_selection.zig");
 pub const backends = struct {
     pub const iree = @import("backends/iree.zig");
+    pub const demo = @import("backends/demo.zig");
 };
 
 // Data loading and processing
 pub const data_loader = @import("data_loader.zig");
+
+// Distributed training system
+pub const controllers = struct {
+    pub const shepherd = @import("controllers/shepherd.zig");
+};
+pub const worker = @import("worker.zig");
+pub const algorithms = struct {
+    pub const diloco = @import("algorithms/diloco.zig");
+};
 
 // Models
 pub const models = struct {

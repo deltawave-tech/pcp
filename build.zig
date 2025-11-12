@@ -157,7 +157,9 @@ fn addIreeDependencies(target: *std.Build.Step.Compile, b: *std.Build) void {
     // FlatCC Dependency
     target.linkSystemLibrary("flatcc_parsing");
     
-    // MLIR library needed for the dialect registration in pass_anchors
+    // MLIR libraries needed for the dialect registration in pass_anchors
+    target.linkSystemLibrary("MLIRFuncDialect");
+    target.linkSystemLibrary("MLIRArithDialect");
     target.linkSystemLibrary("StablehloOps");
     
     // macOS Frameworks

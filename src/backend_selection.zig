@@ -53,7 +53,7 @@ pub const Backend = enum {
     /// Convert backend to IREE driver name
     pub fn toIreeDriverName(self: Backend) []const u8 {
         return switch (self) {
-            .metal => "metal",
+            .metal => "metal-spirv",
             .cuda => "cuda",
             .cpu => "local-sync", // IREE's CPU driver name
             .demo => "local-sync", // Use CPU for demo

@@ -223,8 +223,8 @@ pub const c = struct {
     pub const MlirDialectHandle = extern struct {
         ptr: ?*anyopaque,
     };
-    extern fn mlirGetDialectHandle__func__() MlirDialectHandle;
-    extern fn mlirGetDialectHandle__arith__() MlirDialectHandle;
+    pub extern fn mlirGetDialectHandle__func__() MlirDialectHandle;
+    pub extern fn mlirGetDialectHandle__arith__() MlirDialectHandle;
     extern fn mlirGetDialectHandle__linalg__() MlirDialectHandle;
     extern fn mlirGetDialectHandle__gpu__() MlirDialectHandle;
     extern fn mlirGetDialectHandle__spirv__() MlirDialectHandle;

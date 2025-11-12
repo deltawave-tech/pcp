@@ -122,7 +122,10 @@ fn buildAdamUpdateFunction(
     const new_v = try ops.add(builder, v_decay, v_update);
 
     // Broadcast timestep to tensor shape for power computation
-    const t_tensor = try ops.broadcast(builder, timestep, params_dims);
+    // broadcastInDim requires broadcast dimensions - for scalar to tensor, use empty dimensions
+    const broadcast_dims = try builder.allocator.alloc(i64, 0); // empty dims for scalar broadcast
+    defer builder.allocator.free(broadcast_dims);
+    const t_tensor = try ops.broadcastInDim(builder, timestep, params_dims, broadcast_dims);
 
     // Calculate beta1^t and beta2^t using exponential operation
     const beta1_power_t = try ops.exp(builder, try ops.multiply(builder, try ops.log(builder, beta1_tensor), t_tensor));
@@ -206,8 +209,6 @@ pub fn AdamMLIR(comptime T: type) type {
             const params_dims = try params.shape.getDims(self.builder.allocator);
             defer self.builder.allocator.free(params_dims);
 
-            const zero_op = hlo.zeroConstant(self.builder.ctx, params_dims, self.element_type);
-
             // Create m state (first moment)
             const m_op = hlo.zeroConstant(self.builder.ctx, params_dims, self.element_type);
             self.m_state = try self.builder.newTensor(m_op.getResult(0));
@@ -232,7 +233,6 @@ pub fn AdamMLIR(comptime T: type) type {
 
             // Create scalar timestep tensor
             const scalar_shape = &[_]i64{}; // scalar shape
-            const scalar_type = mlir.Type.rankedTensorType(self.builder.ctx, scalar_shape, self.element_type);
             const timestep_tensor = try ops.constant(self.builder, @as(f64, @floatCast(t_val)), scalar_shape, self.element_type);
 
             // 1. Prepare operands for the call

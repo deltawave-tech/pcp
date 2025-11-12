@@ -449,4 +449,25 @@ pub fn build(b: *std.Build) void {
 
     const run_isolated_vjp_tests_step = b.step("run-isolated-vjp-tests", "Run isolated VJP numerical verification tests");
     run_isolated_vjp_tests_step.dependOn(&run_isolated_vjp_tests_cmd.step);
+
+    // MLIR Optimizer Tests - Numerical verification of Adam and Nesterov optimizers
+    const mlir_optimizer_tests = b.addExecutable(.{
+        .name = "mlir_optimizer_tests",
+        .root_source_file = b.path("src/examples/mlir_optimizer_test.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    // Add module dependencies
+    mlir_optimizer_tests.root_module.addImport("pcp", pcp_module);
+
+    // IREE dependencies
+    addIreeDependencies(mlir_optimizer_tests, b);
+
+    // Run step for MLIR optimizer tests
+    const run_mlir_optimizer_tests_cmd = b.addRunArtifact(mlir_optimizer_tests);
+    run_mlir_optimizer_tests_cmd.step.dependOn(&mlir_optimizer_tests.step);
+
+    const run_mlir_optimizer_tests_step = b.step("run-mlir-optimizer-tests", "Run MLIR optimizer numerical verification tests");
+    run_mlir_optimizer_tests_step.dependOn(&run_mlir_optimizer_tests_cmd.step);
 }

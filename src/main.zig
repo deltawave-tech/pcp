@@ -24,7 +24,10 @@ pub const models = struct {
 // Legacy systems (will be phased out)
 pub const autodiff = @import("autodiff.zig");
 
-pub const optimizers = struct {};
+pub const optimizers = struct {
+    pub const adam_mlir = @import("optimizers/adam_mlir.zig");
+    pub const nesterov_mlir = @import("optimizers/nesterov_mlir.zig");
+};
 
 test {
     // Import all tests from modules

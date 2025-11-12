@@ -114,16 +114,51 @@ fn addIreeDependencies(target: *std.Build.Step.Compile, b: *std.Build) void {
     target.addLibraryPath(.{ .cwd_relative = iree_lib_path });
     target.addLibraryPath(.{ .cwd_relative = iree_runtime_lib_path });
     target.addLibraryPath(.{ .cwd_relative = flatcc_lib_path });
+    const iree_build_lib_path = b.fmt("{s}/iree-build/llvm-project/lib", .{absolute_workshop_path});
+    target.addLibraryPath(.{ .cwd_relative = iree_build_lib_path });
+
+    // --- Build and Link C++ Dialect Anchors ---
+    const dialect_anchors_lib = b.addStaticLibrary(.{
+        .name = "dialect_anchors",
+        .target = target.root_module.resolved_target.?,
+        .optimize = target.root_module.optimize.?,
+    });
+    dialect_anchors_lib.addCSourceFile(.{
+        .file = b.path("src/mlir/pass_anchors.cpp"),
+        .flags = &.{"-std=c++17"},
+    });
+    
+    // Add include paths needed by pass_anchors.cpp
+    const mlir_include_path = b.fmt("{s}/iree/third_party/llvm-project/mlir/include", .{absolute_workshop_path});
+    const llvm_include_path = b.fmt("{s}/iree/third_party/llvm-project/llvm/include", .{absolute_workshop_path});
+    const iree_build_include_path = b.fmt("{s}/iree-build/llvm-project/include", .{absolute_workshop_path});
+    const iree_build_mlir_include_path = b.fmt("{s}/iree-build/llvm-project/tools/mlir/include", .{absolute_workshop_path});
+    const stablehlo_include_path = b.fmt("{s}/iree/third_party/stablehlo", .{absolute_workshop_path});
+    const stablehlo_build_include_path = b.fmt("{s}/iree-build/llvm-external-projects/stablehlo", .{absolute_workshop_path});
+
+    dialect_anchors_lib.addIncludePath(.{ .cwd_relative = mlir_include_path });
+    dialect_anchors_lib.addIncludePath(.{ .cwd_relative = llvm_include_path });
+    dialect_anchors_lib.addIncludePath(.{ .cwd_relative = iree_build_include_path });
+    dialect_anchors_lib.addIncludePath(.{ .cwd_relative = iree_build_mlir_include_path });
+    dialect_anchors_lib.addIncludePath(.{ .cwd_relative = stablehlo_include_path });
+    dialect_anchors_lib.addIncludePath(.{ .cwd_relative = stablehlo_build_include_path });
+    dialect_anchors_lib.linkLibCpp();
+    
+    target.linkLibrary(dialect_anchors_lib);
+    target.step.dependOn(&dialect_anchors_lib.step);
 
     // --- Link All Required Libraries ---
     target.linkLibCpp();
     
-    // Core IREE Libraries
+    // Core IREE
     target.linkSystemLibrary("IREECompiler");
     target.linkSystemLibrary("iree_runtime_unified");
     
-    // Category 1: FlatCC Dependency for the runtime
+    // FlatCC Dependency
     target.linkSystemLibrary("flatcc_parsing");
+    
+    // MLIR library needed for the dialect registration in pass_anchors
+    target.linkSystemLibrary("StablehloOps");
     
     // macOS Frameworks
     if (target.root_module.resolved_target.?.result.os.tag == .macos) {

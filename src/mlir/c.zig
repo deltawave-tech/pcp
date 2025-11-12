@@ -232,14 +232,14 @@ pub const c = struct {
     // ADD THIS LINE for the Async dialect
     extern fn mlirGetDialectHandle__async__() MlirDialectHandle;
     // StableHLO dialect registration - NOW ENABLED!
-    extern fn mlirGetDialectHandle__stablehlo__() MlirDialectHandle;
+    pub extern fn mlirGetDialectHandle__stablehlo__() MlirDialectHandle;
     extern fn mlirGetDialectHandle__chlo__() MlirDialectHandle;
     extern fn mlirGetDialectHandle__tensor__() MlirDialectHandle;
     extern fn mlirGetDialectHandle__transform__() MlirDialectHandle;
 
-    extern fn mlirDialectHandleInsertDialect(handle: MlirDialectHandle, registry: *MlirDialectRegistry) void;
-    extern fn mlirContextAppendDialectRegistry(ctx: *MlirContext, registry: *MlirDialectRegistry) void;
-    extern fn mlirDialectHandleLoadDialect(handle: MlirDialectHandle, ctx: *MlirContext) *MlirDialect;
+    pub extern fn mlirDialectHandleInsertDialect(handle: MlirDialectHandle, registry: *MlirDialectRegistry) void;
+    pub extern fn mlirContextAppendDialectRegistry(ctx: *MlirContext, registry: *MlirDialectRegistry) void;
+    pub extern fn mlirDialectHandleLoadDialect(handle: MlirDialectHandle, ctx: *MlirContext) *MlirDialect;
     extern fn mlirContextLoadAllAvailableDialects(ctx: *MlirContext) void;
 
     // Pass registration functions

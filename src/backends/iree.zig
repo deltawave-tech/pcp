@@ -97,7 +97,7 @@ pub const IreeBackend = struct {
     }
 
     /// Execute a training step with a pre-compiled VMFB artifact.
-    pub fn execute(self: *Self, vmfb_bytes: []const u8, inputs_data: [][]const u8, input_shapes: [][]const i64) ![][]u8 {
+    pub fn execute(self: *Self, vmfb_bytes: []const u8, function_name: []const u8, inputs_data: [][]const u8, input_shapes: [][]const i64) ![][]u8 {
         // 1. Load the .vmfb module into the session
         // NOTE: In a real app, you would load this once and cache it. For now, we load it on every call.
         try ireeCheck(c.iree_runtime_session_append_bytecode_module_from_memory(
@@ -106,10 +106,15 @@ pub const IreeBackend = struct {
             c.iree_allocator_null(), // We don't own the flatbuffer data
         ));
 
-        // 2. Initialize a call to the main function
+        // 2. Initialize a call to the specified function
         var call: c.iree_runtime_call_t = undefined;
-        const main_fn_name = c.iree_string_view_t{ .data = "module.main", .size = 11 };
-        try ireeCheck(c.iree_runtime_call_initialize_by_name(self.session.?, main_fn_name, &call));
+        
+        // IREE expects the format "module.<function_name>"
+        const full_fn_name = try std.fmt.allocPrint(self.allocator, "module.{s}", .{function_name});
+        defer self.allocator.free(full_fn_name);
+        
+        const fn_name_view = c.iree_string_view_t{ .data = full_fn_name.ptr, .size = full_fn_name.len };
+        try ireeCheck(c.iree_runtime_call_initialize_by_name(self.session.?, fn_name_view, &call));
         defer c.iree_runtime_call_deinitialize(&call);
 
         // 3. Create IREE buffer views from input data using the simpler allocate_buffer_copy API
@@ -201,7 +206,7 @@ pub const IreeBackend = struct {
 
     fn executeTrainingStepInterface(ptr: *anyopaque, artifact: []const u8, data: [][]const u8, shapes: [][]const i64) anyerror![][]u8 {
         const self: *Self = @ptrCast(@alignCast(ptr));
-        return self.execute(artifact, data, shapes);
+        return self.execute(artifact, "main", data, shapes);
     }
 
     fn deinitInterface(ptr: *anyopaque) void {

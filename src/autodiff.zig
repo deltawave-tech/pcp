@@ -46,6 +46,8 @@ fn getVjpFn(op_name: []const u8) ?VJPFn {
         return reshapeVJP;
     } else if (std.mem.eql(u8, op_name, "stablehlo.reduce_sum")) {
         return reduceSumVJP;
+    } else if (std.mem.eql(u8, op_name, "stablehlo.reduce")) {
+        return reduceSumVJP;
     } else if (std.mem.eql(u8, op_name, "stablehlo.gather")) {
         return gatherVJP;
     } else if (std.mem.eql(u8, op_name, "stablehlo.slice")) {
@@ -615,9 +617,24 @@ fn reduceSumVJP(
             const grad_rank = grad_out_type.getRank();
             
             if (grad_rank == 0) {
-                // Full reduction to scalar - broadcast_dimensions is empty for scalar broadcast
-                const grad_input = try builder.createAndAttach("stablehlo.broadcast", &.{grad_out}, &.{original_shape_type}, .{});
-                try result.append(grad_input.getResult(0));
+                // Full reduction to scalar - use broadcast_in_dim with empty broadcast_dimensions
+                // For empty array, we need to pass a valid pointer to empty data
+                const empty_dims: [0]i64 = .{};
+                const empty_broadcast_dims_attr = c.mlirDenseI64ArrayGet(builder.ctx.handle, 0, &empty_dims);
+                
+                var state = c.operationStateGet("stablehlo.broadcast_in_dim", builder.loc.handle);
+                c.mlirOperationStateAddOperands(&state, 1, @ptrCast(@constCast(&grad_out.handle)));
+                c.mlirOperationStateAddResults(&state, 1, @ptrCast(@constCast(&original_shape_type.handle)));
+                
+                // Add the broadcast_dimensions attribute (empty for scalar broadcast)
+                const attr_name = c.identifierGet(builder.ctx.handle, "broadcast_dimensions");
+                const named_attr = c.MlirNamedAttribute{ .name = attr_name, .attribute = empty_broadcast_dims_attr };
+                c.mlirOperationStateAddAttributes(&state, 1, @ptrCast(@constCast(&named_attr)));
+                
+                const broadcast_op = c.operationCreate(&state);
+                builder.insertion_block.appendOwnedOperation(mlir.Operation{ .handle = broadcast_op });
+                
+                try result.append(mlir.Value{ .handle = c.operationGetResult(broadcast_op, 0) });
             } else {
                 // Partial reduction - compute which dimensions remain
                 // For now, assume reduction kept the first grad_rank dimensions

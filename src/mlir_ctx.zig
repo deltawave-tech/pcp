@@ -368,7 +368,7 @@ pub const MLIRContext = struct {
 
 /// Serialize an MLIR module to a string representation for network transfer.
 pub fn serializeMLIRModule(allocator: Allocator, module: mlir.Module) ![]u8 {
-    std.debug.print("serializeMLIRModule: Creating buffer...\n", .{});
+    // Debug: std.debug.print("serializeMLIRModule: Creating buffer...\n", .{});
     var buffer = std.ArrayList(u8).init(allocator);
     var serialization_error = false;
     
@@ -387,7 +387,7 @@ pub fn serializeMLIRModule(allocator: Allocator, module: mlir.Module) ![]u8 {
             const context = @as(*SerializationContext, @ptrCast(@alignCast(userData.?)));
             const data = data_ptr[0..data_len];
             
-            std.debug.print("MLIR serialization callback: appending {} bytes (total so far: {})\n", .{ data_len, context.buffer.items.len });
+            // Debug: std.debug.print("MLIR serialization callback: appending {} bytes (total so far: {})\n", .{ data_len, context.buffer.items.len });
             
             // Add bounds checking to prevent buffer overflow
             if (data_len > 100 * 1024 * 1024) { // 100MB sanity check
@@ -403,7 +403,7 @@ pub fn serializeMLIRModule(allocator: Allocator, module: mlir.Module) ![]u8 {
         }
     }.callback;
 
-    std.debug.print("serializeMLIRModule: About to call mlirOperationPrint...\n", .{});
+    // Debug: std.debug.print("serializeMLIRModule: About to call mlirOperationPrint...\n", .{});
     // Add null checks
     const module_op = module.op();
     if (@intFromPtr(module_op.handle) == 0) {
@@ -412,7 +412,7 @@ pub fn serializeMLIRModule(allocator: Allocator, module: mlir.Module) ![]u8 {
     }
     
     c.mlirOperationPrint(module_op.handle, writeToArrayList, &ctx);
-    std.debug.print("serializeMLIRModule: mlirOperationPrint completed, buffer size: {}\n", .{buffer.items.len});
+    // Debug: std.debug.print("serializeMLIRModule: mlirOperationPrint completed, buffer size: {}\n", .{buffer.items.len});
     
     // Check if any errors occurred during serialization
     if (serialization_error) {

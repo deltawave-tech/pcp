@@ -50,13 +50,23 @@ pub const Backend = enum {
         };
     }
 
-    /// Convert backend to IREE driver name
+    /// Convert backend to IREE driver name (for runtime)
     pub fn toIreeDriverName(self: Backend) []const u8 {
         return switch (self) {
             .metal => "metal-spirv",
             .cuda => "cuda",
-            .cpu => "local-sync", // IREE's CPU driver name
+            .cpu => "local-sync", // IREE's CPU runtime driver name
             .demo => "local-sync", // Use CPU for demo
+        };
+    }
+
+    /// Convert backend to IREE compilation target name (for iree-compile)
+    pub fn toIreeCompilationTarget(self: Backend) []const u8 {
+        return switch (self) {
+            .metal => "metal-spirv",
+            .cuda => "cuda", 
+            .cpu => "llvm-cpu", // IREE's CPU compilation target
+            .demo => "llvm-cpu", // Use CPU for demo
         };
     }
 };

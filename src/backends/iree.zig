@@ -5,7 +5,13 @@ const std = @import("std");
 const c = @cImport({
     // Disable atomic support entirely - we don't need it for basic runtime usage
     @cDefine("IREE_SYNCHRONIZATION_DISABLE_UNSAFE", "1");
+    // Enable all available drivers that we linked
+    @cDefine("IREE_HAVE_HAL_LOCAL_SYNC_DRIVER_MODULE", "1");
+    @cDefine("IREE_HAVE_HAL_METAL_DRIVER_MODULE", "1");
+    // Configure system allocator to use libc (matching IREE build configuration)
+    @cDefine("IREE_ALLOCATOR_SYSTEM_CTL", "iree_allocator_libc_ctl");
     @cInclude("iree/base/api.h");
+    @cInclude("iree/base/allocator.h");
     @cInclude("iree/runtime/api.h");
 });
 const WorkerBackend = @import("worker_backend.zig").WorkerBackend;
@@ -16,7 +22,17 @@ const mlir = @import("../mlir.zig");
 fn ireeCheck(status: c.iree_status_t) !void {
     // In IREE, null status indicates success, non-null indicates error
     if (status != null) {
-        // In a real app, you would format the error string from the status
+        // Try to get more detailed error information
+        std.debug.print("IREE Error Details:\n", .{});
+        
+        // Get error code if available
+        const code = c.iree_status_code(status);
+        std.debug.print("  Status code: {}\n", .{code});
+        
+        // Try to get error message if available - be careful with this
+        // as the status might be in an unusual state
+        std.debug.print("  Status pointer: 0x{x}\n", .{@intFromPtr(status)});
+        
         c.iree_status_free(status);
         return error.IreeRuntimeError;
     }
@@ -34,14 +50,19 @@ pub const IreeBackend = struct {
     pub fn init(allocator: std.mem.Allocator, backend: backend_selection.Backend) !*IreeBackend {
         var self = try allocator.create(IreeBackend);
         
+        // FIX 2: Add errdefer to prevent memory leak on initialization failure.
+        errdefer allocator.destroy(self);
+
         // 1. Create instance
         var instance_options: c.iree_runtime_instance_options_t = undefined;
         c.iree_runtime_instance_options_initialize(&instance_options);
         c.iree_runtime_instance_options_use_all_available_drivers(&instance_options);
+
+        // Use system allocator like working IREE samples
         try ireeCheck(c.iree_runtime_instance_create(
             &instance_options,
-            c.iree_allocator_null(), // Use null allocator and rely on instance allocator
-            @ptrCast(&self.instance),
+            c.iree_allocator_system(),
+            &self.instance,
         ));
 
         // 2. Create the HAL device directly using the instance
@@ -49,7 +70,7 @@ pub const IreeBackend = struct {
         try ireeCheck(c.iree_runtime_instance_try_create_default_device(
             self.instance.?,
             c.iree_string_view_t{ .data = driver_name.ptr, .size = driver_name.len },
-            @ptrCast(&self.device),
+            &self.device,
         ));
 
         // 4. Create the runtime session
@@ -60,7 +81,7 @@ pub const IreeBackend = struct {
             &session_options,
             self.device.?,
             c.iree_runtime_instance_host_allocator(self.instance.?),
-            @ptrCast(&self.session),
+            &self.session,
         ));
         
         self.allocator = allocator;

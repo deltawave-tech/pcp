@@ -116,6 +116,18 @@ fn addIreeDependencies(target: *std.Build.Step.Compile, b: *std.Build) void {
     target.addLibraryPath(.{ .cwd_relative = flatcc_lib_path });
     const iree_build_lib_path = b.fmt("{s}/iree-build/llvm-project/lib", .{absolute_workshop_path});
     target.addLibraryPath(.{ .cwd_relative = iree_build_lib_path });
+    const iree_base_lib_path = b.fmt("{s}/iree-build/runtime/src/iree/base", .{absolute_workshop_path});
+    target.addLibraryPath(.{ .cwd_relative = iree_base_lib_path });
+    const iree_hal_drivers_path = b.fmt("{s}/iree-build/runtime/src/iree/hal/drivers/local_sync", .{absolute_workshop_path});
+    target.addLibraryPath(.{ .cwd_relative = iree_hal_drivers_path });
+    const iree_hal_registration_path = b.fmt("{s}/iree-build/runtime/src/iree/hal/drivers/local_sync/registration", .{absolute_workshop_path});
+    target.addLibraryPath(.{ .cwd_relative = iree_hal_registration_path });
+    const iree_hal_drivers_base_path = b.fmt("{s}/iree-build/runtime/src/iree/hal/drivers", .{absolute_workshop_path});
+    target.addLibraryPath(.{ .cwd_relative = iree_hal_drivers_base_path });
+    const iree_hal_metal_path = b.fmt("{s}/iree-build/runtime/src/iree/hal/drivers/metal", .{absolute_workshop_path});
+    target.addLibraryPath(.{ .cwd_relative = iree_hal_metal_path });
+    const iree_hal_metal_registration_path = b.fmt("{s}/iree-build/runtime/src/iree/hal/drivers/metal/registration", .{absolute_workshop_path});
+    target.addLibraryPath(.{ .cwd_relative = iree_hal_metal_registration_path });
 
     // --- Build and Link C++ Dialect Anchors ---
     const dialect_anchors_lib = b.addStaticLibrary(.{
@@ -161,6 +173,17 @@ fn addIreeDependencies(target: *std.Build.Step.Compile, b: *std.Build) void {
     target.linkSystemLibrary("MLIRFuncDialect");
     target.linkSystemLibrary("MLIRArithDialect");
     target.linkSystemLibrary("StablehloOps");
+    
+    // IREE HAL driver initialization (enables use_all_available_drivers)
+    target.linkSystemLibrary("iree_hal_drivers_drivers");
+    
+    // CPU/Local-sync driver
+    target.linkSystemLibrary("iree_hal_drivers_local_sync_sync_driver");
+    target.linkSystemLibrary("iree_hal_drivers_local_sync_registration_registration");
+    
+    // Metal driver for M3
+    target.linkSystemLibrary("iree_hal_drivers_metal_metal");
+    target.linkSystemLibrary("iree_hal_drivers_metal_registration_registration");
     
     // macOS Frameworks
     if (target.root_module.resolved_target.?.result.os.tag == .macos) {

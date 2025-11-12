@@ -47,12 +47,12 @@ pub fn main() !void {
     // 3. Compile MLIR to a VMFB artifact using IREE
     //    We will replace the body of 'lowerToSPIRV' later, for now we can adapt the call.
     //    Let's find the IREE target for the current OS.
-    const target_backend = backend_selection.Backend.selectDefault();
-    std.debug.print("Compiling MLIR to VMFB for backend: {s}...\n", .{target_backend.toIreeDriverName()});
+    const target_backend = backend_selection.Backend.metal; // Test with Metal backend
+    std.debug.print("Compiling MLIR to VMFB for backend: {s}...\n", .{target_backend.toIreeCompilationTarget()});
 
     // The 'compileToVMFB' function (which you may have from a previous step) handles this.
     // If not, you would implement it in mlir_ctx.zig to call 'iree-compile'.
-    const vmfb_binary = try mlir_context.compileToVMFB(allocator, module, target_backend.toIreeDriverName());
+    const vmfb_binary = try mlir_context.compileToVMFB(allocator, module, target_backend.toIreeCompilationTarget());
     defer allocator.free(vmfb_binary);
     std.debug.print("✓ Compiled to VMFB artifact ({} bytes)\n", .{vmfb_binary.len});
 

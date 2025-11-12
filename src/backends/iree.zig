@@ -108,7 +108,7 @@ pub const IreeBackend = struct {
 
         // 2. Initialize a call to the main function
         var call: c.iree_runtime_call_t = undefined;
-        const main_fn_name = c.iree_string_view_t{ .data = "main", .size = 4 };
+        const main_fn_name = c.iree_string_view_t{ .data = "module.main", .size = 11 };
         try ireeCheck(c.iree_runtime_call_initialize_by_name(self.session.?, main_fn_name, &call));
         defer c.iree_runtime_call_deinitialize(&call);
 

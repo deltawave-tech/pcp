@@ -355,7 +355,7 @@ pub const Shepherd = struct {
             std.log.err("Failed to broadcast shutdown: {}", .{err});
         };
         
-        std.log.info("Shepherd stopped");
+        std.log.info("Shepherd stopped", .{});
     }
 };
 

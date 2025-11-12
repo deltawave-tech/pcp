@@ -108,8 +108,8 @@ pub fn main() !void {
     // 4. Wait for all worker threads to finish. They exit after receiving the SHUTDOWN message.
     for (worker_handles, 0..) |handle, i| {
         handle.join();
-        std.debug.print("👋 Worker {} has shut down gracefully.\n", .{i + 1});
+        std.debug.print("🌙 Worker {} has shut down gracefully.\n", .{i + 1});
     }
 
-    std.debug.print("\n✅ Demo Complete: Distributed training of Nano-Transformer finished successfully!\n", .{});
+    std.debug.print("\n🌑 Demo Complete: Distributed training of Nano-Transformer finished successfully!\n", .{});
 }

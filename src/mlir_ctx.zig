@@ -117,12 +117,10 @@ pub const MLIRContext = struct {
     }
     
     /// Compiles an MLIR module to a VMFB artifact using the IREE compiler.
-    pub fn compileToVMFB(self: *Self, allocator: Allocator, module: mlir.Module, iree_target: []const u8) ![]u8 {
-        _ = self; // Not using self directly, but good practice for a method
+    pub fn compileToVMFB(self: *Self, allocator: Allocator, mlir_source: []const u8, iree_target: []const u8) ![]u8 {
+        _ = self; // Not using self directly
 
-        // 1. Serialize MLIR module to a string
-        const mlir_source = try serializeMLIRModule(allocator, module);
-        defer allocator.free(mlir_source);
+        // 1. No need to serialize anymore, we already have the source!
 
         // 2. Create unique temporary file paths to avoid race conditions
         const timestamp = std.time.timestamp();

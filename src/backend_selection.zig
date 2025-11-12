@@ -28,6 +28,7 @@ const Worker = worker.Worker;
 pub const Backend = enum {
     metal,
     cuda,
+    rocm,
     cpu,
     demo,
     
@@ -45,6 +46,7 @@ pub const Backend = enum {
         return switch (self) {
             .metal => "metal",
             .cuda => "cuda",
+            .rocm => "rocm",
             .cpu => "cpu", 
             .demo => "demo",
         };
@@ -55,6 +57,7 @@ pub const Backend = enum {
         return switch (self) {
             .metal => "metal", // IREE's Metal runtime driver name
             .cuda => "cuda",
+            .rocm => "rocm",
             .cpu => "local-sync", // IREE's CPU runtime driver name
             .demo => "local-sync", // Use CPU for demo
         };
@@ -64,7 +67,8 @@ pub const Backend = enum {
     pub fn toIreeCompilationTarget(self: Backend) []const u8 {
         return switch (self) {
             .metal => "metal-spirv",
-            .cuda => "cuda", 
+            .cuda => "cuda",
+            .rocm => "rocm", 
             .cpu => "llvm-cpu", // IREE's CPU compilation target
             .demo => "llvm-cpu", // Use CPU for demo
         };
@@ -93,7 +97,7 @@ pub fn createExecutor(allocator: Allocator, backend: Backend) !Executor {
 /// Create a WorkerBackend for the specified backend
 pub fn createWorkerBackend(allocator: Allocator, backend: Backend) !WorkerBackend {
     return switch (backend) {
-        .metal, .cuda, .cpu => blk: {
+        .metal, .cuda, .rocm, .cpu => blk: {
             // Use IREE backend for all hardware accelerators
             std.log.info("Using IREE backend for {s} execution", .{backend.toString()});
             const iree = try iree_backend.IreeBackend.init(allocator, backend);

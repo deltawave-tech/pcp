@@ -193,6 +193,39 @@ fn addIreeDependencies(target: *std.Build.Step.Compile, b: *std.Build) void {
     }
 }
 
+// NEW REUSABLE FUNCTION for Cap'n Proto
+fn addCapnpDependencies(target: *std.Build.Step.Compile, b: *std.Build, capnp_config: CapnpConfig) void {
+    if (!capnp_config.enabled) {
+        std.debug.print("==> Cap'n Proto not found for '{s}', skipping linkage.\n", .{target.name});
+        return;
+    }
+    
+    std.debug.print("==> Adding Cap'n Proto bridge for '{s}'\n", .{target.name});
+
+    // Add include path for the executable itself to find capnp_bridge.h
+    target.addIncludePath(b.path("src/network"));
+
+    // Link against the system Cap'n Proto libraries
+    if (capnp_config.lib_dir) |lib_dir| {
+        target.addLibraryPath(.{ .cwd_relative = lib_dir });
+    }
+    target.linkSystemLibrary("capnp");
+    target.linkSystemLibrary("kj");
+    
+    // Also link the C++ source files directly into the executable
+    target.addCSourceFiles(.{
+        .files = &.{
+            "src/network/protocol.capnp.c++",
+            "src/network/capnp_bridge.cpp",
+        },
+        .flags = &.{"-std=c++17"},
+    });
+
+    if (capnp_config.include_dir) |include_dir| {
+        target.addIncludePath(.{ .cwd_relative = include_dir });
+    }
+}
+
 pub fn build(b: *std.Build) void {
     std.debug.print("==> Starting build script\n", .{});
     const target = b.standardTargetOptions(.{});
@@ -215,6 +248,13 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/main.zig"),
     });
     addIreeIncludes(pcp_module, b);
+    
+    // Add network include path for @cImport in capnp_zig_wrapper.zig
+    pcp_module.addIncludePath(b.path("src/network"));
+    if (capnp_config.include_dir) |include_dir| {
+        pcp_module.addIncludePath(.{ .cwd_relative = include_dir });
+    }
+    
     std.debug.print("==> PCP module created successfully\n", .{});
 
     // Create the GPT-2 module
@@ -484,6 +524,9 @@ pub fn build(b: *std.Build) void {
 
     // IREE dependencies
     addIreeDependencies(distributed_transformer_test, b);
+
+    // Cap'n Proto dependencies
+    addCapnpDependencies(distributed_transformer_test, b, capnp_config);
 
     // Run step for distributed transformer test
     const run_distributed_transformer_test_cmd = b.addRunArtifact(distributed_transformer_test);

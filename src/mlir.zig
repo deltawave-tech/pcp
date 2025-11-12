@@ -246,6 +246,13 @@ pub const Context = struct {
         pub fn verify(self: Self) bool {
             return c.c.mlirOperationVerify(self.handle).isSuccess();
         }
+
+        // ADD THIS METHOD
+        pub fn getType(self: Self) Type {
+            const type_attr = c.c.mlirOperationGetAttributeByName(self.handle, c.c.mlirStringRefCreateFromCString("function_type"));
+            // An MlirTypeAttr is a type of MlirAttribute that wraps an MlirType
+            return Type{ .handle = c.c.mlirTypeAttrGetValue(type_attr) };
+        }
     };
     
     /// MLIR Region - represents a CFG region
@@ -501,6 +508,14 @@ pub const Context = struct {
         /// Create a string attribute
         pub fn stringAttr(context: Context, value: []const u8) Self {
             return Self{ .handle = c.c.stringAttrGet(context.handle, value) };
+        }
+        
+        // ADD THIS NEW METHOD
+        /// Create a symbol reference attribute
+        pub fn symbolRefAttr(context: Context, value: []const u8) Self {
+            const str_ref = c.c.mlirStringRefCreateFromCString(@ptrCast(value.ptr));
+            const handle = c.c.mlirSymbolRefAttrGet(context.handle, str_ref);
+            return Self{ .handle = handle };
         }
         
         /// Create a boolean attribute

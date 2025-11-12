@@ -58,14 +58,13 @@ pub const DemoBackend = struct {
             .ptr = self,
             .vtable = &.{
                 .executeTrainingStep = executeTrainingStep,
-                .getContext = getContextInterface,
                 .deinit = deinitInterface,
             },
         };
     }
     
     /// Simulate training step execution with realistic timing and results
-    fn executeTrainingStep(ptr: *anyopaque, _: mlir.Module, inputs: [][]const u8) anyerror![][]u8 {
+    fn executeTrainingStep(ptr: *anyopaque, _: []const u8, inputs: [][]const u8, _: [][]const i64) anyerror![][]u8 {
         const self: *Self = @ptrCast(@alignCast(ptr));
         self.execution_count += 1;
         

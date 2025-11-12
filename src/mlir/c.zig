@@ -42,7 +42,7 @@ pub const c = struct {
     };
 
     // String utilities
-    extern fn mlirStringRefCreateFromCString(str: [*:0]const u8) MlirStringRef;
+    pub extern fn mlirStringRefCreateFromCString(str: [*:0]const u8) MlirStringRef;
 
     // Logical result for MLIR operations
     pub const MlirLogicalResult = extern struct {
@@ -95,10 +95,13 @@ pub const c = struct {
     pub extern fn mlirOperationGetAttributeByName(operation: *MlirOperation, name: MlirStringRef) *MlirAttribute;
     pub extern fn mlirOperationRemoveAttributeByName(op: *MlirOperation, name: MlirStringRef) bool;
     pub extern fn mlirAttributeParseGet(ctx: *MlirContext, str: MlirStringRef) *MlirAttribute;
+    pub extern fn mlirTypeAttrGetValue(attr: *MlirAttribute) *MlirType;
+    
+    // ADD THIS NEW EXTERN FOR SymbolRefAttr
+    pub extern fn mlirSymbolRefAttrGet(ctx: *MlirContext, value: MlirStringRef) *MlirAttribute;
     pub extern fn mlirOperationGetLocation(op: *MlirOperation) *MlirLocation;
     pub extern fn mlirOperationGetNumAttributes(op: *MlirOperation) isize;
     pub extern fn mlirOperationGetAttribute(op: *MlirOperation, pos: isize) MlirNamedAttribute;
-    pub extern fn mlirTypeAttrGetType(attr: *MlirAttribute) *MlirType;
 
     // Add this extern
     pub extern fn mlirBoolAttrGet(ctx: *MlirContext, value: c_int) *MlirAttribute;

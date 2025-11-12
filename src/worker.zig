@@ -177,8 +177,8 @@ pub const Worker = struct {
         };
         
         // 2. Decode and cache the VMFB
-        const b64_vmfb_str = payload.get("vmfb") orelse return error.MissingVmfbField;
-        const vmfb_string = switch (b64_vmfb_str.*) {
+        const b64_vmfb_val = payload.get("vmfb") orelse return error.MissingVmfbField;
+        const vmfb_string = switch (b64_vmfb_val) {
             .string => |s| s,
             else => return error.InvalidVmfbFormat,
         };
@@ -190,7 +190,7 @@ pub const Worker = struct {
         
         // 3. Parse and cache the data input shapes
         const shapes_json = payload.get("data_input_shapes") orelse return error.MissingShapesField;
-        const shapes_array = switch (shapes_json.*) {
+        const shapes_array = switch (shapes_json) {
             .array => |arr| arr,
             else => return error.InvalidShapesFormat,
         };
@@ -280,7 +280,13 @@ pub const Worker = struct {
 
         // 7. Execute using the backend. The backend's vtable now points to
         //    a function that expects the VMFB bytes and shapes.
-        const outputs = try self.backend.executeTrainingStep(vmfb, inputs, shapes);
+        // Convert [][]i64 to [][]const i64
+        var const_shapes = try self.allocator.alloc([]const i64, shapes.len);
+        defer self.allocator.free(const_shapes);
+        for (shapes, 0..) |shape, i| {
+            const_shapes[i] = shape;
+        }
+        const outputs = try self.backend.executeTrainingStep(vmfb, inputs, const_shapes);
         defer {
             for (outputs) |o| self.allocator.free(o);
             self.allocator.free(outputs);

@@ -637,6 +637,24 @@ pub fn log(ctx: mlir.Context, operand: mlir.Value, loc: mlir.Location) mlir.Oper
     });
 }
 
+/// Creates a stablehlo.sqrt operation
+pub fn sqrt(ctx: mlir.Context, operand: mlir.Value, loc: mlir.Location) mlir.Operation {
+    return mlir.Operation.create(ctx, "stablehlo.sqrt", .{
+        .operands = &.{operand},
+        .results = &.{operand.getType()},
+        .location = loc,
+    });
+}
+
+/// Creates a stablehlo.power operation
+pub fn power(ctx: mlir.Context, lhs: mlir.Value, rhs: mlir.Value, loc: mlir.Location) mlir.Operation {
+    return mlir.Operation.create(ctx, "stablehlo.power", .{
+        .operands = &.{ lhs, rhs },
+        .results = &.{lhs.getType()},
+        .location = loc,
+    });
+}
+
 /// Creates a stablehlo.tanh operation
 pub fn tanh(ctx: mlir.Context, operand: mlir.Value, loc: mlir.Location) mlir.Operation {
     return mlir.Operation.create(ctx, "stablehlo.tanh", .{

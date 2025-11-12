@@ -5,6 +5,8 @@ const tensor = @import("tensor.zig");
 const hlo = @import("mlir/dialects/stablehlo.zig");
 
 const Tensor = tensor.Tensor(void); // DataType is encoded in mlir.Type
+const Shape = tensor.Shape;
+const DType = tensor.DType;
 
 /// MLIRBuilder is a stateful object that constructs the MLIR graph
 /// MLIR operation creation
@@ -688,6 +690,22 @@ pub fn log(builder: *MLIRBuilder, a: Tensor) !Tensor {
     return try builder.createAndAppendOp(operation);
 }
 
+/// Element-wise square root
+pub fn sqrt(builder: *MLIRBuilder, a: Tensor) !Tensor {
+    // Use StableHLO dialect wrapper
+    const operation = hlo.sqrt(builder.ctx, a.value, builder.loc);
+
+    return try builder.createAndAppendOp(operation);
+}
+
+/// Element-wise power operation
+pub fn power(builder: *MLIRBuilder, base: Tensor, exponent: Tensor) !Tensor {
+    // Note: This may require broadcasting `base` and `exponent`
+    const b_tensors = try broadcastTensors(builder, base, exponent);
+    const operation = hlo.power(builder.ctx, b_tensors[0].value, b_tensors[1].value, builder.loc);
+    return try builder.createAndAppendOp(operation);
+}
+
 /// Type conversion operation
 pub fn convert(builder: *MLIRBuilder, a: Tensor, target_type: mlir.Type) !Tensor {
     // Use StableHLO dialect wrapper
@@ -774,16 +792,27 @@ pub fn oneHot(builder: *MLIRBuilder, indices: Tensor, depth: i64, on_value: f64,
 pub fn constant(builder: *MLIRBuilder, value: f64, shape: []const i64, element_type: mlir.Type) !Tensor {
     const tensor_type = mlir.Type.rankedTensorType(builder.ctx, shape, element_type);
     
-    // Create a dense attribute for the value. For a scalar, this is simple.
-    // For a tensor, it broadcasts the value across the shape.
-    const attr = mlir.Attribute.denseElementsAttrSplat(tensor_type, value);
-
+    // Compute element count
+    var elem_count: usize = 1;
+    for (shape) |dim| {
+        elem_count *= @intCast(dim);
+    }
+    
+    // Assume f32 for now (extend for other types as needed) 
+    const f_val: f32 = @floatCast(value);
+    const data = try builder.allocator.alloc(f32, elem_count);
+    defer builder.allocator.free(data);
+    @memset(data, f_val);
+    
+    const host_data = std.mem.sliceAsBytes(data);
+    
+    const attr = mlir.Attribute.denseElementsAttr(builder.ctx, tensor_type, host_data);
+    
     const constant_op = hlo.constant(builder.ctx, .{
         .value = attr,
         .result_type = tensor_type,
     });
     
-    // Use the reliable "create and append" pattern.
     return builder.createAndAppendOp(constant_op);
 }
 

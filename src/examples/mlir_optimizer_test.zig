@@ -54,7 +54,7 @@ pub const ExecutionHelper = struct {
         var mlir_context = try mlir_ctx.MLIRContext.init(self.allocator);
         defer mlir_context.deinit();
 
-        const backend = backend_selection.Backend.metal;
+        const backend = backend_selection.Backend.cpu;  // Change from .metal
         
         const vmfb_binary = try mlir_context.compileToVMFB(self.allocator, module, backend.toIreeCompilationTarget());
         defer self.allocator.free(vmfb_binary);
@@ -95,12 +95,12 @@ pub fn testAdamSingleStepVerification(allocator: Allocator) !void {
     var adam = try AdamMLIR.init(allocator, &builder, adam_conf, element_type);
     defer adam.deinit();
 
-    // Build main function: main(p, m, v, g, t) -> (new_p, new_m, new_v)
+    // Build main function: SIGNATURE CHANGE -> main(p, m, v, g, t) -> (new_p, new_m, new_v)
     const scalar_type = mlir.Type.rankedTensorType(context, &.{}, element_type);
     const func_type = mlir.Type.functionType(
         context,
         &.{scalar_type, scalar_type, scalar_type, scalar_type, scalar_type}, // p, m, v, g, t
-        &.{scalar_type, scalar_type, scalar_type},                         // new_p, new_m, new_v
+        &.{scalar_type, scalar_type, scalar_type},                           // new_p, new_m, new_v
     );
 
     const main_fn = try builder.createFunction("main", func_type);
@@ -110,21 +110,18 @@ pub fn testAdamSingleStepVerification(allocator: Allocator) !void {
     const m_in = try builder.newTensor(main_fn.entry_block.getArgument(1));
     const v_in = try builder.newTensor(main_fn.entry_block.getArgument(2));
     const g_in = try builder.newTensor(main_fn.entry_block.getArgument(3));
-    _ = try builder.newTensor(main_fn.entry_block.getArgument(4)); // timestep unused in this test
+    const t_in = try builder.newTensor(main_fn.entry_block.getArgument(4));
     
-    // Set optimizer's internal state for this call
-    adam.m_state = m_in;
-    adam.v_state = v_in;
-    adam.timestep = 0; // Will be incremented to 1 in update
-
-    const new_params = try adam.update(p_in, g_in);
+    const results = try adam.update(p_in, g_in, m_in, v_in, t_in);
     
-    // Return new parameter and updated internal states
+    // Return the results directly from the struct.
     _ = try builder.createAndAttach("func.return", &.{
-        new_params.value,
-        adam.m_state.?.value,
-        adam.v_state.?.value,
+        results.new_params.value,
+        results.new_m.value,
+        results.new_v.value,
     }, &.{}, .{});
+
+    builder.module.op().dump();
 
     // Prepare test inputs
     const p0 = [_]f32{0.5};
@@ -140,6 +137,7 @@ pub fn testAdamSingleStepVerification(allocator: Allocator) !void {
         std.mem.sliceAsBytes(&g1),
         std.mem.sliceAsBytes(&t1),
     };
+    // Input shapes are all rank-0 scalars
     var shapes = [_][]const i64{ &[_]i64{}, &[_]i64{}, &[_]i64{}, &[_]i64{}, &[_]i64{} };
 
     const outputs = try helper.executeModule(builder.module, "main", &inputs_bytes, &shapes);
@@ -294,20 +292,16 @@ pub fn testAdamMatrixVerification(allocator: Allocator) !void {
     const m_in = try builder.newTensor(main_fn.entry_block.getArgument(1));
     const v_in = try builder.newTensor(main_fn.entry_block.getArgument(2));
     const g_in = try builder.newTensor(main_fn.entry_block.getArgument(3));
-    _ = try builder.newTensor(main_fn.entry_block.getArgument(4)); // timestep unused in this test
+    const t_in = try builder.newTensor(main_fn.entry_block.getArgument(4));
     
-    // Set optimizer's internal state
-    adam.m_state = m_in;
-    adam.v_state = v_in;
-    adam.timestep = 0;
-
-    const new_params = try adam.update(p_in, g_in);
+    // Call the new stateless update function with tensor timestep
+    const results = try adam.update(p_in, g_in, m_in, v_in, t_in);
     
     // Return updated values
     _ = try builder.createAndAttach("func.return", &.{
-        new_params.value,
-        adam.m_state.?.value,
-        adam.v_state.?.value,
+        results.new_params.value,
+        results.new_m.value,
+        results.new_v.value,
     }, &.{}, .{});
 
     // Prepare test inputs - 2x2 matrices
@@ -325,7 +319,7 @@ pub fn testAdamMatrixVerification(allocator: Allocator) !void {
         std.mem.sliceAsBytes(&t1),
     };
     var shapes = [_][]const i64{ 
-        &[_]i64{2, 2}, &[_]i64{2, 2}, &[_]i64{2, 2}, &[_]i64{2, 2}, &[_]i64{} 
+        &[_]i64{2, 2}, &[_]i64{2, 2}, &[_]i64{2, 2}, &[_]i64{2, 2}, &[_]i64{}
     };
 
     const outputs = try helper.executeModule(builder.module, "main", &inputs_bytes, &shapes);
@@ -677,6 +671,46 @@ fn createTargetTensor(builder: *MLIRBuilder, shape: []const i64, element_type: m
     return try ops.constant(builder, 1.0, shape, element_type);
 }
 
+pub fn testPowerOperation(allocator: Allocator) !void {
+    std.debug.print("\n=== Testing stablehlo.power on IREE ===\n", .{});
+    var helper = ExecutionHelper{.allocator = allocator};
+    try initGlobalMLIRContext(allocator);
+    const context = global_mlir_context.?.getContext();
+    var builder = try MLIRBuilder.init(allocator, context);
+    defer builder.deinit();
+    const element_type = mlir.Type.f32Type(context);
+    const scalar_type = mlir.Type.rankedTensorType(context, &.{1}, element_type);  // Use {1} to avoid rank-0 issues
+    const func_type = mlir.Type.functionType(
+        context,
+        &.{scalar_type, scalar_type},  // base, exponent
+        &.{scalar_type},  // result
+    );
+    const main_fn = try builder.createFunction("main", func_type);
+    builder.setInsertionBlock(main_fn.entry_block);
+    const base_in = try builder.newTensor(main_fn.entry_block.getArgument(0));
+    const exp_in = try builder.newTensor(main_fn.entry_block.getArgument(1));
+    const pow_result = try ops.power(&builder, base_in, exp_in);
+    _ = try builder.createAndAttach("func.return", &.{pow_result.value}, &.{}, .{});
+    // Test inputs: 0.999 ^ 1.0 = 0.999
+    const base_val = [_]f32{0.999};
+    const exp_val = [_]f32{1.0};
+    var inputs_bytes = [_][]const u8{
+        std.mem.sliceAsBytes(&base_val),
+        std.mem.sliceAsBytes(&exp_val),
+    };
+    var shapes = [_][]const i64{ &[_]i64{1}, &[_]i64{1} };
+    const outputs = try helper.executeModule(builder.module, "main", &inputs_bytes, &shapes);
+    defer { for (outputs) |o| allocator.free(o); allocator.free(outputs); }
+    const result_val: f32 = @bitCast(std.mem.readInt(u32, outputs[0][0..4], .little));
+    std.debug.print("Computed power: {d} (Expected: 0.999)\n", .{result_val});
+    if (@abs(result_val - 0.999) > 1e-6) {
+        std.debug.print("ERROR: stablehlo.power failed on Metal\n", .{});
+    } else {
+        std.debug.print("stablehlo.power works correctly\n", .{});
+    }
+    // Repeat with local_sync backend to compare
+}
+
 /// Main test runner
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -686,6 +720,9 @@ pub fn main() !void {
     
     std.debug.print("=== MLIR Optimizer Numerical Verification Tests ===\n", .{});
     std.debug.print("Testing optimizer implementations with end-to-end IREE execution\n", .{});
+    
+    // First test the power operation in isolation
+    try testPowerOperation(allocator);
     
     // Run numerical verification tests
     try testAdamSingleStepVerification(allocator);

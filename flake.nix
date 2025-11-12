@@ -8,7 +8,6 @@
   };
   outputs = { self, nixpkgs, zig-overlay, zls, flake-utils }@inputs:
     let
-      # Your original, correct overlay structure with gdbm, zls, meson, and libxml2 overrides added
       overlays = [
         (final: prev: {
           zigpkgs = inputs.zig-overlay.packages.${prev.system};
@@ -26,17 +25,6 @@
                 "https://registry.npmjs.org/@anthropic-ai/claude-code/-/claude-code-${version}.tgz";
               hash = "sha256-6tbbCaF1HIgdk1vpbgQnBKWghaKKphGIGZoXtmnhY2I=";
             };
-          });
-          gdbm = prev.gdbm.overrideAttrs (old: {
-            doCheck = false; # Disable tests to bypass failures under emulation
-          });
-          meson = prev.meson.overrideAttrs (old: {
-            doCheck =
-              false; # Disable tests to bypass the failing "215 source set realistic example" test under emulation
-          });
-          libxml2 = prev.libxml2.overrideAttrs (old: {
-            doCheck =
-              false; # Disable tests to bypass "Illegal instruction" error in runxmlconf under QEMU emulation
           });
         })
       ];
@@ -58,35 +46,6 @@
           postInstall = (old.postInstall or "") + ''
             cp -v bin/mlir-pdll $out/bin
           '';
-        });
-        # --- IREE SDK (Build from Source v3.8.0) ---
-        iree-sdk = pkgs.stdenv.mkDerivation (finalAttrs: {
-          pname = "iree-sdk";
-          version = "3.8.0";
-          src = pkgs.fetchFromGitHub {
-            owner = "iree-org";
-            repo = "iree";
-            rev = "v${finalAttrs.version}";
-            hash = "sha256-cPy2xudIH1OVVzDlq5YAg1uFu59h6zDOvXpKaJ+fuP8=";
-            fetchSubmodules = true;
-          };
-          nativeBuildInputs = [ pkgs.cmake pkgs.ninja pkgs.python3 ];
-          buildInputs = [ llvmPkg.libllvm mlirPkg ];
-          cmakeFlags = [
-            "-DCMAKE_BUILD_TYPE=Release"
-            "-DIREE_BUILD_COMPILER=ON"
-            "-DIREE_BUILD_SAMPLES=OFF"
-            "-DIREE_BUILD_TESTS=OFF"
-          ] ++ (lib.optionals pkgs.stdenv.isDarwin
-            [ "-DCMAKE_OSX_ARCHITECTURES=arm64" ]);
-          installPhase = ''
-            cmake --install . --prefix $out
-          '';
-          meta = with lib; {
-            description = "IREE SDK built from source";
-            homepage = "https://iree.dev/";
-            platforms = [ "aarch64-darwin" "x86_64-darwin" "x86_64-linux" ];
-          };
         });
       in rec {
         packages.default = packages.pcp;
@@ -148,7 +107,6 @@
             llvmPkg.libllvm.dev
             mlirPkg.dev
             packages.stablehlo.dev
-            iree-sdk
             pkgs.zig
             pkgs.pkg-config
             llvmPkg.lld
@@ -164,7 +122,7 @@
             llvmPkg.libllvm
             mlirPkg
             pkgs.capnproto
-            iree-sdk
+            packages.iree-sdk
           ];
           dontConfigure = true;
           doCheck = true;
@@ -172,7 +130,7 @@
           zigCheckFlags = [ "--verbose" "--color" "off" ];
           zigInstallFlags = [ "--verbose" "--color" "off" ];
           CAPNP_DIR = "${pkgs.capnproto}";
-          IREE_SDK_DIR = "${iree-sdk}";
+          IREE_SDK_DIR = "${packages.iree-sdk}";
         };
         devShells.default = pkgs.mkShell {
           nativeBuildInputs = packages.pcp.nativeBuildInputs
@@ -184,12 +142,50 @@
             echo "ZLS version: $(zls --version)"
             export ZIG_GLOBAL_CACHE_DIR="$(pwd)/.zig-cache"
             export CAPNP_DIR="${pkgs.capnproto}"
-            export IREE_SDK_DIR="${iree-sdk}"
+            export IREE_SDK_DIR="${packages.iree-sdk}"
             ${lib.optionalString pkgs.stdenv.isDarwin ''
               export MACOSX_DEPLOYMENT_TARGET="11.0"
             ''}
           '';
         };
         checks.pcp = packages.pcp;
+        packages.iree-sdk = pkgsLLVM.llvmPackages.stdenv.mkDerivation rec {
+          pname = "iree-sdk";
+          version = "3.8.0";
+          src = pkgs.fetchFromGitHub {
+            owner = "iree-org";
+            repo = "iree";
+            rev = "v${version}";
+            hash = "sha256-G7fPelraUhiXc/rJSr7J2OAaVSLggvghsSAoaGuGrxc=";
+            fetchSubmodules = true;
+          };
+          nativeBuildInputs = [
+            pkgs.cmake
+            pkgs.ninja
+            pkgs.python3
+            pkgsLLVM.llvmPackages.libllvm
+          ];
+          propagatedBuildInputs = [ pkgsLLVM.llvmPackages.lld ];
+          buildInputs = [ pkgs.gtest ];
+          cmakeFlags = [
+            # Flags suggested in
+            # https://iree.dev/building-from-source/getting-started/#configuration-settings
+            (lib.cmakeFeature "CMAKE_BUILD_TYPE" "RelWithDebInfo")
+            (lib.cmakeFeature "CMAKE_AR" "ar")
+            (lib.cmakeFeature "CMAKE_C_COMPILER" "clang")
+            (lib.cmakeFeature "CMAKE_CXX_COMPILER" "clang++")
+
+            (lib.cmakeBool "IREE_ENABLE_ASSERTIONS" true)
+            (lib.cmakeBool "IREE_ENABLE_SPLIT_DWARF" true)
+            (lib.cmakeBool "IREE_ENABLE_THIN_ARCHIVES" true)
+            (lib.cmakeBool "IREE_ENABLE_LLD" true)
+
+          ];
+          meta = with lib; {
+            description = "IREE SDK built from source";
+            homepage = "https://iree.dev/";
+            platforms = [ "aarch64-darwin" "x86_64-darwin" "x86_64-linux" ];
+          };
+        };
       });
 }

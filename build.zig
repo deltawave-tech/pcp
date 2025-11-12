@@ -247,50 +247,10 @@ pub fn build(b: *std.Build) void {
     }
 
 
-    // GPT-2 training example executable
-    std.debug.print("==> Creating GPT-2 example executable\n", .{});
-    const gpt2_example = b.addExecutable(.{
-        .name = "gpt2_example",
-        .root_source_file = b.path("src/examples/gpt2_training.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-
-    // Add module dependencies for GPT-2 example
-    gpt2_example.root_module.addImport("pcp", pcp_module);
-    gpt2_example.root_module.addImport("gpt2", gpt2_module);
-
-    // IREE dependencies
-    addIreeDependencies(gpt2_example, b);
-
-    // Run step for GPT-2 example (default)
-    const run_gpt2_cmd = b.addRunArtifact(gpt2_example);
-    run_gpt2_cmd.step.dependOn(&gpt2_example.step); // Only depend on the gpt2_example
-
-    const run_gpt2_step = b.step("run", "Run the GPT-2 training example");
-    run_gpt2_step.dependOn(&run_gpt2_cmd.step);
+    // GPT-2 training example executable removed - obsolete
 
 
-    // MLIR Comprehensive Verification Test - consolidates all MLIR functionality testing
-    const mlir_verification_test = b.addExecutable(.{
-        .name = "mlir_verification_test",
-        .root_source_file = b.path("src/examples/mlir_verification_test.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-
-    // Add module dependencies
-    mlir_verification_test.root_module.addImport("pcp", pcp_module);
-
-    // IREE dependencies
-    addIreeDependencies(mlir_verification_test, b);
-
-    // Run step for comprehensive MLIR verification
-    const run_mlir_verification_cmd = b.addRunArtifact(mlir_verification_test);
-    run_mlir_verification_cmd.step.dependOn(&mlir_verification_test.step);
-
-    const run_mlir_verification_step = b.step("run-mlir-verification", "Run comprehensive MLIR operations and autodiff verification tests");
-    run_mlir_verification_step.dependOn(&run_mlir_verification_cmd.step);
+    // MLIR verification test removed - superseded by isolated_vjp_tests.zig
 
 
 

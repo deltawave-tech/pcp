@@ -17,6 +17,13 @@ const CapnpConfig = struct {
     lib_dir: ?[]const u8 = null,
 };
 
+// NEW: IREE configuration struct
+const IreeConfig = struct {
+    enabled: bool = false,
+    source_dir: ?[]const u8 = null, // Path to 'iree'
+    build_dir: ?[]const u8 = null, // Path to 'iree-build'
+};
+
 // Attempt to find Cap'n Proto installation
 fn detectCapnp(b: *std.Build) CapnpConfig {
     var config = CapnpConfig{};
@@ -39,16 +46,20 @@ fn detectCapnp(b: *std.Build) CapnpConfig {
 
         // Test if directories exist
         if (std.fs.cwd().access(include_dir, .{})) |_| {
+            // Success: include_dir exists, now check lib_dir
             if (std.fs.cwd().access(lib_dir, .{})) |_| {
+                // Success: both directories exist
                 config.enabled = true;
                 config.include_dir = b.dupe(include_dir);
                 config.lib_dir = b.dupe(lib_dir);
                 std.debug.print("Found Cap'n Proto via CAPNP_DIR at: {s}\n", .{capnp_dir});
                 return config;
             } else |_| {
+                // Failure: lib_dir does not exist
                 std.debug.print("CAPNP_DIR lib directory not accessible, continuing with auto-detection\n", .{});
             }
         } else |_| {
+            // Failure: include_dir does not exist
             std.debug.print("CAPNP_DIR include directory not accessible, continuing with auto-detection\n", .{});
         }
     } else |_| {
@@ -90,44 +101,108 @@ fn detectCapnp(b: *std.Build) CapnpConfig {
     return config;
 }
 
-// Add IREE include paths to a module
-fn addIreeIncludes(mod: *std.Build.Module, b: *std.Build) void {
-    const absolute_workshop_path = "/Users/philipp/_projects/workshop";
-    const iree_source_path = b.fmt("{s}/iree", .{absolute_workshop_path});
-    const iree_build_include_path = b.fmt("{s}/iree-build/include", .{absolute_workshop_path});
-    const iree_runtime_src_path = b.fmt("{s}/iree/runtime/src", .{absolute_workshop_path});
-    mod.addIncludePath(.{ .cwd_relative = iree_source_path });
-    mod.addIncludePath(.{ .cwd_relative = iree_build_include_path });
-    mod.addIncludePath(.{ .cwd_relative = iree_runtime_src_path });
+// NEW: Function to detect IREE installation (Corrected and Cleaned)
+fn detectIree(b: *std.Build) IreeConfig {
+    var config = IreeConfig{};
+    const build_root_path = b.build_root.path orelse ".";
+
+    // 1. Prioritize an environment variable for the IREE base directory
+    if (std.process.getEnvVarOwned(b.allocator, "IREE_DIR") catch null) |iree_dir| {
+        defer b.allocator.free(iree_dir);
+        std.debug.print("Attempting to find IREE via IREE_DIR: {s}\n", .{iree_dir});
+
+        const source_path = std.fs.path.join(b.allocator, &[_][]const u8{ iree_dir, "iree" }) catch |err| {
+            std.debug.print("Failed to construct IREE source path: {s}\n", .{@errorName(err)});
+            return config;
+        };
+        // NOTE: No defer here
+
+        const build_path = std.fs.path.join(b.allocator, &[_][]const u8{ iree_dir, "iree-build" }) catch |err| {
+            std.debug.print("Failed to construct IREE build path: {s}\n", .{@errorName(err)});
+            b.allocator.free(source_path); // Clean up previous allocation
+            return config;
+        };
+        // NOTE: No defer here
+
+        if (std.fs.cwd().access(source_path, .{})) |_| {
+            if (std.fs.cwd().access(build_path, .{})) |_| {
+                config.enabled = true;
+                config.source_dir = source_path; // Transfer ownership
+                config.build_dir = build_path;   // Transfer ownership
+                std.debug.print("Found IREE via IREE_DIR.\n  Source: {s}\n  Build:  {s}\n", .{ source_path, build_path });
+                // We don't free source_path/build_path here because we are giving ownership to the config struct
+                return config;
+            } else |_| {}
+        } else |_| {}
+
+        // If we reach here, the paths were not found, so we must clean up
+        b.allocator.free(source_path);
+        b.allocator.free(build_path);
+        std.debug.print("IREE_DIR was set, but 'iree' or 'iree-build' not found. Falling back.\n", .{});
+    }
+
+    // 2. Fallback to relative path (sibling directories)
+    const parent_dir = std.fs.path.dirname(build_root_path) orelse "..";
+    const relative_source_path = std.fs.path.join(b.allocator, &[_][]const u8{ parent_dir, "iree" }) catch return config;
+    const relative_build_path = std.fs.path.join(b.allocator, &[_][]const u8{ parent_dir, "iree-build" }) catch {
+        b.allocator.free(relative_source_path);
+        return config;
+    };
+
+    if (std.fs.cwd().access(relative_source_path, .{})) |_| {
+        if (std.fs.cwd().access(relative_build_path, .{})) |_| {
+            config.enabled = true;
+            config.source_dir = relative_source_path; // Transfer ownership
+            config.build_dir = relative_build_path;   // Transfer ownership
+            std.debug.print("Found IREE via relative path.\n  Source: {s}\n  Build:  {s}\n", .{ relative_source_path, relative_build_path });
+            return config;
+        } else |_| {}
+    } else |_| {}
+
+    // If we reach here, nothing was found. Free the memory from the relative path check.
+    b.allocator.free(relative_source_path);
+    b.allocator.free(relative_build_path);
+
+    std.debug.print("IREE not found via IREE_DIR or relative path ('../iree'). Please set IREE_DIR or check your directory structure.\n", .{});
+
+    return config;
 }
 
-fn addIreeDependencies(target: *std.Build.Step.Compile, b: *std.Build) void {
-    std.debug.print("==> Configuring IREE dependencies for '{s}'\n", .{target.name});
-    const absolute_workshop_path = "/Users/philipp/_projects/workshop";
+// REFACTORED: Add IREE include paths to a module
+fn addIreeIncludes(mod: *std.Build.Module, b: *std.Build, iree_config: IreeConfig) void {
+    if (!iree_config.enabled) return;
+    const source_dir = iree_config.source_dir.?;
+    const build_dir = iree_config.build_dir.?;
 
-    // --- Path Definitions ---
-    const iree_lib_path = b.fmt("{s}/iree-build/lib", .{absolute_workshop_path});
-    const iree_runtime_lib_path = b.fmt("{s}/iree-build/runtime/src/iree/runtime", .{absolute_workshop_path});
-    const flatcc_lib_path = b.fmt("{s}/iree-build/build_tools/third_party/flatcc", .{absolute_workshop_path});
+    // Use resolved paths from IREE detection
+    mod.addIncludePath(.{ .cwd_relative = source_dir });
+    mod.addIncludePath(.{ .cwd_relative = b.fmt("{s}/include", .{build_dir}) });
+    mod.addIncludePath(.{ .cwd_relative = b.fmt("{s}/runtime/src", .{source_dir}) });
+}
+
+// REFACTORED: Add IREE dependencies to a target
+fn addIreeDependencies(target: *std.Build.Step.Compile, b: *std.Build, iree_config: IreeConfig) void {
+    if (!iree_config.enabled) {
+        std.debug.print("==> IREE not found for '{s}', skipping IREE dependencies.\n", .{target.name});
+        return;
+    }
+    const source_dir = iree_config.source_dir.?;
+    const build_dir = iree_config.build_dir.?;
+
+    std.debug.print("==> Configuring IREE dependencies for '{s}'\n", .{target.name});
 
     // --- Library Paths ---
-    target.addLibraryPath(.{ .cwd_relative = iree_lib_path });
-    target.addLibraryPath(.{ .cwd_relative = iree_runtime_lib_path });
-    target.addLibraryPath(.{ .cwd_relative = flatcc_lib_path });
-    const iree_build_lib_path = b.fmt("{s}/iree-build/llvm-project/lib", .{absolute_workshop_path});
-    target.addLibraryPath(.{ .cwd_relative = iree_build_lib_path });
-    const iree_base_lib_path = b.fmt("{s}/iree-build/runtime/src/iree/base", .{absolute_workshop_path});
-    target.addLibraryPath(.{ .cwd_relative = iree_base_lib_path });
-    const iree_hal_drivers_path = b.fmt("{s}/iree-build/runtime/src/iree/hal/drivers/local_sync", .{absolute_workshop_path});
-    target.addLibraryPath(.{ .cwd_relative = iree_hal_drivers_path });
-    const iree_hal_registration_path = b.fmt("{s}/iree-build/runtime/src/iree/hal/drivers/local_sync/registration", .{absolute_workshop_path});
-    target.addLibraryPath(.{ .cwd_relative = iree_hal_registration_path });
-    const iree_hal_drivers_base_path = b.fmt("{s}/iree-build/runtime/src/iree/hal/drivers", .{absolute_workshop_path});
-    target.addLibraryPath(.{ .cwd_relative = iree_hal_drivers_base_path });
-    const iree_hal_metal_path = b.fmt("{s}/iree-build/runtime/src/iree/hal/drivers/metal", .{absolute_workshop_path});
-    target.addLibraryPath(.{ .cwd_relative = iree_hal_metal_path });
-    const iree_hal_metal_registration_path = b.fmt("{s}/iree-build/runtime/src/iree/hal/drivers/metal/registration", .{absolute_workshop_path});
-    target.addLibraryPath(.{ .cwd_relative = iree_hal_metal_registration_path });
+    // Use resolved paths from IREE detection
+    target.addLibraryPath(.{ .cwd_relative = b.fmt("{s}/lib", .{build_dir}) });
+    target.addLibraryPath(.{ .cwd_relative = b.fmt("{s}/runtime/src/iree/runtime", .{build_dir}) });
+    target.addLibraryPath(.{ .cwd_relative = b.fmt("{s}/build_tools/third_party/flatcc", .{build_dir}) });
+    target.addLibraryPath(.{ .cwd_relative = b.fmt("{s}/llvm-project/lib", .{build_dir}) });
+    target.addLibraryPath(.{ .cwd_relative = b.fmt("{s}/runtime/src/iree/base", .{build_dir}) });
+    target.addLibraryPath(.{ .cwd_relative = b.fmt("{s}/runtime/src/iree/hal/drivers/local_sync", .{build_dir}) });
+    target.addLibraryPath(.{ .cwd_relative = b.fmt("{s}/runtime/src/iree/hal/drivers/local_sync/registration", .{build_dir}) });
+    target.addLibraryPath(.{ .cwd_relative = b.fmt("{s}/runtime/src/iree/hal/drivers", .{build_dir}) });
+    target.addLibraryPath(.{ .cwd_relative = b.fmt("{s}/runtime/src/iree/hal/drivers/metal", .{build_dir}) });
+    target.addLibraryPath(.{ .cwd_relative = b.fmt("{s}/runtime/src/iree/hal/drivers/metal/registration", .{build_dir}) });
 
     // --- Build and Link C++ Dialect Anchors ---
     const dialect_anchors_lib = b.addStaticLibrary(.{
@@ -141,19 +216,13 @@ fn addIreeDependencies(target: *std.Build.Step.Compile, b: *std.Build) void {
     });
     
     // Add include paths needed by pass_anchors.cpp
-    const mlir_include_path = b.fmt("{s}/iree/third_party/llvm-project/mlir/include", .{absolute_workshop_path});
-    const llvm_include_path = b.fmt("{s}/iree/third_party/llvm-project/llvm/include", .{absolute_workshop_path});
-    const iree_build_include_path = b.fmt("{s}/iree-build/llvm-project/include", .{absolute_workshop_path});
-    const iree_build_mlir_include_path = b.fmt("{s}/iree-build/llvm-project/tools/mlir/include", .{absolute_workshop_path});
-    const stablehlo_include_path = b.fmt("{s}/iree/third_party/stablehlo", .{absolute_workshop_path});
-    const stablehlo_build_include_path = b.fmt("{s}/iree-build/llvm-external-projects/stablehlo", .{absolute_workshop_path});
-
-    dialect_anchors_lib.addIncludePath(.{ .cwd_relative = mlir_include_path });
-    dialect_anchors_lib.addIncludePath(.{ .cwd_relative = llvm_include_path });
-    dialect_anchors_lib.addIncludePath(.{ .cwd_relative = iree_build_include_path });
-    dialect_anchors_lib.addIncludePath(.{ .cwd_relative = iree_build_mlir_include_path });
-    dialect_anchors_lib.addIncludePath(.{ .cwd_relative = stablehlo_include_path });
-    dialect_anchors_lib.addIncludePath(.{ .cwd_relative = stablehlo_build_include_path });
+    // Use resolved paths from IREE detection
+    dialect_anchors_lib.addIncludePath(.{ .cwd_relative = b.fmt("{s}/third_party/llvm-project/mlir/include", .{source_dir}) });
+    dialect_anchors_lib.addIncludePath(.{ .cwd_relative = b.fmt("{s}/third_party/llvm-project/llvm/include", .{source_dir}) });
+    dialect_anchors_lib.addIncludePath(.{ .cwd_relative = b.fmt("{s}/llvm-project/include", .{build_dir}) });
+    dialect_anchors_lib.addIncludePath(.{ .cwd_relative = b.fmt("{s}/llvm-project/tools/mlir/include", .{build_dir}) });
+    dialect_anchors_lib.addIncludePath(.{ .cwd_relative = b.fmt("{s}/third_party/stablehlo", .{source_dir}) });
+    dialect_anchors_lib.addIncludePath(.{ .cwd_relative = b.fmt("{s}/llvm-external-projects/stablehlo", .{build_dir}) });
     dialect_anchors_lib.linkLibCpp();
     
     target.linkLibrary(dialect_anchors_lib);
@@ -233,12 +302,18 @@ pub fn build(b: *std.Build) void {
 
     // === STREAMLINED BUILD LOGIC ===
 
-    // Keep capnp detection as it's separate.
+    // Detect dependencies
     const capnp_config = detectCapnp(b);
+    const iree_config = detectIree(b); // NEW
     std.debug.print("==> Cap'n Proto detected: enabled={}, include={s}, lib={s}\n", .{
         capnp_config.enabled,
         capnp_config.include_dir orelse "null",
         capnp_config.lib_dir orelse "null"
+    });
+    std.debug.print("==> IREE detected: enabled={}, source={s}, build={s}\n", .{
+        iree_config.enabled,
+        iree_config.source_dir orelse "null",
+        iree_config.build_dir orelse "null"
     });
 
 
@@ -247,7 +322,7 @@ pub fn build(b: *std.Build) void {
     const pcp_module = b.addModule("pcp", .{
         .root_source_file = b.path("src/main.zig"),
     });
-    addIreeIncludes(pcp_module, b);
+    addIreeIncludes(pcp_module, b, iree_config); // REFACTORED
     
     // Add network include path for @cImport in capnp_zig_wrapper.zig
     pcp_module.addIncludePath(b.path("src/network"));
@@ -306,14 +381,30 @@ pub fn build(b: *std.Build) void {
     m3_pipeline_test.root_module.addImport("pcp", pcp_module);
 
     // IREE dependencies
-    addIreeDependencies(m3_pipeline_test, b);
+    addIreeDependencies(m3_pipeline_test, b, iree_config); // REFACTORED
 
 
     const run_m3_pipeline_test_cmd = b.addRunArtifact(m3_pipeline_test);
     run_m3_pipeline_test_cmd.step.dependOn(&m3_pipeline_test.step);
 
-    const run_m3_pipeline_test_step = b.step("run-m3-pipeline-test", "Test complete MLIR → SPIR-V → MSL → Metal pipeline on M3");
+    const run_m3_pipeline_test_step = b.step("run-m3-pipeline-test", "Test IREE Metal pipeline on M3");
     run_m3_pipeline_test_step.dependOn(&run_m3_pipeline_test_cmd.step);
+
+    // --- NEW: CPU Pipeline Test ---
+    const cpu_pipeline_test = b.addExecutable(.{
+        .name = "cpu_pipeline_test",
+        .root_source_file = b.path("src/examples/cpu_pipeline_test.zig"), // NEW FILE
+        .target = target,
+        .optimize = optimize,
+    });
+    cpu_pipeline_test.root_module.addImport("pcp", pcp_module);
+    addIreeDependencies(cpu_pipeline_test, b, iree_config); // REFACTORED
+
+    const run_cpu_pipeline_test_cmd = b.addRunArtifact(cpu_pipeline_test);
+    run_cpu_pipeline_test_cmd.step.dependOn(&cpu_pipeline_test.step);
+
+    const run_cpu_pipeline_test_step = b.step("run-cpu-pipeline-test", "Test IREE CPU pipeline");
+    run_cpu_pipeline_test_step.dependOn(&run_cpu_pipeline_test_cmd.step);
 
 
 
@@ -330,7 +421,7 @@ pub fn build(b: *std.Build) void {
     main_distributed.root_module.addImport("pcp", pcp_module);
 
     // IREE dependencies
-    addIreeDependencies(main_distributed, b);
+    addIreeDependencies(main_distributed, b, iree_config); // REFACTORED
 
     // Cap'n Proto bridge linking (specific to this target)
     if (!capnp_config.enabled) {
@@ -452,7 +543,7 @@ pub fn build(b: *std.Build) void {
     gpt2_model_test.root_module.addImport("pcp", pcp_module);
 
     // IREE dependencies
-    addIreeDependencies(gpt2_model_test, b);
+    addIreeDependencies(gpt2_model_test, b, iree_config); // REFACTORED
 
 
     // Install the executable
@@ -477,7 +568,7 @@ pub fn build(b: *std.Build) void {
     isolated_vjp_tests.root_module.addImport("pcp", pcp_module);
 
     // IREE dependencies
-    addIreeDependencies(isolated_vjp_tests, b);
+    addIreeDependencies(isolated_vjp_tests, b, iree_config); // REFACTORED
 
 
     // Install the test executable
@@ -502,7 +593,7 @@ pub fn build(b: *std.Build) void {
     mlir_optimizer_tests.root_module.addImport("pcp", pcp_module);
 
     // IREE dependencies
-    addIreeDependencies(mlir_optimizer_tests, b);
+    addIreeDependencies(mlir_optimizer_tests, b, iree_config); // REFACTORED
 
     // Run step for MLIR optimizer tests
     const run_mlir_optimizer_tests_cmd = b.addRunArtifact(mlir_optimizer_tests);
@@ -523,7 +614,7 @@ pub fn build(b: *std.Build) void {
     distributed_transformer_test.root_module.addImport("pcp", pcp_module);
 
     // IREE dependencies
-    addIreeDependencies(distributed_transformer_test, b);
+    addIreeDependencies(distributed_transformer_test, b, iree_config); // REFACTORED
 
     // Cap'n Proto dependencies
     addCapnpDependencies(distributed_transformer_test, b, capnp_config);

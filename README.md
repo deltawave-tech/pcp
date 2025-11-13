@@ -69,16 +69,17 @@ IREE handles the entire lowering pipeline from a high-level dialect to a hardwar
 
 ### Step 1: Clone This Repository
 
-Clone this project repository. Do **not** use `--recursive`.
+Clone this project repository.
 
 ```sh
-git clone <your-repo-url>
-cd <your-repo-name>
+git clone https://github.com/deltawave-tech/pcp.git
+cd pcp
+git checkout iree-install-test
 ```
 
 ### Step 2: Build IREE from Source
 
-PCP depends on a local build of Google's IREE project. This is a one-time setup that can take a significant amount of time (~1 hour). The build script expects IREE to be in a sibling directory.
+PCP depends on a local build of IREE. This is a one-time setup that can take a significant amount of time (~1 hour). The build script expects IREE to be in a sibling directory.
 
 Navigate to the parent directory of your project and clone IREE:
 
@@ -105,7 +106,7 @@ After this step, your directory structure should look like this:
 
 ```
 /some/path/
-├── your-project-repo/  (This project)
+├── pcp/  (This project)
 ├── iree/               (IREE source code)
 └── iree-build/         (IREE build artifacts)
 ```
@@ -125,11 +126,6 @@ If `IREE_DIR` is not set, the build script will automatically look for the sibli
 
 Navigate back to this project's directory and use Zig to build and run the verification tests.
 
-Build all project executables:
-
-```sh
-zig build
-```
 
 Run the IREE pipeline verification tests:
 

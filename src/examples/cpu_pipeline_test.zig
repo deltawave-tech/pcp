@@ -28,15 +28,13 @@ pub fn main() !void {
         \\  }
         \\}
     ;
-    const module = try mlir.Module.parse(mlir_context.getContext(), stablehlo_module_str);
-    defer module.deinit();
     std.debug.print("✓ Created StableHLO module\n", .{});
 
     // NEW: Select the CPU backend for compilation and execution
     const target_backend = backend_selection.Backend.cpu;
     std.debug.print("Compiling MLIR to VMFB for backend: {s}...\n", .{target_backend.toIreeCompilationTarget()});
 
-    const vmfb_binary = try mlir_context.compileToVMFB(allocator, module, target_backend.toIreeCompilationTarget());
+    const vmfb_binary = try mlir_context.compileToVMFB(allocator, stablehlo_module_str, target_backend.toIreeCompilationTarget());
     defer allocator.free(vmfb_binary);
     std.debug.print("✓ Compiled to VMFB artifact ({} bytes)\n", .{vmfb_binary.len});
 

@@ -8,6 +8,8 @@ const c = @cImport({
     // Enable all available drivers that we linked
     @cDefine("IREE_HAVE_HAL_LOCAL_SYNC_DRIVER_MODULE", "1");
     @cDefine("IREE_HAVE_HAL_METAL_DRIVER_MODULE", "1");
+    @cDefine("IREE_HAVE_HAL_VULKAN_DRIVER_MODULE", "1");
+    @cDefine("IREE_HAVE_HAL_CUDA_DRIVER_MODULE", "1");
     // Configure system allocator to use libc (matching IREE build configuration)
     @cDefine("IREE_ALLOCATOR_SYSTEM_CTL", "iree_allocator_libc_ctl");
     @cInclude("iree/base/api.h");
@@ -24,15 +26,20 @@ fn ireeCheck(status: c.iree_status_t) !void {
     if (status != null) {
         // Try to get more detailed error information
         std.debug.print("IREE Error Details:\n", .{});
-        
+
         // Get error code if available
         const code = c.iree_status_code(status);
         std.debug.print("  Status code: {}\n", .{code});
-        
-        // Try to get error message if available - be careful with this
-        // as the status might be in an unusual state
-        std.debug.print("  Status pointer: 0x{x}\n", .{@intFromPtr(status)});
-        
+
+        // Try to get error message
+        var buffer: [1024]u8 = undefined;
+        var out_length: c.iree_host_size_t = 0;
+        _ = c.iree_status_format(status, buffer.len, &buffer, &out_length);
+        if (out_length > 0 and out_length < buffer.len) {
+            const msg_len: usize = @intCast(out_length);
+            std.debug.print("  Error message: {s}\n", .{buffer[0..msg_len]});
+        }
+
         c.iree_status_free(status);
         return error.IreeRuntimeError;
     }

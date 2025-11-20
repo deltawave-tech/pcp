@@ -223,13 +223,13 @@ fn addIreeDependencies(target: *std.Build.Step.Compile, b: *std.Build, iree_conf
     dialect_anchors_lib.addIncludePath(.{ .cwd_relative = b.fmt("{s}/llvm-project/tools/mlir/include", .{build_dir}) });
     dialect_anchors_lib.addIncludePath(.{ .cwd_relative = b.fmt("{s}/third_party/stablehlo", .{source_dir}) });
     dialect_anchors_lib.addIncludePath(.{ .cwd_relative = b.fmt("{s}/llvm-external-projects/stablehlo", .{build_dir}) });
-    dialect_anchors_lib.linkLibCpp();
-    
+    dialect_anchors_lib.linkSystemLibrary("stdc++");
+
     target.linkLibrary(dialect_anchors_lib);
     target.step.dependOn(&dialect_anchors_lib.step);
 
     // --- Link All Required Libraries ---
-    target.linkLibCpp();
+    target.linkSystemLibrary("stdc++");
     
     // Core IREE
     target.linkSystemLibrary("IREECompiler");
@@ -249,16 +249,29 @@ fn addIreeDependencies(target: *std.Build.Step.Compile, b: *std.Build, iree_conf
     // CPU/Local-sync driver
     target.linkSystemLibrary("iree_hal_drivers_local_sync_sync_driver");
     target.linkSystemLibrary("iree_hal_drivers_local_sync_registration_registration");
-    
-    // Metal driver for M3
-    target.linkSystemLibrary("iree_hal_drivers_metal_metal");
-    target.linkSystemLibrary("iree_hal_drivers_metal_registration_registration");
-    
-    // macOS Frameworks
+
+    // Platform-specific GPU drivers
     if (target.root_module.resolved_target.?.result.os.tag == .macos) {
+        // Metal driver for macOS (M3)
+        target.linkSystemLibrary("iree_hal_drivers_metal_metal");
+        target.linkSystemLibrary("iree_hal_drivers_metal_registration_registration");
         target.linkFramework("Foundation");
         target.linkFramework("Metal");
         target.linkFramework("CoreGraphics");
+    } else if (target.root_module.resolved_target.?.result.os.tag == .linux) {
+        // Vulkan driver for Linux
+        target.addLibraryPath(.{ .cwd_relative = b.fmt("{s}/runtime/src/iree/hal/drivers/vulkan", .{build_dir}) });
+        target.addLibraryPath(.{ .cwd_relative = b.fmt("{s}/runtime/src/iree/hal/drivers/vulkan/registration", .{build_dir}) });
+        target.linkSystemLibrary("iree_hal_drivers_vulkan_vulkan");
+        target.linkSystemLibrary("iree_hal_drivers_vulkan_dynamic_symbols");
+        target.linkSystemLibrary("iree_hal_drivers_vulkan_registration_registration");
+
+        // CUDA driver for Linux (NVIDIA GPUs)
+        target.addLibraryPath(.{ .cwd_relative = b.fmt("{s}/runtime/src/iree/hal/drivers/cuda", .{build_dir}) });
+        target.addLibraryPath(.{ .cwd_relative = b.fmt("{s}/runtime/src/iree/hal/drivers/cuda/registration", .{build_dir}) });
+        target.linkSystemLibrary("iree_hal_drivers_cuda_cuda");
+        target.linkSystemLibrary("iree_hal_drivers_cuda_dynamic_symbols");
+        target.linkSystemLibrary("iree_hal_drivers_cuda_registration_registration");
     }
 }
 
@@ -406,7 +419,21 @@ pub fn build(b: *std.Build) void {
     const run_cpu_pipeline_test_step = b.step("run-cpu-pipeline-test", "Test IREE CPU pipeline");
     run_cpu_pipeline_test_step.dependOn(&run_cpu_pipeline_test_cmd.step);
 
+    // --- NEW: CUDA Pipeline Test ---
+    const cuda_pipeline_test = b.addExecutable(.{
+        .name = "cuda_pipeline_test",
+        .root_source_file = b.path("src/examples/cuda_pipeline_test.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    cuda_pipeline_test.root_module.addImport("pcp", pcp_module);
+    addIreeDependencies(cuda_pipeline_test, b, iree_config);
 
+    const run_cuda_pipeline_test_cmd = b.addRunArtifact(cuda_pipeline_test);
+    run_cuda_pipeline_test_cmd.step.dependOn(&cuda_pipeline_test.step);
+
+    const run_cuda_pipeline_test_step = b.step("run-cuda-pipeline-test", "Test IREE CUDA pipeline on NVIDIA GPU");
+    run_cuda_pipeline_test_step.dependOn(&run_cuda_pipeline_test_cmd.step);
 
 
 

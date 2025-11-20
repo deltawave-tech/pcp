@@ -142,3 +142,9 @@ For any platform (testing CPU backend):
 ```sh
 zig build run-cpu-pipeline-test
 ```
+
+For Linux with NVIDIA GPU (testing CUDA backend):
+
+```sh
+zig build run-cuda-pipeline-test
+```

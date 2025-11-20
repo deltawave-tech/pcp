@@ -3,6 +3,7 @@ const mlir = @import("mlir.zig");
 const mlir_ctx = @import("mlir_ctx.zig"); // Import complete MLIR context
 const tensor = @import("tensor.zig");
 const hlo = @import("mlir/dialects/stablehlo.zig");
+const c = @import("mlir/c.zig").c;
 
 const Tensor = tensor.Tensor(void); // DataType is encoded in mlir.Type
 const Shape = tensor.Shape;
@@ -137,6 +138,8 @@ pub const MLIRBuilder = struct {
     
     /// Creates an MLIR operation, appends it to the current block, and returns the operation handle.
     /// This is the primary method for building the graph safely.
+    /// Creates an MLIR operation, appends it to the current block, and returns the operation handle.
+    /// FIX: Direct struct assignment to avoid SmallVector growth issues
     pub fn createAndAttach(
         self: *Self,
         op_name: []const u8,
@@ -146,16 +149,66 @@ pub const MLIRBuilder = struct {
             attributes: []const struct { []const u8, mlir.Attribute } = &.{},
         },
     ) !mlir.Operation {
-        const op = mlir.Operation.create(self.ctx, op_name, .{
-            .operands = operands,
-            .results = result_types,
-            .attributes = options.attributes,
-            .location = self.loc,
-        });
+        // 1. Initialize state
+        var state = c.operationStateGet(op_name, self.loc.handle);
 
-        // Use the designated insertion block instead of accessing module regions directly
+        // 2. Prepare Operands
+        var operand_handles: []*c.MlirValue = undefined;
+        if (operands.len > 0) {
+            operand_handles = try self.allocator.alloc(*c.MlirValue, operands.len);
+        }
+        defer if (operands.len > 0) self.allocator.free(operand_handles);
+
+        for (operands, 0..) |op, i| {
+            operand_handles[i] = op.handle;
+        }
+
+        // 3. Prepare Results
+        var result_handles: []*c.MlirType = undefined;
+        if (result_types.len > 0) {
+            result_handles = try self.allocator.alloc(*c.MlirType, result_types.len);
+        }
+        defer if (result_types.len > 0) self.allocator.free(result_handles);
+
+        for (result_types, 0..) |rt, i| {
+            result_handles[i] = rt.handle;
+        }
+
+        // 4. Prepare Attributes
+        var named_attrs: []c.MlirNamedAttribute = undefined;
+        if (options.attributes.len > 0) {
+            named_attrs = try self.allocator.alloc(c.MlirNamedAttribute, options.attributes.len);
+        }
+        defer if (options.attributes.len > 0) self.allocator.free(named_attrs);
+
+        for (options.attributes, 0..) |attr_pair, i| {
+            const name_id = c.identifierGet(self.ctx.handle, attr_pair[0]);
+            named_attrs[i] = c.MlirNamedAttribute{
+                .name = name_id,
+                .attribute = attr_pair[1].handle,
+            };
+        }
+
+        // 5. Direct Assignment to State Struct (avoids SmallVector growth)
+        if (operands.len > 0) {
+            state.nOperands = @intCast(operands.len);
+            state.operands = operand_handles.ptr;
+        }
+
+        if (result_types.len > 0) {
+            state.nResults = @intCast(result_types.len);
+            state.results = result_handles.ptr;
+        }
+
+        if (options.attributes.len > 0) {
+            state.nAttributes = @intCast(options.attributes.len);
+            state.attributes = named_attrs.ptr;
+        }
+
+        // 6. Create Operation
+        const op = mlir.Operation{ .handle = c.operationCreate(&state) };
         self.insertion_block.appendOwnedOperation(op);
-        
+
         return op;
     }
     
@@ -167,52 +220,49 @@ pub const MLIRBuilder = struct {
         return mlir.Block{ .handle = block_handle };
     }
 
-    /// Creates a complete, well-formed `func.func` operation with an empty body,
-    /// attaches it to the module, and returns the function's entry block for population.
-    /// This abstracts away the unsafe C API for function creation.
+    /// Creates a complete, well-formed `func.func` operation
+    /// FIX: Direct struct assignment to avoid SmallVector issues
     pub fn createFunction(
         self: *Self,
         name: []const u8,
         func_type: mlir.Type,
     ) !struct { func_op: mlir.Operation, entry_block: mlir.Block } {
         std.log.info("MLIRBuilder.createFunction: Creating function '{s}'...", .{name});
-        const c_api = @import("mlir/c.zig").c;
 
-        // 1. Create the operation state WITHOUT a region initially.
-        // This prevents the verifier from complaining about an un-nested function.
-        var state = c_api.operationStateGet("func.func", self.loc.handle);
+        var state = c.operationStateGet("func.func", self.loc.handle);
 
-        // 2. Add the function's attributes (type and name).
-        // You are correct: sym_visibility is not needed for top-level functions.
+        // Attributes
         const func_type_attr = mlir.Attribute.typeAttr(func_type);
         const sym_name_attr = mlir.Attribute.stringAttr(self.ctx, name);
+        const func_type_id = c.identifierGet(self.ctx.handle, "function_type");
+        const sym_name_id = c.identifierGet(self.ctx.handle, "sym_name");
 
-        const func_type_id = c_api.identifierGet(self.ctx.handle, "function_type");
-        const sym_name_id = c_api.identifierGet(self.ctx.handle, "sym_name");
-
-        var named_attrs = [_]c_api.MlirNamedAttribute{
+        var named_attrs = [_]c.MlirNamedAttribute{
             .{ .name = func_type_id, .attribute = func_type_attr.handle },
             .{ .name = sym_name_id, .attribute = sym_name_attr.handle },
         };
-        c_api.mlirOperationStateAddAttributes(&state, named_attrs.len, @ptrCast(&named_attrs[0]));
-        
-        // Add one region placeholder.
-        var regions = [_]*c_api.MlirRegion{c_api.regionCreate()};
-        c_api.operationStateAddOwnedRegions(&state, 1, @ptrCast(&regions[0]));
 
-        // 3. Create the function operation.
-        const func_op_handle = c_api.operationCreate(&state);
+        // Direct struct assignment instead of mlirOperationStateAddAttributes
+        state.nAttributes = 2;
+        state.attributes = &named_attrs;
+
+        // Add region placeholder using the safe function (regions are opaque pointers)
+        var regions = [_]*c.MlirRegion{c.regionCreate()};
+        c.operationStateAddOwnedRegions(&state, 1, @ptrCast(&regions[0]));
+
+        // Create operation
+        const func_op_handle = c.operationCreate(&state);
         const func_op = mlir.Operation{ .handle = func_op_handle };
-        
-        // 4. CRITICAL STEP: Immediately attach the (empty) function to the module's body.
+
+        // Attach to module
         self.module_body.appendOwnedOperation(func_op);
 
-        // 5. Now, create and add the entry block to the function's region.
+        // Add entry block
         const region = func_op.getRegion(0);
         const entry_block = try createBlock();
-        c_api.regionAppendOwnedBlock(region.handle, entry_block.handle);
+        c.regionAppendOwnedBlock(region.handle, entry_block.handle);
 
-        // 6. Add block arguments based on the function type.
+        // Add block arguments
         std.log.info("MLIRBuilder.createFunction: Adding block arguments...", .{});
         const func_type_wrapper = func_type.as(mlir.FunctionType) orelse return error.NotAFunctionType;
         const num_inputs = func_type_wrapper.getNumInputs();
@@ -221,10 +271,6 @@ pub const MLIRBuilder = struct {
             _ = entry_block.addArgument(input_type, self.loc);
         }
         std.log.info("MLIRBuilder.createFunction: Block arguments added ({})", .{num_inputs});
-
-        std.log.info("MLIRBuilder.createFunction: Function '{s}' created and attached successfully.", .{name});
-        
-        // Note: Verification removed - will be done after function body is complete
 
         return .{ .func_op = func_op, .entry_block = entry_block };
     }

@@ -137,9 +137,6 @@ pub const MLIRBuilder = struct {
     }
     
     /// Creates an MLIR operation, appends it to the current block, and returns the operation handle.
-    /// This is the primary method for building the graph safely.
-    /// Creates an MLIR operation, appends it to the current block, and returns the operation handle.
-    /// FIX: Direct struct assignment to avoid SmallVector growth issues
     pub fn createAndAttach(
         self: *Self,
         op_name: []const u8,
@@ -149,7 +146,9 @@ pub const MLIRBuilder = struct {
             attributes: []const struct { []const u8, mlir.Attribute } = &.{},
         },
     ) !mlir.Operation {
-        // 1. Initialize state
+        // 1. Initialize state using C API (Fixes "invalid pointer")
+        // We use the C API to create the struct, but we will manually assign
+        // the arrays below to avoid the "SmallVector" resize crash.
         var state = c.operationStateGet(op_name, self.loc.handle);
 
         // 2. Prepare Operands
@@ -163,6 +162,11 @@ pub const MLIRBuilder = struct {
             operand_handles[i] = op.handle;
         }
 
+        if (operands.len > 0) {
+            state.nOperands = @intCast(operands.len);
+            state.operands = operand_handles.ptr;
+        }
+
         // 3. Prepare Results
         var result_handles: []*c.MlirType = undefined;
         if (result_types.len > 0) {
@@ -174,6 +178,11 @@ pub const MLIRBuilder = struct {
             result_handles[i] = rt.handle;
         }
 
+        if (result_types.len > 0) {
+            state.nResults = @intCast(result_types.len);
+            state.results = result_handles.ptr;
+        }
+
         // 4. Prepare Attributes
         var named_attrs: []c.MlirNamedAttribute = undefined;
         if (options.attributes.len > 0) {
@@ -182,22 +191,14 @@ pub const MLIRBuilder = struct {
         defer if (options.attributes.len > 0) self.allocator.free(named_attrs);
 
         for (options.attributes, 0..) |attr_pair, i| {
-            const name_id = c.identifierGet(self.ctx.handle, attr_pair[0]);
+            const name_str = attr_pair[0];
+            // Manually create StringRef for attribute name
+            const name_ref = c.MlirStringRef{ .data = name_str.ptr, .length = name_str.len };
+            const name_id = c.mlirIdentifierGet(self.ctx.handle, name_ref);
             named_attrs[i] = c.MlirNamedAttribute{
                 .name = name_id,
                 .attribute = attr_pair[1].handle,
             };
-        }
-
-        // 5. Direct Assignment to State Struct (avoids SmallVector growth)
-        if (operands.len > 0) {
-            state.nOperands = @intCast(operands.len);
-            state.operands = operand_handles.ptr;
-        }
-
-        if (result_types.len > 0) {
-            state.nResults = @intCast(result_types.len);
-            state.results = result_handles.ptr;
         }
 
         if (options.attributes.len > 0) {
@@ -205,7 +206,7 @@ pub const MLIRBuilder = struct {
             state.attributes = named_attrs.ptr;
         }
 
-        // 6. Create Operation
+        // 5. Create Operation
         const op = mlir.Operation{ .handle = c.operationCreate(&state) };
         self.insertion_block.appendOwnedOperation(op);
 
@@ -221,7 +222,6 @@ pub const MLIRBuilder = struct {
     }
 
     /// Creates a complete, well-formed `func.func` operation
-    /// FIX: Direct struct assignment to avoid SmallVector issues
     pub fn createFunction(
         self: *Self,
         name: []const u8,
@@ -229,11 +229,13 @@ pub const MLIRBuilder = struct {
     ) !struct { func_op: mlir.Operation, entry_block: mlir.Block } {
         std.log.info("MLIRBuilder.createFunction: Creating function '{s}'...", .{name});
 
+        // 1. Initialize State using C API (Fixes "invalid pointer")
         var state = c.operationStateGet("func.func", self.loc.handle);
 
-        // Attributes
+        // 2. Attributes
         const func_type_attr = mlir.Attribute.typeAttr(func_type);
         const sym_name_attr = mlir.Attribute.stringAttr(self.ctx, name);
+
         const func_type_id = c.identifierGet(self.ctx.handle, "function_type");
         const sym_name_id = c.identifierGet(self.ctx.handle, "sym_name");
 
@@ -242,27 +244,29 @@ pub const MLIRBuilder = struct {
             .{ .name = sym_name_id, .attribute = sym_name_attr.handle },
         };
 
-        // Direct struct assignment instead of mlirOperationStateAddAttributes
         state.nAttributes = 2;
         state.attributes = &named_attrs;
 
-        // Add region placeholder using the safe function (regions are opaque pointers)
-        var regions = [_]*c.MlirRegion{c.regionCreate()};
-        c.operationStateAddOwnedRegions(&state, 1, @ptrCast(&regions[0]));
+        // 3. Region
+        // We use the C API to create the region pointer, but manually assign it
+        // to avoid 'operationStateAddOwnedRegions' overhead.
+        var region = c.regionCreate();
+        state.nRegions = 1;
+        state.regions = @ptrCast(&region);
 
-        // Create operation
+        // 4. Create Operation
         const func_op_handle = c.operationCreate(&state);
         const func_op = mlir.Operation{ .handle = func_op_handle };
 
         // Attach to module
         self.module_body.appendOwnedOperation(func_op);
 
-        // Add entry block
-        const region = func_op.getRegion(0);
+        // 5. Add entry block
+        const region_handle = func_op.getRegion(0);
         const entry_block = try createBlock();
-        c.regionAppendOwnedBlock(region.handle, entry_block.handle);
+        c.regionAppendOwnedBlock(region_handle.handle, entry_block.handle);
 
-        // Add block arguments
+        // 6. Add block arguments
         std.log.info("MLIRBuilder.createFunction: Adding block arguments...", .{});
         const func_type_wrapper = func_type.as(mlir.FunctionType) orelse return error.NotAFunctionType;
         const num_inputs = func_type_wrapper.getNumInputs();

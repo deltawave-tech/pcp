@@ -19,6 +19,8 @@ const c = @cImport({
 const WorkerBackend = @import("worker_backend.zig").WorkerBackend;
 const backend_selection = @import("../backend_selection.zig");
 const mlir = @import("../mlir.zig");
+const pcp = @import("../main.zig");
+const DType = pcp.tensor.DType;
 
 // Helper to check for IREE errors
 fn ireeCheck(status: c.iree_status_t) !void {
@@ -53,6 +55,18 @@ pub const IreeBackend = struct {
     backend: backend_selection.Backend,
 
     const Self = @This();
+
+    // Helper to map DType to IREE element type
+    fn getIreeType(dtype: DType) c.iree_hal_element_type_t {
+        return switch (dtype) {
+            .f32 => c.IREE_HAL_ELEMENT_TYPE_FLOAT_32,
+            .f64 => c.IREE_HAL_ELEMENT_TYPE_FLOAT_64,
+            .f16 => c.IREE_HAL_ELEMENT_TYPE_FLOAT_16,
+            .i32 => c.IREE_HAL_ELEMENT_TYPE_SINT_32,
+            .i64 => c.IREE_HAL_ELEMENT_TYPE_SINT_64,
+            .bool => c.IREE_HAL_ELEMENT_TYPE_BOOL_8, // IREE treats i1 as 8-bit bool
+        };
+    }
 
     pub fn init(allocator: std.mem.Allocator, backend: backend_selection.Backend) !*IreeBackend {
         var self = try allocator.create(IreeBackend);
@@ -104,7 +118,14 @@ pub const IreeBackend = struct {
     }
 
     /// Execute a training step with a pre-compiled VMFB artifact.
-    pub fn execute(self: *Self, vmfb_bytes: []const u8, function_name: []const u8, inputs_data: [][]const u8, input_shapes: [][]const i64) ![][]u8 {
+    pub fn execute(
+        self: *Self,
+        vmfb_bytes: []const u8,
+        function_name: []const u8,
+        inputs_data: [][]const u8,
+        input_shapes: [][]const i64,
+        input_dtypes: ?[]const DType
+    ) ![][]u8 {
         // 1. Load the .vmfb module into the session
         // NOTE: In a real app, you would load this once and cache it. For now, we load it on every call.
         try ireeCheck(c.iree_runtime_session_append_bytecode_module_from_memory(
@@ -115,25 +136,28 @@ pub const IreeBackend = struct {
 
         // 2. Initialize a call to the specified function
         var call: c.iree_runtime_call_t = undefined;
-        
+
         // IREE expects the format "module.<function_name>"
         const full_fn_name = try std.fmt.allocPrint(self.allocator, "module.{s}", .{function_name});
         defer self.allocator.free(full_fn_name);
-        
+
         const fn_name_view = c.iree_string_view_t{ .data = full_fn_name.ptr, .size = full_fn_name.len };
         try ireeCheck(c.iree_runtime_call_initialize_by_name(self.session.?, fn_name_view, &call));
         defer c.iree_runtime_call_deinitialize(&call);
 
         // 3. Create IREE buffer views from input data using the simpler allocate_buffer_copy API
         std.debug.assert(inputs_data.len == input_shapes.len);
-        
-        for (inputs_data, input_shapes) |input_slice, shape_slice| {
+
+        for (inputs_data, input_shapes, 0..) |input_slice, shape_slice, i| {
             // Convert shapes to IREE format
             var iree_shape = try self.allocator.alloc(c.iree_hal_dim_t, shape_slice.len);
             defer self.allocator.free(iree_shape);
-            for (shape_slice, 0..) |dim, i| {
-                iree_shape[i] = @intCast(dim);
+            for (shape_slice, 0..) |dim, k| {
+                iree_shape[k] = @intCast(dim);
             }
+
+            // Determine element type: Use provided dtype or default to f32
+            const element_type = if (input_dtypes) |dtypes| getIreeType(dtypes[i]) else c.IREE_HAL_ELEMENT_TYPE_FLOAT_32;
 
             // Create buffer view directly from data - much simpler than manual mapping!
             var buffer_view: ?*c.iree_hal_buffer_view_t = null;
@@ -142,7 +166,7 @@ pub const IreeBackend = struct {
                 c.iree_runtime_session_device_allocator(self.session.?),
                 @intCast(shape_slice.len),
                 iree_shape.ptr,
-                c.IREE_HAL_ELEMENT_TYPE_FLOAT_32, // Assuming f32 for now
+                element_type, // Use dynamic type
                 c.IREE_HAL_ENCODING_TYPE_DENSE_ROW_MAJOR,
                 .{
                     .type = c.IREE_HAL_MEMORY_TYPE_DEVICE_LOCAL,
@@ -213,7 +237,9 @@ pub const IreeBackend = struct {
 
     fn executeTrainingStepInterface(ptr: *anyopaque, artifact: []const u8, data: [][]const u8, shapes: [][]const i64) anyerror![][]u8 {
         const self: *Self = @ptrCast(@alignCast(ptr));
-        return self.execute(artifact, "main", data, shapes);
+        // Note: In the future, the worker protocol should include type info.
+        // For now, assuming f32 defaults in the interface is consistent with previous behavior.
+        return self.execute(artifact, "main", data, shapes, null);
     }
 
     fn deinitInterface(ptr: *anyopaque) void {

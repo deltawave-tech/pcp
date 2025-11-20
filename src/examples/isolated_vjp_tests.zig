@@ -7,6 +7,7 @@ const tensor = pcp.tensor;
 const mlir_ctx = pcp.mlir_ctx;
 const backend_selection = pcp.backend_selection;
 const IreeBackend = pcp.backends.iree.IreeBackend;
+const DType = pcp.tensor.DType;
 
 const Allocator = std.mem.Allocator;
 const MLIRBuilder = ops.MLIRBuilder;
@@ -44,14 +45,19 @@ pub const ExecutionHelper = struct {
         function_name: []const u8,
         inputs: [][]const u8,
         input_shapes: [][]const i64,
+        input_dtypes: ?[]const DType,
     ) ![][]u8 {
         var mlir_context = try mlir_ctx.MLIRContext.init(self.allocator);
         defer mlir_context.deinit();
 
-        const backend = backend_selection.Backend.metal;
-        
+        const backend = backend_selection.Backend.cuda;
+
+        // Serialize the MLIR module to a string first
+        const mlir_source = try mlir_ctx.serializeMLIRModule(self.allocator, module);
+        defer self.allocator.free(mlir_source);
+
         // This call might fail. `try` will correctly propagate the error.
-        const vmfb_binary = try mlir_context.compileToVMFB(self.allocator, module, backend.toIreeCompilationTarget());
+        const vmfb_binary = try mlir_context.compileToVMFB(self.allocator, mlir_source, backend.toIreeCompilationTarget());
         defer self.allocator.free(vmfb_binary);
 
         var iree_backend = try IreeBackend.init(self.allocator, backend);
@@ -60,8 +66,8 @@ pub const ExecutionHelper = struct {
         // This is the call that was previously causing the NOT_FOUND error.
         // By using `try`, we ensure that if it fails, the error is returned
         // immediately, preventing the segfault.
-        const outputs = try iree_backend.execute(vmfb_binary, function_name, inputs, input_shapes);
-        
+        const outputs = try iree_backend.execute(vmfb_binary, function_name, inputs, input_shapes, input_dtypes);
+
         return outputs;
     }
 };
@@ -107,7 +113,7 @@ pub fn testMultiplyVJP(allocator: Allocator) !void {
         var inputs_bytes = [_][]const u8{ std.mem.sliceAsBytes(&input_a), std.mem.sliceAsBytes(&input_b) };
         var shapes = [_][]const i64{ &[_]i64{}, &[_]i64{} };
 
-        const outputs = try helper.executeModule(builder.module, "forward_mul", &inputs_bytes, &shapes);
+        const outputs = try helper.executeModule(builder.module, "forward_mul", &inputs_bytes, &shapes, null);
         defer { for(outputs) |o| allocator.free(o); allocator.free(outputs); }
 
         const forward_result: f32 = @bitCast(std.mem.readInt(u32, outputs[0][0..4], .little));
@@ -130,7 +136,7 @@ pub fn testMultiplyVJP(allocator: Allocator) !void {
         };
         var shapes = [_][]const i64{ &[_]i64{}, &[_]i64{}, &[_]i64{} };
 
-        const grad_outputs = try helper.executeModule(builder.module, "forward_mul_grad", &inputs_bytes, &shapes);
+        const grad_outputs = try helper.executeModule(builder.module, "forward_mul_grad", &inputs_bytes, &shapes, null);
         defer { for(grad_outputs) |o| allocator.free(o); allocator.free(grad_outputs); }
 
         // The grad function returns two values: (grad_a, grad_b)
@@ -183,7 +189,7 @@ pub fn testAddVJP(allocator: Allocator) !void {
         var inputs_bytes = [_][]const u8{ std.mem.sliceAsBytes(&input_a), std.mem.sliceAsBytes(&input_b) };
         var shapes = [_][]const i64{ &[_]i64{}, &[_]i64{} };
 
-        const outputs = try helper.executeModule(builder.module, "forward_add", &inputs_bytes, &shapes);
+        const outputs = try helper.executeModule(builder.module, "forward_add", &inputs_bytes, &shapes, null);
         defer { for(outputs) |o| allocator.free(o); allocator.free(outputs); }
 
         const forward_result: f32 = @bitCast(std.mem.readInt(u32, outputs[0][0..4], .little));
@@ -205,7 +211,7 @@ pub fn testAddVJP(allocator: Allocator) !void {
         };
         var shapes = [_][]const i64{ &[_]i64{}, &[_]i64{}, &[_]i64{} };
 
-        const grad_outputs = try helper.executeModule(builder.module, "forward_add_grad", &inputs_bytes, &shapes);
+        const grad_outputs = try helper.executeModule(builder.module, "forward_add_grad", &inputs_bytes, &shapes, null);
         defer { for(grad_outputs) |o| allocator.free(o); allocator.free(grad_outputs); }
 
         const grad_a: f32 = @bitCast(std.mem.readInt(u32, grad_outputs[0][0..4], .little));
@@ -255,7 +261,7 @@ pub fn testSubtractVJP(allocator: Allocator) !void {
         var inputs_bytes = [_][]const u8{ std.mem.sliceAsBytes(&input_a), std.mem.sliceAsBytes(&input_b) };
         var shapes = [_][]const i64{ &[_]i64{}, &[_]i64{} };
 
-        const outputs = try helper.executeModule(builder.module, "forward_subtract", &inputs_bytes, &shapes);
+        const outputs = try helper.executeModule(builder.module, "forward_subtract", &inputs_bytes, &shapes, null);
         defer { for(outputs) |o| allocator.free(o); allocator.free(outputs); }
 
         const forward_result: f32 = @bitCast(std.mem.readInt(u32, outputs[0][0..4], .little));
@@ -277,7 +283,7 @@ pub fn testSubtractVJP(allocator: Allocator) !void {
         };
         var shapes = [_][]const i64{ &[_]i64{}, &[_]i64{}, &[_]i64{} };
 
-        const grad_outputs = try helper.executeModule(builder.module, "forward_subtract_grad", &inputs_bytes, &shapes);
+        const grad_outputs = try helper.executeModule(builder.module, "forward_subtract_grad", &inputs_bytes, &shapes, null);
         defer { for(grad_outputs) |o| allocator.free(o); allocator.free(grad_outputs); }
 
         const grad_a: f32 = @bitCast(std.mem.readInt(u32, grad_outputs[0][0..4], .little));
@@ -327,7 +333,7 @@ pub fn testDivideVJP(allocator: Allocator) !void {
         var inputs_bytes = [_][]const u8{ std.mem.sliceAsBytes(&input_a), std.mem.sliceAsBytes(&input_b) };
         var shapes = [_][]const i64{ &[_]i64{}, &[_]i64{} };
 
-        const outputs = try helper.executeModule(builder.module, "forward_divide", &inputs_bytes, &shapes);
+        const outputs = try helper.executeModule(builder.module, "forward_divide", &inputs_bytes, &shapes, null);
         defer { for(outputs) |o| allocator.free(o); allocator.free(outputs); }
 
         const forward_result: f32 = @bitCast(std.mem.readInt(u32, outputs[0][0..4], .little));
@@ -349,7 +355,7 @@ pub fn testDivideVJP(allocator: Allocator) !void {
         };
         var shapes = [_][]const i64{ &[_]i64{}, &[_]i64{}, &[_]i64{} };
 
-        const grad_outputs = try helper.executeModule(builder.module, "forward_divide_grad", &inputs_bytes, &shapes);
+        const grad_outputs = try helper.executeModule(builder.module, "forward_divide_grad", &inputs_bytes, &shapes, null);
         defer { for(grad_outputs) |o| allocator.free(o); allocator.free(grad_outputs); }
 
         const grad_a: f32 = @bitCast(std.mem.readInt(u32, grad_outputs[0][0..4], .little));
@@ -404,7 +410,7 @@ pub fn testMatmulVJP(allocator: Allocator) !void {
         var inputs_bytes = [_][]const u8{ std.mem.sliceAsBytes(&input_a), std.mem.sliceAsBytes(&input_b) };
         var shapes = [_][]const i64{ &[_]i64{2, 2}, &[_]i64{2, 2} };
 
-        const outputs = try helper.executeModule(builder.module, "forward_matmul", &inputs_bytes, &shapes);
+        const outputs = try helper.executeModule(builder.module, "forward_matmul", &inputs_bytes, &shapes, null);
         defer { for(outputs) |o| allocator.free(o); allocator.free(outputs); }
 
         const result_slice: []const f32 = @alignCast(std.mem.bytesAsSlice(f32, outputs[0]));
@@ -428,7 +434,7 @@ pub fn testMatmulVJP(allocator: Allocator) !void {
         };
         var shapes = [_][]const i64{ &[_]i64{2, 2}, &[_]i64{2, 2}, &[_]i64{2, 2} };
 
-        const grad_outputs = try helper.executeModule(builder.module, "forward_matmul_grad", &inputs_bytes, &shapes);
+        const grad_outputs = try helper.executeModule(builder.module, "forward_matmul_grad", &inputs_bytes, &shapes, null);
         defer { for(grad_outputs) |o| allocator.free(o); allocator.free(grad_outputs); }
 
         try std.testing.expectEqual(@as(usize, 2), grad_outputs.len);
@@ -486,7 +492,7 @@ pub fn testTransposeVJP(allocator: Allocator) !void {
         var inputs_bytes = [_][]const u8{ std.mem.sliceAsBytes(&input_a) };
         var shapes = [_][]const i64{ &[_]i64{2, 3} };
 
-        const outputs = try helper.executeModule(builder.module, "forward_transpose", &inputs_bytes, &shapes);
+        const outputs = try helper.executeModule(builder.module, "forward_transpose", &inputs_bytes, &shapes, null);
         defer { for(outputs) |o| allocator.free(o); allocator.free(outputs); }
 
         const result_slice: []const f32 = @alignCast(std.mem.bytesAsSlice(f32, outputs[0]));
@@ -508,7 +514,7 @@ pub fn testTransposeVJP(allocator: Allocator) !void {
         };
         var shapes = [_][]const i64{ &[_]i64{2, 3}, &[_]i64{3, 2} };
 
-        const grad_outputs = try helper.executeModule(builder.module, "forward_transpose_grad", &inputs_bytes, &shapes);
+        const grad_outputs = try helper.executeModule(builder.module, "forward_transpose_grad", &inputs_bytes, &shapes, null);
         defer { for(grad_outputs) |o| allocator.free(o); allocator.free(grad_outputs); }
 
         const grad_a: []const f32 = @alignCast(std.mem.bytesAsSlice(f32, grad_outputs[0]));
@@ -557,7 +563,7 @@ pub fn testReshapeVJP(allocator: Allocator) !void {
         var inputs_bytes = [_][]const u8{ std.mem.sliceAsBytes(&input_a) };
         var shapes = [_][]const i64{ &[_]i64{2, 3} };
 
-        const outputs = try helper.executeModule(builder.module, "forward_reshape", &inputs_bytes, &shapes);
+        const outputs = try helper.executeModule(builder.module, "forward_reshape", &inputs_bytes, &shapes, null);
         defer { for(outputs) |o| allocator.free(o); allocator.free(outputs); }
 
         const result_slice: []const f32 = @alignCast(std.mem.bytesAsSlice(f32, outputs[0]));
@@ -579,7 +585,7 @@ pub fn testReshapeVJP(allocator: Allocator) !void {
         };
         var shapes = [_][]const i64{ &[_]i64{2, 3}, &[_]i64{6} };
 
-        const grad_outputs = try helper.executeModule(builder.module, "forward_reshape_grad", &inputs_bytes, &shapes);
+        const grad_outputs = try helper.executeModule(builder.module, "forward_reshape_grad", &inputs_bytes, &shapes, null);
         defer { for(grad_outputs) |o| allocator.free(o); allocator.free(grad_outputs); }
 
         const grad_a: []const f32 = @alignCast(std.mem.bytesAsSlice(f32, grad_outputs[0]));
@@ -628,7 +634,7 @@ pub fn testReduceSumVJP(allocator: Allocator) !void {
         var inputs_bytes = [_][]const u8{ std.mem.sliceAsBytes(&input_a) };
         var shapes = [_][]const i64{ &[_]i64{2, 3} };
 
-        const outputs = try helper.executeModule(builder.module, "forward_reducesum", &inputs_bytes, &shapes);
+        const outputs = try helper.executeModule(builder.module, "forward_reducesum", &inputs_bytes, &shapes, null);
         defer { for(outputs) |o| allocator.free(o); allocator.free(outputs); }
 
         const forward_result: f32 = @bitCast(std.mem.readInt(u32, outputs[0][0..4], .little));
@@ -648,7 +654,7 @@ pub fn testReduceSumVJP(allocator: Allocator) !void {
         };
         var shapes = [_][]const i64{ &[_]i64{2, 3}, &[_]i64{} };
 
-        const grad_outputs = try helper.executeModule(builder.module, "forward_reducesum_grad", &inputs_bytes, &shapes);
+        const grad_outputs = try helper.executeModule(builder.module, "forward_reducesum_grad", &inputs_bytes, &shapes, null);
         defer { for(grad_outputs) |o| allocator.free(o); allocator.free(grad_outputs); }
 
         const grad_a: []const f32 = @alignCast(std.mem.bytesAsSlice(f32, grad_outputs[0]));
@@ -697,14 +703,14 @@ pub fn testExpVJP(allocator: Allocator) !void {
     var bwd_shapes = [_][]const i64{ &[_]i64{}, &[_]i64{} };
 
     // Verify Forward
-    const fwd_out = try helper.executeModule(builder.module, "forward_exp", &fwd_inputs, &fwd_shapes);
+    const fwd_out = try helper.executeModule(builder.module, "forward_exp", &fwd_inputs, &fwd_shapes, null);
     defer { for(fwd_out) |o| allocator.free(o); allocator.free(fwd_out); }
     const fwd_val: f32 = @bitCast(std.mem.readInt(u32, fwd_out[0][0..4], .little));
     const expected_fwd = @exp(2.0);
     try std.testing.expectApproxEqAbs(expected_fwd, fwd_val, 1e-5);
 
     // Verify Backward
-    const bwd_out = try helper.executeModule(builder.module, "forward_exp_grad", &bwd_inputs, &bwd_shapes);
+    const bwd_out = try helper.executeModule(builder.module, "forward_exp_grad", &bwd_inputs, &bwd_shapes, null);
     defer { for(bwd_out) |o| allocator.free(o); allocator.free(bwd_out); }
     const grad_x: f32 = @bitCast(std.mem.readInt(u32, bwd_out[0][0..4], .little));
 
@@ -740,7 +746,7 @@ pub fn testLogVJP(allocator: Allocator) !void {
     var bwd_inputs = [_][]const u8{ std.mem.sliceAsBytes(&input), std.mem.sliceAsBytes(&grad_out) };
     var bwd_shapes = [_][]const i64{ &[_]i64{}, &[_]i64{} };
 
-    const bwd_out = try helper.executeModule(builder.module, "forward_log_grad", &bwd_inputs, &bwd_shapes);
+    const bwd_out = try helper.executeModule(builder.module, "forward_log_grad", &bwd_inputs, &bwd_shapes, null);
     defer { for(bwd_out) |o| allocator.free(o); allocator.free(bwd_out); }
     const grad_x: f32 = @bitCast(std.mem.readInt(u32, bwd_out[0][0..4], .little));
 
@@ -776,7 +782,7 @@ pub fn testRsqrtVJP(allocator: Allocator) !void {
     var bwd_inputs = [_][]const u8{ std.mem.sliceAsBytes(&input), std.mem.sliceAsBytes(&grad_out) };
     var bwd_shapes = [_][]const i64{ &[_]i64{}, &[_]i64{} };
 
-    const bwd_out = try helper.executeModule(builder.module, "forward_rsqrt_grad", &bwd_inputs, &bwd_shapes);
+    const bwd_out = try helper.executeModule(builder.module, "forward_rsqrt_grad", &bwd_inputs, &bwd_shapes, null);
     defer { for(bwd_out) |o| allocator.free(o); allocator.free(bwd_out); }
     const grad_x: f32 = @bitCast(std.mem.readInt(u32, bwd_out[0][0..4], .little));
 
@@ -831,7 +837,10 @@ pub fn testSelectVJP(allocator: Allocator) !void {
     };
     var bwd_shapes = [_][]const i64{ &[_]i64{2}, &[_]i64{2}, &[_]i64{2}, &[_]i64{2} };
 
-    const bwd_out = try helper.executeModule(builder.module, "forward_select_grad", &bwd_inputs, &bwd_shapes);
+    // Define types: [bool, f32, f32, f32]
+    const bwd_dtypes = [_]DType{ .bool, .f32, .f32, .f32 };
+
+    const bwd_out = try helper.executeModule(builder.module, "forward_select_grad", &bwd_inputs, &bwd_shapes, &bwd_dtypes);
     defer { for(bwd_out) |o| allocator.free(o); allocator.free(bwd_out); }
 
     // Result order: [pred_grad (dummy), true_grad, false_grad]
@@ -917,7 +926,7 @@ pub fn testChainRule(allocator: Allocator) !void {
         var inputs_bytes = [_][]const u8{ std.mem.sliceAsBytes(&input_x), std.mem.sliceAsBytes(&input_w), std.mem.sliceAsBytes(&input_b) };
         var shapes = [_][]const i64{ &[_]i64{}, &[_]i64{}, &[_]i64{} };
 
-        const outputs = try helper.executeModule(builder.module, "forward_chain", &inputs_bytes, &shapes);
+        const outputs = try helper.executeModule(builder.module, "forward_chain", &inputs_bytes, &shapes, null);
         defer { for(outputs) |o| allocator.free(o); allocator.free(outputs); }
 
         const forward_result: f32 = @bitCast(std.mem.readInt(u32, outputs[0][0..4], .little));
@@ -941,7 +950,7 @@ pub fn testChainRule(allocator: Allocator) !void {
         };
         var shapes = [_][]const i64{ &[_]i64{}, &[_]i64{}, &[_]i64{}, &[_]i64{} };
 
-        const grad_outputs = try helper.executeModule(builder.module, "forward_chain_grad", &inputs_bytes, &shapes);
+        const grad_outputs = try helper.executeModule(builder.module, "forward_chain_grad", &inputs_bytes, &shapes, null);
         defer { for(grad_outputs) |o| allocator.free(o); allocator.free(grad_outputs); }
 
         // The grad function returns three values: (grad_x, grad_w, grad_b)

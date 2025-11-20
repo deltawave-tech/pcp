@@ -1239,8 +1239,7 @@ fn logVJP(
     return result.toOwnedSlice();
 }
 
-/// VJP rule for rsqrt (1/sqrt(x)): da = -0.5 * grad_out * (a ^ -1.5)
-/// Optimized: da = -0.5 * grad_out * rsqrt(a) * rsqrt(a) * rsqrt(a)
+/// VJP for rsqrt: da = -0.5 * grad_out * (a ^ -1.5)
 fn rsqrtVJP(
     builder: *MLIRBuilder,
     original_op: mlir.Operation,
@@ -1255,24 +1254,37 @@ fn rsqrtVJP(
     var result = std.ArrayList(mlir.Value).init(builder.allocator);
     defer result.deinit();
 
-    // 1. Recompute rsqrt(a)
+    // 1. rsqrt(a)
     const rsqrt_op = try builder.createAndAttach("stablehlo.rsqrt", &.{a}, &.{tensor_type}, .{});
     const rsqrt_val = rsqrt_op.getResult(0);
 
-    // 2. Compute rsqrt(a)^3 = rsqrt * rsqrt * rsqrt
+    // 2. rsqrt(a)^3
     const sq = try builder.createAndAttach("stablehlo.multiply", &.{rsqrt_val, rsqrt_val}, &.{tensor_type}, .{});
     const cub = try builder.createAndAttach("stablehlo.multiply", &.{sq.getResult(0), rsqrt_val}, &.{tensor_type}, .{});
 
-    // 3. Create constant -0.5 broadcasted to shape
-    const neg_half_attr = c.mlirDenseElementsAttrFloatSplatGet(tensor_type.handle, -0.5);
+    // 3. Constant -0.5 (Robust Method: Explicit Byte Buffer)
+    const ranked_type = tensor_type.as(mlir.RankedTensorType) orelse return error.InvalidTensorType;
+    const shape = try ranked_type.getShape(builder.allocator);
+    defer builder.allocator.free(shape);
+
+    var elem_count: usize = 1;
+    for (shape) |d| elem_count *= @intCast(d);
+
+    const neg_half_data = try builder.allocator.alloc(f32, elem_count);
+    defer builder.allocator.free(neg_half_data);
+    @memset(neg_half_data, -0.5);
+
+    const neg_half_bytes = std.mem.sliceAsBytes(neg_half_data);
+    const neg_half_attr = mlir.Attribute.denseElementsAttr(builder.ctx, tensor_type, neg_half_bytes);
+
     const neg_half_op = mlir.Operation.create(builder.ctx, "stablehlo.constant", .{
-        .attributes = &.{.{ "value", mlir.Attribute{ .handle = neg_half_attr } }},
+        .attributes = &.{.{ "value", neg_half_attr }},
         .results = &.{tensor_type},
         .location = builder.loc,
     });
     builder.insertion_block.appendOwnedOperation(neg_half_op);
 
-    // 4. multiply everything: grad_out * -0.5 * rsqrt^3
+    // 4. Multiply: grad_out * -0.5 * rsqrt^3
     const term1 = try builder.createAndAttach("stablehlo.multiply", &.{grad_out, neg_half_op.getResult(0)}, &.{tensor_type}, .{});
     const final_grad = try builder.createAndAttach("stablehlo.multiply", &.{term1.getResult(0), cub.getResult(0)}, &.{tensor_type}, .{});
 
@@ -1302,7 +1314,6 @@ fn convertVJP(
     return result.toOwnedSlice();
 }
 
-/// VJP rule for select: gradients flow to true/false branches masked by predicate
 fn selectVJP(
     builder: *MLIRBuilder,
     original_op: mlir.Operation,
@@ -1312,32 +1323,73 @@ fn selectVJP(
     _ = original_op;
     const grad_out = adjoints[0];
     const pred = primals[0];
-    // primals[1] is on_true, primals[2] is on_false
-
     var result = std.ArrayList(mlir.Value).init(builder.allocator);
     defer result.deinit();
 
-    const type = grad_out.getType();
+    const result_type = grad_out.getType();
 
-    // Create zero
-    const zero_attr = c.mlirDenseElementsAttrFloatSplatGet(type.handle, 0.0);
+    // 1. Create zero f32 tensor for the select branches (Standard logic)
+    const ranked_type = result_type.as(mlir.RankedTensorType) orelse return error.InvalidTensorType;
+    const shape = try ranked_type.getShape(builder.allocator);
+    defer builder.allocator.free(shape);
+
+    var elem_count: usize = 1;
+    for (shape) |d| elem_count *= @intCast(d);
+
+    const zero_data = try builder.allocator.alloc(f32, elem_count);
+    defer builder.allocator.free(zero_data);
+    @memset(zero_data, 0.0);
+
+    const zero_attr = mlir.Attribute.denseElementsAttr(builder.ctx, result_type, std.mem.sliceAsBytes(zero_data));
     const zero_op = mlir.Operation.create(builder.ctx, "stablehlo.constant", .{
-        .attributes = &.{.{ "value", mlir.Attribute{ .handle = zero_attr } }},
-        .results = &.{type},
+        .attributes = &.{.{ "value", zero_attr }},
+        .results = &.{result_type},
         .location = builder.loc,
     });
     builder.insertion_block.appendOwnedOperation(zero_op);
     const zero = zero_op.getResult(0);
 
-    // grad_true
-    const grad_true = try builder.createAndAttach("stablehlo.select", &.{pred, grad_out, zero}, &.{type}, .{});
+    // 2. Create zero predicate gradient (i1 type) safely via i8
+    // We do this to avoid issues with packing i1 values in raw buffers
+    const pred_type = pred.getType();
+    const pred_ranked_type = pred_type.as(mlir.RankedTensorType) orelse return error.InvalidTensorType;
+    const pred_shape = try pred_ranked_type.getShape(builder.allocator);
+    defer builder.allocator.free(pred_shape);
 
-    // grad_false
-    const grad_false = try builder.createAndAttach("stablehlo.select", &.{pred, zero, grad_out}, &.{type}, .{});
+    var pred_elem_count: usize = 1;
+    for (pred_shape) |d| pred_elem_count *= @intCast(d);
 
-    // Return gradients for all three operands: pred (dummy), on_true, on_false
-    // Using grad_true as dummy for pred since it won't be used for non-differentiable mask
-    try result.append(grad_true.getResult(0));
+    // Create i8 type and tensor type
+    const i8_mlir_type = c.mlirIntegerTypeGet(builder.ctx.handle, 8);
+    const i8_type = mlir.Type{ .handle = i8_mlir_type };
+    const i8_tensor_type = mlir.Type.rankedTensorType(builder.ctx, pred_shape, i8_type);
+
+    // Allocate zeroed bytes
+    const pred_zero_data = try builder.allocator.alloc(u8, pred_elem_count);
+    defer builder.allocator.free(pred_zero_data);
+    @memset(pred_zero_data, 0);
+
+    // Create i8 constant
+    const pred_zero_attr = mlir.Attribute.denseElementsAttr(builder.ctx, i8_tensor_type, pred_zero_data);
+    const pred_zero_op = mlir.Operation.create(builder.ctx, "stablehlo.constant", .{
+        .attributes = &.{.{ "value", pred_zero_attr }},
+        .results = &.{i8_tensor_type},
+        .location = builder.loc,
+    });
+    builder.insertion_block.appendOwnedOperation(pred_zero_op);
+
+    // Convert i8 zero -> i1 zero
+    const pred_zero_cvt = try builder.createAndAttach("stablehlo.convert", &.{pred_zero_op.getResult(0)}, &.{pred_type}, .{});
+
+    // 3. Compute gradients for select
+    // grad_true = select(pred, grad_out, 0.0)
+    const grad_true = try builder.createAndAttach("stablehlo.select", &.{pred, grad_out, zero}, &.{result_type}, .{});
+
+    // grad_false = select(pred, 0.0, grad_out)
+    const grad_false = try builder.createAndAttach("stablehlo.select", &.{pred, zero, grad_out}, &.{result_type}, .{});
+
+    // Gradients: [pred (dummy i1 zero), on_true, on_false]
+    try result.append(pred_zero_cvt.getResult(0));
     try result.append(grad_true.getResult(0));
     try result.append(grad_false.getResult(0));
 

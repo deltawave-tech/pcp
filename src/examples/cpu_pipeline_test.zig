@@ -52,7 +52,7 @@ pub fn main() !void {
     };
 
     std.debug.print("👻 Dispatching VMFB to IREE runtime for execution...\n", .{});
-    const outputs = try iree_backend.execute(vmfb_binary, "main", &inputs_data, &input_shapes);
+    const outputs = try iree_backend.execute(vmfb_binary, "main", &inputs_data, &input_shapes, null);
     defer {
         for (outputs) |o| allocator.free(o);
         allocator.free(outputs);

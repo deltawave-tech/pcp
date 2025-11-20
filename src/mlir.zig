@@ -510,10 +510,10 @@ pub const Context = struct {
             return Self{ .handle = c.c.stringAttrGet(context.handle, value) };
         }
         
-        // ADD THIS NEW METHOD
         /// Create a symbol reference attribute
+        /// SAFE FIX: Use stringRefFromString which respects length, not null terminator
         pub fn symbolRefAttr(context: Context, value: []const u8) Self {
-            const str_ref = c.c.mlirStringRefCreateFromCString(@ptrCast(value.ptr));
+            const str_ref = c.c.stringRefFromString(value);
             const handle = c.c.mlirSymbolRefAttrGet(context.handle, str_ref);
             return Self{ .handle = handle };
         }

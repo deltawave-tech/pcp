@@ -145,6 +145,11 @@ pub const DiLoCo = struct {
             try introspected_shapes.append(shape);
         }
         const parameter_shapes = try introspected_shapes.toOwnedSlice();
+        // Add errdefer to cleanup parameter_shapes if subsequent allocations fail
+        errdefer {
+            for (parameter_shapes) |s| allocator.free(s);
+            allocator.free(parameter_shapes);
+        }
         std.debug.print("✓ Introspection complete. Found {} trainable parameter tensors.\n", .{parameter_shapes.len});
 
         // Extract data input shapes (the last num_data_inputs)
@@ -153,7 +158,7 @@ pub const DiLoCo = struct {
             for (data_shapes.items) |s| allocator.free(s);
             data_shapes.deinit();
         }
-        
+
         for (num_params..func_type.getNumInputs()) |i| {
             const input_type = func_type.getInput(i);
             const ranked_type = input_type.as(mlir.RankedTensorType) orelse return error.DataInputIsNotATensor;
@@ -161,6 +166,10 @@ pub const DiLoCo = struct {
             try data_shapes.append(shape);
         }
         const data_input_shapes = try data_shapes.toOwnedSlice();
+        errdefer {
+            for (data_input_shapes) |s| allocator.free(s);
+            allocator.free(data_input_shapes);
+        }
         std.debug.print("✓ Found {} data input shapes.\n", .{data_input_shapes.len});
 
         // === END NEW SECTION ===

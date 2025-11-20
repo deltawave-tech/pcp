@@ -10,14 +10,14 @@ fi
 
 # 1. Build the project
 echo "⛓️ Building PCP Distributed..."
-zig build main_distributed
+zig build
 if [ $? -ne 0 ]; then
     echo "Build failed."
     exit 1
 fi
 
 # Path to the executable
-EXE="./zig-out/bin/main_distributed"
+EXE="./zig-out/bin/pcp_distributed"
 # Use the model file you generated earlier
 MODEL_PATH="models/nano_stablehlo.mlir"
 

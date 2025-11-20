@@ -550,14 +550,16 @@ pub const DiLoCo = struct {
             try main_input_types.append(forward_fn_type.getInput(i));
         }
 
-        // Main outputs = all gradients of the forward function's inputs + the final loss
+        // Main outputs = updated parameters (only the parameter inputs) + the final loss
         const grad_fn_type = grad_fn_op.getType().as(mlir.FunctionType) orelse return error.NotAFunctionType;
         var main_output_types = std.ArrayList(mlir.Type).init(self.allocator);
         defer main_output_types.deinit();
 
-        // Add gradient types for each of the forward function's inputs
-        for (0..(grad_fn_type.getNumResults())) |i| {
-            try main_output_types.append(grad_fn_type.getResult(i));
+        const num_params = self.parameter_shapes.len;
+
+        // Return updated parameters (same types as parameter inputs)
+        for (0..num_params) |i| {
+            try main_output_types.append(forward_fn_type.getInput(i));
         }
         // Add the loss type (the single output of the forward function)
         try main_output_types.append(forward_fn_type.getResult(0));
@@ -601,18 +603,36 @@ pub const DiLoCo = struct {
             .attributes = &.{.{ "callee", grad_callee_attr }},
         });
 
-        // 4.6: Return all gradients and the loss from 'main'
+        // 4.6: Apply optimizer updates to get new parameters
+        // The worker should return updated parameters, not gradients!
+        std.debug.print("Adding optimizer update step to worker graph...\n", .{});
+
         var final_return_values = std.ArrayList(mlir.Value).init(self.allocator);
         defer final_return_values.deinit();
 
-        // Add all results from the grad call
-        for (0..grad_call_op.getNumResults()) |i| {
-            try final_return_values.append(grad_call_op.getResult(i));
+        // For each parameter: new_param = param - lr * grad
+        for (0..num_params) |i| {
+            const param_val = main_func_args[i];
+            const grad_val = grad_call_op.getResult(i);
+
+            // Convert to tensors for ops API
+            const param_tensor = try builder.newTensor(param_val);
+            const grad_tensor = try builder.newTensor(grad_val);
+
+            // Simple SGD update: new_param = param - lr * grad
+            const lr_const = try ops.constant(builder, @as(f64, @floatCast(self.config.base_config.learning_rate)), &.{}, self.element_type);
+            const scaled_grad = try ops.multiply(builder, lr_const, grad_tensor);
+            const new_param_tensor = try ops.subtract(builder, param_tensor, scaled_grad);
+
+            try final_return_values.append(new_param_tensor.value);
         }
-        // Add the loss
+
+        // Add the loss as the final return value
         try final_return_values.append(loss_val);
 
         _ = try builder.createAndAttach("func.return", final_return_values.items, &.{}, .{});
+
+        std.debug.print("✓ Worker graph now returns updated parameters + loss\n", .{});
 
         // === PHASE 5: FINALIZE AND SERIALIZE ===
         std.debug.print("✓ Final worker graph constructed successfully.\n", .{});

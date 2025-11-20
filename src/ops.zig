@@ -146,69 +146,27 @@ pub const MLIRBuilder = struct {
             attributes: []const struct { []const u8, mlir.Attribute } = &.{},
         },
     ) !mlir.Operation {
-        // 1. Initialize state using C API (Fixes "invalid pointer")
-        // We use the C API to create the struct, but we will manually assign
-        // the arrays below to avoid the "SmallVector" resize crash.
-        var state = c.operationStateGet(op_name, self.loc.handle);
+        std.debug.print("DEBUG: createAndAttach entering for {s}\n", .{op_name});
 
-        // 2. Prepare Operands
-        var operand_handles: []*c.MlirValue = undefined;
-        if (operands.len > 0) {
-            operand_handles = try self.allocator.alloc(*c.MlirValue, operands.len);
-        }
-        defer if (operands.len > 0) self.allocator.free(operand_handles);
+        const op = mlir.Operation.create(self.ctx, op_name, .{
+            .operands = operands,
+            .results = result_types,
+            .attributes = options.attributes,
+            .location = self.loc,
+        });
 
-        for (operands, 0..) |op, i| {
-            operand_handles[i] = op.handle;
-        }
+        std.debug.print("DEBUG: createAndAttach operation created: 0x{x}\n", .{@intFromPtr(op.handle)});
 
-        if (operands.len > 0) {
-            state.nOperands = @intCast(operands.len);
-            state.operands = operand_handles.ptr;
-        }
+        // DEBUG: Verification disabled to isolate if verifier triggers the invalid pointer crash
+        // if (!op.verify()) {
+        //    std.log.err("Failed to verify operation: {s}", .{op_name});
+        //    op.dump();
+        //    return error.OperationVerificationFailed;
+        // }
+        // std.debug.print("DEBUG: createAndAttach verify passed\n", .{});
 
-        // 3. Prepare Results
-        var result_handles: []*c.MlirType = undefined;
-        if (result_types.len > 0) {
-            result_handles = try self.allocator.alloc(*c.MlirType, result_types.len);
-        }
-        defer if (result_types.len > 0) self.allocator.free(result_handles);
-
-        for (result_types, 0..) |rt, i| {
-            result_handles[i] = rt.handle;
-        }
-
-        if (result_types.len > 0) {
-            state.nResults = @intCast(result_types.len);
-            state.results = result_handles.ptr;
-        }
-
-        // 4. Prepare Attributes
-        var named_attrs: []c.MlirNamedAttribute = undefined;
-        if (options.attributes.len > 0) {
-            named_attrs = try self.allocator.alloc(c.MlirNamedAttribute, options.attributes.len);
-        }
-        defer if (options.attributes.len > 0) self.allocator.free(named_attrs);
-
-        for (options.attributes, 0..) |attr_pair, i| {
-            const name_str = attr_pair[0];
-            // Manually create StringRef for attribute name
-            const name_ref = c.MlirStringRef{ .data = name_str.ptr, .length = name_str.len };
-            const name_id = c.mlirIdentifierGet(self.ctx.handle, name_ref);
-            named_attrs[i] = c.MlirNamedAttribute{
-                .name = name_id,
-                .attribute = attr_pair[1].handle,
-            };
-        }
-
-        if (options.attributes.len > 0) {
-            state.nAttributes = @intCast(options.attributes.len);
-            state.attributes = named_attrs.ptr;
-        }
-
-        // 5. Create Operation
-        const op = mlir.Operation{ .handle = c.operationCreate(&state) };
         self.insertion_block.appendOwnedOperation(op);
+        std.debug.print("DEBUG: createAndAttach appended operation\n", .{});
 
         return op;
     }

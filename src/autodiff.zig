@@ -207,48 +207,62 @@ fn processOperationVJP(
     value_map: *std.AutoHashMap(mlir.Value, mlir.Value),
 ) !void {
     const op_name = op.getName();
-    
-    // Get output gradients for this operation
+    std.debug.print("DEBUG: Processing VJP for {s}\n", .{op_name});
+
     const output_gradients = try getOutputGradients(allocator, op, adjoint_map);
-    defer allocator.free(output_gradients);
-    
+
+    // Log output gradients allocation
+    if (output_gradients.len > 0) {
+        std.debug.print("DEBUG: output_gradients for {s}: len={} ptr={*}\n", .{op_name, output_gradients.len, output_gradients.ptr});
+    }
+
+    // Safe defer free for output_gradients
+    defer if (output_gradients.len > 0) {
+        std.debug.print("DEBUG: Freeing output_gradients for {s}\n", .{op_name});
+        allocator.free(output_gradients);
+    };
+
     if (output_gradients.len == 0) {
-        // No gradient flows through this operation
+        std.debug.print("DEBUG: No output gradients for {s}\n", .{op_name});
         return;
     }
 
-    // Constants are now handled in the first pass, so we can skip them here
     if (std.mem.eql(u8, op_name, "stablehlo.constant")) {
         return;
     }
-    
-    // Runtime dispatch to the correct VJP rule
+
     if (getVjpFn(op_name)) |vjp_rule| {
-        // NEW: Look up primals in the value_map to get handles valid in the grad scope.
         var mapped_primals = std.ArrayList(mlir.Value).init(allocator);
         defer mapped_primals.deinit();
 
         for (0..op.getNumOperands()) |i| {
             const primal_operand = op.getOperand(i);
             const mapped_operand = value_map.get(primal_operand) orelse {
-                // This is the error we were seeing. It means a value wasn't mapped.
-                // This should now be resolved by handling constants correctly.
-                std.debug.print("FATAL: Could not find primal value in value_map. This indicates a bug in the reverse walk or constant handling.\n", .{});
-                op.dump();
+                std.debug.print("FATAL: Primal value not found for op {s} operand {}\n", .{op_name, i});
                 return error.PrimalValueNotFound;
             };
             try mapped_primals.append(mapped_operand);
         }
 
+        // Log before calling VJP
+        std.debug.print("DEBUG: Calling VJP rule for {s}\n", .{op_name});
+
         const input_gradients = try vjp_rule(builder, op, mapped_primals.items, output_gradients);
-        defer allocator.free(input_gradients);
-        
-        // Add input gradients to the adjoint map
+
+        // Log result from VJP
+        std.debug.print("DEBUG: VJP {s} returned slice: len={} ptr={*}\n", .{op_name, input_gradients.len, input_gradients.ptr});
+
+        // CRITICAL: Only free if length > 0 to avoid freeing static empty slice pointers
+        defer if (input_gradients.len > 0) {
+            std.debug.print("DEBUG: Freeing input_gradients for {s} ptr={*}\n", .{op_name, input_gradients.ptr});
+            // Use builder.allocator if that's what VJP rules use, or match the allocator passed in.
+            // Assuming builder.allocator and allocator are the same, but let's be consistent with the create.
+            builder.allocator.free(input_gradients);
+        };
+
         try addInputGradients(builder, op, input_gradients, adjoint_map);
-        
-        // NOTE: Forward operations are now pre-built in the first pass, so we don't need to recreate them here
     } else {
-        std.debug.print("Warning: No VJP rule for operation: {s}\n", .{op_name});
+        std.debug.print("DEBUG: No VJP rule found for {s}\n", .{op_name});
     }
 }
 
@@ -332,30 +346,60 @@ fn divideVJP(
     primals: []const mlir.Value,
     adjoints: []const mlir.Value,
 ) ![]mlir.Value {
+    std.debug.print("DEBUG: Entering divideVJP\n", .{});
     _ = original_op;
+
+    if (adjoints.len < 1) {
+        std.debug.print("FATAL: divideVJP adjoints empty\n", .{});
+        return error.InvalidAdjoints;
+    }
+    if (primals.len < 2) {
+        std.debug.print("FATAL: divideVJP primals < 2\n", .{});
+        return error.InvalidPrimals;
+    }
+
     const grad_out = adjoints[0];
     const a = primals[0];
     const b = primals[1];
-    
+
+    // Verify handles are not obviously null/garbage
+    std.debug.print("DEBUG: divideVJP inputs: grad_out=0x{x}, a=0x{x}, b=0x{x}\n", .{
+        @intFromPtr(grad_out.handle),
+        @intFromPtr(a.handle),
+        @intFromPtr(b.handle)
+    });
+
     var result = std.ArrayList(mlir.Value).init(builder.allocator);
-    defer result.deinit();
-    
+    errdefer result.deinit();
+
+    std.debug.print("DEBUG: divideVJP: creating grad_a (div)\n", .{});
     // da = grad_out / b
     const grad_a = try builder.createAndAttach("stablehlo.divide", &.{ grad_out, b }, &.{grad_out.getType()}, .{});
+
+    std.debug.print("DEBUG: divideVJP: appending grad_a\n", .{});
     try result.append(grad_a.getResult(0));
-    
+
+    std.debug.print("DEBUG: divideVJP: creating a_times_grad (mul)\n", .{});
     // db = -grad_out * a / (b * b)
-    // Compute a * grad_out
     const a_times_grad = try builder.createAndAttach("stablehlo.multiply", &.{ a, grad_out }, &.{grad_out.getType()}, .{});
-    // Compute b * b
+
+    std.debug.print("DEBUG: divideVJP: creating b_squared (mul)\n", .{});
     const b_squared = try builder.createAndAttach("stablehlo.multiply", &.{ b, b }, &.{b.getType()}, .{});
-    // Compute (a * grad_out) / (b * b)
+
+    std.debug.print("DEBUG: divideVJP: creating positive_grad_b (div)\n", .{});
     const positive_grad_b = try builder.createAndAttach("stablehlo.divide", &.{ a_times_grad.getResult(0), b_squared.getResult(0) }, &.{grad_out.getType()}, .{});
-    // Negate to get -grad_out * a / (b * b)
+
+    std.debug.print("DEBUG: divideVJP: creating grad_b (neg)\n", .{});
     const grad_b = try builder.createAndAttach("stablehlo.negate", &.{ positive_grad_b.getResult(0) }, &.{grad_out.getType()}, .{});
+
+    std.debug.print("DEBUG: divideVJP: appending grad_b\n", .{});
     try result.append(grad_b.getResult(0));
-    
-    return result.toOwnedSlice();
+
+    std.debug.print("DEBUG: divideVJP: converting to owned slice\n", .{});
+    const slice = try result.toOwnedSlice();
+
+    std.debug.print("DEBUG: divideVJP allocated slice len={} ptr={*}\n", .{slice.len, slice.ptr});
+    return slice;
 }
 
 /// VJP rule for negation: da = -grad_out
@@ -559,12 +603,14 @@ fn constantVJP(
     adjoints: []const mlir.Value,
 ) ![]mlir.Value {
     _ = original_op;
-    _ = builder;
     _ = primals;
     _ = adjoints;
-    
-    // Constants have no inputs, so no gradients to return
-    return &[_]mlir.Value{};
+
+    // CRITICAL FIX: Allocate an empty slice using the builder's allocator.
+    // Returning &[_]mlir.Value{} returns a pointer to static/stack memory,
+    // which causes allocator.free() to crash with "invalid pointer".
+    const empty = try builder.allocator.alloc(mlir.Value, 0);
+    return empty;
 }
 
 /// VJP rule for reshape: da = reshape(grad_out, original_shape)
@@ -736,8 +782,12 @@ fn returnVJP(
 ) ![]mlir.Value {
     _ = original_op;
     _ = primals;
-    
-    // Return operation just passes gradients through to its operand
+
+    // dupe allocates using allocator, so it returns safe pointer (even if empty? alloc(0) is safe)
+    // But to be ultra-safe with our defensive freeing:
+    if (adjoints.len == 0) {
+        return builder.allocator.alloc(mlir.Value, 0);
+    }
     return builder.allocator.dupe(mlir.Value, adjoints);
 }
 

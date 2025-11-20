@@ -706,9 +706,20 @@ pub const DiLoCo = struct {
             try total_param_bytes.appendSlice(tensor_data);
         }
 
-        // Serialize batch data as raw bytes (u32 tokens -> bytes)
-        const input_ids_bytes = std.mem.sliceAsBytes(batch.x);
-        const targets_bytes = std.mem.sliceAsBytes(batch.y);
+        // --- FIX START ---
+        // Convert u32 batch data to i64 for IREE
+        // The model expects tensor<...xi64>, but batch.x is []u32.
+        const input_ids_i64 = try self.allocator.alloc(i64, batch.x.len);
+        defer self.allocator.free(input_ids_i64);
+        for (batch.x, 0..) |val, i| input_ids_i64[i] = @intCast(val);
+
+        const targets_i64 = try self.allocator.alloc(i64, batch.y.len);
+        defer self.allocator.free(targets_i64);
+        for (batch.y, 0..) |val, i| targets_i64[i] = @intCast(val);
+
+        const input_ids_bytes = std.mem.sliceAsBytes(input_ids_i64);
+        const targets_bytes = std.mem.sliceAsBytes(targets_i64);
+        // --- FIX END ---
 
         // VALIDATION: Check that we have valid data before serialization
         if (total_param_bytes.items.len == 0) {

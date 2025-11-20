@@ -663,6 +663,195 @@ pub fn testReduceSumVJP(allocator: Allocator) !void {
     std.debug.print("✓ reduceSumVJP isolated test PASSED\n", .{});
 }
 
+/// Test expVJP: f(x) = exp(x) with x=2.0
+/// Expected: forward=e^2=7.389056, dx = grad_out * e^x
+pub fn testExpVJP(allocator: Allocator) !void {
+    std.debug.print("\n=== Testing expVJP ===\n", .{});
+    try initGlobalMLIRContext(allocator);
+    const context = global_mlir_context.?.getContext();
+    var helper = ExecutionHelper{.allocator = allocator};
+    var builder = try MLIRBuilder.init(allocator, context);
+    defer builder.deinit();
+
+    // Build Module
+    const f32_type = mlir.Type.f32Type(context);
+    const scalar_type = mlir.Type.rankedTensorType(context, &.{}, f32_type);
+    const func_type = mlir.Type.functionType(context, &.{scalar_type}, &.{scalar_type});
+
+    const fwd_result = try builder.createFunction("forward_exp", func_type);
+    builder.setInsertionBlock(fwd_result.entry_block);
+    const arg = try builder.newTensor(fwd_result.entry_block.getArgument(0));
+
+    // We use the raw operation creation here to simulate what would be in ops.zig
+    const exp_op = try builder.createAndAttach("stablehlo.exponential", &.{arg.value}, &.{scalar_type}, .{});
+    _ = try builder.createAndAttach("func.return", &.{exp_op.getResult(0)}, &.{}, .{});
+
+    _ = try autodiff.buildGradientGraph(allocator, &builder, fwd_result.func_op);
+
+    // Test Data: x = 2.0, grad_out = 1.0
+    const input = [_]f32{2.0};
+    const grad_out = [_]f32{1.0};
+    var fwd_inputs = [_][]const u8{ std.mem.sliceAsBytes(&input) };
+    var bwd_inputs = [_][]const u8{ std.mem.sliceAsBytes(&input), std.mem.sliceAsBytes(&grad_out) };
+    var fwd_shapes = [_][]const i64{ &[_]i64{} };
+    var bwd_shapes = [_][]const i64{ &[_]i64{}, &[_]i64{} };
+
+    // Verify Forward
+    const fwd_out = try helper.executeModule(builder.module, "forward_exp", &fwd_inputs, &fwd_shapes);
+    defer { for(fwd_out) |o| allocator.free(o); allocator.free(fwd_out); }
+    const fwd_val: f32 = @bitCast(std.mem.readInt(u32, fwd_out[0][0..4], .little));
+    const expected_fwd = @exp(2.0);
+    try std.testing.expectApproxEqAbs(expected_fwd, fwd_val, 1e-5);
+
+    // Verify Backward
+    const bwd_out = try helper.executeModule(builder.module, "forward_exp_grad", &bwd_inputs, &bwd_shapes);
+    defer { for(bwd_out) |o| allocator.free(o); allocator.free(bwd_out); }
+    const grad_x: f32 = @bitCast(std.mem.readInt(u32, bwd_out[0][0..4], .little));
+
+    // d/dx(e^x) = e^x. With grad_out=1.0, result is e^2
+    try std.testing.expectApproxEqAbs(expected_fwd, grad_x, 1e-5);
+    std.debug.print("✓ Exp verified. f(2)={d:.4}, f'(2)={d:.4}\n", .{fwd_val, grad_x});
+}
+
+/// Test logVJP: f(x) = log(x) with x=2.0
+/// Expected: forward=ln(2)=0.6931, dx = grad_out / x
+pub fn testLogVJP(allocator: Allocator) !void {
+    std.debug.print("\n=== Testing logVJP ===\n", .{});
+    try initGlobalMLIRContext(allocator);
+    const context = global_mlir_context.?.getContext();
+    var helper = ExecutionHelper{.allocator = allocator};
+    var builder = try MLIRBuilder.init(allocator, context);
+    defer builder.deinit();
+
+    const f32_type = mlir.Type.f32Type(context);
+    const scalar_type = mlir.Type.rankedTensorType(context, &.{}, f32_type);
+    const func_type = mlir.Type.functionType(context, &.{scalar_type}, &.{scalar_type});
+
+    const fwd_result = try builder.createFunction("forward_log", func_type);
+    builder.setInsertionBlock(fwd_result.entry_block);
+    const arg = try builder.newTensor(fwd_result.entry_block.getArgument(0));
+    const log_op = try builder.createAndAttach("stablehlo.log", &.{arg.value}, &.{scalar_type}, .{});
+    _ = try builder.createAndAttach("func.return", &.{log_op.getResult(0)}, &.{}, .{});
+
+    _ = try autodiff.buildGradientGraph(allocator, &builder, fwd_result.func_op);
+
+    const input = [_]f32{2.0};
+    const grad_out = [_]f32{1.0};
+    var bwd_inputs = [_][]const u8{ std.mem.sliceAsBytes(&input), std.mem.sliceAsBytes(&grad_out) };
+    var bwd_shapes = [_][]const i64{ &[_]i64{}, &[_]i64{} };
+
+    const bwd_out = try helper.executeModule(builder.module, "forward_log_grad", &bwd_inputs, &bwd_shapes);
+    defer { for(bwd_out) |o| allocator.free(o); allocator.free(bwd_out); }
+    const grad_x: f32 = @bitCast(std.mem.readInt(u32, bwd_out[0][0..4], .little));
+
+    // d/dx(ln(x)) = 1/x = 1/2 = 0.5
+    try std.testing.expectApproxEqAbs(0.5, grad_x, 1e-5);
+    std.debug.print("✓ Log verified. f'(2)={d:.4}\n", .{grad_x});
+}
+
+/// Test rsqrtVJP: f(x) = x^(-0.5) with x=4.0
+/// Expected: forward=0.5, dx = -0.5 * x^(-1.5)
+pub fn testRsqrtVJP(allocator: Allocator) !void {
+    std.debug.print("\n=== Testing rsqrtVJP ===\n", .{});
+    try initGlobalMLIRContext(allocator);
+    const context = global_mlir_context.?.getContext();
+    var helper = ExecutionHelper{.allocator = allocator};
+    var builder = try MLIRBuilder.init(allocator, context);
+    defer builder.deinit();
+
+    const f32_type = mlir.Type.f32Type(context);
+    const scalar_type = mlir.Type.rankedTensorType(context, &.{}, f32_type);
+    const func_type = mlir.Type.functionType(context, &.{scalar_type}, &.{scalar_type});
+
+    const fwd_result = try builder.createFunction("forward_rsqrt", func_type);
+    builder.setInsertionBlock(fwd_result.entry_block);
+    const arg = try builder.newTensor(fwd_result.entry_block.getArgument(0));
+    const op = try builder.createAndAttach("stablehlo.rsqrt", &.{arg.value}, &.{scalar_type}, .{});
+    _ = try builder.createAndAttach("func.return", &.{op.getResult(0)}, &.{}, .{});
+
+    _ = try autodiff.buildGradientGraph(allocator, &builder, fwd_result.func_op);
+
+    const input = [_]f32{4.0};
+    const grad_out = [_]f32{1.0};
+    var bwd_inputs = [_][]const u8{ std.mem.sliceAsBytes(&input), std.mem.sliceAsBytes(&grad_out) };
+    var bwd_shapes = [_][]const i64{ &[_]i64{}, &[_]i64{} };
+
+    const bwd_out = try helper.executeModule(builder.module, "forward_rsqrt_grad", &bwd_inputs, &bwd_shapes);
+    defer { for(bwd_out) |o| allocator.free(o); allocator.free(bwd_out); }
+    const grad_x: f32 = @bitCast(std.mem.readInt(u32, bwd_out[0][0..4], .little));
+
+    // f(x) = x^-0.5 -> f'(x) = -0.5 * x^-1.5
+    // x=4, x^-1.5 = 1 / 4^1.5 = 1/8 = 0.125
+    // f'(4) = -0.5 * 0.125 = -0.0625
+    try std.testing.expectApproxEqAbs(-0.0625, grad_x, 1e-5);
+    std.debug.print("✓ Rsqrt verified. f'(4)={d:.6} (expected -0.0625)\n", .{grad_x});
+}
+
+/// Test selectVJP: f(pred, a, b) = pred ? a : b
+/// Expected: if pred=true, da=grad, db=0. if pred=false, da=0, db=grad.
+pub fn testSelectVJP(allocator: Allocator) !void {
+    std.debug.print("\n=== Testing selectVJP ===\n", .{});
+    try initGlobalMLIRContext(allocator);
+    const context = global_mlir_context.?.getContext();
+    var helper = ExecutionHelper{.allocator = allocator};
+    var builder = try MLIRBuilder.init(allocator, context);
+    defer builder.deinit();
+
+    const f32_type = mlir.Type.f32Type(context);
+    const i1_type = mlir.Type.i1Type(context);
+    // Using rank-1 tensor of size 2 to test both true and false paths simultaneously
+    const tensor_f32 = mlir.Type.rankedTensorType(context, &.{2}, f32_type);
+    const tensor_i1 = mlir.Type.rankedTensorType(context, &.{2}, i1_type);
+
+    const func_type = mlir.Type.functionType(context, &.{tensor_i1, tensor_f32, tensor_f32}, &.{tensor_f32});
+
+    const fwd_result = try builder.createFunction("forward_select", func_type);
+    builder.setInsertionBlock(fwd_result.entry_block);
+    const pred = fwd_result.entry_block.getArgument(0);
+    const on_true = fwd_result.entry_block.getArgument(1);
+    const on_false = fwd_result.entry_block.getArgument(2);
+
+    const op = try builder.createAndAttach("stablehlo.select", &.{pred, on_true, on_false}, &.{tensor_f32}, .{});
+    _ = try builder.createAndAttach("func.return", &.{op.getResult(0)}, &.{}, .{});
+
+    _ = try autodiff.buildGradientGraph(allocator, &builder, fwd_result.func_op);
+
+    // Inputs: pred=[true, false], on_true=[1.0, 1.0], on_false=[2.0, 2.0]
+    // IREE expects i1 as i8 (byte) usually, 1=true, 0=false
+    const pred_data = [_]u8{1, 0};
+    const true_data = [_]f32{1.0, 1.0};
+    const false_data = [_]f32{2.0, 2.0};
+    const grad_data = [_]f32{10.0, 20.0}; // Gradient coming back
+
+    var bwd_inputs = [_][]const u8{
+        std.mem.sliceAsBytes(&pred_data),
+        std.mem.sliceAsBytes(&true_data),
+        std.mem.sliceAsBytes(&false_data),
+        std.mem.sliceAsBytes(&grad_data)
+    };
+    var bwd_shapes = [_][]const i64{ &[_]i64{2}, &[_]i64{2}, &[_]i64{2}, &[_]i64{2} };
+
+    const bwd_out = try helper.executeModule(builder.module, "forward_select_grad", &bwd_inputs, &bwd_shapes);
+    defer { for(bwd_out) |o| allocator.free(o); allocator.free(bwd_out); }
+
+    // Result order: [pred_grad (dummy), true_grad, false_grad]
+    const true_grad = @as([*]const f32, @ptrCast(@alignCast(bwd_out[1].ptr)))[0..2];
+    const false_grad = @as([*]const f32, @ptrCast(@alignCast(bwd_out[2].ptr)))[0..2];
+
+    std.debug.print("True Grad: {any}\n", .{true_grad});
+    std.debug.print("False Grad: {any}\n", .{false_grad});
+
+    // Index 0 (True): Should receive gradient 10.0
+    try std.testing.expectApproxEqAbs(10.0, true_grad[0], 1e-5);
+    try std.testing.expectApproxEqAbs(0.0, false_grad[0], 1e-5);
+
+    // Index 1 (False): Should receive gradient 20.0
+    try std.testing.expectApproxEqAbs(0.0, true_grad[1], 1e-5);
+    try std.testing.expectApproxEqAbs(20.0, false_grad[1], 1e-5);
+
+    std.debug.print("✓ Select verified.\n", .{});
+}
+
 /// Test chain rule: f(x, w, b) = (x * w) + b
 /// This tests gradient propagation through a sequence of operations
 /// Expected gradients: df/dx = w, df/dw = x, df/db = 1
@@ -845,7 +1034,14 @@ pub fn main() !void {
     try testTransposeVJP(allocator);
     try testReshapeVJP(allocator);
     try testReduceSumVJP(allocator);
-    
+
+    // NEW TESTS FOR GPT-2 OPS
+    try testExpVJP(allocator);
+    try testLogVJP(allocator);
+    try testRsqrtVJP(allocator);
+    try testSelectVJP(allocator);
+    // Convert test implies simple pass through, implicitly tested via others
+
     std.debug.print("\n🌚 Individual VJP Tests Completed Successfully! 🌚\n", .{});
     
     // Test chain rule and gradient propagation  

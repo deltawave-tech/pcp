@@ -54,6 +54,16 @@ fn getVjpFn(op_name: []const u8) ?VJPFn {
         return sliceVJP;
     } else if (std.mem.eql(u8, op_name, "stablehlo.broadcast_in_dim")) {
         return broadcastInDimVJP;
+    } else if (std.mem.eql(u8, op_name, "stablehlo.exponential")) {
+        return expVJP;
+    } else if (std.mem.eql(u8, op_name, "stablehlo.log")) {
+        return logVJP;
+    } else if (std.mem.eql(u8, op_name, "stablehlo.rsqrt")) {
+        return rsqrtVJP;
+    } else if (std.mem.eql(u8, op_name, "stablehlo.convert")) {
+        return convertVJP;
+    } else if (std.mem.eql(u8, op_name, "stablehlo.select")) {
+        return selectVJP;
     } else if (std.mem.eql(u8, op_name, "func.return")) {
         return returnVJP;
     } else {
@@ -1181,6 +1191,158 @@ pub const AutoDiff = struct {
         return forward_fn; // Placeholder
     }
 };
+
+/// VJP rule for exponential: da = grad_out * exp(a)
+fn expVJP(
+    builder: *MLIRBuilder,
+    original_op: mlir.Operation,
+    primals: []const mlir.Value,
+    adjoints: []const mlir.Value,
+) ![]mlir.Value {
+    _ = original_op;
+    const grad_out = adjoints[0];
+    const a = primals[0];
+
+    var result = std.ArrayList(mlir.Value).init(builder.allocator);
+    defer result.deinit();
+
+    // recompute exp(a)
+    // In an optimized system we would cache this from forward pass,
+    // but recomputing is safe and correct.
+    const exp_a = try builder.createAndAttach("stablehlo.exponential", &.{a}, &.{a.getType()}, .{});
+
+    // grad_in = grad_out * exp(a)
+    const grad_in = try builder.createAndAttach("stablehlo.multiply", &.{grad_out, exp_a.getResult(0)}, &.{grad_out.getType()}, .{});
+
+    try result.append(grad_in.getResult(0));
+    return result.toOwnedSlice();
+}
+
+/// VJP rule for log: da = grad_out / a
+fn logVJP(
+    builder: *MLIRBuilder,
+    original_op: mlir.Operation,
+    primals: []const mlir.Value,
+    adjoints: []const mlir.Value,
+) ![]mlir.Value {
+    _ = original_op;
+    const grad_out = adjoints[0];
+    const a = primals[0];
+
+    var result = std.ArrayList(mlir.Value).init(builder.allocator);
+    defer result.deinit();
+
+    // grad_in = grad_out / a
+    const grad_in = try builder.createAndAttach("stablehlo.divide", &.{grad_out, a}, &.{grad_out.getType()}, .{});
+
+    try result.append(grad_in.getResult(0));
+    return result.toOwnedSlice();
+}
+
+/// VJP rule for rsqrt (1/sqrt(x)): da = -0.5 * grad_out * (a ^ -1.5)
+/// Optimized: da = -0.5 * grad_out * rsqrt(a) * rsqrt(a) * rsqrt(a)
+fn rsqrtVJP(
+    builder: *MLIRBuilder,
+    original_op: mlir.Operation,
+    primals: []const mlir.Value,
+    adjoints: []const mlir.Value,
+) ![]mlir.Value {
+    _ = original_op;
+    const grad_out = adjoints[0];
+    const a = primals[0];
+    const tensor_type = a.getType();
+
+    var result = std.ArrayList(mlir.Value).init(builder.allocator);
+    defer result.deinit();
+
+    // 1. Recompute rsqrt(a)
+    const rsqrt_op = try builder.createAndAttach("stablehlo.rsqrt", &.{a}, &.{tensor_type}, .{});
+    const rsqrt_val = rsqrt_op.getResult(0);
+
+    // 2. Compute rsqrt(a)^3 = rsqrt * rsqrt * rsqrt
+    const sq = try builder.createAndAttach("stablehlo.multiply", &.{rsqrt_val, rsqrt_val}, &.{tensor_type}, .{});
+    const cub = try builder.createAndAttach("stablehlo.multiply", &.{sq.getResult(0), rsqrt_val}, &.{tensor_type}, .{});
+
+    // 3. Create constant -0.5 broadcasted to shape
+    const neg_half_attr = c.mlirDenseElementsAttrFloatSplatGet(tensor_type.handle, -0.5);
+    const neg_half_op = mlir.Operation.create(builder.ctx, "stablehlo.constant", .{
+        .attributes = &.{.{ "value", mlir.Attribute{ .handle = neg_half_attr } }},
+        .results = &.{tensor_type},
+        .location = builder.loc,
+    });
+    builder.insertion_block.appendOwnedOperation(neg_half_op);
+
+    // 4. multiply everything: grad_out * -0.5 * rsqrt^3
+    const term1 = try builder.createAndAttach("stablehlo.multiply", &.{grad_out, neg_half_op.getResult(0)}, &.{tensor_type}, .{});
+    const final_grad = try builder.createAndAttach("stablehlo.multiply", &.{term1.getResult(0), cub.getResult(0)}, &.{tensor_type}, .{});
+
+    try result.append(final_grad.getResult(0));
+    return result.toOwnedSlice();
+}
+
+/// VJP rule for convert: cast gradient back to input type
+fn convertVJP(
+    builder: *MLIRBuilder,
+    original_op: mlir.Operation,
+    primals: []const mlir.Value,
+    adjoints: []const mlir.Value,
+) ![]mlir.Value {
+    _ = original_op;
+    const grad_out = adjoints[0];
+    const input = primals[0];
+
+    var result = std.ArrayList(mlir.Value).init(builder.allocator);
+    defer result.deinit();
+
+    // Convert gradient back to input type
+    const input_type = input.getType();
+    const convert_op = try builder.createAndAttach("stablehlo.convert", &.{grad_out}, &.{input_type}, .{});
+
+    try result.append(convert_op.getResult(0));
+    return result.toOwnedSlice();
+}
+
+/// VJP rule for select: gradients flow to true/false branches masked by predicate
+fn selectVJP(
+    builder: *MLIRBuilder,
+    original_op: mlir.Operation,
+    primals: []const mlir.Value,
+    adjoints: []const mlir.Value,
+) ![]mlir.Value {
+    _ = original_op;
+    const grad_out = adjoints[0];
+    const pred = primals[0];
+    // primals[1] is on_true, primals[2] is on_false
+
+    var result = std.ArrayList(mlir.Value).init(builder.allocator);
+    defer result.deinit();
+
+    const type = grad_out.getType();
+
+    // Create zero
+    const zero_attr = c.mlirDenseElementsAttrFloatSplatGet(type.handle, 0.0);
+    const zero_op = mlir.Operation.create(builder.ctx, "stablehlo.constant", .{
+        .attributes = &.{.{ "value", mlir.Attribute{ .handle = zero_attr } }},
+        .results = &.{type},
+        .location = builder.loc,
+    });
+    builder.insertion_block.appendOwnedOperation(zero_op);
+    const zero = zero_op.getResult(0);
+
+    // grad_true
+    const grad_true = try builder.createAndAttach("stablehlo.select", &.{pred, grad_out, zero}, &.{type}, .{});
+
+    // grad_false
+    const grad_false = try builder.createAndAttach("stablehlo.select", &.{pred, zero, grad_out}, &.{type}, .{});
+
+    // Return gradients for all three operands: pred (dummy), on_true, on_false
+    // Using grad_true as dummy for pred since it won't be used for non-differentiable mask
+    try result.append(grad_true.getResult(0));
+    try result.append(grad_true.getResult(0));
+    try result.append(grad_false.getResult(0));
+
+    return result.toOwnedSlice();
+}
 
 /// Test function for MLIR autodiff
 pub fn testMLIRAutoDiff(allocator: Allocator) !void {

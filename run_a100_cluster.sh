@@ -1,5 +1,8 @@
 #!/bin/bash
 
+# Set PATH to include zig
+export PATH=$PATH:/opt/zig
+
 # 0. Setup
 # Ensure data exists
 if [ ! -f "tiny_shakespeare.txt" ]; then
@@ -17,7 +20,7 @@ if [ $? -ne 0 ]; then
 fi
 
 # Path to the executable
-EXE="./zig-out/bin/pcp_distributed"
+EXE="./zig-out/bin/main_distributed"
 # Use the model file you generated earlier
 MODEL_PATH="models/nano_stablehlo.mlir"
 

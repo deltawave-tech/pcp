@@ -66,7 +66,49 @@ fn detectCapnp(b: *std.Build) CapnpConfig {
         // Environment variable not set, continue with auto-detection
     }
 
-    // 2. If no environment variable, proceed with auto-detection of common paths
+    // 2. Check sibling directory (e.g., ../capnproto-install)
+    const pcp_root = b.build_root.path orelse ".";
+    const parent = std.fs.path.dirname(pcp_root) orelse "..";
+    const sibling_install = std.fs.path.join(b.allocator, &[_][]const u8{ parent, "capnproto-install" }) catch {
+        std.debug.print("Failed to construct sibling Cap'n Proto path\n", .{});
+        // Continue to standard paths
+        return config; // Temporarily, but we'll continue below
+    };
+    defer b.allocator.free(sibling_install);
+
+    const sibling_include = std.fs.path.join(b.allocator, &[_][]const u8{ sibling_install, "include" }) catch {
+        std.debug.print("Failed to construct sibling include path\n", .{});
+        // Continue to standard paths
+        return config;
+    };
+    defer b.allocator.free(sibling_include);
+
+    const sibling_lib = std.fs.path.join(b.allocator, &[_][]const u8{ sibling_install, "lib" }) catch {
+        std.debug.print("Failed to construct sibling lib path\n", .{});
+        // Continue to standard paths
+        return config;
+    };
+    defer b.allocator.free(sibling_lib);
+
+    // Check if sibling installation exists
+    const sibling_header = std.fs.path.join(b.allocator, &[_][]const u8{ sibling_include, "capnp", "common.h" }) catch {
+        std.debug.print("Failed to construct sibling header path\n", .{});
+        // Continue to standard paths
+        return config;
+    };
+    defer b.allocator.free(sibling_header);
+
+    if (std.fs.cwd().access(sibling_header, .{})) |_| {
+        config.enabled = true;
+        config.include_dir = b.dupe(sibling_include);
+        config.lib_dir = b.dupe(sibling_lib);
+        std.debug.print("Found Cap'n Proto via sibling dir at: {s}\n", .{sibling_install});
+        return config;
+    } else |_| {
+        std.debug.print("Sibling Cap'n Proto directory not found, checking standard locations\n", .{});
+    }
+
+    // 3. If no sibling directory, proceed with auto-detection of common paths
     const capnp_candidates = [_]struct { include: []const u8, lib: []const u8 }{
         // Homebrew paths (macOS)
         .{ .include = "/opt/homebrew/opt/capnp/include", .lib = "/opt/homebrew/lib" },
@@ -191,6 +233,12 @@ fn addIreeDependencies(target: *std.Build.Step.Compile, b: *std.Build, iree_conf
 
     std.debug.print("==> Configuring IREE dependencies for '{s}'\n", .{target.name});
 
+    // --- Include Paths ---
+    // Add IREE include paths so @cImport can find headers
+    target.addIncludePath(.{ .cwd_relative = source_dir });
+    target.addIncludePath(.{ .cwd_relative = b.fmt("{s}/include", .{build_dir}) });
+    target.addIncludePath(.{ .cwd_relative = b.fmt("{s}/runtime/src", .{source_dir}) });
+
     // --- Library Paths ---
     // Use resolved paths from IREE detection
     target.addLibraryPath(.{ .cwd_relative = b.fmt("{s}/lib", .{build_dir}) });
@@ -297,7 +345,7 @@ fn addCapnpDependencies(target: *std.Build.Step.Compile, b: *std.Build, capnp_co
     // Also link the C++ source files directly into the executable
     target.addCSourceFiles(.{
         .files = &.{
-            "src/network/protocol.capnp.c++",
+            "src/network/protocol.capnp.cpp",
             "src/network/capnp_bridge.cpp",
         },
         .flags = &.{"-std=c++17"},
@@ -463,12 +511,12 @@ pub fn build(b: *std.Build) void {
         });
         capnp_bridge_lib.addCSourceFiles(.{
             .files = &.{
-                "src/network/protocol.capnp.c++",
+                "src/network/protocol.capnp.cpp",
                 "src/network/capnp_bridge.cpp",
             },
             .flags = &.{"-std=c++17"},
         });
-        capnp_bridge_lib.linkLibCpp(); // IMPORTANT: Link against C++ standard library
+        capnp_bridge_lib.linkSystemLibrary("stdc++"); // Link against libstdc++ for clang compatibility
 
         // NEW: Expose the public header directory to any executable that links this library.
         capnp_bridge_lib.addIncludePath(b.path("src/network"));
@@ -500,11 +548,14 @@ pub fn build(b: *std.Build) void {
         main_distributed.linkSystemLibrary("capnp");
         main_distributed.linkSystemLibrary("kj");
 
+        // Ensure libstdc++ is linked after Cap'n Proto libraries for proper symbol resolution
+        main_distributed.linkSystemLibrary("stdc++");
+
         std.debug.print("==> Cap'n Proto bridge library configured successfully\n", .{});
     }
 
     // Install the distributed training executable
-    //b.installArtifact(main_distributed);
+    b.installArtifact(main_distributed);
 
     // Run step for distributed training
     const run_main_distributed_cmd = b.addRunArtifact(main_distributed);

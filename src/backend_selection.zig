@@ -89,7 +89,7 @@ pub fn createExecutor(allocator: Allocator, backend: Backend) !Executor {
             std.log.info("Demo backend initialized", .{});
             break :blk demo.asExecutor();
         },
-        .metal, .cuda, .cpu => {
+        .metal, .cuda, .cpu, .vulkan, .rocm => {
             // For actual hardware backends, the Shepherd would use IREE compilation
             // but this createExecutor function is deprecated for worker use
             std.log.err("{s} backend execution should use IREE WorkerBackend directly", .{backend.toString()});

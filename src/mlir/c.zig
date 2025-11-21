@@ -9,7 +9,10 @@ pub const c = struct {
     pub const MlirOperation = opaque {};
     pub const MlirBlock = opaque {};
     pub const MlirRegion = opaque {};
-    pub const MlirLocation = opaque {};
+    // FIXED: MlirLocation must be a struct to match C ABI pass-by-value
+    pub const MlirLocation = extern struct {
+        ptr: ?*const anyopaque,
+    };
     pub const MlirModule = opaque {};
     pub const MlirAttribute = opaque {};
     pub const MlirDialect = opaque {};
@@ -18,7 +21,7 @@ pub const c = struct {
     pub const MlirOpPassManager = opaque {};
     pub const MlirOperationState = extern struct {
         name: MlirStringRef,
-        location: *MlirLocation,
+        location: MlirLocation, // FIXED: Value type, not pointer
         nResults: isize,
         results: ?[*]const *MlirType,
         nOperands: isize,
@@ -70,23 +73,23 @@ pub const c = struct {
     extern fn mlirDialectRegistryDestroy(registry: *MlirDialectRegistry) void;
 
     // Location operations
-    extern fn mlirLocationUnknownGet(ctx: *MlirContext) *MlirLocation;
+    extern fn mlirLocationUnknownGet(ctx: *MlirContext) MlirLocation;
 
     // Module operations
-    extern fn mlirModuleCreateEmpty(location: *MlirLocation) *MlirModule;
+    extern fn mlirModuleCreateEmpty(location: MlirLocation) *MlirModule;
     extern fn mlirModuleDestroy(module: *MlirModule) void;
     extern fn mlirModuleGetOperation(module: *MlirModule) *MlirOperation;
     extern fn mlirModuleCreateParse(ctx: *MlirContext, module_str: MlirStringRef) *MlirModule;
 
     // Operation operations
     pub const MlirIdentifier = opaque {};
-    extern fn mlirOperationCreate(state: *MlirOperationState) *MlirOperation;
+    pub extern fn mlirOperationCreate(state: *MlirOperationState) *MlirOperation;
     // ENSURE THIS EXTERN IS PRESENT AND PUBLIC
     pub extern fn mlirOperationDestroy(op: *MlirOperation) void;
     extern fn mlirOperationClone(op: *MlirOperation) *MlirOperation;
     pub extern fn mlirOperationPrint(op: *MlirOperation, callback: *const fn ([*]const u8, usize, ?*anyopaque) callconv(.C) void, userData: ?*anyopaque) void;
     extern fn mlirOperationDump(op: *MlirOperation) void;
-    extern fn mlirOperationGetResult(op: *MlirOperation, pos: isize) *MlirValue;
+    pub extern fn mlirOperationGetResult(op: *MlirOperation, pos: isize) *MlirValue;
     // ADD THIS NEW EXTERN
     pub extern fn mlirOperationVerify(op: *MlirOperation) MlirLogicalResult;
     pub extern fn mlirOperationGetOperand(op: *MlirOperation, pos: isize) *MlirValue;
@@ -100,7 +103,7 @@ pub const c = struct {
     
     // ADD THIS NEW EXTERN FOR SymbolRefAttr
     pub extern fn mlirSymbolRefAttrGet(ctx: *MlirContext, value: MlirStringRef) *MlirAttribute;
-    pub extern fn mlirOperationGetLocation(op: *MlirOperation) *MlirLocation;
+    pub extern fn mlirOperationGetLocation(op: *MlirOperation) MlirLocation;
     pub extern fn mlirOperationGetNumAttributes(op: *MlirOperation) isize;
     pub extern fn mlirOperationGetAttribute(op: *MlirOperation, pos: isize) MlirNamedAttribute;
 
@@ -112,14 +115,14 @@ pub const c = struct {
     extern fn mlirRegionGetFirstBlock(region: *MlirRegion) *MlirBlock;
     extern fn mlirBlockGetFirstOperation(block: *MlirBlock) *MlirOperation;
     extern fn mlirBlockGetTerminator(block: *MlirBlock) *MlirOperation;
-    extern fn mlirRegionCreate() *MlirRegion;
+    pub extern fn mlirRegionCreate() *MlirRegion;
     extern fn mlirRegionAppendOwnedBlock(region: *MlirRegion, block: *MlirBlock) void;
     extern fn mlirOperationGetNextInBlock(op: *MlirOperation) *MlirOperation;
     extern fn mlirOperationGetNumOperands(op: *MlirOperation) isize;
     extern fn mlirOperationGetNumResults(op: *MlirOperation) isize;
 
     // Operation state operations
-    extern fn mlirOperationStateGet(name: MlirStringRef, location: *MlirLocation) MlirOperationState;
+    pub extern fn mlirOperationStateGet(name: MlirStringRef, location: MlirLocation) MlirOperationState;
     pub extern fn mlirOperationStateAddOperands(state: *MlirOperationState, n: isize, operands: [*]*MlirValue) void;
     pub extern fn mlirOperationStateAddResults(state: *MlirOperationState, n: isize, results: [*]*MlirType) void;
     // DEFINITIVE FIX: The C API expects a pointer to the first element of the array (*),
@@ -147,7 +150,7 @@ pub const c = struct {
 
     // Value operations
     extern fn mlirValueGetType(value: *MlirValue) *MlirType;
-    pub extern fn mlirBlockAddArgument(block: *MlirBlock, type: *MlirType, loc: *MlirLocation) *MlirValue;
+    pub extern fn mlirBlockAddArgument(block: *MlirBlock, type: *MlirType, loc: MlirLocation) *MlirValue;
     pub extern fn mlirValueIsAOpResult(value: *MlirValue) bool;
     pub extern fn mlirOpResultGetOwner(value: *MlirValue) *MlirOperation;
     pub extern fn mlirValueDump(value: *MlirValue) void;
@@ -175,11 +178,11 @@ pub const c = struct {
     // extern fn mlirOpBuilderDestroy(builder: *MlirOpBuilder) void;
 
     // Block operations
-    extern fn mlirBlockCreate(nArgs: isize, args: [*]*MlirType, locs: [*]*MlirLocation) *MlirBlock;
+    extern fn mlirBlockCreate(nArgs: isize, args: [*]*MlirType, locs: [*]const MlirLocation) *MlirBlock;
     extern fn mlirBlockDestroy(block: *MlirBlock) void;
-    extern fn mlirModuleGetBody(module: *MlirModule) *MlirBlock;
-    extern fn mlirBlockAppendOwnedOperation(block: *MlirBlock, operation: *MlirOperation) void;
-    extern fn mlirBlockInsertArgument(block: *MlirBlock, pos: isize, type: *MlirType, loc: *MlirLocation) *MlirValue;
+    pub extern fn mlirModuleGetBody(module: *MlirModule) *MlirBlock;
+    pub extern fn mlirBlockAppendOwnedOperation(block: *MlirBlock, operation: *MlirOperation) void;
+    extern fn mlirBlockInsertArgument(block: *MlirBlock, pos: isize, type: *MlirType, loc: MlirLocation) *MlirValue;
 
     // Attribute operations for constants
     extern fn mlirAttributeGetNull() *MlirAttribute;
@@ -504,7 +507,7 @@ pub const c = struct {
     }
 
     // Module wrapper functions
-    pub fn moduleCreateEmpty(location: *MlirLocation) *MlirModule {
+    pub fn moduleCreateEmpty(location: MlirLocation) *MlirModule {
         return mlirModuleCreateEmpty(location);
     }
 
@@ -521,7 +524,7 @@ pub const c = struct {
     }
 
     // Location wrapper functions
-    pub fn locationUnknownGet(ctx: *MlirContext) *MlirLocation {
+    pub fn locationUnknownGet(ctx: *MlirContext) MlirLocation {
         return mlirLocationUnknownGet(ctx);
     }
 
@@ -530,7 +533,7 @@ pub const c = struct {
         return mlirOperationCreate(state);
     }
 
-    pub fn operationStateGet(name: []const u8, location: *MlirLocation) MlirOperationState {
+    pub fn operationStateGet(name: []const u8, location: MlirLocation) MlirOperationState {
         return mlirOperationStateGet(stringRefFromString(name), location);
     }
 
@@ -679,7 +682,7 @@ pub const c = struct {
         return mlirOperationGetAttribute(op, pos);
     }
 
-    pub fn operationGetLocation(op: *MlirOperation) *MlirLocation {
+    pub fn operationGetLocation(op: *MlirOperation) MlirLocation {
         return mlirOperationGetLocation(op);
     }
 
@@ -733,7 +736,7 @@ pub const c = struct {
     // }
 
     // Block wrapper functions
-    pub fn blockCreate(nArgs: isize, args: [*]*MlirType, locs: [*]*MlirLocation) *MlirBlock {
+    pub fn blockCreate(nArgs: isize, args: [*]*MlirType, locs: [*]const MlirLocation) *MlirBlock {
         return mlirBlockCreate(nArgs, args, locs);
     }
 
@@ -741,7 +744,7 @@ pub const c = struct {
         mlirBlockDestroy(block);
     }
 
-    pub fn blockAddArgument(block: *MlirBlock, pos: isize, arg_type: *MlirType, loc: *MlirLocation) *MlirValue {
+    pub fn blockAddArgument(block: *MlirBlock, pos: isize, arg_type: *MlirType, loc: MlirLocation) *MlirValue {
         return mlirBlockInsertArgument(block, pos, arg_type, loc);
     }
 

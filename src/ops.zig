@@ -187,9 +187,11 @@ pub const MLIRBuilder = struct {
     ) !struct { func_op: mlir.Operation, entry_block: mlir.Block } {
         std.log.info("MLIRBuilder.createFunction: Creating function '{s}'...", .{name});
 
-        // 1. Initialize State
+        const op_name_ref = c.stringRefFromString("func.func");
+
+        // MANUAL STATE INITIALIZATION (Bypasses ABI risk of mlirOperationStateGet)
         var state: c.MlirOperationState = undefined;
-        state.name = c.stringRefFromString("func.func");
+        state.name = op_name_ref;
         state.location = self.loc.handle;
         state.nResults = 0;
         state.results = null;
@@ -203,39 +205,32 @@ pub const MLIRBuilder = struct {
         state.attributes = null;
         state.enableResultTypeInference = false;
 
-        const allocator = std.heap.c_allocator;
-
-        // 2. Prepare Attributes
-        // Function Op has 2 attributes: type and name
-        var attr_handles = try allocator.alloc(c.MlirNamedAttribute, 2);
-        defer allocator.free(attr_handles);
-
+        // STACK ALLOCATION for attributes
         const func_type_attr = mlir.Attribute.typeAttr(func_type);
         const sym_name_attr = mlir.Attribute.stringAttr(self.ctx, name);
 
-        const func_type_id = c.identifierGet(self.ctx.handle, "function_type");
-        const sym_name_id = c.identifierGet(self.ctx.handle, "sym_name");
+        const func_type_id = c.mlirIdentifierGet(self.ctx.handle, c.stringRefFromString("function_type"));
+        const sym_name_id = c.mlirIdentifierGet(self.ctx.handle, c.stringRefFromString("sym_name"));
 
-        attr_handles[0] = .{ .name = func_type_id, .attribute = func_type_attr.handle };
-        attr_handles[1] = .{ .name = sym_name_id, .attribute = sym_name_attr.handle };
+        const attr_handles = [_]c.MlirNamedAttribute{
+            .{ .name = func_type_id, .attribute = func_type_attr.handle },
+            .{ .name = sym_name_id, .attribute = sym_name_attr.handle },
+        };
 
+        // Direct assignment to state
         state.nAttributes = 2;
-        state.attributes = attr_handles.ptr;
+        state.attributes = &attr_handles;
 
-        // 3. Region
-        const region = c.regionCreate();
+        // STACK ALLOCATION for regions
+        const region = c.mlirRegionCreate();
+        var regions = [_]*c.MlirRegion{region};
 
-        // Create array to hold the region pointer
-        var regions = try allocator.alloc(*c.MlirRegion, 1);
-        defer allocator.free(regions); // Free the container array
-        regions[0] = region;
-
+        // Direct assignment
         state.nRegions = 1;
-        state.regions = regions.ptr;
+        state.regions = &regions;
 
-        // 4. Create Operation
-        // Takes ownership of the Region object, but copies the array content
-        const func_op_handle = c.operationCreate(&state);
+        // Create Operation
+        const func_op_handle = c.mlirOperationCreate(&state);
         const func_op = mlir.Operation{ .handle = func_op_handle };
 
         // Attach to module

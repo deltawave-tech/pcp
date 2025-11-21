@@ -151,38 +151,23 @@ pub const Context = struct {
             const loc = args.location orelse Location.unknown(ctx);
             const op_name_ref = c.c.stringRefFromString(op_name);
 
-            // 1. Manually Initialize State
+            // MANUAL STATE INITIALIZATION
             var state: c.c.MlirOperationState = undefined;
             state.name = op_name_ref;
             state.location = loc.handle;
-            state.nResults = 0;
-            state.results = null;
-            state.nOperands = 0;
-            state.operands = null;
-            state.nRegions = 0;
-            state.regions = null;
-            state.nSuccessors = 0;
-            state.successors = null;
-            state.nAttributes = 0;
-            state.attributes = null;
+            state.nResults = 0; state.results = null;
+            state.nOperands = 0; state.operands = null;
+            state.nRegions = 0; state.regions = null;
+            state.nSuccessors = 0; state.successors = null;
+            state.nAttributes = 0; state.attributes = null;
             state.enableResultTypeInference = false;
 
             const allocator = std.heap.c_allocator;
 
-            // 2. Prepare Buffers (Direct Allocation)
-            // We declare these as optionals so we can free them cleanly at the end
+            // Populate Operands
             var operand_handles: ?[]*c.c.MlirValue = null;
             defer if (operand_handles) |h| allocator.free(h);
-
-            var result_handles: ?[]*c.c.MlirType = null;
-            defer if (result_handles) |h| allocator.free(h);
-
-            var attr_handles: ?[]c.c.MlirNamedAttribute = null;
-            defer if (attr_handles) |h| allocator.free(h);
-
-            // 3. Populate Operands
             if (args.operands.len > 0) {
-                // Use explicit alloc instead of ArrayList
                 operand_handles = allocator.alloc(*c.c.MlirValue, args.operands.len) catch unreachable;
                 for (args.operands, 0..) |operand, i| {
                     operand_handles.?[i] = operand.handle;
@@ -191,7 +176,9 @@ pub const Context = struct {
                 state.operands = operand_handles.?.ptr;
             }
 
-            // 4. Populate Results
+            // Populate Results
+            var result_handles: ?[]*c.c.MlirType = null;
+            defer if (result_handles) |h| allocator.free(h);
             if (args.results.len > 0) {
                 result_handles = allocator.alloc(*c.c.MlirType, args.results.len) catch unreachable;
                 for (args.results, 0..) |result_type, i| {
@@ -201,11 +188,14 @@ pub const Context = struct {
                 state.results = result_handles.?.ptr;
             }
 
-            // 5. Populate Attributes
+            // Populate Attributes
+            var attr_handles: ?[]c.c.MlirNamedAttribute = null;
+            defer if (attr_handles) |h| allocator.free(h);
             if (args.attributes.len > 0) {
                 attr_handles = allocator.alloc(c.c.MlirNamedAttribute, args.attributes.len) catch unreachable;
                 for (args.attributes, 0..) |attr_pair, i| {
-                    const name_id = c.c.identifierGet(ctx.handle, attr_pair[0]);
+                    const name_str = c.c.stringRefFromString(attr_pair[0]);
+                    const name_id = c.c.mlirIdentifierGet(ctx.handle, name_str);
                     attr_handles.?[i] = .{
                         .name = name_id,
                         .attribute = attr_pair[1].handle,
@@ -215,11 +205,7 @@ pub const Context = struct {
                 state.attributes = attr_handles.?.ptr;
             }
 
-            // 6. Create Operation
-            // The C API copies the arrays (operands, results, attributes),
-            // so it is safe for our defer blocks to free the containers.
-            const handle = c.c.operationCreate(&state);
-
+            const handle = c.c.mlirOperationCreate(&state);
             return Self{ .handle = handle };
         }
         
@@ -617,12 +603,14 @@ pub const Context = struct {
 
 
     /// MLIR Location - source location information
+    /// FIXED: Now holds the struct directly (value type) instead of pointer
     pub const Location = struct {
-        handle: *c.c.MlirLocation,
-        
+        handle: c.c.MlirLocation,
+
         const Self = @This();
-        
+
         pub fn unknown(context: Context) Self {
+            // locationUnknownGet returns struct by value
             return Self{ .handle = c.c.locationUnknownGet(context.handle) };
         }
     };

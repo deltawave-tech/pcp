@@ -216,11 +216,11 @@ fn processOperationVJP(
         std.debug.print("DEBUG: output_gradients for {s}: len={} ptr={*}\n", .{op_name, output_gradients.len, output_gradients.ptr});
     }
 
-    // Safe defer free for output_gradients
-    defer if (output_gradients.len > 0) {
+    // CRITICAL FIX: Always free the slice, even if length is 0.
+    defer {
         std.debug.print("DEBUG: Freeing output_gradients for {s}\n", .{op_name});
         allocator.free(output_gradients);
-    };
+    }
 
     if (output_gradients.len == 0) {
         std.debug.print("DEBUG: No output gradients for {s}\n", .{op_name});
@@ -252,13 +252,13 @@ fn processOperationVJP(
         // Log result from VJP
         std.debug.print("DEBUG: VJP {s} returned slice: len={} ptr={*}\n", .{op_name, input_gradients.len, input_gradients.ptr});
 
-        // CRITICAL: Only free if length > 0 to avoid freeing static empty slice pointers
-        defer if (input_gradients.len > 0) {
+        // CRITICAL FIX: Always free the slice, even if length is 0.
+        // Zig's GPA returns a valid pointer for alloc(0), and free() expects to handle it.
+        // Skipping free() for len=0 causes a memory leak.
+        defer {
             std.debug.print("DEBUG: Freeing input_gradients for {s} ptr={*}\n", .{op_name, input_gradients.ptr});
-            // Use builder.allocator if that's what VJP rules use, or match the allocator passed in.
-            // Assuming builder.allocator and allocator are the same, but let's be consistent with the create.
             builder.allocator.free(input_gradients);
-        };
+        }
 
         try addInputGradients(builder, op, input_gradients, adjoint_map);
     } else {

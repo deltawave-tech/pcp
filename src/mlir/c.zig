@@ -124,7 +124,7 @@ pub const c = struct {
     // DEFINITIVE FIX: The C API expects a pointer to the first element of the array (*),
     // not a pointer-to-a-pointer (**). The binding is now corrected to [*]const.
     pub extern fn mlirOperationStateAddAttributes(state: *MlirOperationState, n: isize, attributes: [*]const MlirNamedAttribute) void;
-    extern fn mlirOperationStateAddOwnedRegions(state: *MlirOperationState, n: isize, regions: [*]*MlirRegion) void;
+    pub extern fn mlirOperationStateAddOwnedRegions(state: *MlirOperationState, n: isize, regions: [*]*MlirRegion) void;
 
     // Named attribute
     pub const MlirNamedAttribute = extern struct {

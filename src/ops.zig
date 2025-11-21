@@ -187,30 +187,35 @@ pub const MLIRBuilder = struct {
     ) !struct { func_op: mlir.Operation, entry_block: mlir.Block } {
         std.log.info("MLIRBuilder.createFunction: Creating function '{s}'...", .{name});
 
-        // 1. Initialize State using C API (Fixes "invalid pointer")
+        // 1. Initialize State using C API
         var state = c.operationStateGet("func.func", self.loc.handle);
 
-        // 2. Attributes
+        // 2. Prepare Attributes
         const func_type_attr = mlir.Attribute.typeAttr(func_type);
         const sym_name_attr = mlir.Attribute.stringAttr(self.ctx, name);
 
         const func_type_id = c.identifierGet(self.ctx.handle, "function_type");
         const sym_name_id = c.identifierGet(self.ctx.handle, "sym_name");
 
-        var named_attrs = [_]c.MlirNamedAttribute{
-            .{ .name = func_type_id, .attribute = func_type_attr.handle },
-            .{ .name = sym_name_id, .attribute = sym_name_attr.handle },
-        };
+        // Use ArrayList to ensure safe memory layout for C API
+        var named_attrs = std.ArrayList(c.MlirNamedAttribute).init(self.allocator);
+        defer named_attrs.deinit();
 
-        state.nAttributes = 2;
-        state.attributes = &named_attrs;
+        try named_attrs.append(.{ .name = func_type_id, .attribute = func_type_attr.handle });
+        try named_attrs.append(.{ .name = sym_name_id, .attribute = sym_name_attr.handle });
+
+        // FIX: Manually set state fields instead of using helper to avoid potential ABI/SmallVector issues.
+        state.nAttributes = @intCast(named_attrs.items.len);
+        state.attributes = named_attrs.items.ptr;
 
         // 3. Region
-        // We use the C API to create the region pointer, but manually assign it
-        // to avoid 'operationStateAddOwnedRegions' overhead.
-        var region = c.regionCreate();
+        const region = c.regionCreate();
+
+        // FIX: Create an explicit array of regions and set state fields directly
+        var regions = [_]*c.MlirRegion{ region };
+
         state.nRegions = 1;
-        state.regions = @ptrCast(&region);
+        state.regions = &regions;
 
         // 4. Create Operation
         const func_op_handle = c.operationCreate(&state);

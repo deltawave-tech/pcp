@@ -188,60 +188,45 @@ pub const MLIRBuilder = struct {
     ) !struct { func_op: mlir.Operation, entry_block: mlir.Block } {
         std.log.info("MLIRBuilder.createFunction: Creating function '{s}'...", .{name});
 
-        const op_name_ref = c.stringRefFromString("func.func");
-
-        // MANUAL STATE INITIALIZATION (Bypasses ABI risk of mlirOperationStateGet)
-        var state: c.MlirOperationState = undefined;
-        state.name = op_name_ref;
-        state.location = self.loc.handle;
-        state.nResults = 0;
-        state.results = null;
-        state.nOperands = 0;
-        state.operands = null;
-        state.nSuccessors = 0;
-        state.successors = null;
-        state.enableResultTypeInference = false;
-
-        // STACK ALLOCATION for attributes (Size is fixed at 2)
-        const func_type_attr = mlir.Attribute.typeAttr(func_type);
-        const sym_name_attr = mlir.Attribute.stringAttr(self.ctx, name);
-
+        // 1. Prepare Identifiers
         const func_type_id = c.mlirIdentifierGet(self.ctx.handle, c.stringRefFromString("function_type"));
         const sym_name_id = c.mlirIdentifierGet(self.ctx.handle, c.stringRefFromString("sym_name"));
 
-        // Create array on stack. No allocator needed.
+        // 2. Prepare Attributes
+        const func_type_attr = mlir.Attribute.typeAttr(func_type);
+        const sym_name_attr = mlir.Attribute.stringAttr(self.ctx, name);
+
         const attr_handles = [_]c.MlirNamedAttribute{
             .{ .name = func_type_id, .attribute = func_type_attr.handle },
             .{ .name = sym_name_id, .attribute = sym_name_attr.handle },
         };
 
-        // Direct assignment to state
-        state.nAttributes = 2;
-        state.attributes = &attr_handles;
+        // 3. Initialize Opaque State (In-place)
+        var buffer: c.OpaqueState = undefined;
+        mlir.initOperationState(&buffer, "func.func", self.loc);
+        const state_ptr: *c.MlirOperationState = @ptrCast(&buffer.data);
 
-        // STACK ALLOCATION for regions (Size is fixed at 1)
+        // 4. Add Attributes via C Helper
+        c.mlirOperationStateAddAttributes(state_ptr, attr_handles.len, &attr_handles);
+
+        // 5. Prepare & Add Region
         const region = c.mlirRegionCreate();
-        // Create array on stack
-        const regions = [_]*c.MlirRegion{region};
+        var regions = [_]*c.MlirRegion{region};
+        c.mlirOperationStateAddOwnedRegions(state_ptr, regions.len, &regions);
 
-        // Direct assignment
-        state.nRegions = 1;
-        state.regions = &regions;
-
-        // Create Operation
-        // The C API copies the arrays, so stack allocation is safe.
-        const func_op_handle = c.mlirOperationCreate(&state);
+        // 6. Create Operation
+        const func_op_handle = c.mlirOperationCreate(state_ptr);
         const func_op = mlir.Operation{ .handle = func_op_handle };
 
-        // Attach to module
+        // 7. Attach to module
         self.module_body.appendOwnedOperation(func_op);
 
-        // 5. Add entry block
+        // 8. Add entry block
         const region_handle = func_op.getRegion(0);
         const entry_block = try createBlock();
         c.regionAppendOwnedBlock(region_handle.handle, entry_block.handle);
 
-        // 6. Add block arguments
+        // 9. Add block arguments
         const func_type_wrapper = func_type.as(mlir.FunctionType) orelse return error.NotAFunctionType;
         const num_inputs = func_type_wrapper.getNumInputs();
         for (0..num_inputs) |i| {

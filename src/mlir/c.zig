@@ -19,24 +19,21 @@ pub const c = struct {
     pub const MlirDialectRegistry = opaque {};
     pub const MlirPassManager = opaque {};
     pub const MlirOpPassManager = opaque {};
+    // INCREASED SIZE: The C struct appears to be larger than 128 bytes in this build.
+    // We increase this to 1024 to safely cover the struct size and avoid stack smashing/garbage reads.
+    pub const StateSize: usize = 1024;
+    pub const StateAlign: usize = 8; // Standard pointer alignment on 64-bit
+
+    pub const OpaqueState = extern struct {
+        data: [StateSize]u8 align(StateAlign),
+    };
+
+    // Phantom definition for casting (layout overlay)
     pub const MlirOperationState = extern struct {
         name: MlirStringRef,
-        location: MlirLocation, // FIXED: Value type, not pointer
-        nResults: isize,
-        results: ?[*]const *MlirType,
-        nOperands: isize,
-        operands: ?[*]const *MlirValue,
-        nRegions: isize,
-        regions: ?[*]const *MlirRegion,
-        nSuccessors: isize,
-        successors: ?[*]const *MlirBlock,
-        nAttributes: isize,
-        // DEFINITIVE FIX: The C API defines this field as `const MlirNamedAttribute *`,
-        // which corresponds to `[*]const MlirNamedAttribute` in Zig. The previous
-        // type `[*]*MlirAttribute` was incorrect and the root cause of the attribute bug.
-        // Made optional to support null when count is 0.
-        attributes: ?[*]const MlirNamedAttribute,
-        enableResultTypeInference: bool,
+        location: MlirLocation,
+        // Pad the rest to the full size
+        _pad: [StateSize - @sizeOf(MlirStringRef) - @sizeOf(MlirLocation)]u8,
     };
 
     // String reference

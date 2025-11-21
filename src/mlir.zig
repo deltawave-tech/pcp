@@ -26,6 +26,26 @@ pub fn testMLIROperations(allocator: std.mem.Allocator) !void {
 
 const Allocator = std.mem.Allocator;
 
+/// Helper to initialize an OpaqueState safely IN PLACE.
+/// Takes a pointer to avoid struct-return ABI issues.
+/// This ensures we zero exactly the memory that we pass to the C API.
+pub fn initOperationState(buffer: *c.c.OpaqueState, name: []const u8, loc: Location) void {
+    // 1. Zero out the entire memory block directly at the pointer address (1024 bytes).
+    // This guarantees nOperands, nResults, nRegions, attributes, etc. are all 0/null.
+    @memset(&buffer.data, 0);
+
+    // 2. Cast to our overlay struct to set known fields
+    const state_ptr: *c.c.MlirOperationState = @ptrCast(&buffer.data);
+
+    // 3. Set fields.
+    // WARNING: We assume the C++ layout starts with name and location.
+    // This is standard for mlir-c/IR.h.
+    state_ptr.name = c.c.stringRefFromString(name);
+    state_ptr.location = loc.handle;
+
+    // We implicitly set enableResultTypeInference to false (0) via memset.
+}
+
 /// MLIR Context - owns all IR objects and manages their lifecycle
 pub const Context = struct {
     handle: *c.c.MlirContext,
@@ -142,7 +162,7 @@ pub const Context = struct {
         const Self = @This();
         
         /// Create an operation from an operation state
-        /// UPDATED: Now accepts an allocator
+        /// SAFE IMPLEMENTATION: Opaque State + C Helpers
         pub fn create(allocator: std.mem.Allocator, ctx: Context, op_name: []const u8, args: struct {
             operands: []const Value = &.{},
             results: []const Type = &.{},
@@ -150,61 +170,48 @@ pub const Context = struct {
             location: ?Location = null,
         }) !Self {
             const loc = args.location orelse Location.unknown(ctx);
-            const op_name_ref = c.c.stringRefFromString(op_name);
 
-            var state: c.c.MlirOperationState = undefined;
-            state.name = op_name_ref;
-            state.location = loc.handle;
-            state.nResults = 0; state.results = null;
-            state.nOperands = 0; state.operands = null;
-            state.nRegions = 0; state.regions = null;
-            state.nSuccessors = 0; state.successors = null;
-            state.nAttributes = 0; state.attributes = null;
-            state.enableResultTypeInference = false;
+            // 1. Allocate buffer on stack and initialize in-place
+            var buffer: c.c.OpaqueState = undefined;
+            initOperationState(&buffer, op_name, loc);
+            const state_ptr: *c.c.MlirOperationState = @ptrCast(&buffer.data);
 
-            // Use provided allocator for temporary arrays
-            var operand_handles: ?[]*c.c.MlirValue = null;
-            defer if (operand_handles) |h| allocator.free(h);
-
-            var result_handles: ?[]*c.c.MlirType = null;
-            defer if (result_handles) |h| allocator.free(h);
-
-            var attr_handles: ?[]c.c.MlirNamedAttribute = null;
-            defer if (attr_handles) |h| allocator.free(h);
-
+            // 2. Add Operands via C Helper (Allocates heap memory internally)
             if (args.operands.len > 0) {
-                operand_handles = try allocator.alloc(*c.c.MlirValue, args.operands.len);
-                for (args.operands, 0..) |operand, i| {
-                    operand_handles.?[i] = operand.handle;
-                }
-                state.nOperands = @intCast(args.operands.len);
-                state.operands = operand_handles.?.ptr;
+                const operand_handles = try allocator.alloc(*c.c.MlirValue, args.operands.len);
+                defer allocator.free(operand_handles);
+                for (args.operands, 0..) |opd, i| operand_handles[i] = opd.handle;
+                c.c.mlirOperationStateAddOperands(state_ptr, @intCast(args.operands.len), operand_handles.ptr);
             }
 
+            // 3. Add Results via C Helper
             if (args.results.len > 0) {
-                result_handles = try allocator.alloc(*c.c.MlirType, args.results.len);
-                for (args.results, 0..) |result_type, i| {
-                    result_handles.?[i] = result_type.handle;
-                }
-                state.nResults = @intCast(args.results.len);
-                state.results = result_handles.?.ptr;
+                const result_handles = try allocator.alloc(*c.c.MlirType, args.results.len);
+                defer allocator.free(result_handles);
+                for (args.results, 0..) |res, i| result_handles[i] = res.handle;
+                c.c.mlirOperationStateAddResults(state_ptr, @intCast(args.results.len), result_handles.ptr);
             }
 
+            // 4. Add Attributes via C Helper
             if (args.attributes.len > 0) {
-                attr_handles = try allocator.alloc(c.c.MlirNamedAttribute, args.attributes.len);
+                const attr_handles = try allocator.alloc(c.c.MlirNamedAttribute, args.attributes.len);
+                defer allocator.free(attr_handles);
+
                 for (args.attributes, 0..) |attr_pair, i| {
                     const name_str = c.c.stringRefFromString(attr_pair[0]);
                     const name_id = c.c.mlirIdentifierGet(ctx.handle, name_str);
-                    attr_handles.?[i] = .{
+                    attr_handles[i] = .{
                         .name = name_id,
                         .attribute = attr_pair[1].handle,
                     };
                 }
-                state.nAttributes = @intCast(args.attributes.len);
-                state.attributes = attr_handles.?.ptr;
+                c.c.mlirOperationStateAddAttributes(state_ptr, @intCast(args.attributes.len), attr_handles.ptr);
             }
 
-            const handle = c.c.mlirOperationCreate(&state);
+            // 5. Create Operation
+            // The C API reads our zeroed+populated blob and creates the Op.
+            // It manages the memory of the arrays added via Add* helpers.
+            const handle = c.c.mlirOperationCreate(state_ptr);
             return Self{ .handle = handle };
         }
         

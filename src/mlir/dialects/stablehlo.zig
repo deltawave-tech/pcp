@@ -158,23 +158,33 @@ pub fn reduce_max(
     const return_op = mlir.Operation.create(ctx, "stablehlo.return", .{ .operands = &.{max_op.getResult(0)} });
     c_api.blockAppendOwnedOperation(body_block.handle, return_op.handle);
 
-    // 5. Build the final stablehlo.reduce operation state using opaque buffer (in-place)
-    var buffer: c_api.OpaqueState = undefined;
-    mlir.initOperationState(&buffer, "stablehlo.reduce", loc);
-    const state_ptr: *c_api.MlirOperationState = @ptrCast(&buffer.data);
+    // 5. Build the final stablehlo.reduce operation using pcpCreateOperation
+    var operands = [_]*c_api.MlirValue{ operand.handle, init_value.handle };
+    var results = [_]*c_api.MlirType{ result_type.handle };
+    var regions = [_]*c_api.MlirRegion{ body_region };
 
-    const operands = [_]*c_api.MlirValue{ operand.handle, init_value.handle };
-    c_api.mlirOperationStateAddOperands(state_ptr, operands.len, @constCast(@ptrCast(&operands[0])));
-    const results = [_]*c_api.MlirType{ result_type.handle };
-    c_api.mlirOperationStateAddResults(state_ptr, results.len, @constCast(@ptrCast(&results[0])));
-    const regions = [_]*c_api.MlirRegion{ body_region };
-    c_api.operationStateAddOwnedRegions(state_ptr, regions.len, @constCast(@ptrCast(&regions[0])));
     const dimensions_attr = mlir.Attribute.denseI64ArrayAttr(ctx, dimensions);
     const attr_name_id = c_api.identifierGet(ctx.handle, "dimensions");
-    const named_attr = c_api.MlirNamedAttribute{ .name = attr_name_id, .attribute = dimensions_attr.handle };
-    c_api.mlirOperationStateAddAttributes(state_ptr, 1, @constCast(@ptrCast(&named_attr)));
+    var named_attrs = [_]c_api.MlirNamedAttribute{
+        .{ .name = attr_name_id, .attribute = dimensions_attr.handle }
+    };
 
-    return mlir.Operation{ .handle = c_api.operationCreate(state_ptr) };
+    const name_ref = c_api.stringRefFromString("stablehlo.reduce");
+
+    const op_args = c_api.PcpOpArgs{
+        .nResults = 1,
+        .results = &results,
+        .nOperands = 2,
+        .operands = &operands,
+        .nAttributes = 1,
+        .attributes = &named_attrs,
+        .nRegions = 1,
+        .regions = &regions,
+    };
+
+    const handle = c_api.pcpCreateOperation(&name_ref, &loc.handle, &op_args);
+
+    return mlir.Operation{ .handle = handle };
 }
 
 /// Creates a generic stablehlo.reduce operation with a summation body.
@@ -234,23 +244,33 @@ pub fn reduce_sum(
     const return_op = try mlir.Operation.create(allocator, ctx, "stablehlo.return", .{ .operands = &.{add_op.getResult(0)} });
     c_api.blockAppendOwnedOperation(body_block.handle, return_op.handle);
 
-    // 5. Build the final stablehlo.reduce operation state using opaque buffer (in-place)
-    var buffer: c_api.OpaqueState = undefined;
-    mlir.initOperationState(&buffer, "stablehlo.reduce", loc);
-    const state_ptr: *c_api.MlirOperationState = @ptrCast(&buffer.data);
+    // 5. Build the final stablehlo.reduce operation using pcpCreateOperation
+    var operands = [_]*c_api.MlirValue{ operand.handle, init_value.handle };
+    var results = [_]*c_api.MlirType{ result_type.handle };
+    var regions = [_]*c_api.MlirRegion{ body_region };
 
-    const operands = [_]*c_api.MlirValue{ operand.handle, init_value.handle };
-    c_api.mlirOperationStateAddOperands(state_ptr, operands.len, @constCast(@ptrCast(&operands[0])));
-    const results = [_]*c_api.MlirType{ result_type.handle };
-    c_api.mlirOperationStateAddResults(state_ptr, results.len, @constCast(@ptrCast(&results[0])));
-    const regions = [_]*c_api.MlirRegion{ body_region };
-    c_api.operationStateAddOwnedRegions(state_ptr, regions.len, @constCast(@ptrCast(&regions[0])));
     const dimensions_attr = mlir.Attribute.denseI64ArrayAttr(ctx, dimensions);
     const attr_name_id = c_api.identifierGet(ctx.handle, "dimensions");
-    const named_attr = c_api.MlirNamedAttribute{ .name = attr_name_id, .attribute = dimensions_attr.handle };
-    c_api.mlirOperationStateAddAttributes(state_ptr, 1, @constCast(@ptrCast(&named_attr)));
+    var named_attrs = [_]c_api.MlirNamedAttribute{
+        .{ .name = attr_name_id, .attribute = dimensions_attr.handle }
+    };
 
-    return mlir.Operation{ .handle = c_api.operationCreate(state_ptr) };
+    const name_ref = c_api.stringRefFromString("stablehlo.reduce");
+
+    const op_args = c_api.PcpOpArgs{
+        .nResults = 1,
+        .results = &results,
+        .nOperands = 2,
+        .operands = &operands,
+        .nAttributes = 1,
+        .attributes = &named_attrs,
+        .nRegions = 1,
+        .regions = &regions,
+    };
+
+    const handle = c_api.pcpCreateOperation(&name_ref, &loc.handle, &op_args);
+
+    return mlir.Operation{ .handle = handle };
 }
 
 /// Creates a stablehlo.compare operation
@@ -286,23 +306,31 @@ pub fn compare(ctx: mlir.Context, lhs: mlir.Value, rhs: mlir.Value, direction: C
     // Attributes
     const direction_id = c.c.identifierGet(ctx.handle, "comparison_direction");
     const type_id = c.c.identifierGet(ctx.handle, "compare_type");
-    const named_attrs = [_]c.c.MlirNamedAttribute{
+    var named_attrs = [_]c.c.MlirNamedAttribute{
         .{ .name = direction_id, .attribute = direction_attr.handle },
         .{ .name = type_id, .attribute = type_attr.handle },
     };
 
-    // Create operation using opaque state buffer (in-place)
-    var buffer: c.c.OpaqueState = undefined;
-    mlir.initOperationState(&buffer, "stablehlo.compare", loc);
-    const state_ptr: *c.c.MlirOperationState = @ptrCast(&buffer.data);
+    // Create operation using pcpCreateOperation with packed args
     var operands = [_]*c.c.MlirValue{ lhs.handle, rhs.handle };
     var result_types = [_]*c.c.MlirType{ result_type.handle };
 
-    c.c.mlirOperationStateAddOperands(state_ptr, operands.len, @ptrCast(&operands));
-    c.c.mlirOperationStateAddResults(state_ptr, result_types.len, @ptrCast(&result_types));
-    c.c.mlirOperationStateAddAttributes(state_ptr, named_attrs.len, named_attrs[0..].ptr);
+    const name_ref = c.c.stringRefFromString("stablehlo.compare");
 
-    return mlir.Operation{ .handle = c.c.operationCreate(state_ptr) };
+    const op_args = c.c.PcpOpArgs{
+        .nResults = 1,
+        .results = &result_types,
+        .nOperands = 2,
+        .operands = &operands,
+        .nAttributes = @intCast(named_attrs.len),
+        .attributes = &named_attrs,
+        .nRegions = 0,
+        .regions = null,
+    };
+
+    const handle = c.c.pcpCreateOperation(&name_ref, &loc.handle, &op_args);
+
+    return mlir.Operation{ .handle = handle };
 }
 
 pub const CompareDirection = enum {
@@ -873,24 +901,32 @@ pub fn gather(
     // named_attrs now includes sorted
     const gather_dim_numbers_id = c.c.identifierGet(ctx.handle, "dimension_numbers");
     const slice_sizes_id = c.c.identifierGet(ctx.handle, "slice_sizes");
-    const named_attrs = [_]c.c.MlirNamedAttribute{
+    var named_attrs = [_]c.c.MlirNamedAttribute{
         .{ .name = gather_dim_numbers_id, .attribute = dim_numbers_attr.handle },
         .{ .name = slice_sizes_id, .attribute = slice_sizes_attr.handle },
         .{ .name = sorted_id, .attribute = sorted_attr.handle },
     };
 
-    // Create the operation state using opaque buffer (in-place)
-    var buffer: c.c.OpaqueState = undefined;
-    mlir.initOperationState(&buffer, "stablehlo.gather", loc);
-    const state_ptr: *c.c.MlirOperationState = @ptrCast(&buffer.data);
+    // Create the operation using pcpCreateOperation with packed args
     var operands = [_]*c.c.MlirValue{ operand.handle, start_indices.handle };
     var result_types = [_]*c.c.MlirType{ result_type.handle };
 
-    c.c.mlirOperationStateAddOperands(state_ptr, operands.len, @ptrCast(&operands));
-    c.c.mlirOperationStateAddResults(state_ptr, result_types.len, @ptrCast(&result_types));
-    c.c.mlirOperationStateAddAttributes(state_ptr, named_attrs.len, named_attrs[0..].ptr);
+    const name_ref = c.c.stringRefFromString("stablehlo.gather");
 
-    return mlir.Operation{ .handle = c.c.operationCreate(state_ptr) };
+    const op_args = c.c.PcpOpArgs{
+        .nResults = 1,
+        .results = &result_types,
+        .nOperands = 2,
+        .operands = &operands,
+        .nAttributes = @intCast(named_attrs.len),
+        .attributes = &named_attrs,
+        .nRegions = 0,
+        .regions = null,
+    };
+
+    const handle = c.c.pcpCreateOperation(&name_ref, &loc.handle, &op_args);
+
+    return mlir.Operation{ .handle = handle };
 }
 
 /// Attribute for stablehlo.scatter dimension numbers.

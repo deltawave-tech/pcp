@@ -122,6 +122,25 @@ pub const c = struct {
     pub extern fn mlirOperationStateGet(name: MlirStringRef, location: MlirLocation) MlirOperationState;
     pub extern fn mlirOperationStateAddOperands(state: *MlirOperationState, n: isize, operands: [*]*MlirValue) void;
     pub extern fn mlirOperationStateAddResults(state: *MlirOperationState, n: isize, results: [*]*MlirType) void;
+
+    // Packed arguments struct for safe ABI passing
+    pub const PcpOpArgs = extern struct {
+        nResults: isize,
+        results: ?[*]*MlirType,
+        nOperands: isize,
+        operands: ?[*]*MlirValue,
+        nAttributes: isize,
+        attributes: ?[*]const MlirNamedAttribute,
+        nRegions: isize,
+        regions: ?[*]*MlirRegion,
+    };
+
+    // Updated extern with reduced argument count
+    pub extern fn pcpCreateOperation(
+        name: *const MlirStringRef,
+        location: *const MlirLocation,
+        args: *const PcpOpArgs
+    ) *MlirOperation;
     // DEFINITIVE FIX: The C API expects a pointer to the first element of the array (*),
     // not a pointer-to-a-pointer (**). The binding is now corrected to [*]const.
     pub extern fn mlirOperationStateAddAttributes(state: *MlirOperationState, n: isize, attributes: [*]const MlirNamedAttribute) void;

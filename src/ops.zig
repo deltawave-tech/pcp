@@ -188,45 +188,52 @@ pub const MLIRBuilder = struct {
     ) !struct { func_op: mlir.Operation, entry_block: mlir.Block } {
         std.log.info("MLIRBuilder.createFunction: Creating function '{s}'...", .{name});
 
-        // 1. Prepare Identifiers
+        // 1. Prepare Attributes
         const func_type_id = c.mlirIdentifierGet(self.ctx.handle, c.stringRefFromString("function_type"));
         const sym_name_id = c.mlirIdentifierGet(self.ctx.handle, c.stringRefFromString("sym_name"));
-
-        // 2. Prepare Attributes
         const func_type_attr = mlir.Attribute.typeAttr(func_type);
         const sym_name_attr = mlir.Attribute.stringAttr(self.ctx, name);
 
-        const attr_handles = [_]c.MlirNamedAttribute{
+        var attr_handles = [_]c.MlirNamedAttribute{
             .{ .name = func_type_id, .attribute = func_type_attr.handle },
             .{ .name = sym_name_id, .attribute = sym_name_attr.handle },
         };
 
-        // 3. Initialize Opaque State (In-place)
-        var buffer: c.OpaqueState = undefined;
-        mlir.initOperationState(&buffer, "func.func", self.loc);
-        const state_ptr: *c.MlirOperationState = @ptrCast(&buffer.data);
-
-        // 4. Add Attributes via C Helper
-        c.mlirOperationStateAddAttributes(state_ptr, attr_handles.len, &attr_handles);
-
-        // 5. Prepare & Add Region
+        // 2. Prepare Region
         const region = c.mlirRegionCreate();
         var regions = [_]*c.MlirRegion{region};
-        c.mlirOperationStateAddOwnedRegions(state_ptr, regions.len, &regions);
 
-        // 6. Create Operation
-        const func_op_handle = c.mlirOperationCreate(state_ptr);
+        // 3. Create Operation using C++ Helper with Packed Args
+        const name_ref = c.stringRefFromString("func.func");
+
+        const op_args = c.PcpOpArgs{
+            .nResults = 0,
+            .results = null,
+            .nOperands = 0,
+            .operands = null,
+            .nAttributes = @intCast(attr_handles.len),
+            .attributes = &attr_handles,
+            .nRegions = @intCast(regions.len),
+            .regions = &regions,
+        };
+
+        const func_op_handle = c.pcpCreateOperation(
+            &name_ref,
+            &self.loc.handle,
+            &op_args
+        );
+
         const func_op = mlir.Operation{ .handle = func_op_handle };
 
-        // 7. Attach to module
+        // 4. Attach to module
         self.module_body.appendOwnedOperation(func_op);
 
-        // 8. Add entry block
+        // 5. Add entry block
         const region_handle = func_op.getRegion(0);
         const entry_block = try createBlock();
         c.regionAppendOwnedBlock(region_handle.handle, entry_block.handle);
 
-        // 9. Add block arguments
+        // 6. Add block arguments
         const func_type_wrapper = func_type.as(mlir.FunctionType) orelse return error.NotAFunctionType;
         const num_inputs = func_type_wrapper.getNumInputs();
         for (0..num_inputs) |i| {

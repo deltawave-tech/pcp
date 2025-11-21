@@ -26,25 +26,7 @@ pub fn testMLIROperations(allocator: std.mem.Allocator) !void {
 
 const Allocator = std.mem.Allocator;
 
-/// Helper to initialize an OpaqueState safely IN PLACE.
-/// Takes a pointer to avoid struct-return ABI issues.
-/// This ensures we zero exactly the memory that we pass to the C API.
-pub fn initOperationState(buffer: *c.c.OpaqueState, name: []const u8, loc: Location) void {
-    // 1. Zero out the entire memory block directly at the pointer address (1024 bytes).
-    // This guarantees nOperands, nResults, nRegions, attributes, etc. are all 0/null.
-    @memset(&buffer.data, 0);
-
-    // 2. Cast to our overlay struct to set known fields
-    const state_ptr: *c.c.MlirOperationState = @ptrCast(&buffer.data);
-
-    // 3. Set fields.
-    // WARNING: We assume the C++ layout starts with name and location.
-    // This is standard for mlir-c/IR.h.
-    state_ptr.name = c.c.stringRefFromString(name);
-    state_ptr.location = loc.handle;
-
-    // We implicitly set enableResultTypeInference to false (0) via memset.
-}
+// initOperationState has been removed - we now use pcpCreateOperation instead
 
 /// MLIR Context - owns all IR objects and manages their lifecycle
 pub const Context = struct {
@@ -161,8 +143,7 @@ pub const Context = struct {
         
         const Self = @This();
         
-        /// Create an operation from an operation state
-        /// SAFE IMPLEMENTATION: Opaque State + C Helpers
+        /// Create an operation safely using the C++ helper with packed args
         pub fn create(allocator: std.mem.Allocator, ctx: Context, op_name: []const u8, args: struct {
             operands: []const Value = &.{},
             results: []const Type = &.{},
@@ -170,48 +151,54 @@ pub const Context = struct {
             location: ?Location = null,
         }) !Self {
             const loc = args.location orelse Location.unknown(ctx);
+            const name_ref = c.c.stringRefFromString(op_name);
 
-            // 1. Allocate buffer on stack and initialize in-place
-            var buffer: c.c.OpaqueState = undefined;
-            initOperationState(&buffer, op_name, loc);
-            const state_ptr: *c.c.MlirOperationState = @ptrCast(&buffer.data);
-
-            // 2. Add Operands via C Helper (Allocates heap memory internally)
+            // 1. Prepare Operands
+            var operand_handles: ?[]*c.c.MlirValue = null;
             if (args.operands.len > 0) {
-                const operand_handles = try allocator.alloc(*c.c.MlirValue, args.operands.len);
-                defer allocator.free(operand_handles);
-                for (args.operands, 0..) |opd, i| operand_handles[i] = opd.handle;
-                c.c.mlirOperationStateAddOperands(state_ptr, @intCast(args.operands.len), operand_handles.ptr);
+                const handles = try allocator.alloc(*c.c.MlirValue, args.operands.len);
+                for (args.operands, 0..) |opd, i| handles[i] = opd.handle;
+                operand_handles = handles;
             }
+            defer if (operand_handles) |h| allocator.free(h);
 
-            // 3. Add Results via C Helper
+            // 2. Prepare Results
+            var result_handles: ?[]*c.c.MlirType = null;
             if (args.results.len > 0) {
-                const result_handles = try allocator.alloc(*c.c.MlirType, args.results.len);
-                defer allocator.free(result_handles);
-                for (args.results, 0..) |res, i| result_handles[i] = res.handle;
-                c.c.mlirOperationStateAddResults(state_ptr, @intCast(args.results.len), result_handles.ptr);
+                const handles = try allocator.alloc(*c.c.MlirType, args.results.len);
+                for (args.results, 0..) |res, i| handles[i] = res.handle;
+                result_handles = handles;
             }
+            defer if (result_handles) |h| allocator.free(h);
 
-            // 4. Add Attributes via C Helper
+            // 3. Prepare Attributes
+            var attr_handles: ?[]c.c.MlirNamedAttribute = null;
             if (args.attributes.len > 0) {
-                const attr_handles = try allocator.alloc(c.c.MlirNamedAttribute, args.attributes.len);
-                defer allocator.free(attr_handles);
-
+                const handles = try allocator.alloc(c.c.MlirNamedAttribute, args.attributes.len);
                 for (args.attributes, 0..) |attr_pair, i| {
                     const name_str = c.c.stringRefFromString(attr_pair[0]);
                     const name_id = c.c.mlirIdentifierGet(ctx.handle, name_str);
-                    attr_handles[i] = .{
-                        .name = name_id,
-                        .attribute = attr_pair[1].handle,
-                    };
+                    handles[i] = .{ .name = name_id, .attribute = attr_pair[1].handle };
                 }
-                c.c.mlirOperationStateAddAttributes(state_ptr, @intCast(args.attributes.len), attr_handles.ptr);
+                attr_handles = handles;
             }
+            defer if (attr_handles) |h| allocator.free(h);
 
-            // 5. Create Operation
-            // The C API reads our zeroed+populated blob and creates the Op.
-            // It manages the memory of the arrays added via Add* helpers.
-            const handle = c.c.mlirOperationCreate(state_ptr);
+            // 4. Pack Arguments safely
+            const op_args = c.c.PcpOpArgs{
+                .nResults = @intCast(args.results.len),
+                .results = if (result_handles) |h| h.ptr else null,
+                .nOperands = @intCast(args.operands.len),
+                .operands = if (operand_handles) |h| h.ptr else null,
+                .nAttributes = @intCast(args.attributes.len),
+                .attributes = if (attr_handles) |h| h.ptr else null,
+                .nRegions = 0,
+                .regions = null,
+            };
+
+            // 5. Call C++ Helper
+            const handle = c.c.pcpCreateOperation(&name_ref, &loc.handle, &op_args);
+
             return Self{ .handle = handle };
         }
         

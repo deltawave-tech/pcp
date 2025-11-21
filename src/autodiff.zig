@@ -423,75 +423,62 @@ fn negateVJP(
 }
 
 /// VJP rule for transpose: da = transpose(grad_out) with inverse permutation
-fn transposeVJP(
-    builder: *MLIRBuilder,
-    original_op: mlir.Operation,
-    primals: []const mlir.Value,
-    adjoints: []const mlir.Value,
-) ![]mlir.Value {
+fn transposeVJP(builder: *MLIRBuilder, original_op: mlir.Operation, primals: []const mlir.Value, adjoints: []const mlir.Value) ![]mlir.Value {
     const grad_out = adjoints[0];
-    const a = primals[0]; // Primal 'a'
-    
+    const a = primals[0];
     var result = std.ArrayList(mlir.Value).init(builder.allocator);
-    defer result.deinit();
-    
-    // Get the permutation attribute from the original transpose operation
+
     const permutation_attr = c.operationGetAttributeByName(original_op.handle, "permutation");
-        
-    if (@intFromPtr(permutation_attr) == 0) {
-        return error.MissingPermutationAttribute;
-    }
-    
-    // Get the rank to know how many elements in permutation
+    if (@intFromPtr(permutation_attr) == 0) return error.MissingPermutationAttribute;
+
     const input_type = a.getType().as(mlir.RankedTensorType).?;
     const rank = input_type.getRank();
-    
-    // Parse the actual permutation from the DenseI64ArrayAttr
-    // The permutation_attr is a DenseI64ArrayAttr containing the permutation indices
-    if (!c.attributeIsADenseI64Array(permutation_attr)) {
-        return error.InvalidPermutationAttributeType;
-    }
-    
-    const num_elements = c.denseArrayGetNumElements(permutation_attr);
-    
-    if (num_elements != rank) {
-        return error.PermutationRankMismatch;
-    }
-    
-    // Extract the actual permutation from the attribute
+    if (!c.attributeIsADenseI64Array(permutation_attr)) return error.InvalidPermutationAttributeType;
+
     var permutation = try builder.allocator.alloc(i64, rank);
     defer builder.allocator.free(permutation);
-    
-    for (0..rank) |i| {
-        permutation[i] = c.denseI64ArrayGetElement(permutation_attr, @intCast(i));
-    }
-    
-    // Compute inverse permutation: if perm[i] = j, then inv_perm[j] = i
+    for (0..rank) |i| permutation[i] = c.denseI64ArrayGetElement(permutation_attr, @intCast(i));
+
     var inv_permutation = try builder.allocator.alloc(i64, rank);
     defer builder.allocator.free(inv_permutation);
-    
-    for (permutation, 0..) |target_dim, source_dim| {
-        inv_permutation[@intCast(target_dim)] = @intCast(source_dim);
-    }
-    
-    // Create the inverse permutation attribute
+    for (permutation, 0..) |target_dim, source_dim| inv_permutation[@intCast(target_dim)] = @intCast(source_dim);
+
     const inv_perm_attr = c.mlirDenseI64ArrayGet(builder.ctx.handle, @intCast(rank), inv_permutation.ptr);
-    
-    // Create transpose operation with inverse permutation
-    var state = c.operationStateGet("stablehlo.transpose", builder.loc.handle);
-    c.mlirOperationStateAddOperands(&state, 1, @ptrCast(@constCast(&grad_out.handle)));
-    c.mlirOperationStateAddResults(&state, 1, @ptrCast(@constCast(&a.getType().handle)));
-    
-    // Add the permutation attribute
+
+    // Manual state initialization
+    var state: c.MlirOperationState = undefined;
+    state.name = c.stringRefFromString("stablehlo.transpose");
+    state.location = builder.loc.handle;
+    state.nResults = 0; state.results = null; state.nOperands = 0; state.operands = null; state.nRegions = 0; state.regions = null; state.nSuccessors = 0; state.successors = null; state.nAttributes = 0; state.attributes = null; state.enableResultTypeInference = false;
+
+    const c_allocator = std.heap.c_allocator;
+
+    // Operands
+    var op_handles = try c_allocator.alloc(*c.MlirValue, 1);
+    defer c_allocator.free(op_handles);
+    op_handles[0] = grad_out.handle;
+    state.nOperands = 1;
+    state.operands = op_handles.ptr;
+
+    // Results
+    var res_handles = try c_allocator.alloc(*c.MlirType, 1);
+    defer c_allocator.free(res_handles);
+    res_handles[0] = a.getType().handle;
+    state.nResults = 1;
+    state.results = res_handles.ptr;
+
+    // Attributes
     const attr_name = c.identifierGet(builder.ctx.handle, "permutation");
     const named_attr = c.MlirNamedAttribute{ .name = attr_name, .attribute = inv_perm_attr };
-    c.mlirOperationStateAddAttributes(&state, 1, @ptrCast(@constCast(&named_attr)));
-    
+    var attr_handles = try c_allocator.alloc(c.MlirNamedAttribute, 1);
+    defer c_allocator.free(attr_handles);
+    attr_handles[0] = named_attr;
+    state.nAttributes = 1;
+    state.attributes = attr_handles.ptr;
+
     const transpose_op = c.operationCreate(&state);
     builder.insertion_block.appendOwnedOperation(mlir.Operation{ .handle = transpose_op });
-    
     try result.append(mlir.Value{ .handle = c.operationGetResult(transpose_op, 0) });
-    
     return result.toOwnedSlice();
 }
 
@@ -638,91 +625,96 @@ fn reshapeVJP(
 }
 
 /// VJP rule for reduce_sum: da = broadcast(grad_out, original_shape)
-fn reduceSumVJP(
-    builder: *MLIRBuilder,
-    original_op: mlir.Operation,
-    primals: []const mlir.Value,
-    adjoints: []const mlir.Value,
-) ![]mlir.Value {
+fn reduceSumVJP(builder: *MLIRBuilder, original_op: mlir.Operation, primals: []const mlir.Value, adjoints: []const mlir.Value) ![]mlir.Value {
     const grad_out = adjoints[0];
-    const input = primals[0]; // Original input to reduce_sum
-    
+    const input = primals[0];
     var result = std.ArrayList(mlir.Value).init(builder.allocator);
-    
+    const c_allocator = std.heap.c_allocator;
+
     if (!isValueFromConstantOp(input)) {
-        // Get the original input shape and broadcast the gradient back to it
         const original_shape_type = input.getType();
-        const input_tensor_type = original_shape_type.as(mlir.RankedTensorType).?;
-        _ = input_tensor_type; // Suppress unused variable warning
-        
-        // Get the dimensions attribute from the reduce_sum operation
         const dimensions_attr = c.operationGetAttributeByName(original_op.handle, "dimensions");
-        
+
         if (@intFromPtr(dimensions_attr) != 0) {
-            // Parse the dimensions that were reduced
-            // For DenseI64ArrayAttr, we need manual parsing
-            // For now, create broadcast_dimensions manually
-            
-            // The broadcast_dimensions should contain all dimensions from the original shape
-            // that were NOT in the reduction dimensions
             var broadcast_dims = std.ArrayList(i64).init(builder.allocator);
             defer broadcast_dims.deinit();
-            
-            // Simple heuristic: if grad_out is scalar (rank 0), all dims were reduced
+
             const grad_out_type = grad_out.getType().as(mlir.RankedTensorType).?;
             const grad_rank = grad_out_type.getRank();
-            
+
             if (grad_rank == 0) {
-                // Full reduction to scalar - use broadcast_in_dim with empty broadcast_dimensions
-                // For empty array, we need to pass a valid pointer to empty data
+                // Scalar broadcast (empty dims)
                 const empty_dims: [0]i64 = .{};
                 const empty_broadcast_dims_attr = c.mlirDenseI64ArrayGet(builder.ctx.handle, 0, &empty_dims);
-                
-                var state = c.operationStateGet("stablehlo.broadcast_in_dim", builder.loc.handle);
-                c.mlirOperationStateAddOperands(&state, 1, @ptrCast(@constCast(&grad_out.handle)));
-                c.mlirOperationStateAddResults(&state, 1, @ptrCast(@constCast(&original_shape_type.handle)));
-                
-                // Add the broadcast_dimensions attribute (empty for scalar broadcast)
+
+                var state: c.MlirOperationState = undefined;
+                state.name = c.stringRefFromString("stablehlo.broadcast_in_dim");
+                state.location = builder.loc.handle;
+                state.nResults = 0; state.results = null; state.nOperands = 0; state.operands = null; state.nRegions = 0; state.regions = null; state.nSuccessors = 0; state.successors = null; state.nAttributes = 0; state.attributes = null; state.enableResultTypeInference = false;
+
+                var op_handles = try c_allocator.alloc(*c.MlirValue, 1);
+                defer c_allocator.free(op_handles);
+                op_handles[0] = grad_out.handle;
+                state.nOperands = 1;
+                state.operands = op_handles.ptr;
+
+                var res_handles = try c_allocator.alloc(*c.MlirType, 1);
+                defer c_allocator.free(res_handles);
+                res_handles[0] = original_shape_type.handle;
+                state.nResults = 1;
+                state.results = res_handles.ptr;
+
                 const attr_name = c.identifierGet(builder.ctx.handle, "broadcast_dimensions");
                 const named_attr = c.MlirNamedAttribute{ .name = attr_name, .attribute = empty_broadcast_dims_attr };
-                c.mlirOperationStateAddAttributes(&state, 1, @ptrCast(@constCast(&named_attr)));
-                
+                var attr_handles = try c_allocator.alloc(c.MlirNamedAttribute, 1);
+                defer c_allocator.free(attr_handles);
+                attr_handles[0] = named_attr;
+                state.nAttributes = 1;
+                state.attributes = attr_handles.ptr;
+
                 const broadcast_op = c.operationCreate(&state);
                 builder.insertion_block.appendOwnedOperation(mlir.Operation{ .handle = broadcast_op });
-                
                 try result.append(mlir.Value{ .handle = c.operationGetResult(broadcast_op, 0) });
             } else {
-                // Partial reduction - compute which dimensions remain
-                // For now, assume reduction kept the first grad_rank dimensions
-                for (0..@intCast(grad_rank)) |i| {
-                    try broadcast_dims.append(@intCast(i));
-                }
-                
-                // Create broadcast_in_dim with proper dimensions
+                // Partial broadcast
+                for (0..@intCast(grad_rank)) |i| try broadcast_dims.append(@intCast(i));
+
                 const broadcast_dims_attr = c.mlirDenseI64ArrayGet(builder.ctx.handle, @intCast(broadcast_dims.items.len), broadcast_dims.items.ptr);
-                
-                var state = c.operationStateGet("stablehlo.broadcast_in_dim", builder.loc.handle);
-                c.mlirOperationStateAddOperands(&state, 1, @ptrCast(@constCast(&grad_out.handle)));
-                c.mlirOperationStateAddResults(&state, 1, @ptrCast(@constCast(&original_shape_type.handle)));
-                
-                // Add the broadcast_dimensions attribute
+
+                var state: c.MlirOperationState = undefined;
+                state.name = c.stringRefFromString("stablehlo.broadcast_in_dim");
+                state.location = builder.loc.handle;
+                state.nResults = 0; state.results = null; state.nOperands = 0; state.operands = null; state.nRegions = 0; state.regions = null; state.nSuccessors = 0; state.successors = null; state.nAttributes = 0; state.attributes = null; state.enableResultTypeInference = false;
+
+                var op_handles = try c_allocator.alloc(*c.MlirValue, 1);
+                defer c_allocator.free(op_handles);
+                op_handles[0] = grad_out.handle;
+                state.nOperands = 1;
+                state.operands = op_handles.ptr;
+
+                var res_handles = try c_allocator.alloc(*c.MlirType, 1);
+                defer c_allocator.free(res_handles);
+                res_handles[0] = original_shape_type.handle;
+                state.nResults = 1;
+                state.results = res_handles.ptr;
+
                 const attr_name = c.identifierGet(builder.ctx.handle, "broadcast_dimensions");
                 const named_attr = c.MlirNamedAttribute{ .name = attr_name, .attribute = broadcast_dims_attr };
-                c.mlirOperationStateAddAttributes(&state, 1, @ptrCast(@constCast(&named_attr)));
-                
+                var attr_handles = try c_allocator.alloc(c.MlirNamedAttribute, 1);
+                defer c_allocator.free(attr_handles);
+                attr_handles[0] = named_attr;
+                state.nAttributes = 1;
+                state.attributes = attr_handles.ptr;
+
                 const broadcast_op = c.operationCreate(&state);
-                // CRITICAL FIX: Use the builder's pre-established insertion block instead of accessing module regions directly
                 builder.insertion_block.appendOwnedOperation(mlir.Operation{ .handle = broadcast_op });
-                
                 try result.append(mlir.Value{ .handle = c.operationGetResult(broadcast_op, 0) });
             }
         } else {
-            // Fallback: assume full reduction and use simple broadcast
             const grad_input = try builder.createAndAttach("stablehlo.broadcast", &.{grad_out}, &.{original_shape_type}, .{});
             try result.append(grad_input.getResult(0));
         }
     }
-    
     return result.toOwnedSlice();
 }
 
@@ -929,73 +921,74 @@ fn broadcastInDimVJP(
 
 
 fn createGradientFunction(builder: *MLIRBuilder, forward_fn: mlir.Operation, name: []const u8) !mlir.Operation {
-    // Get the forward function's block to inspect its arguments
     const forward_region = forward_fn.getRegion(0);
     const forward_block = forward_region.getBlock(0);
-    
-    // Get the number of arguments in the forward function
     const num_args = forward_block.getNumArguments();
-    
-    // Collect input types: forward function args + output gradient
+
     var input_types = std.ArrayList(mlir.Type).init(builder.allocator);
     defer input_types.deinit();
-    
-    // Add types for all forward function arguments
     for (0..num_args) |i| {
         const arg = forward_block.getArgument(i);
         try input_types.append(arg.getType());
     }
-    
-    // Add type for output gradient (same as forward function's return type)
+
     const return_value = getReturnValue(forward_fn) orelse {
         return error.NoReturnOperation;
     };
-    const output_grad_type = return_value.getType();
-    try input_types.append(output_grad_type);
-    
-    // Collect output types: gradients for each forward function argument
+    try input_types.append(return_value.getType());
+
     var output_types = std.ArrayList(mlir.Type).init(builder.allocator);
     defer output_types.deinit();
-    
     for (0..num_args) |i| {
         const arg = forward_block.getArgument(i);
         try output_types.append(arg.getType());
     }
-    
-    // Create function type
+
     const function_type = mlir.Type.functionType(builder.ctx, input_types.items, output_types.items);
-    
-    // Create the gradient function using the C API directly for proper region setup
+
+    // MANUAL STATE INITIALIZATION
+    const op_name_ref = c.stringRefFromString("func.func");
     const location = builder.loc;
-    var op_state = c.operationStateGet("func.func", location.handle);
-    
-    // Add attributes
+    var state: c.MlirOperationState = undefined;
+    state.name = op_name_ref;
+    state.location = location.handle;
+    state.nResults = 0; state.results = null;
+    state.nOperands = 0; state.operands = null;
+    state.nRegions = 0; state.regions = null;
+    state.nSuccessors = 0; state.successors = null;
+    state.nAttributes = 0; state.attributes = null;
+    state.enableResultTypeInference = false;
+
+    const c_allocator = std.heap.c_allocator;
+
+    // SYSTEMIC FIX: Direct allocation instead of ArrayList
+    var attr_handles = try c_allocator.alloc(c.MlirNamedAttribute, 2);
+    defer c_allocator.free(attr_handles);
+
     const sym_name_attr = mlir.Attribute.stringAttr(builder.ctx, name);
     const function_type_attr = mlir.Attribute.typeAttr(function_type);
-    
     const sym_name_id = c.identifierGet(builder.ctx.handle, "sym_name");
     const function_type_id = c.identifierGet(builder.ctx.handle, "function_type");
-    
-    var attributes = [_]c.MlirNamedAttribute{
-        c.MlirNamedAttribute{ .name = sym_name_id, .attribute = sym_name_attr.handle },
-        c.MlirNamedAttribute{ .name = function_type_id, .attribute = function_type_attr.handle },
-    };
-    
-    c.mlirOperationStateAddAttributes(&op_state, 2, @ptrCast(&attributes));
-    
-    // Create and add a region for the function body
+
+    attr_handles[0] = .{ .name = sym_name_id, .attribute = sym_name_attr.handle };
+    attr_handles[1] = .{ .name = function_type_id, .attribute = function_type_attr.handle };
+
+    state.nAttributes = 2;
+    state.attributes = attr_handles.ptr;
+
     const region = c.regionCreate();
-    c.operationStateAddOwnedRegions(&op_state, 1, @ptrCast(@constCast(&region)));
-    
-    // Create the operation
-    const grad_fn = mlir.Operation{ .handle = c.operationCreate(&op_state) };
-    
-    // Add the gradient function to the module
+    var regions = try c_allocator.alloc(*c.MlirRegion, 1);
+    defer c_allocator.free(regions);
+    regions[0] = region;
+
+    state.nRegions = 1;
+    state.regions = regions.ptr;
+
+    const grad_fn = mlir.Operation{ .handle = c.operationCreate(&state) };
     const module_body = c.moduleGetBody(builder.module.handle);
     c.blockAppendOwnedOperation(module_body, grad_fn.handle);
-    
+
     std.debug.print("Created gradient function with {} inputs and {} outputs\n", .{input_types.items.len, output_types.items.len});
-    
     return grad_fn;
 }
 
@@ -1154,62 +1147,84 @@ fn addInputGradients(
     }
 }
 
-fn finalizeGradientFunction(
-    allocator: Allocator,
-    builder: *MLIRBuilder,
-    gradient_fn: mlir.Operation,
-    forward_fn: mlir.Operation,
-    adjoint_map: *std.AutoHashMap(mlir.Value, mlir.Value),
-) !void {
-    // Get the arguments of the original forward function
+fn finalizeGradientFunction(allocator: Allocator, builder: *MLIRBuilder, gradient_fn: mlir.Operation, forward_fn: mlir.Operation, adjoint_map: *std.AutoHashMap(mlir.Value, mlir.Value)) !void {
     const forward_region = forward_fn.getRegion(0);
     const forward_block = forward_region.getBlock(0);
-    
-    // Get number of arguments in the forward function
     const num_args = forward_block.getNumArguments();
-    
-    // Collect gradients for function arguments
     var input_gradients = std.ArrayList(mlir.Value).init(allocator);
     defer input_gradients.deinit();
-    
+
     std.debug.print("Finalizing gradient function with {} forward function arguments\n", .{num_args});
-    
-    // For each argument of the forward function, look up its gradient
+
+    const c_allocator = std.heap.c_allocator;
+
     for (0..num_args) |i| {
         const arg = forward_block.getArgument(i);
-        
         if (adjoint_map.get(arg)) |gradient| {
             try input_gradients.append(gradient);
             std.debug.print("  Found gradient for argument {}\n", .{i});
         } else {
-            // Create a zero-filled tensor for missing gradients
             const arg_type = arg.getType();
-            const zero_data = [_]f32{0.0};
+            const ranked_type = arg_type.as(mlir.RankedTensorType) orelse return error.InvalidTensorType;
+            const shape = try ranked_type.getShape(allocator);
+            defer allocator.free(shape);
+            var elem_count: usize = 1;
+            for (shape) |d| elem_count *= @intCast(d);
+            const zero_data = try allocator.alloc(f32, elem_count);
+            defer allocator.free(zero_data);
+            @memset(zero_data, 0.0);
             const zero_bytes = std.mem.sliceAsBytes(zero_data[0..]);
-            
-            // Create a shape for the zero tensor (assuming scalar for now)
-            var zero_shape = try tensor.Shape.initWithDims(builder.ctx, &[_]i64{1}, .f32);
-            defer zero_shape.deinit();
-            
-            const zero_gradient = try builder.createConstant(zero_bytes, arg_type, zero_shape);
+            const zero_attr = mlir.Attribute.denseElementsAttr(builder.ctx, arg_type, zero_bytes);
+
+            // Manual constant creation
+            var state: c.MlirOperationState = undefined;
+            state.name = c.stringRefFromString("stablehlo.constant");
+            state.location = builder.loc.handle;
+            state.nResults = 0; state.results = null; state.nOperands = 0; state.operands = null; state.nRegions = 0; state.regions = null; state.nSuccessors = 0; state.successors = null; state.nAttributes = 0; state.attributes = null; state.enableResultTypeInference = false;
+
+            var result_handles = try c_allocator.alloc(*c.MlirType, 1);
+            defer c_allocator.free(result_handles);
+            result_handles[0] = arg_type.handle;
+            state.nResults = 1;
+            state.results = result_handles.ptr;
+
+            const val_id = c.identifierGet(builder.ctx.handle, "value");
+            const named_attr = c.MlirNamedAttribute{ .name = val_id, .attribute = zero_attr.handle };
+            var attr_handles = try c_allocator.alloc(c.MlirNamedAttribute, 1);
+            defer c_allocator.free(attr_handles);
+            attr_handles[0] = named_attr;
+            state.nAttributes = 1;
+            state.attributes = attr_handles.ptr;
+
+            const zero_handle = c.operationCreate(&state);
+            const zero_gradient = mlir.Value{ .handle = c.operationGetResult(zero_handle, 0) };
+            builder.insertion_block.appendOwnedOperation(mlir.Operation{ .handle = zero_handle });
+
             try input_gradients.append(zero_gradient);
             std.debug.print("  Created zero gradient for argument {}\n", .{i});
         }
     }
-    
-    // Get the block of the new gradient function
-    // This assumes the new grad_fn has one region and one block
     const grad_fn_block = gradient_fn.getRegion(0).getBlock(0);
-    
-    // Create the final 'func.return' operation with the collected gradients
-    const return_op = mlir.Operation.create(builder.ctx, "func.return", .{
-        .operands = input_gradients.items,
-        .location = builder.loc,
-    });
-    
-    // Add the return op to the block, making the gradient function complete and valid
-    c.blockAppendOwnedOperation(grad_fn_block.handle, return_op.handle);
-    
+
+    // Manual return op creation
+    var state: c.MlirOperationState = undefined;
+    state.name = c.stringRefFromString("func.return");
+    state.location = builder.loc.handle;
+    state.nResults = 0; state.results = null; state.nOperands = 0; state.operands = null; state.nRegions = 0; state.regions = null; state.nSuccessors = 0; state.successors = null; state.nAttributes = 0; state.attributes = null; state.enableResultTypeInference = false;
+
+    if (input_gradients.items.len > 0) {
+        var op_handles = try c_allocator.alloc(*c.MlirValue, input_gradients.items.len);
+        defer c_allocator.free(op_handles);
+        for (input_gradients.items, 0..) |val, i| op_handles[i] = val.handle;
+        state.nOperands = @intCast(input_gradients.items.len);
+        state.operands = op_handles.ptr;
+        const return_handle = c.operationCreate(&state);
+        c.blockAppendOwnedOperation(grad_fn_block.handle, return_handle);
+    } else {
+        const return_handle = c.operationCreate(&state);
+        c.blockAppendOwnedOperation(grad_fn_block.handle, return_handle);
+    }
+
     std.debug.print("Added func.return to gradient function with {} gradients\n", .{input_gradients.items.len});
 }
 
@@ -1290,54 +1305,57 @@ fn logVJP(
 }
 
 /// VJP for rsqrt: da = -0.5 * grad_out * (a ^ -1.5)
-fn rsqrtVJP(
-    builder: *MLIRBuilder,
-    original_op: mlir.Operation,
-    primals: []const mlir.Value,
-    adjoints: []const mlir.Value,
-) ![]mlir.Value {
+fn rsqrtVJP(builder: *MLIRBuilder, original_op: mlir.Operation, primals: []const mlir.Value, adjoints: []const mlir.Value) ![]mlir.Value {
     _ = original_op;
     const grad_out = adjoints[0];
     const a = primals[0];
     const tensor_type = a.getType();
-
     var result = std.ArrayList(mlir.Value).init(builder.allocator);
-    defer result.deinit();
 
-    // 1. rsqrt(a)
     const rsqrt_op = try builder.createAndAttach("stablehlo.rsqrt", &.{a}, &.{tensor_type}, .{});
     const rsqrt_val = rsqrt_op.getResult(0);
-
-    // 2. rsqrt(a)^3
     const sq = try builder.createAndAttach("stablehlo.multiply", &.{rsqrt_val, rsqrt_val}, &.{tensor_type}, .{});
     const cub = try builder.createAndAttach("stablehlo.multiply", &.{sq.getResult(0), rsqrt_val}, &.{tensor_type}, .{});
 
-    // 3. Constant -0.5 (Robust Method: Explicit Byte Buffer)
+    // Create -0.5 constant manually
     const ranked_type = tensor_type.as(mlir.RankedTensorType) orelse return error.InvalidTensorType;
     const shape = try ranked_type.getShape(builder.allocator);
     defer builder.allocator.free(shape);
-
     var elem_count: usize = 1;
     for (shape) |d| elem_count *= @intCast(d);
-
     const neg_half_data = try builder.allocator.alloc(f32, elem_count);
     defer builder.allocator.free(neg_half_data);
     @memset(neg_half_data, -0.5);
-
     const neg_half_bytes = std.mem.sliceAsBytes(neg_half_data);
     const neg_half_attr = mlir.Attribute.denseElementsAttr(builder.ctx, tensor_type, neg_half_bytes);
 
-    const neg_half_op = mlir.Operation.create(builder.ctx, "stablehlo.constant", .{
-        .attributes = &.{.{ "value", neg_half_attr }},
-        .results = &.{tensor_type},
-        .location = builder.loc,
-    });
+    // Manual constant op creation
+    var state: c.MlirOperationState = undefined;
+    state.name = c.stringRefFromString("stablehlo.constant");
+    state.location = builder.loc.handle;
+    state.nResults = 0; state.results = null; state.nOperands = 0; state.operands = null; state.nRegions = 0; state.regions = null; state.nSuccessors = 0; state.successors = null; state.nAttributes = 0; state.attributes = null; state.enableResultTypeInference = false;
+
+    const c_allocator = std.heap.c_allocator;
+    var result_handles = try c_allocator.alloc(*c.MlirType, 1);
+    defer c_allocator.free(result_handles);
+    result_handles[0] = tensor_type.handle;
+    state.nResults = 1;
+    state.results = result_handles.ptr;
+
+    const val_id = c.identifierGet(builder.ctx.handle, "value");
+    const named_attr = c.MlirNamedAttribute{ .name = val_id, .attribute = neg_half_attr.handle };
+    var attr_handles = try c_allocator.alloc(c.MlirNamedAttribute, 1);
+    defer c_allocator.free(attr_handles);
+    attr_handles[0] = named_attr;
+    state.nAttributes = 1;
+    state.attributes = attr_handles.ptr;
+
+    const neg_half_handle = c.operationCreate(&state);
+    const neg_half_op = mlir.Operation{ .handle = neg_half_handle };
     builder.insertion_block.appendOwnedOperation(neg_half_op);
 
-    // 4. Multiply: grad_out * -0.5 * rsqrt^3
     const term1 = try builder.createAndAttach("stablehlo.multiply", &.{grad_out, neg_half_op.getResult(0)}, &.{tensor_type}, .{});
     const final_grad = try builder.createAndAttach("stablehlo.multiply", &.{term1.getResult(0), cub.getResult(0)}, &.{tensor_type}, .{});
-
     try result.append(final_grad.getResult(0));
     return result.toOwnedSlice();
 }
@@ -1364,85 +1382,94 @@ fn convertVJP(
     return result.toOwnedSlice();
 }
 
-fn selectVJP(
-    builder: *MLIRBuilder,
-    original_op: mlir.Operation,
-    primals: []const mlir.Value,
-    adjoints: []const mlir.Value,
-) ![]mlir.Value {
+fn selectVJP(builder: *MLIRBuilder, original_op: mlir.Operation, primals: []const mlir.Value, adjoints: []const mlir.Value) ![]mlir.Value {
     _ = original_op;
     const grad_out = adjoints[0];
     const pred = primals[0];
     var result = std.ArrayList(mlir.Value).init(builder.allocator);
-    defer result.deinit();
-
     const result_type = grad_out.getType();
+    const c_allocator = std.heap.c_allocator;
 
-    // 1. Create zero f32 tensor for the select branches (Standard logic)
+    // 1. Create zero f32 tensor
     const ranked_type = result_type.as(mlir.RankedTensorType) orelse return error.InvalidTensorType;
     const shape = try ranked_type.getShape(builder.allocator);
     defer builder.allocator.free(shape);
-
     var elem_count: usize = 1;
     for (shape) |d| elem_count *= @intCast(d);
-
     const zero_data = try builder.allocator.alloc(f32, elem_count);
     defer builder.allocator.free(zero_data);
     @memset(zero_data, 0.0);
-
     const zero_attr = mlir.Attribute.denseElementsAttr(builder.ctx, result_type, std.mem.sliceAsBytes(zero_data));
-    const zero_op = mlir.Operation.create(builder.ctx, "stablehlo.constant", .{
-        .attributes = &.{.{ "value", zero_attr }},
-        .results = &.{result_type},
-        .location = builder.loc,
-    });
+
+    var state: c.MlirOperationState = undefined;
+    state.name = c.stringRefFromString("stablehlo.constant");
+    state.location = builder.loc.handle;
+    state.nResults = 0; state.results = null; state.nOperands = 0; state.operands = null; state.nRegions = 0; state.regions = null; state.nSuccessors = 0; state.successors = null; state.nAttributes = 0; state.attributes = null; state.enableResultTypeInference = false;
+
+    var result_handles = try c_allocator.alloc(*c.MlirType, 1);
+    defer c_allocator.free(result_handles);
+    result_handles[0] = result_type.handle;
+    state.nResults = 1;
+    state.results = result_handles.ptr;
+
+    const val_id = c.identifierGet(builder.ctx.handle, "value");
+    const named_attr = c.MlirNamedAttribute{ .name = val_id, .attribute = zero_attr.handle };
+    var attr_handles = try c_allocator.alloc(c.MlirNamedAttribute, 1);
+    defer c_allocator.free(attr_handles);
+    attr_handles[0] = named_attr;
+    state.nAttributes = 1;
+    state.attributes = attr_handles.ptr;
+
+    const zero_handle = c.operationCreate(&state);
+    const zero_op = mlir.Operation{ .handle = zero_handle };
     builder.insertion_block.appendOwnedOperation(zero_op);
     const zero = zero_op.getResult(0);
 
-    // 2. Create zero predicate gradient (i1 type) safely via i8
-    // We do this to avoid issues with packing i1 values in raw buffers
+    // 2. Create zero predicate gradient (i8 -> i1)
     const pred_type = pred.getType();
     const pred_ranked_type = pred_type.as(mlir.RankedTensorType) orelse return error.InvalidTensorType;
     const pred_shape = try pred_ranked_type.getShape(builder.allocator);
     defer builder.allocator.free(pred_shape);
-
     var pred_elem_count: usize = 1;
     for (pred_shape) |d| pred_elem_count *= @intCast(d);
 
-    // Create i8 type and tensor type
     const i8_mlir_type = c.mlirIntegerTypeGet(builder.ctx.handle, 8);
     const i8_type = mlir.Type{ .handle = i8_mlir_type };
     const i8_tensor_type = mlir.Type.rankedTensorType(builder.ctx, pred_shape, i8_type);
-
-    // Allocate zeroed bytes
     const pred_zero_data = try builder.allocator.alloc(u8, pred_elem_count);
     defer builder.allocator.free(pred_zero_data);
     @memset(pred_zero_data, 0);
-
-    // Create i8 constant
     const pred_zero_attr = mlir.Attribute.denseElementsAttr(builder.ctx, i8_tensor_type, pred_zero_data);
-    const pred_zero_op = mlir.Operation.create(builder.ctx, "stablehlo.constant", .{
-        .attributes = &.{.{ "value", pred_zero_attr }},
-        .results = &.{i8_tensor_type},
-        .location = builder.loc,
-    });
+
+    var p_state: c.MlirOperationState = undefined;
+    p_state.name = c.stringRefFromString("stablehlo.constant");
+    p_state.location = builder.loc.handle;
+    p_state.nResults = 0; p_state.results = null; p_state.nOperands = 0; p_state.operands = null; p_state.nRegions = 0; p_state.regions = null; p_state.nSuccessors = 0; p_state.successors = null; p_state.nAttributes = 0; p_state.attributes = null; p_state.enableResultTypeInference = false;
+
+    var p_result_handles = try c_allocator.alloc(*c.MlirType, 1);
+    defer c_allocator.free(p_result_handles);
+    p_result_handles[0] = i8_tensor_type.handle;
+    p_state.nResults = 1;
+    p_state.results = p_result_handles.ptr;
+
+    const p_named_attr = c.MlirNamedAttribute{ .name = val_id, .attribute = pred_zero_attr.handle };
+    var p_attr_handles = try c_allocator.alloc(c.MlirNamedAttribute, 1);
+    defer c_allocator.free(p_attr_handles);
+    p_attr_handles[0] = p_named_attr;
+    p_state.nAttributes = 1;
+    p_state.attributes = p_attr_handles.ptr;
+
+    const pred_zero_handle = c.operationCreate(&p_state);
+    const pred_zero_op = mlir.Operation{ .handle = pred_zero_handle };
     builder.insertion_block.appendOwnedOperation(pred_zero_op);
 
-    // Convert i8 zero -> i1 zero
     const pred_zero_cvt = try builder.createAndAttach("stablehlo.convert", &.{pred_zero_op.getResult(0)}, &.{pred_type}, .{});
-
-    // 3. Compute gradients for select
-    // grad_true = select(pred, grad_out, 0.0)
     const grad_true = try builder.createAndAttach("stablehlo.select", &.{pred, grad_out, zero}, &.{result_type}, .{});
-
-    // grad_false = select(pred, 0.0, grad_out)
     const grad_false = try builder.createAndAttach("stablehlo.select", &.{pred, zero, grad_out}, &.{result_type}, .{});
 
-    // Gradients: [pred (dummy i1 zero), on_true, on_false]
     try result.append(pred_zero_cvt.getResult(0));
     try result.append(grad_true.getResult(0));
     try result.append(grad_false.getResult(0));
-
     return result.toOwnedSlice();
 }
 

@@ -149,54 +149,77 @@ pub const Context = struct {
             location: ?Location = null,
         }) Self {
             const loc = args.location orelse Location.unknown(ctx);
+            const op_name_ref = c.c.stringRefFromString(op_name);
 
-            // 1. Initialize State
-            var state = c.c.operationStateGet(op_name, loc.handle);
+            // 1. Manually Initialize State
+            var state: c.c.MlirOperationState = undefined;
+            state.name = op_name_ref;
+            state.location = loc.handle;
+            state.nResults = 0;
+            state.results = null;
+            state.nOperands = 0;
+            state.operands = null;
+            state.nRegions = 0;
+            state.regions = null;
+            state.nSuccessors = 0;
+            state.successors = null;
+            state.nAttributes = 0;
+            state.attributes = null;
+            state.enableResultTypeInference = false;
 
-            // 2. Add Operands
+            const allocator = std.heap.c_allocator;
+
+            // 2. Prepare Buffers (Direct Allocation)
+            // We declare these as optionals so we can free them cleanly at the end
+            var operand_handles: ?[]*c.c.MlirValue = null;
+            defer if (operand_handles) |h| allocator.free(h);
+
+            var result_handles: ?[]*c.c.MlirType = null;
+            defer if (result_handles) |h| allocator.free(h);
+
+            var attr_handles: ?[]c.c.MlirNamedAttribute = null;
+            defer if (attr_handles) |h| allocator.free(h);
+
+            // 3. Populate Operands
             if (args.operands.len > 0) {
-                // Create a temporary array of MlirValue pointers
-                var operand_handles = std.ArrayList(*c.c.MlirValue).init(std.heap.page_allocator);
-                defer operand_handles.deinit();
-
-                for (args.operands) |operand| {
-                    operand_handles.append(operand.handle) catch unreachable;
+                // Use explicit alloc instead of ArrayList
+                operand_handles = allocator.alloc(*c.c.MlirValue, args.operands.len) catch unreachable;
+                for (args.operands, 0..) |operand, i| {
+                    operand_handles.?[i] = operand.handle;
                 }
-
-                c.c.mlirOperationStateAddOperands(&state, @intCast(operand_handles.items.len), operand_handles.items.ptr);
+                state.nOperands = @intCast(args.operands.len);
+                state.operands = operand_handles.?.ptr;
             }
 
-            // 3. Add Results
+            // 4. Populate Results
             if (args.results.len > 0) {
-                var result_handles = std.ArrayList(*c.c.MlirType).init(std.heap.page_allocator);
-                defer result_handles.deinit();
-
-                for (args.results) |result_type| {
-                    result_handles.append(result_type.handle) catch unreachable;
+                result_handles = allocator.alloc(*c.c.MlirType, args.results.len) catch unreachable;
+                for (args.results, 0..) |result_type, i| {
+                    result_handles.?[i] = result_type.handle;
                 }
-
-                c.c.mlirOperationStateAddResults(&state, @intCast(result_handles.items.len), result_handles.items.ptr);
+                state.nResults = @intCast(args.results.len);
+                state.results = result_handles.?.ptr;
             }
 
-            // 4. Add Attributes
+            // 5. Populate Attributes
             if (args.attributes.len > 0) {
-                var named_attrs = std.ArrayList(c.c.MlirNamedAttribute).init(std.heap.page_allocator);
-                defer named_attrs.deinit();
-
-                for (args.attributes) |attr_pair| {
+                attr_handles = allocator.alloc(c.c.MlirNamedAttribute, args.attributes.len) catch unreachable;
+                for (args.attributes, 0..) |attr_pair, i| {
                     const name_id = c.c.identifierGet(ctx.handle, attr_pair[0]);
-                    const named_attr = c.c.MlirNamedAttribute{
+                    attr_handles.?[i] = .{
                         .name = name_id,
                         .attribute = attr_pair[1].handle,
                     };
-                    named_attrs.append(named_attr) catch unreachable;
                 }
-
-                c.c.mlirOperationStateAddAttributes(&state, @intCast(named_attrs.items.len), named_attrs.items.ptr);
+                state.nAttributes = @intCast(args.attributes.len);
+                state.attributes = attr_handles.?.ptr;
             }
 
-            // 5. Create Operation
+            // 6. Create Operation
+            // The C API copies the arrays (operands, results, attributes),
+            // so it is safe for our defer blocks to free the containers.
             const handle = c.c.operationCreate(&state);
+
             return Self{ .handle = handle };
         }
         
@@ -439,21 +462,24 @@ pub const Context = struct {
         
         /// Create a function type with given inputs and results
         pub fn functionType(context: Context, inputs: []const Type, results: []const Type) Self {
-            var input_handles = std.ArrayList(*c.c.MlirType).init(std.heap.page_allocator);
-            defer input_handles.deinit();
-            
-            for (inputs) |input| {
-                input_handles.append(input.handle) catch unreachable;
+            // SYSTEMIC FIX: Use direct allocation instead of ArrayList
+            const allocator = std.heap.c_allocator;
+
+            var input_handles = allocator.alloc(*c.c.MlirType, inputs.len) catch unreachable;
+            defer allocator.free(input_handles);
+
+            for (inputs, 0..) |input, i| {
+                input_handles[i] = input.handle;
             }
-            
-            var result_handles = std.ArrayList(*c.c.MlirType).init(std.heap.page_allocator);
-            defer result_handles.deinit();
-            
-            for (results) |result| {
-                result_handles.append(result.handle) catch unreachable;
+
+            var result_handles = allocator.alloc(*c.c.MlirType, results.len) catch unreachable;
+            defer allocator.free(result_handles);
+
+            for (results, 0..) |result, i| {
+                result_handles[i] = result.handle;
             }
-            
-            return Self{ .handle = c.c.functionTypeGet(context.handle, input_handles.items, result_handles.items) };
+
+            return Self{ .handle = c.c.functionTypeGet(context.handle, input_handles, result_handles) };
         }
     };
 

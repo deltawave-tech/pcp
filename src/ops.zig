@@ -187,34 +187,54 @@ pub const MLIRBuilder = struct {
     ) !struct { func_op: mlir.Operation, entry_block: mlir.Block } {
         std.log.info("MLIRBuilder.createFunction: Creating function '{s}'...", .{name});
 
-        // 1. Initialize State using C API
-        var state = c.operationStateGet("func.func", self.loc.handle);
+        // 1. Initialize State
+        var state: c.MlirOperationState = undefined;
+        state.name = c.stringRefFromString("func.func");
+        state.location = self.loc.handle;
+        state.nResults = 0;
+        state.results = null;
+        state.nOperands = 0;
+        state.operands = null;
+        state.nRegions = 0;
+        state.regions = null;
+        state.nSuccessors = 0;
+        state.successors = null;
+        state.nAttributes = 0;
+        state.attributes = null;
+        state.enableResultTypeInference = false;
+
+        const allocator = std.heap.c_allocator;
 
         // 2. Prepare Attributes
+        // Function Op has 2 attributes: type and name
+        var attr_handles = try allocator.alloc(c.MlirNamedAttribute, 2);
+        defer allocator.free(attr_handles);
+
         const func_type_attr = mlir.Attribute.typeAttr(func_type);
         const sym_name_attr = mlir.Attribute.stringAttr(self.ctx, name);
 
         const func_type_id = c.identifierGet(self.ctx.handle, "function_type");
         const sym_name_id = c.identifierGet(self.ctx.handle, "sym_name");
 
-        // Use ArrayList to ensure safe memory layout for C API
-        var named_attrs = std.ArrayList(c.MlirNamedAttribute).init(self.allocator);
-        defer named_attrs.deinit();
+        attr_handles[0] = .{ .name = func_type_id, .attribute = func_type_attr.handle };
+        attr_handles[1] = .{ .name = sym_name_id, .attribute = sym_name_attr.handle };
 
-        try named_attrs.append(.{ .name = func_type_id, .attribute = func_type_attr.handle });
-        try named_attrs.append(.{ .name = sym_name_id, .attribute = sym_name_attr.handle });
-
-        // FIX: Use helper function instead of manual field assignment
-        c.mlirOperationStateAddAttributes(&state, @intCast(named_attrs.items.len), named_attrs.items.ptr);
+        state.nAttributes = 2;
+        state.attributes = attr_handles.ptr;
 
         // 3. Region
         const region = c.regionCreate();
 
-        // FIX: Use helper function for regions
-        var regions = [_]*c.MlirRegion{region};
-        c.mlirOperationStateAddOwnedRegions(&state, 1, &regions);
+        // Create array to hold the region pointer
+        var regions = try allocator.alloc(*c.MlirRegion, 1);
+        defer allocator.free(regions); // Free the container array
+        regions[0] = region;
+
+        state.nRegions = 1;
+        state.regions = regions.ptr;
 
         // 4. Create Operation
+        // Takes ownership of the Region object, but copies the array content
         const func_op_handle = c.operationCreate(&state);
         const func_op = mlir.Operation{ .handle = func_op_handle };
 
@@ -227,14 +247,12 @@ pub const MLIRBuilder = struct {
         c.regionAppendOwnedBlock(region_handle.handle, entry_block.handle);
 
         // 6. Add block arguments
-        std.log.info("MLIRBuilder.createFunction: Adding block arguments...", .{});
         const func_type_wrapper = func_type.as(mlir.FunctionType) orelse return error.NotAFunctionType;
         const num_inputs = func_type_wrapper.getNumInputs();
         for (0..num_inputs) |i| {
             const input_type = func_type_wrapper.getInput(i);
             _ = entry_block.addArgument(input_type, self.loc);
         }
-        std.log.info("MLIRBuilder.createFunction: Block arguments added ({})", .{num_inputs});
 
         return .{ .func_op = func_op, .entry_block = entry_block };
     }

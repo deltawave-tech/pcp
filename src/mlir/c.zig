@@ -20,18 +20,19 @@ pub const c = struct {
         name: MlirStringRef,
         location: *MlirLocation,
         nResults: isize,
-        results: [*]const *MlirType,
+        results: ?[*]const *MlirType,
         nOperands: isize,
-        operands: [*]const *MlirValue,
+        operands: ?[*]const *MlirValue,
         nRegions: isize,
-        regions: [*]const *MlirRegion,
+        regions: ?[*]const *MlirRegion,
         nSuccessors: isize,
-        successors: [*]const *MlirBlock,
+        successors: ?[*]const *MlirBlock,
         nAttributes: isize,
         // DEFINITIVE FIX: The C API defines this field as `const MlirNamedAttribute *`,
         // which corresponds to `[*]const MlirNamedAttribute` in Zig. The previous
         // type `[*]*MlirAttribute` was incorrect and the root cause of the attribute bug.
-        attributes: [*]const MlirNamedAttribute,
+        // Made optional to support null when count is 0.
+        attributes: ?[*]const MlirNamedAttribute,
         enableResultTypeInference: bool,
     };
 

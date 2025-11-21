@@ -142,16 +142,16 @@ pub const Context = struct {
         const Self = @This();
         
         /// Create an operation from an operation state
-        pub fn create(ctx: Context, op_name: []const u8, args: struct {
+        /// UPDATED: Now accepts an allocator
+        pub fn create(allocator: std.mem.Allocator, ctx: Context, op_name: []const u8, args: struct {
             operands: []const Value = &.{},
             results: []const Type = &.{},
             attributes: []const struct { []const u8, Attribute } = &.{},
             location: ?Location = null,
-        }) Self {
+        }) !Self {
             const loc = args.location orelse Location.unknown(ctx);
             const op_name_ref = c.c.stringRefFromString(op_name);
 
-            // MANUAL STATE INITIALIZATION
             var state: c.c.MlirOperationState = undefined;
             state.name = op_name_ref;
             state.location = loc.handle;
@@ -162,13 +162,18 @@ pub const Context = struct {
             state.nAttributes = 0; state.attributes = null;
             state.enableResultTypeInference = false;
 
-            const allocator = std.heap.c_allocator;
-
-            // Populate Operands
+            // Use provided allocator for temporary arrays
             var operand_handles: ?[]*c.c.MlirValue = null;
             defer if (operand_handles) |h| allocator.free(h);
+
+            var result_handles: ?[]*c.c.MlirType = null;
+            defer if (result_handles) |h| allocator.free(h);
+
+            var attr_handles: ?[]c.c.MlirNamedAttribute = null;
+            defer if (attr_handles) |h| allocator.free(h);
+
             if (args.operands.len > 0) {
-                operand_handles = allocator.alloc(*c.c.MlirValue, args.operands.len) catch unreachable;
+                operand_handles = try allocator.alloc(*c.c.MlirValue, args.operands.len);
                 for (args.operands, 0..) |operand, i| {
                     operand_handles.?[i] = operand.handle;
                 }
@@ -176,11 +181,8 @@ pub const Context = struct {
                 state.operands = operand_handles.?.ptr;
             }
 
-            // Populate Results
-            var result_handles: ?[]*c.c.MlirType = null;
-            defer if (result_handles) |h| allocator.free(h);
             if (args.results.len > 0) {
-                result_handles = allocator.alloc(*c.c.MlirType, args.results.len) catch unreachable;
+                result_handles = try allocator.alloc(*c.c.MlirType, args.results.len);
                 for (args.results, 0..) |result_type, i| {
                     result_handles.?[i] = result_type.handle;
                 }
@@ -188,11 +190,8 @@ pub const Context = struct {
                 state.results = result_handles.?.ptr;
             }
 
-            // Populate Attributes
-            var attr_handles: ?[]c.c.MlirNamedAttribute = null;
-            defer if (attr_handles) |h| allocator.free(h);
             if (args.attributes.len > 0) {
-                attr_handles = allocator.alloc(c.c.MlirNamedAttribute, args.attributes.len) catch unreachable;
+                attr_handles = try allocator.alloc(c.c.MlirNamedAttribute, args.attributes.len);
                 for (args.attributes, 0..) |attr_pair, i| {
                     const name_str = c.c.stringRefFromString(attr_pair[0]);
                     const name_id = c.c.mlirIdentifierGet(ctx.handle, name_str);
@@ -447,18 +446,17 @@ pub const Context = struct {
         }
         
         /// Create a function type with given inputs and results
-        pub fn functionType(context: Context, inputs: []const Type, results: []const Type) Self {
-            // SYSTEMIC FIX: Use direct allocation instead of ArrayList
-            const allocator = std.heap.c_allocator;
-
-            var input_handles = allocator.alloc(*c.c.MlirType, inputs.len) catch unreachable;
+        /// UPDATED: Now accepts an allocator for temporary C-API array construction
+        pub fn functionType(allocator: std.mem.Allocator, context: Context, inputs: []const Type, results: []const Type) !Self {
+            // Use the provided allocator (safe Zig GPA) instead of c_allocator
+            var input_handles = try allocator.alloc(*c.c.MlirType, inputs.len);
             defer allocator.free(input_handles);
 
             for (inputs, 0..) |input, i| {
                 input_handles[i] = input.handle;
             }
 
-            var result_handles = allocator.alloc(*c.c.MlirType, results.len) catch unreachable;
+            var result_handles = try allocator.alloc(*c.c.MlirType, results.len);
             defer allocator.free(result_handles);
 
             for (results, 0..) |result, i| {

@@ -109,12 +109,12 @@ pub const MLIRBuilder = struct {
     /// Create a constant tensor from host data - for tensor creation
     pub fn createConstant(self: *Self, host_data: []const u8, mlir_type: mlir.Type, shape: tensor.Shape) !mlir.Value {
         _ = shape; // Will be used later for validation
-        
+
         // Create dense elements attribute from host data
         const attr = mlir.Attribute.denseElementsAttr(self.ctx, mlir_type, host_data);
 
-        // Create the constant operation with proper attributes
-        const constant_op = mlir.Operation.create(self.ctx, "stablehlo.constant", .{
+        // Pass self.allocator to Operation.create
+        const constant_op = try mlir.Operation.create(self.allocator, self.ctx, "stablehlo.constant", .{
             .attributes = &.{.{ "value", attr }},
             .results = &.{mlir_type},
             .location = self.loc,
@@ -122,14 +122,14 @@ pub const MLIRBuilder = struct {
 
         // Use the robust "create and append" pattern
         self.insertion_block.appendOwnedOperation(constant_op);
-        
+
         // Return the result value
         return constant_op.getResult(0);
     }
 
     /// Create a generic operation using the MLIR C API
     pub fn createOp(self: *Self, op_name: []const u8, operands: []const mlir.Value, result_type: mlir.Type) !mlir.Operation {
-        return mlir.Operation.create(self.ctx, op_name, .{
+        return mlir.Operation.create(self.allocator, self.ctx, op_name, .{
             .operands = operands,
             .results = &.{result_type},
             .location = self.loc,
@@ -148,7 +148,8 @@ pub const MLIRBuilder = struct {
     ) !mlir.Operation {
         std.debug.print("DEBUG: createAndAttach entering for {s}\n", .{op_name});
 
-        const op = mlir.Operation.create(self.ctx, op_name, .{
+        // Pass self.allocator to Operation.create
+        const op = try mlir.Operation.create(self.allocator, self.ctx, op_name, .{
             .operands = operands,
             .results = result_types,
             .attributes = options.attributes,
@@ -197,21 +198,18 @@ pub const MLIRBuilder = struct {
         state.results = null;
         state.nOperands = 0;
         state.operands = null;
-        state.nRegions = 0;
-        state.regions = null;
         state.nSuccessors = 0;
         state.successors = null;
-        state.nAttributes = 0;
-        state.attributes = null;
         state.enableResultTypeInference = false;
 
-        // STACK ALLOCATION for attributes
+        // STACK ALLOCATION for attributes (Size is fixed at 2)
         const func_type_attr = mlir.Attribute.typeAttr(func_type);
         const sym_name_attr = mlir.Attribute.stringAttr(self.ctx, name);
 
         const func_type_id = c.mlirIdentifierGet(self.ctx.handle, c.stringRefFromString("function_type"));
         const sym_name_id = c.mlirIdentifierGet(self.ctx.handle, c.stringRefFromString("sym_name"));
 
+        // Create array on stack. No allocator needed.
         const attr_handles = [_]c.MlirNamedAttribute{
             .{ .name = func_type_id, .attribute = func_type_attr.handle },
             .{ .name = sym_name_id, .attribute = sym_name_attr.handle },
@@ -221,15 +219,17 @@ pub const MLIRBuilder = struct {
         state.nAttributes = 2;
         state.attributes = &attr_handles;
 
-        // STACK ALLOCATION for regions
+        // STACK ALLOCATION for regions (Size is fixed at 1)
         const region = c.mlirRegionCreate();
-        var regions = [_]*c.MlirRegion{region};
+        // Create array on stack
+        const regions = [_]*c.MlirRegion{region};
 
         // Direct assignment
         state.nRegions = 1;
         state.regions = &regions;
 
         // Create Operation
+        // The C API copies the arrays, so stack allocation is safe.
         const func_op_handle = c.mlirOperationCreate(&state);
         const func_op = mlir.Operation{ .handle = func_op_handle };
 
@@ -290,7 +290,7 @@ fn broadcastTensors(builder: *MLIRBuilder, a: Tensor, b: Tensor) !struct { Tenso
             try broadcast_dims.append(@intCast(i + rank_diff));
         }
 
-        const op = hlo.broadcast_in_dim(builder.ctx, a.value, target_shape, broadcast_dims.items, builder.loc);
+        const op = try hlo.broadcast_in_dim(builder.allocator, builder.ctx, a.value, target_shape, broadcast_dims.items, builder.loc);
         builder.insertion_block.appendOwnedOperation(op);  // <-- FIX: Append the broadcast op
         a_broadcasted = try builder.newTensor(op.getResult(0));
     }
@@ -305,7 +305,7 @@ fn broadcastTensors(builder: *MLIRBuilder, a: Tensor, b: Tensor) !struct { Tenso
             try broadcast_dims.append(@intCast(i + rank_diff));
         }
 
-        const op = hlo.broadcast_in_dim(builder.ctx, b.value, target_shape, broadcast_dims.items, builder.loc);
+        const op = try hlo.broadcast_in_dim(builder.allocator, builder.ctx, b.value, target_shape, broadcast_dims.items, builder.loc);
         builder.insertion_block.appendOwnedOperation(op);  // <-- FIX: Append the broadcast op
         b_broadcasted = try builder.newTensor(op.getResult(0));
     }
@@ -316,9 +316,9 @@ fn broadcastTensors(builder: *MLIRBuilder, a: Tensor, b: Tensor) !struct { Tenso
 /// Add two tensors element-wise using stablehlo.add with broadcasting support
 pub fn add(builder: *MLIRBuilder, a: Tensor, b: Tensor) !Tensor {
     const b_tensors = try broadcastTensors(builder, a, b);
-    
+
     // Use StableHLO dialect wrapper for clean operation creation
-    const operation = hlo.add(builder.ctx, b_tensors[0].value, b_tensors[1].value, builder.loc);
+    const operation = try hlo.add(builder.allocator, builder.ctx, b_tensors[0].value, b_tensors[1].value, builder.loc);
 
     // MUST use the helper that appends the operation
     return try builder.createAndAppendOp(operation);
@@ -327,9 +327,9 @@ pub fn add(builder: *MLIRBuilder, a: Tensor, b: Tensor) !Tensor {
 /// Subtract two tensors element-wise using stablehlo.subtract with broadcasting support
 pub fn subtract(builder: *MLIRBuilder, a: Tensor, b: Tensor) !Tensor {
     const b_tensors = try broadcastTensors(builder, a, b);
-    
+
     // Use StableHLO dialect wrapper for clean operation creation
-    const operation = hlo.subtract(builder.ctx, b_tensors[0].value, b_tensors[1].value, builder.loc);
+    const operation = try hlo.subtract(builder.allocator, builder.ctx, b_tensors[0].value, b_tensors[1].value, builder.loc);
 
     // MUST use the helper that appends the operation
     return try builder.createAndAppendOp(operation);
@@ -338,9 +338,9 @@ pub fn subtract(builder: *MLIRBuilder, a: Tensor, b: Tensor) !Tensor {
 /// Multiply two tensors element-wise using stablehlo.multiply with broadcasting support
 pub fn multiply(builder: *MLIRBuilder, a: Tensor, b: Tensor) !Tensor {
     const b_tensors = try broadcastTensors(builder, a, b);
-    
+
     // Use StableHLO dialect wrapper for clean operation creation
-    const operation = hlo.multiply(builder.ctx, b_tensors[0].value, b_tensors[1].value, builder.loc);
+    const operation = try hlo.multiply(builder.allocator, builder.ctx, b_tensors[0].value, b_tensors[1].value, builder.loc);
 
     // CRITICAL FIX: Use helper to append and return tensor
     return try builder.createAndAppendOp(operation);
@@ -490,7 +490,7 @@ pub fn transpose(builder: *MLIRBuilder, a: Tensor, permutation: []const i64) !Te
 /// Reshape a tensor using stablehlo.reshape
 pub fn reshape(builder: *MLIRBuilder, a: Tensor, new_shape: []const i64) !Tensor {
     // Use StableHLO dialect wrapper
-    const operation = hlo.reshape(builder.ctx, a.value, new_shape, builder.loc);
+    const operation = try hlo.reshape(builder.allocator, builder.ctx, a.value, new_shape, builder.loc);
 
     // MUST use the helper that appends the operation
     return try builder.createAndAppendOp(operation);
@@ -828,10 +828,10 @@ pub fn constant(builder: *MLIRBuilder, value: f64, shape: []const i64, element_t
     @memset(data, f_val);
     
     const host_data = std.mem.sliceAsBytes(data);
-    
+
     const attr = mlir.Attribute.denseElementsAttr(builder.ctx, tensor_type, host_data);
-    
-    const constant_op = hlo.constant(builder.ctx, .{
+
+    const constant_op = try hlo.constant(builder.allocator, builder.ctx, .{
         .value = attr,
         .result_type = tensor_type,
     });

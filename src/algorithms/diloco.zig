@@ -573,7 +573,7 @@ pub const DiLoCo = struct {
         // Add the loss type (the single output of the forward function)
         try main_output_types.append(forward_fn_type.getResult(0));
 
-        const main_func_type = mlir.Type.functionType(builder.ctx, main_input_types.items, main_output_types.items);
+        const main_func_type = try mlir.Type.functionType(builder.allocator, builder.ctx, main_input_types.items, main_output_types.items);
 
         // 4.2: Create the 'main' function
         const main_result = try builder.createFunction("main", main_func_type);

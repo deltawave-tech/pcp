@@ -227,8 +227,8 @@ fn buildDemoTrainingModule(builder: *ops.MLIRBuilder, description: []const u8) !
     // Create forward+loss function
     const forward_input_types = [_]mlir.Type{ params_type, data_type, data_type };
     const forward_result_types = [_]mlir.Type{loss_type};
-    const forward_func_type = mlir.Type.functionType(builder.ctx, &forward_input_types, &forward_result_types);
-    
+    const forward_func_type = try mlir.Type.functionType(builder.allocator, builder.ctx, &forward_input_types, &forward_result_types);
+
     const forward_result = try builder.createFunction("forward_and_loss_fn", forward_func_type);
     const forward_func = forward_result.func_op;
     const forward_block = forward_result.entry_block;

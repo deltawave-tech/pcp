@@ -481,9 +481,9 @@ fn matmulVJP(
         .lhs_batching_dimensions = batch_dims.items,
         .rhs_batching_dimensions = batch_dims.items,
         .lhs_contracting_dimensions = &.{@intCast(grad_rank - 1)}, // Last dim of grad_out (N)
-        .rhs_contracting_dimensions = &.{@intCast(b_rank - 1)},    // Last dim of B (N) 
+        .rhs_contracting_dimensions = &.{@intCast(b_rank - 1)},    // Last dim of B (N)
     };
-    const grad_a_op = hlo.dot_general(builder.ctx, grad_out, b, .{ .dot_dimension_numbers = grad_a_dot_dims });
+    const grad_a_op = try hlo.dot_general(builder.allocator, builder.ctx, grad_out, b, .{ .dot_dimension_numbers = grad_a_dot_dims });
     builder.insertion_block.appendOwnedOperation(grad_a_op);
     try result.append(grad_a_op.getResult(0));
     
@@ -495,7 +495,7 @@ fn matmulVJP(
         .lhs_contracting_dimensions = &.{@intCast(a_rank - 2)},    // Second-to-last dim of A (M)
         .rhs_contracting_dimensions = &.{@intCast(grad_rank - 2)}, // Second-to-last dim of grad_out (M)
     };
-    const grad_b_op = hlo.dot_general(builder.ctx, a, grad_out, .{ .dot_dimension_numbers = grad_b_dot_dims });
+    const grad_b_op = try hlo.dot_general(builder.allocator, builder.ctx, a, grad_out, .{ .dot_dimension_numbers = grad_b_dot_dims });
     builder.insertion_block.appendOwnedOperation(grad_b_op);
     try result.append(grad_b_op.getResult(0));
     
@@ -644,8 +644,8 @@ fn gatherVJP(
         const shape = try ranked_type.getShape(builder.allocator);
         defer builder.allocator.free(shape);
         const element_type = ranked_type.getElementType();
-        
-        const zero_constant_op = hlo.zeroConstant(builder.ctx, shape, element_type);
+
+        const zero_constant_op = try hlo.zeroConstant(builder.allocator, builder.ctx, shape, element_type);
         builder.insertion_block.appendOwnedOperation(zero_constant_op);
         const zero_tensor = zero_constant_op;
         
@@ -657,8 +657,8 @@ fn gatherVJP(
             .scatter_dims_to_operand_dims = &[_]i64{0}, // scatter to dimension 0
             .index_vector_dim = 1, // index vector is along dimension 1
         };
-        
-        const scatter_op = hlo.scatter(builder.ctx, zero_tensor.getResult(0), start_indices, grad_out, scatter_dim_numbers, builder.loc);
+
+        const scatter_op = try hlo.scatter(builder.allocator, builder.ctx, zero_tensor.getResult(0), start_indices, grad_out, scatter_dim_numbers, builder.loc);
         try result.append(scatter_op.getResult(0));
     }
     
@@ -734,12 +734,12 @@ fn sliceVJP(
         @memset(interior_padding, 0);
 
         // Create a scalar zero for the padding value
-        const zero_scalar_op = hlo.scalarConstant(builder.ctx, 0.0, input_type.getElementType());
+        const zero_scalar_op = try hlo.scalarConstant(builder.allocator, builder.ctx, 0.0, input_type.getElementType());
         builder.insertion_block.appendOwnedOperation(zero_scalar_op);
         const zero_scalar = zero_scalar_op.getResult(0);
 
         // Create the hlo.pad operation to expand grad_out back to input shape
-        const pad_op = hlo.pad(builder.ctx, grad_out, zero_scalar, start_indices, padding_high, interior_padding, builder.loc);
+        const pad_op = try hlo.pad(builder.allocator, builder.ctx, grad_out, zero_scalar, start_indices, padding_high, interior_padding, builder.loc);
         builder.insertion_block.appendOwnedOperation(pad_op);
 
         try result.append(pad_op.getResult(0));
@@ -847,7 +847,8 @@ fn createGradientFunction(builder: *MLIRBuilder, forward_fn: mlir.Operation, nam
         try output_types.append(arg.getType());
     }
 
-    const function_type = mlir.Type.functionType(builder.ctx, input_types.items, output_types.items);
+    // UPDATE: Pass builder.allocator to functionType
+    const function_type = try mlir.Type.functionType(builder.allocator, builder.ctx, input_types.items, output_types.items);
 
     // SAFE REFACTOR: Delegate to builder.createFunction
     // This uses the already-fixed, robust manual initialization logic in ops.zig

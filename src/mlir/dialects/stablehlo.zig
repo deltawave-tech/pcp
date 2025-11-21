@@ -8,8 +8,8 @@ const mlir = @import("../../mlir.zig");
 // --- Operation Builders for the StableHLO Dialect ---
 
 /// Creates a stablehlo.add operation for element-wise addition
-pub fn add(ctx: mlir.Context, lhs: mlir.Value, rhs: mlir.Value, loc: mlir.Location) mlir.Operation {
-    return mlir.Operation.create(ctx, "stablehlo.add", .{
+pub fn add(allocator: std.mem.Allocator, ctx: mlir.Context, lhs: mlir.Value, rhs: mlir.Value, loc: mlir.Location) !mlir.Operation {
+    return mlir.Operation.create(allocator, ctx, "stablehlo.add", .{
         .operands = &.{ lhs, rhs },
         .results = &.{lhs.getType()}, // Result type is same as broadcasted inputs
         .location = loc,
@@ -17,8 +17,8 @@ pub fn add(ctx: mlir.Context, lhs: mlir.Value, rhs: mlir.Value, loc: mlir.Locati
 }
 
 /// Creates a stablehlo.subtract operation for element-wise subtraction
-pub fn subtract(ctx: mlir.Context, lhs: mlir.Value, rhs: mlir.Value, loc: mlir.Location) mlir.Operation {
-    return mlir.Operation.create(ctx, "stablehlo.subtract", .{
+pub fn subtract(allocator: std.mem.Allocator, ctx: mlir.Context, lhs: mlir.Value, rhs: mlir.Value, loc: mlir.Location) !mlir.Operation {
+    return mlir.Operation.create(allocator, ctx, "stablehlo.subtract", .{
         .operands = &.{ lhs, rhs },
         .results = &.{lhs.getType()},
         .location = loc,
@@ -26,8 +26,8 @@ pub fn subtract(ctx: mlir.Context, lhs: mlir.Value, rhs: mlir.Value, loc: mlir.L
 }
 
 /// Creates a stablehlo.multiply operation for element-wise multiplication
-pub fn multiply(ctx: mlir.Context, lhs: mlir.Value, rhs: mlir.Value, loc: mlir.Location) mlir.Operation {
-    return mlir.Operation.create(ctx, "stablehlo.multiply", .{
+pub fn multiply(allocator: std.mem.Allocator, ctx: mlir.Context, lhs: mlir.Value, rhs: mlir.Value, loc: mlir.Location) !mlir.Operation {
+    return mlir.Operation.create(allocator, ctx, "stablehlo.multiply", .{
         .operands = &.{ lhs, rhs },
         .results = &.{lhs.getType()},
         .location = loc,
@@ -53,11 +53,11 @@ pub fn negate(ctx: mlir.Context, operand: mlir.Value, loc: mlir.Location) mlir.O
 }
 
 /// Creates a stablehlo.constant operation
-pub fn constant(ctx: mlir.Context, args: struct {
+pub fn constant(allocator: std.mem.Allocator, ctx: mlir.Context, args: struct {
     value: mlir.Attribute,
     result_type: mlir.Type,
-}) mlir.Operation {
-    return mlir.Operation.create(ctx, "stablehlo.constant", .{
+}) !mlir.Operation {
+    return mlir.Operation.create(allocator, ctx, "stablehlo.constant", .{
         .attributes = &.{.{ "value", args.value }},
         .results = &.{args.result_type},
         .location = mlir.Location.unknown(ctx), // Constants often have an unknown location
@@ -65,10 +65,10 @@ pub fn constant(ctx: mlir.Context, args: struct {
 }
 
 /// Creates a zero constant tensor
-pub fn zeroConstant(ctx: mlir.Context, shape: []const i64, element_type: mlir.Type) mlir.Operation {
+pub fn zeroConstant(allocator: std.mem.Allocator, ctx: mlir.Context, shape: []const i64, element_type: mlir.Type) !mlir.Operation {
     const tensor_type = mlir.Type.rankedTensorType(ctx, shape, element_type);
     const zero_attr = mlir.Attribute.denseElementsAttrSplat(tensor_type, 0.0);
-    return constant(ctx, .{
+    return constant(allocator, ctx, .{
         .value = zero_attr,
         .result_type = tensor_type,
     });
@@ -211,7 +211,7 @@ pub fn reduce_sum(
     // 2. Create the zero constant for init_value using centralized denseElementsAttrSplat
     const scalar_type = mlir.Type.tensor(&.{}, element_type);
     const zero_attr = mlir.Attribute.denseElementsAttrSplat(scalar_type, 0.0);
-    const init_constant_op = constant(ctx, .{ .value = zero_attr, .result_type = scalar_type });
+    const init_constant_op = try constant(allocator, ctx, .{ .value = zero_attr, .result_type = scalar_type });
 
     // FIX: Attach the constant op to the graph before using its result.
     // This resolves the <<UNKNOWN SSA VALUE>> error.
@@ -226,9 +226,9 @@ pub fn reduce_sum(
     // 4. Add arguments and the 'add' operation to the body
     const lhs_arg = body_block.addArgument(scalar_type, loc);
     const rhs_arg = body_block.addArgument(scalar_type, loc);
-    const add_op = add(ctx, lhs_arg, rhs_arg, loc);
+    const add_op = try add(allocator, ctx, lhs_arg, rhs_arg, loc);
     c_api.blockAppendOwnedOperation(body_block.handle, add_op.handle);
-    const return_op = mlir.Operation.create(ctx, "stablehlo.return", .{ .operands = &.{add_op.getResult(0)} });
+    const return_op = try mlir.Operation.create(allocator, ctx, "stablehlo.return", .{ .operands = &.{add_op.getResult(0)} });
     c_api.blockAppendOwnedOperation(body_block.handle, return_op.handle);
     
     // 5. Build the final stablehlo.reduce operation state
@@ -408,13 +408,14 @@ pub const DotDimensionNumbersAttribute = struct {
 /// Creates a stablehlo.dot_general operation for matrix multiplication
 /// This is the most complex operation due to its attributes
 pub fn dot_general(
+    allocator: std.mem.Allocator,
     ctx: mlir.Context,
     lhs: mlir.Value,
     rhs: mlir.Value,
     args: struct {
         dot_dimension_numbers: DotDimensionNumbersAttribute,
     },
-) mlir.Operation {
+) !mlir.Operation {
     const lhs_type = lhs.getType().as(mlir.RankedTensorType).?;
     const rhs_type = rhs.getType().as(mlir.RankedTensorType).?;
 
@@ -475,8 +476,8 @@ pub fn dot_general(
     const result_type = mlir.Type.tensor(result_dims.items, lhs_type.getElementType());
 
     const dot_dim_attr = args.dot_dimension_numbers.asAttr(ctx);
-    
-    return mlir.Operation.create(ctx, "stablehlo.dot_general", .{
+
+    return mlir.Operation.create(allocator, ctx, "stablehlo.dot_general", .{
         .operands = &.{ lhs, rhs },
         .results = &.{result_type},
         .attributes = &.{.{ "dot_dimension_numbers", dot_dim_attr }},
@@ -485,11 +486,11 @@ pub fn dot_general(
 }
 
 /// Creates a stablehlo.reshape operation
-pub fn reshape(ctx: mlir.Context, operand: mlir.Value, result_shape: []const i64, loc: mlir.Location) mlir.Operation {
+pub fn reshape(allocator: std.mem.Allocator, ctx: mlir.Context, operand: mlir.Value, result_shape: []const i64, loc: mlir.Location) !mlir.Operation {
     const input_type = operand.getType().as(mlir.RankedTensorType).?;
     const result_type = mlir.Type.tensor(result_shape, input_type.getElementType());
-    
-    return mlir.Operation.create(ctx, "stablehlo.reshape", .{
+
+    return mlir.Operation.create(allocator, ctx, "stablehlo.reshape", .{
         .operands = &.{operand},
         .results = &.{result_type},
         .location = loc,
@@ -497,12 +498,12 @@ pub fn reshape(ctx: mlir.Context, operand: mlir.Value, result_shape: []const i64
 }
 
 /// Creates a stablehlo.broadcast_in_dim operation
-pub fn broadcast_in_dim(ctx: mlir.Context, operand: mlir.Value, result_shape: []const i64, broadcast_dimensions: []const i64, loc: mlir.Location) mlir.Operation {
+pub fn broadcast_in_dim(allocator: std.mem.Allocator, ctx: mlir.Context, operand: mlir.Value, result_shape: []const i64, broadcast_dimensions: []const i64, loc: mlir.Location) !mlir.Operation {
     const input_type = operand.getType().as(mlir.RankedTensorType).?;
     const result_type = mlir.Type.tensor(result_shape, input_type.getElementType());
     const broadcast_dims_attr = mlir.Attribute.denseI64ArrayAttr(ctx, broadcast_dimensions);
-    
-    return mlir.Operation.create(ctx, "stablehlo.broadcast_in_dim", .{
+
+    return mlir.Operation.create(allocator, ctx, "stablehlo.broadcast_in_dim", .{
         .operands = &.{operand},
         .results = &.{result_type},
         .attributes = &.{.{ "broadcast_dimensions", broadcast_dims_attr }},
@@ -587,11 +588,11 @@ pub fn reduce(ctx: mlir.Context, operand: mlir.Value, init_value: mlir.Value, di
 /// Utility functions for creating common constants
 
 /// Create a scalar constant
-pub fn scalarConstant(ctx: mlir.Context, value: f64, element_type: mlir.Type) mlir.Operation {
+pub fn scalarConstant(allocator: std.mem.Allocator, ctx: mlir.Context, value: f64, element_type: mlir.Type) !mlir.Operation {
     const scalar_type = mlir.Type.tensor(&.{}, element_type); // Scalar tensor (rank 0)
     const attr = mlir.Attribute.denseElementsAttrSplat(scalar_type, value);
-    
-    return constant(ctx, .{
+
+    return constant(allocator, ctx, .{
         .value = attr,
         .result_type = scalar_type,
     });
@@ -921,19 +922,20 @@ pub const ScatterDimensionNumbersAttribute = struct {
 /// Creates a stablehlo.scatter operation for gradient backpropagation.
 /// This is the inverse of gather - it takes updates and indices and scatters them into a larger tensor.
 pub fn scatter(
+    allocator: std.mem.Allocator,
     ctx: mlir.Context,
     operand: mlir.Value, // The tensor to scatter into (e.g., shape [vocab_size, n_embd])
     scatter_indices: mlir.Value, // The indices to scatter at (e.g., shape [batch, seq_len])
     updates: mlir.Value, // The values to scatter (e.g., shape [batch, seq_len, n_embd])
     dimension_numbers: ScatterDimensionNumbersAttribute,
     loc: mlir.Location,
-) mlir.Operation {
+) !mlir.Operation {
     const dim_numbers_attr = dimension_numbers.asAttr(ctx);
 
     // Result type is the same as the operand type
     const result_type = operand.getType();
 
-    return mlir.Operation.create(ctx, "stablehlo.scatter", .{
+    return mlir.Operation.create(allocator, ctx, "stablehlo.scatter", .{
         .operands = &.{ operand, scatter_indices, updates },
         .results = &.{result_type},
         .attributes = &.{
@@ -945,6 +947,7 @@ pub fn scatter(
 
 /// Creates a stablehlo.pad operation
 pub fn pad(
+    allocator: std.mem.Allocator,
     ctx: mlir.Context,
     operand: mlir.Value,
     padding_value: mlir.Value,
@@ -952,7 +955,7 @@ pub fn pad(
     padding_high: []const i64,
     interior_padding: []const i64,
     loc: mlir.Location
-) mlir.Operation {
+) !mlir.Operation {
     const padding_low_attr = mlir.Attribute.denseI64ArrayAttr(ctx, padding_low);
     const padding_high_attr = mlir.Attribute.denseI64ArrayAttr(ctx, padding_high);
     const interior_padding_attr = mlir.Attribute.denseI64ArrayAttr(ctx, interior_padding);
@@ -973,12 +976,12 @@ pub fn pad(
 
     const result_type = mlir.Type.rankedTensorType(ctx, result_shape.items, operand_type.getElementType());
 
-    return mlir.Operation.create(ctx, "stablehlo.pad", .{
+    return mlir.Operation.create(allocator, ctx, "stablehlo.pad", .{
         .operands = &.{ operand, padding_value },
         .results = &.{result_type},
         .attributes = &.{
-            .{ "edge_padding_low", padding_low_attr }, 
-            .{ "edge_padding_high", padding_high_attr }, 
+            .{ "edge_padding_low", padding_low_attr },
+            .{ "edge_padding_high", padding_high_attr },
             .{ "interior_padding", interior_padding_attr }
         },
         .location = loc,

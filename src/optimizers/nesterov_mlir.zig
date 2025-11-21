@@ -70,7 +70,7 @@ pub fn NesterovMLIR(comptime T: type) type {
             // Initialize velocity to zeros with same shape as params
             const params_dims = try params.shape.getDims(self.builder.allocator);
             defer self.builder.allocator.free(params_dims);
-            const zero_op = hlo.zeroConstant(self.builder.ctx, params_dims, self.element_type);
+            const zero_op = try hlo.zeroConstant(self.builder.allocator, self.builder.ctx, params_dims, self.element_type);
             self.velocity = try self.builder.newTensor(zero_op.getResult(0));
         }
 

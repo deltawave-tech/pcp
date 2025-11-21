@@ -150,40 +150,39 @@ pub const Context = struct {
         }) Self {
             const loc = args.location orelse Location.unknown(ctx);
 
+            // 1. Initialize State
             var state = c.c.operationStateGet(op_name, loc.handle);
 
-            // Use ArrayLists to hold data alive until operationCreate
-            var operand_handles = std.ArrayList(*c.c.MlirValue).init(std.heap.page_allocator);
-            defer operand_handles.deinit();
-
-            var result_handles = std.ArrayList(*c.c.MlirType).init(std.heap.page_allocator);
-            defer result_handles.deinit();
-
-            var named_attrs = std.ArrayList(c.c.MlirNamedAttribute).init(std.heap.page_allocator);
-            defer named_attrs.deinit();
-
-            // Add operands
+            // 2. Add Operands
             if (args.operands.len > 0) {
+                // Create a temporary array of MlirValue pointers
+                var operand_handles = std.ArrayList(*c.c.MlirValue).init(std.heap.page_allocator);
+                defer operand_handles.deinit();
+
                 for (args.operands) |operand| {
                     operand_handles.append(operand.handle) catch unreachable;
                 }
-                // Set fields directly to avoid ABI issues
-                state.nOperands = @intCast(operand_handles.items.len);
-                state.operands = operand_handles.items.ptr;
+
+                c.c.mlirOperationStateAddOperands(&state, @intCast(operand_handles.items.len), operand_handles.items.ptr);
             }
 
-            // Add results
+            // 3. Add Results
             if (args.results.len > 0) {
+                var result_handles = std.ArrayList(*c.c.MlirType).init(std.heap.page_allocator);
+                defer result_handles.deinit();
+
                 for (args.results) |result_type| {
                     result_handles.append(result_type.handle) catch unreachable;
                 }
-                // Set fields directly
-                state.nResults = @intCast(result_handles.items.len);
-                state.results = result_handles.items.ptr;
+
+                c.c.mlirOperationStateAddResults(&state, @intCast(result_handles.items.len), result_handles.items.ptr);
             }
 
-            // Add attributes
+            // 4. Add Attributes
             if (args.attributes.len > 0) {
+                var named_attrs = std.ArrayList(c.c.MlirNamedAttribute).init(std.heap.page_allocator);
+                defer named_attrs.deinit();
+
                 for (args.attributes) |attr_pair| {
                     const name_id = c.c.identifierGet(ctx.handle, attr_pair[0]);
                     const named_attr = c.c.MlirNamedAttribute{
@@ -192,11 +191,11 @@ pub const Context = struct {
                     };
                     named_attrs.append(named_attr) catch unreachable;
                 }
-                // Set fields directly
-                state.nAttributes = @intCast(named_attrs.items.len);
-                state.attributes = named_attrs.items.ptr;
+
+                c.c.mlirOperationStateAddAttributes(&state, @intCast(named_attrs.items.len), named_attrs.items.ptr);
             }
 
+            // 5. Create Operation
             const handle = c.c.operationCreate(&state);
             return Self{ .handle = handle };
         }

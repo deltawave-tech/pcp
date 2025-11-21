@@ -204,18 +204,15 @@ pub const MLIRBuilder = struct {
         try named_attrs.append(.{ .name = func_type_id, .attribute = func_type_attr.handle });
         try named_attrs.append(.{ .name = sym_name_id, .attribute = sym_name_attr.handle });
 
-        // FIX: Manually set state fields instead of using helper to avoid potential ABI/SmallVector issues.
-        state.nAttributes = @intCast(named_attrs.items.len);
-        state.attributes = named_attrs.items.ptr;
+        // FIX: Use helper function instead of manual field assignment
+        c.mlirOperationStateAddAttributes(&state, @intCast(named_attrs.items.len), named_attrs.items.ptr);
 
         // 3. Region
         const region = c.regionCreate();
 
-        // FIX: Create an explicit array of regions and set state fields directly
-        var regions = [_]*c.MlirRegion{ region };
-
-        state.nRegions = 1;
-        state.regions = &regions;
+        // FIX: Use helper function for regions
+        var regions = [_]*c.MlirRegion{region};
+        c.mlirOperationStateAddOwnedRegions(&state, 1, &regions);
 
         // 4. Create Operation
         const func_op_handle = c.operationCreate(&state);

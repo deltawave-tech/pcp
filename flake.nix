@@ -24,7 +24,7 @@
         pkgsLLVM = if pkgs.stdenv.isLinux then pkgs.pkgsLLVM else pkgs;
         # The actual LLVM package we are using for building.
         llvmPkg = pkgsLLVM.llvmPackages_21;
-        zls = pkgs.zlspkgs.zls;
+        zls = pkgs.zls;
         # Patch mlir to also contain mlir-pdll
         mlirPkg = llvmPkg.mlir.overrideAttrs (old: {
           postInstall = (old.postInstall or "") + ''
@@ -34,14 +34,6 @@
 
         overlays = [
           (final: prev: {
-            zigpkgs = inputs.zig-overlay.packages.${prev.system};
-            zlspkgs = let orig = zls.packages.${prev.system};
-            in orig // {
-              zls = orig.zls.overrideAttrs (old: {
-                doCheck =
-                  false; # Disable tests to bypass failures (likely due to emulation timeouts or env issues)
-              });
-            };
             # Provide a newer version of claude
             claude-code = prev.claude-code.overrideAttrs (old: rec {
               version = "2.0.36";
@@ -80,7 +72,6 @@
           nativeBuildInputs = [
             llvmPkg.libllvm.dev
             mlirPkg.dev
-            packages.stablehlo.dev
             pkgs.zig
             pkgs.pkg-config
             llvmPkg.lld
@@ -92,7 +83,6 @@
           buildInputs = [
             llvmPkg.libcxx
             llvmPkg.clang-tools
-            packages.stablehlo
             llvmPkg.libllvm
             mlirPkg
             pkgs.capnproto

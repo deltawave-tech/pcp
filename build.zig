@@ -549,8 +549,8 @@ pub fn build(b: *std.Build) void {
         if (capnp_config.lib_dir) |lib_dir| {
             capnp_bridge_lib.addLibraryPath(.{ .cwd_relative = lib_dir });
         }
-        capnp_bridge_lib.linkSystemLibrary("capnp");
-        capnp_bridge_lib.linkSystemLibrary("kj");
+        // Note: Don't link capnp/kj here - static libraries should only contain object files.
+        // The final executable (main_distributed) will link these libraries.
 
         // Add include paths for the main executable
         main_distributed.addIncludePath(b.path("src/network"));

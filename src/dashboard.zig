@@ -51,7 +51,7 @@ pub const Dashboard = struct {
         std.debug.print("\x1b[?1049l\x1b[?25h", .{});
     }
     
-    /// Check for quit key (simplified - just runs for a fixed time for demo)
+    /// Check for quit key (simplified)
     fn checkForQuit(self: *Self) bool {
         _ = self;
         // For now, just return false - in a real implementation, this would check stdin
@@ -113,7 +113,6 @@ pub const Dashboard = struct {
         
         // Instructions
         std.debug.print("\x1b[37mPress Ctrl+C to quit | Updates every 500ms\x1b[0m\n", .{});
-        std.debug.print("\x1b[33mNote: Dashboard runs for 30 seconds in demo mode\x1b[0m\n", .{});
     }
     
     /// Draw a simple bordered box with title
@@ -240,11 +239,8 @@ pub fn runDashboard() !void {
     std.debug.print("\x1b[?25l", .{}); // Hide cursor
     defer std.debug.print("\x1b[?25h", .{}); // Restore cursor at end
 
-    // Run for 30 seconds in demo mode (since we don't have full input handling)
-    const start_time = std.time.timestamp();
-    const demo_duration = 30; // seconds
-
-    while (std.time.timestamp() - start_time < demo_duration) {
+    // Run continuously (Ctrl+C to quit)
+    while (true) {
         // Get current metrics
         const metrics = monitoring.getMetrics();
 
@@ -258,6 +254,4 @@ pub fn runDashboard() !void {
         // Don't burn CPU, refresh every 500ms
         std.time.sleep(500 * std.time.ns_per_ms);
     }
-
-    std.debug.print("\x1b[2J\x1b[H\x1b[32mDashboard demo completed!\x1b[0m\n", .{});
 }

@@ -15,7 +15,6 @@ const shepherd = @import("controllers/shepherd.zig");
 const worker = @import("worker.zig");
 
 // Backend implementations
-const demo_backend = @import("backends/demo.zig");
 const iree_backend = @import("backends/iree.zig");
 
 // NEW: Necessary imports for HostExecutor
@@ -36,7 +35,6 @@ pub const Backend = enum {
     vulkan,
     rocm,
     cpu,
-    demo,
 
     /// Automatically select the best backend for the current platform
     pub fn selectDefault() Backend {
@@ -55,7 +53,6 @@ pub const Backend = enum {
             .vulkan => "vulkan",
             .rocm => "rocm",
             .cpu => "cpu",
-            .demo => "demo",
         };
     }
 
@@ -67,7 +64,6 @@ pub const Backend = enum {
             .vulkan => "vulkan",
             .rocm => "rocm",
             .cpu => "local-sync", // IREE's CPU runtime driver name
-            .demo => "local-sync", // Use CPU for demo
         };
     }
 
@@ -79,7 +75,6 @@ pub const Backend = enum {
             .vulkan => "vulkan-spirv",
             .rocm => "rocm",
             .cpu => "llvm-cpu", // IREE's CPU compilation target
-            .demo => "llvm-cpu", // Use CPU for demo
         };
     }
 };
@@ -186,40 +181,21 @@ const HostExecutor = struct {
 /// Create an Executor for the specified backend
 /// NOTE: This function is now primarily for Shepherd execution
 pub fn createExecutor(allocator: Allocator, backend: Backend) !Executor {
-    return switch (backend) {
-        .demo => blk: {
-            // Demo backend for simulated execution
-            const demo = try demo_backend.DemoBackend.init(allocator);
-            std.log.info("Demo backend initialized", .{});
-            break :blk demo.asExecutor();
-        },
-        .metal, .cuda, .cpu, .vulkan, .rocm => {
-            // For hardware backends, the Shepherd acts as a Host Orchestrator.
-            // It needs a valid MLIR Context to build the graph, but it delegates
-            // heavy execution to Workers. It performs light execution (updates) on CPU.
-            std.log.info("Initializing Host Executor for {s} backend orchestration", .{backend.toString()});
-            const host_exec = try HostExecutor.init(allocator);
-            return host_exec.asExecutor();
-        },
-    };
+    _ = backend;
+    // For hardware backends, the Shepherd acts as a Host Orchestrator.
+    // It needs a valid MLIR Context to build the graph, but it delegates
+    // heavy execution to Workers. It performs light execution (updates) on CPU.
+    std.log.info("Initializing Host Executor for backend orchestration", .{});
+    const host_exec = try HostExecutor.init(allocator);
+    return host_exec.asExecutor();
 }
 
 /// Create a WorkerBackend for the specified backend
 pub fn createWorkerBackend(allocator: Allocator, backend: Backend) !WorkerBackend {
-    return switch (backend) {
-        .metal, .cuda, .vulkan, .rocm, .cpu => blk: {
-            // Use IREE backend for all hardware accelerators
-            std.log.info("Using IREE backend for {s} execution", .{backend.toString()});
-            const iree = try iree_backend.IreeBackend.init(allocator, backend);
-            break :blk iree.asWorkerBackend();
-        },
-        .demo => blk: {
-            // Demo backend for demonstration purposes
-            std.log.info("Using demo worker backend for simulated execution", .{});
-            const demo = try demo_backend.DemoBackend.init(allocator);
-            break :blk demo.asWorkerBackend();
-        },
-    };
+    // Use IREE backend for all hardware accelerators
+    std.log.info("Using IREE backend for {s} execution", .{backend.toString()});
+    const iree = try iree_backend.IreeBackend.init(allocator, backend);
+    return iree.asWorkerBackend();
 }
 
 /// Initialize a complete distributed training system with the specified backend
@@ -233,21 +209,9 @@ pub const DistributedTrainingSystem = struct {
 
     /// Initialize the distributed training system
     pub fn init(allocator: Allocator, backend: Backend) !Self {
-        return initWithDemo(allocator, backend, false);
-    }
+        std.log.info("Initializing distributed training system with {s} backend", .{backend.toString()});
 
-    /// Initialize the distributed training system with optional demo mode
-    pub fn initWithDemo(allocator: Allocator, preferred_backend: Backend, demo_execution: bool) !Self {
-        const backend = if (demo_execution) Backend.demo else preferred_backend;
-
-        std.log.info("Initializing distributed training system with {} backend{s}", .{
-            backend,
-            if (demo_execution) " (demo mode)" else ""
-        });
-
-        // Create the executor for algorithms
-        // If real backend, this returns HostExecutor (Context + CPU IREE).
-        // If demo backend, this returns DemoBackend (Simulation).
+        // Create the executor for algorithms (returns HostExecutor with Context + CPU IREE)
         const executor = try createExecutor(allocator, backend);
 
         // Initialize the shepherd coordinator
@@ -337,8 +301,8 @@ pub fn testBackendSelection(allocator: Allocator) !void {
     const default_backend = Backend.selectDefault();
     std.log.info("Default backend for this platform: {}", .{default_backend});
 
-    // Test system initialization with demo backend
-    var system = try DistributedTrainingSystem.init(allocator, .demo);
+    // Test system initialization with CPU backend
+    var system = try DistributedTrainingSystem.init(allocator, .cpu);
     defer system.deinit();
 
     std.log.info("✓ Backend selection test completed");

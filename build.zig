@@ -590,25 +590,6 @@ pub fn build(b: *std.Build) void {
     run_main_distributed_step.dependOn(&run_main_distributed_cmd.step);
     std.debug.print("==> run-distributed step registered successfully\n", .{});
 
-    // Demo-only executable (no MLIR/StableHLO dependencies)
-    const demo_exe = b.addExecutable(.{
-        .name = "pcp_demo",
-        .root_source_file = b.path("src/main_distributed_demo.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-
-    b.installArtifact(demo_exe);
-
-    const run_demo_cmd = b.addRunArtifact(demo_exe);
-    if (b.args) |args| {
-        run_demo_cmd.addArgs(args);
-    }
-    run_demo_cmd.step.dependOn(&demo_exe.step);
-
-    const run_demo_step = b.step("run-demo", "Run the demo distributed training system (no MLIR)");
-    run_demo_step.dependOn(&run_demo_cmd.step);
-
     // Data pipeline test executable
     const data_pipeline_test = b.addExecutable(.{
         .name = "data_pipeline_test",
@@ -629,31 +610,6 @@ pub fn build(b: *std.Build) void {
 
     const run_data_pipeline_test_step = b.step("test-data-pipeline", "Run the data pipeline tests");
     run_data_pipeline_test_step.dependOn(&run_data_pipeline_test_cmd.step);
-
-    // GPT-2 model graph construction test executable
-    const gpt2_model_test = b.addExecutable(.{
-        .name = "gpt2_model_test",
-        .root_source_file = b.path("src/examples/gpt2_model_test.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-
-    // Add module dependencies for GPT-2 model test
-    gpt2_model_test.root_module.addImport("pcp", pcp_module);
-
-    // IREE dependencies
-    addIreeDependencies(gpt2_model_test, b, iree_config); // REFACTORED
-
-
-    // Install the executable
-    //b.installArtifact(gpt2_model_test);
-
-    // Run step for GPT-2 model test
-    const run_gpt2_model_test_cmd = b.addRunArtifact(gpt2_model_test);
-    run_gpt2_model_test_cmd.step.dependOn(&gpt2_model_test.step);
-
-    const run_gpt2_model_test_step = b.step("run-gpt2-model-test", "Run the GPT-2 model graph construction test");
-    run_gpt2_model_test_step.dependOn(&run_gpt2_model_test_cmd.step);
 
     // Isolated VJP Tests - Numerical verification of core autodiff rules
     const isolated_vjp_tests = b.addExecutable(.{
@@ -700,28 +656,4 @@ pub fn build(b: *std.Build) void {
 
     const run_mlir_optimizer_tests_step = b.step("run-mlir-optimizer-tests", "Run MLIR optimizer numerical verification tests");
     run_mlir_optimizer_tests_step.dependOn(&run_mlir_optimizer_tests_cmd.step);
-
-    // Distributed Nano-Transformer Training Demo
-    const distributed_transformer_test = b.addExecutable(.{
-        .name = "distributed_transformer_test",
-        .root_source_file = b.path("src/examples/distributed_transformer_test.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-
-    // Add module dependencies
-    distributed_transformer_test.root_module.addImport("pcp", pcp_module);
-
-    // IREE dependencies
-    addIreeDependencies(distributed_transformer_test, b, iree_config); // REFACTORED
-
-    // Cap'n Proto dependencies
-    addCapnpDependencies(distributed_transformer_test, b, capnp_config);
-
-    // Run step for distributed transformer test
-    const run_distributed_transformer_test_cmd = b.addRunArtifact(distributed_transformer_test);
-    run_distributed_transformer_test_cmd.step.dependOn(&distributed_transformer_test.step);
-
-    const run_distributed_transformer_test_step = b.step("run-distributed-transformer-demo", "Run distributed nano-transformer training demo");
-    run_distributed_transformer_test_step.dependOn(&run_distributed_transformer_test_cmd.step);
 }

@@ -11,7 +11,6 @@ pub const mlir_ctx = @import("mlir_ctx.zig");
 pub const backend_selection = @import("backend_selection.zig");
 pub const backends = struct {
     pub const iree = @import("backends/iree.zig");
-    pub const demo = @import("backends/demo.zig");
 };
 
 // Data loading and processing
@@ -28,7 +27,6 @@ pub const algorithms = struct {
 
 // Models
 pub const models = struct {
-    pub const gpt2 = @import("models/gpt2.zig");
 };
 
 // Legacy systems (will be phased out)

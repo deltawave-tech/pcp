@@ -29,7 +29,6 @@ const Args = struct {
     host: []const u8,
     port: u16,
     workers: usize,
-    demo_execution: bool,
     model_path: ?[]const u8,
 
     const Mode = enum {
@@ -44,7 +43,6 @@ const Args = struct {
                 .host = "127.0.0.1",
                 .port = 8080,
                 .workers = 2,
-                .demo_execution = false,
                 .model_path = null,
             };
         }
@@ -53,7 +51,6 @@ const Args = struct {
         var host: []const u8 = "127.0.0.1";
         var port: u16 = 8080;
         var workers: usize = 2;
-        var demo_execution: bool = false;
         var model_path: ?[]const u8 = null;
 
         var i: usize = 1;
@@ -90,8 +87,6 @@ const Args = struct {
                         host = connect_str;
                     }
                 }
-            } else if (std.mem.eql(u8, args[i], "--demo-execution")) {
-                demo_execution = true;
             } else if (std.mem.eql(u8, args[i], "--model")) {
                 i += 1;
                 if (i < args.len) {
@@ -106,7 +101,6 @@ const Args = struct {
             .host = host,
             .port = port,
             .workers = workers,
-            .demo_execution = demo_execution,
             .model_path = model_path,
         };
     }
@@ -121,7 +115,6 @@ const Args = struct {
         print("  --port <port>        Port to bind/connect to (default: 8080)\n", .{});
         print("  --workers <count>    Number of workers to wait for (default: 2)\n", .{});
         print("  --model <path>       Path to MLIR model file (Shepherd only)\n", .{});
-        print("  --demo-execution     Use simulated execution for demonstration\n", .{});
         print("  --help               Show this help message\n", .{});
     }
 };
@@ -135,14 +128,13 @@ fn runShepherd(allocator: Allocator, args: Args) !void {
     print("   Waiting for {} workers\n", .{args.workers});
 
     // Determine backend based on platform (A100 = Linux = CUDA)
-    const backend = if (args.demo_execution) backend_selection.Backend.demo else backend_selection.Backend.selectDefault();
+    const backend = backend_selection.Backend.selectDefault();
     print("   Backend: {s}\n", .{backend.toString()});
 
     // Initialize system
-    var system = try backend_selection.DistributedTrainingSystem.initWithDemo(
+    var system = try backend_selection.DistributedTrainingSystem.init(
         allocator,
-        backend,
-        args.demo_execution
+        backend
     );
     defer system.deinit();
 
@@ -209,7 +201,7 @@ fn runWorker(allocator: Allocator, args: Args) !void {
     print("🐉 Starting Worker...\n", .{});
     print("   Connecting to: {s}:{}\n", .{ args.host, args.port });
 
-    const backend = if (args.demo_execution) backend_selection.Backend.demo else backend_selection.Backend.selectDefault();
+    const backend = backend_selection.Backend.selectDefault();
     print("   Backend: {s}\n", .{backend.toString()});
 
     const worker_backend_instance = try backend_selection.createWorkerBackend(allocator, backend);

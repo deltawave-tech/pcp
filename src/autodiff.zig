@@ -499,7 +499,12 @@ fn reduceGradient(builder: *MLIRBuilder, grad: mlir.Value, target_shape: mlir.Va
     const grad_tensor = try builder.newTensor(grad);
     const reduced_tensor = try ops.reduceSum(builder, grad_tensor, reduce_dims.items, false);
 
-    return reduced_tensor.value;
+    // After reduction, reshape to match target shape exactly
+    const target_element_type = target_type.getElementType();
+    const result_type = mlir.Type.rankedTensorType(builder.ctx, target_shape_arr, target_element_type);
+    const reshape_op = try builder.createAndAttach("stablehlo.reshape", &.{reduced_tensor.value}, &.{result_type}, .{});
+
+    return reshape_op.getResult(0);
 }
 
 fn divideVJP(
@@ -889,16 +894,26 @@ fn gatherVJP(
     );
     std.debug.print("DEBUG gatherVJP: One-hot created, rank={}\n", .{one_hot.shape.rank()});
 
-    // Flatten one_hot to [N, Vocab] where N is product of all dims except last
+    // Get one-hot shape - this determines N (number of index lookups)
     const one_hot_type = one_hot.value.getType().as(mlir.RankedTensorType) orelse return error.InvalidTensorType;
     const one_hot_shape = try one_hot_type.getShape(builder.allocator);
     defer builder.allocator.free(one_hot_shape);
+
+    // Flatten one-hot to [N, Vocab] where N is product of all dims except last (vocab dim)
     var n_dims: i64 = 1;
     for (0..(one_hot_shape.len - 1)) |i| {
         n_dims *= one_hot_shape[i];
     }
     const vocab_dim = one_hot_shape[one_hot_shape.len - 1];
 
+    std.debug.print("DEBUG gatherVJP: One-hot shape: {any}, n_dims={}\n", .{one_hot_shape, n_dims});
+
+    // Get grad_out shape
+    const grad_out_shape = try grad_out_type.getShape(builder.allocator);
+    defer builder.allocator.free(grad_out_shape);
+    const embed_dim = grad_out_shape[grad_out_shape.len - 1];
+
+    // Flatten one_hot to [N, Vocab]
     const one_hot_flat_shape = [_]i64{ n_dims, vocab_dim };
     const one_hot_flat_type = mlir.Type.rankedTensorType(
         builder.ctx,
@@ -908,22 +923,52 @@ fn gatherVJP(
     const one_hot_flat_op = try builder.createAndAttach("stablehlo.reshape", &.{one_hot.value}, &.{one_hot_flat_type}, .{});
     const one_hot_flat = one_hot_flat_op.getResult(0);
 
-    // grad_out should be reshaped to [N, Embed] where N matches one_hot's N
-    // Since one_hot was created from indices, N should be the product of indices shape
-    const grad_out_shape = try grad_out_type.getShape(builder.allocator);
-    defer builder.allocator.free(grad_out_shape);
+    // Calculate total elements in grad_out
+    var grad_out_elements: i64 = 1;
+    for (grad_out_shape) |dim| {
+        grad_out_elements *= dim;
+    }
+    const expected_elements = n_dims * embed_dim;
 
-    const embed_dim = grad_out_shape[grad_out_shape.len - 1];
+    std.debug.print("DEBUG gatherVJP: grad_out has {} elements, need {} for [N={}, Embed={}]\n", .{grad_out_elements, expected_elements, n_dims, embed_dim});
 
-    // grad_out should be [n_dims, embed_dim] to match one_hot's [n_dims, vocab_dim]
-    const grad_out_flat_shape = [_]i64{ n_dims, embed_dim };
-    const grad_out_flat_type = mlir.Type.rankedTensorType(
-        builder.ctx,
-        &grad_out_flat_shape,
-        grad_out_type.getElementType()
-    );
-    const grad_out_flat_op = try builder.createAndAttach("stablehlo.reshape", &.{grad_out}, &.{grad_out_flat_type}, .{});
-    const grad_out_flat = grad_out_flat_op.getResult(0);
+    // If grad_out has fewer elements than expected, broadcast/reshape appropriately
+    const grad_out_flat: mlir.Value = if (grad_out_elements == expected_elements) blk: {
+        // Can directly reshape
+        const grad_out_flat_shape = [_]i64{ n_dims, embed_dim };
+        const grad_out_flat_type = mlir.Type.rankedTensorType(
+            builder.ctx,
+            &grad_out_flat_shape,
+            grad_out_type.getElementType()
+        );
+        const grad_out_flat_op = try builder.createAndAttach("stablehlo.reshape", &.{grad_out}, &.{grad_out_flat_type}, .{});
+        break :blk grad_out_flat_op.getResult(0);
+    } else blk2: {
+        // Need to broadcast grad_out to match n_dims
+        // First reshape grad_out to flatten all but last dim
+        var grad_n: i64 = 1;
+        for (0..(grad_out_shape.len - 1)) |i| {
+            grad_n *= grad_out_shape[i];
+        }
+
+        std.debug.print("DEBUG gatherVJP: Broadcasting grad_out from [{}, {}] to [{}, {}]\n", .{grad_n, embed_dim, n_dims, embed_dim});
+
+        // Broadcast to match n_dims
+        const broadcast_shape = [_]i64{ n_dims, embed_dim };
+
+        // Calculate broadcast dimensions
+        const broadcast_dims = [_]i64{0, 1}; // Broadcast along first two dimensions
+        const broadcast_op = try hlo.broadcast_in_dim(
+            builder.allocator,
+            builder.ctx,
+            grad_out,
+            &broadcast_shape,
+            &broadcast_dims,
+            builder.loc
+        );
+        builder.insertion_block.appendOwnedOperation(broadcast_op);
+        break :blk2 broadcast_op.getResult(0);
+    };
 
     std.debug.print("DEBUG gatherVJP: Flattened shapes - one_hot: [{}, {}], grad_out: [{}, {}]\n", .{n_dims, vocab_dim, n_dims, embed_dim});
 

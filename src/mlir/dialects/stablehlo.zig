@@ -1048,8 +1048,34 @@ pub fn scatter(
     c_api.blockAppendOwnedOperation(body_block.handle, return_op.handle);
 
     // Build the scatter operation using pcpCreateOperation
-    const dim_numbers_attr = dimension_numbers.asAttr(ctx);
     const result_type = operand.getType();
+
+    // Build the string for #stablehlo.scatter<...> like gather does
+    var str_buf = std.ArrayList(u8).init(std.heap.page_allocator);
+    defer str_buf.deinit();
+
+    str_buf.appendSlice("#stablehlo.scatter<update_window_dims = [") catch @panic("OOM");
+    for (dimension_numbers.update_window_dims, 0..) |d, i| {
+        if (i > 0) str_buf.appendSlice(", ") catch @panic("OOM");
+        std.fmt.format(str_buf.writer(), "{}", .{d}) catch @panic("OOM");
+    }
+    str_buf.appendSlice("], inserted_window_dims = [") catch @panic("OOM");
+    for (dimension_numbers.inserted_window_dims, 0..) |d, i| {
+        if (i > 0) str_buf.appendSlice(", ") catch @panic("OOM");
+        std.fmt.format(str_buf.writer(), "{}", .{d}) catch @panic("OOM");
+    }
+    str_buf.appendSlice("], scatter_dims_to_operand_dims = [") catch @panic("OOM");
+    for (dimension_numbers.scatter_dims_to_operand_dims, 0..) |d, i| {
+        if (i > 0) str_buf.appendSlice(", ") catch @panic("OOM");
+        std.fmt.format(str_buf.writer(), "{}", .{d}) catch @panic("OOM");
+    }
+    str_buf.appendSlice("], index_vector_dim = ") catch @panic("OOM");
+    std.fmt.format(str_buf.writer(), "{}", .{dimension_numbers.index_vector_dim}) catch @panic("OOM");
+    str_buf.appendSlice(">") catch @panic("OOM");
+
+    const str_ref = c_api.MlirStringRef{ .data = str_buf.items.ptr, .length = str_buf.items.len };
+    const dim_numbers_attr_handle = c_api.mlirAttributeParseGet(ctx.handle, str_ref);
+    const dim_numbers_attr = mlir.Attribute{ .handle = dim_numbers_attr_handle };
 
     var operands = [_]c_api.MlirValue{ operand.handle, scatter_indices.handle, updates.handle };
     var results = [_]c_api.MlirType{ result_type.handle };
@@ -1057,8 +1083,15 @@ pub fn scatter(
 
     const scatter_dim_numbers_ref = c_api.stringRefFromString("scatter_dimension_numbers");
     const scatter_dim_numbers_id = c_api.identifierGet(ctx.handle, scatter_dim_numbers_ref);
+
+    // Add indices_are_sorted attribute like gather does
+    const indices_are_sorted_ref = c_api.stringRefFromString("indices_are_sorted");
+    const sorted_id = c_api.identifierGet(ctx.handle, indices_are_sorted_ref);
+    const sorted_attr = mlir.Attribute.boolAttr(ctx, false);
+
     var named_attrs = [_]c_api.MlirNamedAttribute{
-        .{ .name = scatter_dim_numbers_id, .attribute = dim_numbers_attr.handle }
+        .{ .name = scatter_dim_numbers_id, .attribute = dim_numbers_attr.handle },
+        .{ .name = sorted_id, .attribute = sorted_attr.handle },
     };
 
     const name_ref = c_api.stringRefFromString("stablehlo.scatter");
@@ -1068,7 +1101,7 @@ pub fn scatter(
         .results = &results,
         .nOperands = 3,
         .operands = &operands,
-        .nAttributes = 1,
+        .nAttributes = 2,
         .attributes = &named_attrs,
         .nRegions = 1,
         .regions = &regions,

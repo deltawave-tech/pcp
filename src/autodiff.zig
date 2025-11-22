@@ -650,17 +650,49 @@ fn gatherVJP(
         const zero_constant_op = try hlo.zeroConstant(builder.allocator, builder.ctx, shape, element_type);
         builder.insertion_block.appendOwnedOperation(zero_constant_op);
         const zero_tensor = zero_constant_op;
-        
+
+        // Get shapes to determine if we need to reshape
+        const indices_type = start_indices.getType().as(mlir.RankedTensorType) orelse return error.InvalidTensorType;
+        const grad_out_type = grad_out.getType().as(mlir.RankedTensorType) orelse return error.InvalidTensorType;
+        const indices_shape = try indices_type.getShape(builder.allocator);
+        defer builder.allocator.free(indices_shape);
+        const grad_out_shape = try grad_out_type.getShape(builder.allocator);
+        defer builder.allocator.free(grad_out_shape);
+
+        // Determine the expected updates shape for scatter
+        // With index_vector_dim = 2 and indices [1, 8], they expand to [1, 8, 1]
+        // Expected updates shape: [batch_dims..., update_window_dims...] = [1, 8, n_embd]
+        const expected_updates_rank = indices_shape.len + 1; // [1, 8, n_embd] = rank 3
+
+        // Reshape grad_out if necessary to match expected updates shape
+        var reshaped_grad_out = grad_out;
+        if (grad_out_type.getRank() != expected_updates_rank) {
+            // Need to reshape from [seq_len, n_embd] to [batch, seq_len, n_embd]
+            var expected_shape = std.ArrayList(i64).init(builder.allocator);
+            defer expected_shape.deinit();
+
+            // Add batch dimensions from indices
+            for (indices_shape) |dim| {
+                try expected_shape.append(dim);
+            }
+            // Add embedding dimension from grad_out
+            try expected_shape.append(grad_out_shape[grad_out_shape.len - 1]);
+
+            const reshape_op = try hlo.reshape(builder.allocator, builder.ctx, grad_out, expected_shape.items, builder.loc);
+            builder.insertion_block.appendOwnedOperation(reshape_op);
+            reshaped_grad_out = reshape_op.getResult(0);
+        }
+
         // Use proper stablehlo.scatter operation with dimension numbers
-        // For embedding lookup, we typically scatter back to dimension 0
+        // For embedding lookup, scatter must match gather's dimension numbers
         const scatter_dim_numbers = hlo.ScatterDimensionNumbersAttribute{
-            .update_window_dims = &[_]i64{2}, // n_embd dimension
-            .inserted_window_dims = &[_]i64{0}, // vocab_size dimension
-            .scatter_dims_to_operand_dims = &[_]i64{0}, // scatter to dimension 0
-            .index_vector_dim = 1, // index vector is along dimension 1
+            .update_window_dims = &[_]i64{2}, // n_embd dimension at position 2
+            .inserted_window_dims = &[_]i64{0}, // vocab_size dimension doesn't appear in updates
+            .scatter_dims_to_operand_dims = &[_]i64{0}, // indices map to dimension 0 of operand
+            .index_vector_dim = 2, // index vector is at dimension 2 (trailing dim of indices)
         };
 
-        const scatter_op = try hlo.scatter(builder.allocator, builder.ctx, zero_tensor.getResult(0), start_indices, grad_out, scatter_dim_numbers, builder.loc);
+        const scatter_op = try hlo.scatter(builder.allocator, builder.ctx, zero_tensor.getResult(0), start_indices, reshaped_grad_out, scatter_dim_numbers, builder.loc);
         builder.insertion_block.appendOwnedOperation(scatter_op);
         try result.append(scatter_op.getResult(0));
     }

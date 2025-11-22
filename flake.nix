@@ -126,8 +126,6 @@
             # https://iree.dev/building-from-source/getting-started/#configuration-settings
             (lib.cmakeFeature "CMAKE_BUILD_TYPE" "RelWithDebInfo")
             (lib.cmakeFeature "CMAKE_AR" "ar")
-            (lib.cmakeFeature "CMAKE_C_COMPILER" "clang")
-            (lib.cmakeFeature "CMAKE_CXX_COMPILER" "clang++")
 
             (lib.cmakeBool "IREE_ENABLE_ASSERTIONS" true)
             (lib.cmakeBool "IREE_ENABLE_SPLIT_DWARF" true)

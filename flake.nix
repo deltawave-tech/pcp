@@ -118,7 +118,8 @@
             hash = "sha256-G7fPelraUhiXc/rJSr7J2OAaVSLggvghsSAoaGuGrxc=";
             fetchSubmodules = true;
           };
-          nativeBuildInputs = [ pkgs.cmake pkgs.ninja pkgs.python3 ];
+          nativeBuildInputs =
+            [ pkgs.cmake pkgs.ninja pkgs.python3 pkgs.bintools ];
           propagatedBuildInputs = [ llvmPkg.lld llvmPkg.libllvm ];
           buildInputs = [ pkgs.gtest ];
           cmakeFlags = [

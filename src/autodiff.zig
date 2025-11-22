@@ -112,7 +112,7 @@ fn broadcastToShape(builder: *MLIRBuilder, value: mlir.Value, target_shape: []co
     var broadcast_dims = std.ArrayList(i64).init(builder.allocator);
     defer broadcast_dims.deinit();
 
-    // Align from the right
+    // Align from the right (NumPy broadcasting semantics)
     const rank_diff = target_shape.len - value_shape.len;
     for (0..value_shape.len) |i| {
         try broadcast_dims.append(@intCast(rank_diff + i));
@@ -1509,30 +1509,4 @@ fn selectVJP(builder: *MLIRBuilder, original_op: mlir.Operation, primals: []cons
     try result.append(grad_true.getResult(0));
     try result.append(grad_false.getResult(0));
     return result.toOwnedSlice();
-}
-
-/// Test function for MLIR autodiff
-pub fn testMLIRAutoDiff(allocator: Allocator) !void {
-    std.debug.print("\n=== Testing MLIR Automatic Differentiation ===\n", .{});
-    
-    // Create MLIR context for this test
-    var ctx = try mlir.Context.init();
-    defer ctx.deinit();
-    c.mlirContextSetAllowUnregisteredDialects(ctx.handle, true);
-    
-    // Create MLIR builder
-    var builder = try MLIRBuilder.init(allocator, ctx);
-    defer builder.deinit();
-    
-    // Create autodiff system
-    _ = AutoDiff.init(allocator, &builder);
-    
-    std.debug.print("✓ AutoDiff system initialized\n", .{});
-    
-    // In a real test, we would:
-    // 1. Build a forward function with StableHLO ops
-    // 2. Call autodiff.grad() to get gradient function
-    // 3. Verify the gradient graph is correct
-    
-    std.debug.print("✓ MLIR autodiff test completed\n", .{});
 }

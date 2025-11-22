@@ -443,7 +443,17 @@ pub const Context = struct {
             }
             return null;
         }
-        
+
+        /// Check if this type is an integer type
+        pub fn isInteger(self: Self) bool {
+            return c.c.typeIsAInteger(self.handle);
+        }
+
+        /// Check if this type is an index type
+        pub fn isIndex(self: Self) bool {
+            return c.c.typeIsAIndex(self.handle);
+        }
+
         /// Create a function type with given inputs and results
         /// UPDATED: Now accepts an allocator for temporary C-API array construction
         pub fn functionType(allocator: std.mem.Allocator, context: Context, inputs: []const Type, results: []const Type) !Self {
@@ -513,10 +523,16 @@ pub const Context = struct {
         }
         
         /// Create a dense elements attribute by "splatting" a single value across all elements
-        pub fn denseElementsAttrSplat(shaped_type: Type, value: f64) Self {
+        /// This version takes an attribute (e.g., integer attribute) as the element
+        pub fn denseElementsAttrSplat(shaped_type: Type, element: Self) Self {
+            return Self{ .handle = c.c.mlirDenseElementsAttrSplatGet(shaped_type.handle, element.handle) };
+        }
+
+        /// Create a dense elements attribute by "splatting" a float value across all elements
+        pub fn denseElementsAttrFloatSplat(shaped_type: Type, value: f64) Self {
             return Self{ .handle = c.c.mlirDenseElementsAttrFloatSplatGet(shaped_type.handle, @floatCast(value)) };
         }
-        
+
         /// Create a dictionary attribute from named attributes.
         pub fn dictionary(context: Context, named_attrs: []const c.c.MlirNamedAttribute) Self {
             return Self{ .handle = c.c.dictionaryAttrGet(context.handle, @intCast(named_attrs.len), named_attrs.ptr) };

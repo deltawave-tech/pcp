@@ -233,6 +233,10 @@ pub const c = struct {
     pub const typeIsARankedTensor = mlir_c.mlirTypeIsARankedTensor;
     pub const mlirTypeIsAFunction = mlir_c.mlirTypeIsAFunction;
     pub const typeIsAFunction = mlir_c.mlirTypeIsAFunction;
+    pub const mlirTypeIsAInteger = mlir_c.mlirTypeIsAInteger;
+    pub const typeIsAInteger = mlir_c.mlirTypeIsAInteger;
+    pub const mlirTypeIsAIndex = mlir_c.mlirTypeIsAIndex;
+    pub const typeIsAIndex = mlir_c.mlirTypeIsAIndex;
 
     pub const mlirValueGetType = mlir_c.mlirValueGetType;
     pub const valueGetType = mlir_c.mlirValueGetType;

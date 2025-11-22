@@ -806,28 +806,25 @@ pub fn oneHot(builder: *MLIRBuilder, indices: Tensor, depth: i64, on_value: f64,
 /// This is now the single source of truth for creating constants.
 pub fn constant(builder: *MLIRBuilder, value: f64, shape: []const i64, element_type: mlir.Type) !Tensor {
     const tensor_type = mlir.Type.rankedTensorType(builder.ctx, shape, element_type);
-    
-    // Compute element count
-    var elem_count: usize = 1;
-    for (shape) |dim| {
-        elem_count *= @intCast(dim);
-    }
-    
-    // Assume f32 for now (extend for other types as needed) 
-    const f_val: f32 = @floatCast(value);
-    const data = try builder.allocator.alloc(f32, elem_count);
-    defer builder.allocator.free(data);
-    @memset(data, f_val);
-    
-    const host_data = std.mem.sliceAsBytes(data);
 
-    const attr = mlir.Attribute.denseElementsAttr(builder.ctx, tensor_type, host_data);
+    var attr: mlir.Attribute = undefined;
+
+    if (element_type.isInteger() or element_type.isIndex()) {
+        // Handle Integer/Index types
+        const i_val: i64 = @intFromFloat(value);
+        const element_attr = mlir.Attribute.integerAttr(builder.ctx, i_val, element_type);
+        attr = mlir.Attribute.denseElementsAttrSplat(tensor_type, element_attr);
+    } else {
+        // Handle Float types
+        // Use the specific FloatSplat for floats to ensure correct bit representation
+        attr = mlir.Attribute.denseElementsAttrFloatSplat(tensor_type, value);
+    }
 
     const constant_op = try hlo.constant(builder.allocator, builder.ctx, .{
         .value = attr,
         .result_type = tensor_type,
     });
-    
+
     return builder.createAndAppendOp(constant_op);
 }
 

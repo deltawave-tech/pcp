@@ -67,7 +67,15 @@ pub fn constant(allocator: std.mem.Allocator, ctx: mlir.Context, args: struct {
 /// Creates a zero constant tensor
 pub fn zeroConstant(allocator: std.mem.Allocator, ctx: mlir.Context, shape: []const i64, element_type: mlir.Type) !mlir.Operation {
     const tensor_type = mlir.Type.rankedTensorType(ctx, shape, element_type);
-    const zero_attr = mlir.Attribute.denseElementsAttrSplat(tensor_type, 0.0);
+
+    var zero_attr: mlir.Attribute = undefined;
+    if (element_type.isInteger() or element_type.isIndex()) {
+        const zero_val = mlir.Attribute.integerAttr(ctx, 0, element_type);
+        zero_attr = mlir.Attribute.denseElementsAttrSplat(tensor_type, zero_val);
+    } else {
+        zero_attr = mlir.Attribute.denseElementsAttrFloatSplat(tensor_type, 0.0);
+    }
+
     return constant(allocator, ctx, .{
         .value = zero_attr,
         .result_type = tensor_type,
@@ -222,9 +230,15 @@ pub fn reduce_sum(
     }
     const result_type = mlir.Type.rankedTensorType(ctx, result_shape_list.items, element_type);
 
-    // 2. Create the zero constant for init_value using centralized denseElementsAttrSplat
+    // 2. Create the zero constant for init_value using type-aware attribute creation
     const scalar_type = mlir.Type.tensor(&.{}, element_type);
-    const zero_attr = mlir.Attribute.denseElementsAttrSplat(scalar_type, 0.0);
+    var zero_attr: mlir.Attribute = undefined;
+    if (element_type.isInteger() or element_type.isIndex()) {
+        const zero_val = mlir.Attribute.integerAttr(ctx, 0, element_type);
+        zero_attr = mlir.Attribute.denseElementsAttrSplat(scalar_type, zero_val);
+    } else {
+        zero_attr = mlir.Attribute.denseElementsAttrFloatSplat(scalar_type, 0.0);
+    }
     const init_constant_op = try constant(allocator, ctx, .{ .value = zero_attr, .result_type = scalar_type });
 
     // FIX: Attach the constant op to the graph before using its result.
@@ -630,7 +644,15 @@ pub fn reduce(ctx: mlir.Context, operand: mlir.Value, init_value: mlir.Value, di
 /// Create a scalar constant
 pub fn scalarConstant(allocator: std.mem.Allocator, ctx: mlir.Context, value: f64, element_type: mlir.Type) !mlir.Operation {
     const scalar_type = mlir.Type.tensor(&.{}, element_type); // Scalar tensor (rank 0)
-    const attr = mlir.Attribute.denseElementsAttrSplat(scalar_type, value);
+
+    var attr: mlir.Attribute = undefined;
+    if (element_type.isInteger() or element_type.isIndex()) {
+        const i_val: i64 = @intFromFloat(value);
+        const val_attr = mlir.Attribute.integerAttr(ctx, i_val, element_type);
+        attr = mlir.Attribute.denseElementsAttrSplat(scalar_type, val_attr);
+    } else {
+        attr = mlir.Attribute.denseElementsAttrFloatSplat(scalar_type, value);
+    }
 
     return constant(allocator, ctx, .{
         .value = attr,
@@ -641,23 +663,41 @@ pub fn scalarConstant(allocator: std.mem.Allocator, ctx: mlir.Context, value: f6
 /// Create a zero constant of given shape and type (renamed to avoid duplicate)
 pub fn zeroTensor(ctx: mlir.Context, shape: []const i64, element_type: mlir.Type) mlir.Operation {
     const tensor_type = mlir.Type.tensor(shape, element_type);
-    const attr = mlir.Attribute.denseElementsAttrSplat(tensor_type, 0.0);
-    
-    return constant(ctx, .{
+
+    var attr: mlir.Attribute = undefined;
+    if (element_type.isInteger() or element_type.isIndex()) {
+        const zero_val = mlir.Attribute.integerAttr(ctx, 0, element_type);
+        attr = mlir.Attribute.denseElementsAttrSplat(tensor_type, zero_val);
+    } else {
+        attr = mlir.Attribute.denseElementsAttrFloatSplat(tensor_type, 0.0);
+    }
+
+    const constant_op = constant(std.heap.page_allocator, ctx, .{
         .value = attr,
         .result_type = tensor_type,
-    });
+    }) catch @panic("Failed to create zeroTensor");
+
+    return constant_op;
 }
 
 /// Create a ones constant of given shape and type
 pub fn onesConstant(ctx: mlir.Context, shape: []const i64, element_type: mlir.Type) mlir.Operation {
     const tensor_type = mlir.Type.tensor(shape, element_type);
-    const attr = mlir.Attribute.denseElementsAttrSplat(tensor_type, 1.0);
-    
-    return constant(ctx, .{
+
+    var attr: mlir.Attribute = undefined;
+    if (element_type.isInteger() or element_type.isIndex()) {
+        const one_val = mlir.Attribute.integerAttr(ctx, 1, element_type);
+        attr = mlir.Attribute.denseElementsAttrSplat(tensor_type, one_val);
+    } else {
+        attr = mlir.Attribute.denseElementsAttrFloatSplat(tensor_type, 1.0);
+    }
+
+    const constant_op = constant(std.heap.page_allocator, ctx, .{
         .value = attr,
         .result_type = tensor_type,
-    });
+    }) catch @panic("Failed to create onesConstant");
+
+    return constant_op;
 }
 
 /// Creates a stablehlo.rsqrt operation (reciprocal square root)

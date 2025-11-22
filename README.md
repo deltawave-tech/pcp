@@ -1,6 +1,6 @@
 # PCP
 
-PCP is a distributed tensor computation framework written in Zig. It employs MLIR as its core intermediate representation to provide a compiler-driven approach to automatic differentiation, hardware acceleration, and optimization.
+PCP is a distributed tensor computation framework written in Zig. It employs MLIR and the IREE compiler toolchain as its core to provide automatic differentiation, hardware acceleration, and optimization.
 
 ## Core Architecture
 
@@ -8,45 +8,33 @@ PCP transforms high-level tensor operations into optimized MLIR computation grap
 
 ### Distributed Training Overview
 
-```
-┌──────────────────────────────────────────────────────────────────────┐
-│                            Controller                                │
-├──────────────────────────────────────────────────────────────────────┤
-│  ┌─────────┐ + ┌───────────┐ = ┌─────────────────────────────────┐   │
-│  │ Model   │   │ Algorithm │   │ MLIR Training Graph             │   │
-│  │         │   │           │   │ (Forward + Autodiff + Update)   │   │
-│  └─────────┘   └───────────┘   └─────────────────────────────────┘   │
-└──────────────────────────────┬───────────────────────────────────────┘
-                               │ Serialize & Send
-                               ▼
-┌──────────────────────────────────────────────────────────────────────┐
-│                           Workers                                    │
-├──────────────────────────────────────────────────────────────────────┤
-│ Receive MLIR → Compile to GPU → Execute → Send Results Back          │
-└──────────────────────────────────────────────────────────────────────┘
-```
-
-### MLIR Compilation Pipeline
+The Shepherd (controller) constructs a complete MLIR training graph using the StableHLO dialect. This graph is then compiled by the IREE compiler (`iree-compile`) into a portable `.vmfb` artifact for a specific hardware target (e.g., Metal for macOS, LLVM-CPU for generic CPUs). This binary artifact is sent to workers, which execute it using the cross-platform IREE runtime.
 
 ```
-┌─────────┐   ┌─────────────┐   ┌───────┐   ┌─────────────────┐
-│StableHLO│ → │ GPU Dialect │ → │SPIR-V │ → │Metal/CUDA/CPU   │
-└─────────┘   └─────────────┘   └───────┘   └─────────────────┘
+┌───────────────────────────────────────────────────────────────────┐
+│                            Shepherd                               │
+├───────────────────────────────────────────────────────────────────┤
+│ MLIR Graph (StableHLO) → IREE Compiler → *.vmfb Artifact          │
+└─────────────────────────────┬─────────────────────────────────────┘
+                              │
+                              ▼
+┌───────────────────────────────────────────────────────────────────┐
+│                            Workers                                │
+├───────────────────────────────────────────────────────────────────┤
+│ Receive *.vmfb → IREE Runtime → Execute on GPU/CPU → Send Results │
+└───────────────────────────────────────────────────────────────────┘
 ```
 
-This architecture is implemented through several key components:
+### IREE Compilation Pipeline
 
-- **MLIR as the Core IR**: Computations are represented as MLIR graphs using the stablehlo dialect.
-- **Tensor Abstraction**: Tensors (`src/tensor.zig`) are symbolic handles to `mlir.Value`, representing nodes in the computation graph rather than immediate data buffers.
-- **MLIRBuilder**: A stateful builder (`src/ops.zig`) constructs the MLIR graph via the MLIR C API.
-- **StableHLO Dialect Wrapper**: A clean, idiomatic Zig interface (`src/mlir/dialects/stablehlo.zig`) for creating stablehlo operations.
-- **Graph-to-Graph Automatic Differentiation**: The framework features a VJP-based autodiff engine (`src/autodiff.zig`). It performs a graph-to-graph transformation by applying Vector-Jacobian Product (VJP) rules to the forward-pass graph, thereby generating a new MLIR graph that computes the necessary gradients.
-- **Distributed Training System**: The framework supports distributed training using a Shepherd (coordinator) and Worker model. It implements the DiLoCo algorithm (`src/algorithms/diloco.zig`) for low-communication training. Both global and local parameter updates are managed through MLIR-based optimizers (`src/optimizers/*_mlir.zig`) that construct their update logic as sub-graphs.
-- **JIT-Compiled Execution Backend**: PCP includes a just-in-time (JIT) execution engine for Apple's Metal framework (`src/backends/metal.zig`). The compilation pipeline is as follows:
-  - **Lowering**: The stablehlo graph is lowered through gpu and spirv dialects.
-  - **Translation**: The spirv dialect module is translated to a SPIR-V binary.
-  - **Cross-Compilation**: The SPIR-V binary is translated to Metal Shading Language (MSL).
-  - **Runtime Compilation**: The MSL source is compiled into a native MTLLibrary for execution on the GPU.
+IREE handles the entire lowering pipeline from a high-level dialect to a hardware-specific executable format, abstracting these complex details away from our framework.
+
+```
+┌─────────┐   ┌───────────────────────────┐   ┌─────────────────┐
+│StableHLO│ → │    IREE Compiler          │ → │Metal/CUDA/CPU   │
+│         │   │   (iree-compile tool)     │   │  (via *.vmfb)   │
+└─────────┘   └───────────────────────────┘   └─────────────────┘
+```
 
 ## Project Structure
 
@@ -54,12 +42,12 @@ This architecture is implemented through several key components:
 .
 └── src
     ├── algorithms/              # Distributed training algorithms and interfaces (DiLoCo).
-    ├── backends/                # Hardware execution backends (Metal).
+    ├── backends/                # Hardware execution backends (IREE, Demo).
     ├── controllers/             # The Shepherd coordinator node.
     ├── examples/                # Usage examples and component tests.
     ├── mlir/                    # MLIR C-API wrappers, dialect definitions, and bridges.
     ├── models/                  # Model definitions (GPT-2) as MLIR graphs.
-    ├── network/                 # TCP communication and messaging protocol.
+    ├── network/                 # TCP communication and messaging protocol (Cap'n Proto).
     ├── optimizers/              # MLIR-based optimizers (Adam, Nesterov).
     ├── autodiff.zig             # VJP-based automatic differentiation engine.
     ├── main_distributed.zig     # Entry point for the distributed system.
@@ -73,98 +61,90 @@ This architecture is implemented through several key components:
 
 ### Prerequisites
 
-Make sure you have the following tools installed:
+- **Zig**: Version 0.12.0 or newer.
+- **System Build Tools**: `git`, `cmake`, `ninja`.
+- **Cap'n Proto**: (Required for distributed functionality). The build script will try to find it automatically. If it fails, you may need to install it or set the `CAPNP_DIR` environment variable.
+  - **macOS**: `brew install capnp`
+  - **Ubuntu/Debian**: `sudo apt install capnproto libcapnp-dev`
 
-* **macOS:** `brew install git cmake ninja capnp`
-* **Ubuntu/Debian:** `sudo apt install build-essential git cmake ninja capnproto libcapnp-dev`
+### Step 1: Clone This Repository
 
-### Step 1: Clone the Repository
-
-Clone the repository and all its submodules (`llvm-project`, `stablehlo`, etc.).
-
-```sh
-git clone --recursive <your-repo-url>
-cd <your-repo-name>
-```
-
-### Step 2: Build C++ Dependencies (One-Time, ~1 Hour)
-
-We provide a script that compiles LLVM, MLIR, and StableHLO. This is a long process that runs in the background.
+Clone this project repository.
 
 ```sh
-./build_llvm_with_stablehlo.sh
+git clone https://github.com/deltawave-tech/pcp.git
+cd pcp
+git checkout iree-install-test
 ```
 
-This script will create a local `llvm-build/` directory containing the libraries and headers our project needs.
+### Step 2: Build IREE from Source
 
-### Step 3: Set Environment Variables (Optional)
+PCP depends on a local build of IREE. This is a one-time setup that can take a significant amount of time (~1 hour). The build script expects IREE to be in a sibling directory.
 
-For better control over dependency detection, you can set environment variables:
+Navigate to the parent directory of your project and clone IREE:
 
 ```sh
-# LLVM/MLIR location
-export LLVM_DIR=/path/to/your/llvm-build
-
-# Cap'n Proto location (if not in standard system paths)
-export CAPNP_DIR=/path/to/your/capnp-installation
+cd ..
+git clone https://github.com/openxla/iree.git
+cd iree
 ```
 
-If not set, the build system will auto-detect dependencies in common locations:
-- **LLVM:** `llvm-build/bin/llvm-config` (project-local), system installations via Homebrew, package managers, etc.
-- **Cap'n Proto:** System installations via Homebrew (`/opt/homebrew`), package managers (`/usr`, `/usr/local`)
+Initialize IREE's submodules:
 
-### Step 4: Build the Project
 ```sh
-zig build
+git submodule update --init --recursive
 ```
 
-### Step 5: Run Tests
+Build IREE using CMake. This will create a sibling `iree-build` directory.
+
 ```sh
-zig build test
+cmake -GNinja -B ../iree-build -S . -DCMAKE_BUILD_TYPE=RelWithDebInfo -DIREE_BUILD_COMPILER=ON -DIREE_ENABLE_ASSERTIONS=ON
+cmake --build ../iree-build
 ```
 
-## Building and Running
+After this step, your directory structure should look like this:
 
-Build everything:
+```
+/some/path/
+├── pcp/  (This project)
+├── iree/               (IREE source code)
+└── iree-build/         (IREE build artifacts)
+```
+
+### Step 3: Configure Environment (Optional but Recommended)
+
+For maximum flexibility, you can set the `IREE_DIR` environment variable to point to the directory containing your `iree` and `iree-build` folders.
+
 ```sh
-zig build
+# Example: Add this to your ~/.zshrc or ~/.bashrc
+export IREE_DIR="/path/to/parent/directory"
 ```
 
-Run the distributed training system (requires Cap'n Proto):
+If `IREE_DIR` is not set, the build script will automatically look for the sibling directory structure described in Step 2.
+
+### Step 4: Build and Test PCP
+
+Navigate back to this project's directory and use Zig to build and run the verification tests.
+
+
+Run the IREE pipeline verification tests:
+
+These tests confirm that your environment is correctly configured to compile and execute MLIR graphs via IREE on your available hardware.
+
+For macOS (testing Metal backend):
+
 ```sh
-zig build run-distributed
+zig build run-m3-pipeline-test
 ```
 
-Run the demo (no external dependencies needed):
+For any platform (testing CPU backend):
+
 ```sh
-zig build run-demo
+zig build run-cpu-pipeline-test
 ```
 
-Run all tests:
+For Linux with NVIDIA GPU (testing CUDA backend):
+
 ```sh
-zig build test
-```
-
-See all available commands:
-```sh
-zig build --help
-```
-
-## Usage
-
-To run the distributed training demonstration, which starts one Shepherd and two Workers:
-
-### Start the Shepherd Node:
-```bash
-./zig-out/bin/main_distributed --shepherd --workers 2
-```
-
-### Start the First Worker Node (new terminal):
-```bash
-./zig-out/bin/main_distributed --worker --connect 127.0.0.1:8080
-```
-
-### Start the Second Worker Node (new terminal):
-```bash
-./zig-out/bin/main_distributed --worker --connect 127.0.0.1:8080
+zig build run-cuda-pipeline-test
 ```

@@ -18,22 +18,32 @@ const MessageEnvelope = message.MessageEnvelope;
 const MessageType = message.MessageType;
 const NodeId = message.NodeId;
 const Executor = execution.Executor;
+const Backend = backend_selection.Backend;
+
+/// Worker readiness status
+pub const WorkerStatus = enum {
+    Connected,        // Worker connected but not initialized
+    GraphInitialized, // Worker has loaded VMFB and is ready for tensors
+    Training,         // Worker is actively training
+};
 
 /// Represents a connected worker
 pub const WorkerConnection = struct {
     node_id: NodeId,
     stream: net.Stream,
     last_heartbeat: i64, // timestamp
-    backend: backend_selection.Backend, // NEW FIELD
-    
+    backend: Backend,
+    status: WorkerStatus,
+
     const Self = @This();
-    
-    pub fn init(node_id: NodeId, stream: net.Stream, backend: backend_selection.Backend) Self {
+
+    pub fn init(node_id: NodeId, stream: net.Stream, backend: Backend) Self {
         return Self{
             .node_id = node_id,
             .stream = stream,
             .last_heartbeat = std.time.timestamp(),
             .backend = backend,
+            .status = .Connected,
         };
     }
     
@@ -57,9 +67,10 @@ pub const Shepherd = struct {
     is_running: bool,
     algorithm: ?*training_algorithm.TrainingAlgorithm, // Training algorithm interface
     executor: ?Executor, // Generic execution backend for algorithms
-    
+    compiled_artifacts: std.AutoHashMap(Backend, []const u8), // Cache: Backend -> VMFB bytes
+
     const Self = @This();
-    
+
     pub fn init(allocator: Allocator) Self {
         return Self{
             .allocator = allocator,
@@ -69,6 +80,7 @@ pub const Shepherd = struct {
             .is_running = false,
             .algorithm = null,
             .executor = null,
+            .compiled_artifacts = std.AutoHashMap(Backend, []const u8).init(allocator),
         };
     }
     
@@ -76,13 +88,20 @@ pub const Shepherd = struct {
         if (self.server) |*server| {
             server.deinit();
         }
-        
+
         // Close all worker connections
         for (self.worker_pool.items) |worker| {
             worker.stream.close();
         }
         self.worker_pool.deinit();
-        
+
+        // Clean up compiled artifacts
+        var artifact_iter = self.compiled_artifacts.valueIterator();
+        while (artifact_iter.next()) |vmfb_bytes| {
+            self.allocator.free(vmfb_bytes.*);
+        }
+        self.compiled_artifacts.deinit();
+
         // Clean up executor if owned
         if (self.executor) |executor| {
             executor.deinit();
@@ -263,7 +282,34 @@ pub const Shepherd = struct {
     pub fn getExecutor(self: *Self) ?Executor {
         return self.executor;
     }
-    
+
+    /// Get or compile VMFB artifact for a specific backend
+    /// Caches compiled artifacts to avoid recompilation for workers with the same backend
+    pub fn getArtifact(self: *Self, backend: Backend, mlir_source: []const u8) ![]const u8 {
+        // Check if we have a cached artifact for this backend
+        if (self.compiled_artifacts.get(backend)) |vmfb| {
+            std.log.info("Using cached VMFB for backend: {s}", .{backend.toString()});
+            return vmfb;
+        }
+
+        std.log.info("Compiling VMFB for backend: {s}...", .{backend.toString()});
+
+        // Compile MLIR to VMFB for the target backend
+        const target = backend.toIreeCompilationTarget();
+        const mlir_ctx = @import("../mlir_ctx.zig");
+        const vmfb = try mlir_ctx.MLIRContext.compileToVMFBStatic(
+            self.allocator,
+            mlir_source,
+            target
+        );
+
+        // Cache the compiled artifact
+        try self.compiled_artifacts.put(backend, vmfb);
+        std.log.info("VMFB compiled and cached for backend: {s} ({} bytes)", .{backend.toString(), vmfb.len});
+
+        return vmfb;
+    }
+
     /// Start training once we have enough workers
     pub fn startTraining(self: *Self, required_workers: usize) !void {
         std.log.info("Waiting for {} workers to join...", .{required_workers});
@@ -355,7 +401,7 @@ pub const Shepherd = struct {
             std.log.err("Failed to broadcast shutdown: {}", .{err});
         };
         
-        std.log.info("Shepherd stopped");
+        std.log.info("Shepherd stopped", .{});
     }
 };
 

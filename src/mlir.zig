@@ -26,17 +26,19 @@ pub fn testMLIROperations(allocator: std.mem.Allocator) !void {
 
 const Allocator = std.mem.Allocator;
 
+// initOperationState has been removed - we now use pcpCreateOperation instead
+
 /// MLIR Context - owns all IR objects and manages their lifecycle
 pub const Context = struct {
-    handle: *c.c.MlirContext,
-    
+    handle: c.c.MlirContext,
+
     const Self = @This();
-    
+
     pub fn init() !Self {
         const handle = c.c.contextCreate();
         return Self{ .handle = handle };
     }
-    
+
     pub fn initWithRegistry(registry: DialectRegistry, enable_threading: bool) !Self {
         const handle = c.c.contextCreate();
         c.c.contextSetAllowUnregisteredDialects(handle, true);
@@ -44,17 +46,18 @@ pub const Context = struct {
         _ = enable_threading; // TODO: Implement threading support
         return Self{ .handle = handle };
     }
-    
+
     pub fn deinit(self: Self) void {
         c.c.contextDestroy(self.handle);
     }
-    
+
     pub fn numRegisteredDialects(self: Self) usize {
         return @intCast(c.c.contextGetNumRegisteredDialects(self.handle));
     }
-    
+
     pub fn isRegisteredOperation(self: Self, name: []const u8) bool {
-        return c.c.contextIsRegisteredOperation(self.handle, name);
+        const name_ref = c.c.stringRefFromString(name);
+        return c.c.contextIsRegisteredOperation(self.handle, name_ref);
     }
 };
     
@@ -100,36 +103,37 @@ pub const Context = struct {
     
     /// MLIR Module - represents a compilation unit
     pub const Module = struct {
-        handle: *c.c.MlirModule,
-        
+        handle: c.c.MlirModule,
+
         const Self = @This();
-        
+
         pub fn createEmpty(context: Context) !Self {
             const location = c.c.locationUnknownGet(context.handle);
             const handle = c.c.moduleCreateEmpty(location);
             return Self{ .handle = handle };
         }
-        
+
         pub fn parse(context: Context, module_str: []const u8) !Self {
             std.debug.print("Module.parse: About to call moduleParseString with {} bytes\n", .{module_str.len});
-            
-            const handle = c.c.moduleParseString(context.handle, module_str);
-            
-            std.debug.print("Module.parse: moduleParseString returned handle: 0x{x}\n", .{@intFromPtr(handle)});
-            
-            if (@intFromPtr(handle) == 0) {
+
+            const module_ref = c.c.stringRefFromString(module_str);
+            const handle = c.c.moduleParseString(context.handle, module_ref);
+
+            std.debug.print("Module.parse: moduleParseString returned handle: 0x{x}\n", .{@intFromPtr(handle.ptr)});
+
+            if (@intFromPtr(handle.ptr) == 0) {
                 std.debug.print("Module.parse: Handle is null - returning MLIRParseError\n", .{});
                 return error.MLIRParseError;
             }
-            
+
             std.debug.print("Module.parse: Handle is valid - returning module\n", .{});
             return Self{ .handle = handle };
         }
-        
+
         pub fn deinit(self: Self) void {
             c.c.moduleDestroy(self.handle);
         }
-        
+
         pub fn op(self: Self) Operation {
             return Operation{ .handle = c.c.moduleGetOperation(self.handle) };
         }
@@ -137,51 +141,66 @@ pub const Context = struct {
     
     /// MLIR Operation - represents a single operation in the IR
     pub const Operation = struct {
-        handle: *c.c.MlirOperation,
+        handle: c.c.MlirOperation,
         
         const Self = @This();
         
-        /// Create an operation from an operation state
-        pub fn create(ctx: Context, op_name: []const u8, args: struct {
+        /// Create an operation safely using the C++ helper with packed args
+        pub fn create(allocator: std.mem.Allocator, ctx: Context, op_name: []const u8, args: struct {
             operands: []const Value = &.{},
             results: []const Type = &.{},
             attributes: []const struct { []const u8, Attribute } = &.{},
             location: ?Location = null,
-        }) Self {
+        }) !Self {
             const loc = args.location orelse Location.unknown(ctx);
-            
-            var state = c.c.operationStateGet(op_name, loc.handle);
-            
-            // Add operands
-            for (args.operands) |operand| {
-                var operand_handle = operand.handle;
-                c.c.mlirOperationStateAddOperands(&state, 1, @ptrCast(&operand_handle));
+            const name_ref = c.c.stringRefFromString(op_name);
+
+            // 1. Prepare Operands
+            var operand_handles: ?[]c.c.MlirValue = null;
+            if (args.operands.len > 0) {
+                const handles = try allocator.alloc(c.c.MlirValue, args.operands.len);
+                for (args.operands, 0..) |opd, i| handles[i] = opd.handle;
+                operand_handles = handles;
             }
-            
-            // Add results  
-            for (args.results) |result_type| {
-                var result_handle = result_type.handle;
-                c.c.mlirOperationStateAddResults(&state, 1, @ptrCast(&result_handle));
+            defer if (operand_handles) |h| allocator.free(h);
+
+            // 2. Prepare Results
+            var result_handles: ?[]c.c.MlirType = null;
+            if (args.results.len > 0) {
+                const handles = try allocator.alloc(c.c.MlirType, args.results.len);
+                for (args.results, 0..) |res, i| handles[i] = res.handle;
+                result_handles = handles;
             }
-            
-            // Add attributes
+            defer if (result_handles) |h| allocator.free(h);
+
+            // 3. Prepare Attributes
+            var attr_handles: ?[]c.c.MlirNamedAttribute = null;
             if (args.attributes.len > 0) {
-                var named_attrs = std.ArrayList(c.c.MlirNamedAttribute).init(std.heap.page_allocator);
-                defer named_attrs.deinit();
-                
-                for (args.attributes) |attr_pair| {
-                    const name_id = c.c.identifierGet(ctx.handle, attr_pair[0]);
-                    const named_attr = c.c.MlirNamedAttribute{
-                        .name = name_id,
-                        .attribute = attr_pair[1].handle,
-                    };
-                    named_attrs.append(named_attr) catch unreachable;
+                const handles = try allocator.alloc(c.c.MlirNamedAttribute, args.attributes.len);
+                for (args.attributes, 0..) |attr_pair, i| {
+                    const name_str = c.c.stringRefFromString(attr_pair[0]);
+                    const name_id = c.c.mlirIdentifierGet(ctx.handle, name_str);
+                    handles[i] = .{ .name = name_id, .attribute = attr_pair[1].handle };
                 }
-                
-                c.c.mlirOperationStateAddAttributes(&state, @intCast(named_attrs.items.len), @ptrCast(named_attrs.items.ptr));
+                attr_handles = handles;
             }
-            
-            const handle = c.c.operationCreate(&state);
+            defer if (attr_handles) |h| allocator.free(h);
+
+            // 4. Pack Arguments safely
+            const op_args = c.c.PcpOpArgs{
+                .nResults = @intCast(args.results.len),
+                .results = if (result_handles) |h| h.ptr else null,
+                .nOperands = @intCast(args.operands.len),
+                .operands = if (operand_handles) |h| h.ptr else null,
+                .nAttributes = @intCast(args.attributes.len),
+                .attributes = if (attr_handles) |h| h.ptr else null,
+                .nRegions = 0,
+                .regions = null,
+            };
+
+            // 5. Call C++ Helper
+            const handle = c.c.pcpCreateOperation(&name_ref, &loc.handle, &op_args);
+
             return Self{ .handle = handle };
         }
         
@@ -219,7 +238,7 @@ pub const Context = struct {
         
         pub fn getNext(self: Self) ?Self {
             const next_op = c.c.operationGetNextInBlock(self.handle);
-            if (@intFromPtr(next_op) == 0) return null;
+            if (@intFromPtr(next_op.ptr) == 0) return null;
             return Self{ .handle = next_op };
         }
         
@@ -244,13 +263,21 @@ pub const Context = struct {
         }
         
         pub fn verify(self: Self) bool {
-            return c.c.mlirOperationVerify(self.handle).isSuccess();
+            return c.c.mlirOperationVerify(self.handle);
+        }
+
+        // ADD THIS METHOD
+        pub fn getType(self: Self) Type {
+            const type_name_ref = c.c.stringRefFromString("function_type");
+            const type_attr = c.c.mlirOperationGetAttributeByName(self.handle, type_name_ref);
+            // An MlirTypeAttr is a type of MlirAttribute that wraps an MlirType
+            return Type{ .handle = c.c.mlirTypeAttrGetValue(type_attr) };
         }
     };
     
     /// MLIR Region - represents a CFG region
     pub const Region = struct {
-        handle: *c.c.MlirRegion,
+        handle: c.c.MlirRegion,
         
         const Self = @This();
         
@@ -266,13 +293,13 @@ pub const Context = struct {
     
     /// MLIR Block - represents a basic block
     pub const Block = struct {
-        handle: *c.c.MlirBlock,
+        handle: c.c.MlirBlock,
         
         const Self = @This();
         
         pub fn getFirstOp(self: Self) ?Operation {
             const first_op = c.c.blockGetFirstOperation(self.handle);
-            if (@intFromPtr(first_op) == 0) return null;
+            if (@intFromPtr(first_op.ptr) == 0) return null;
             return Operation{ .handle = first_op };
         }
         
@@ -365,7 +392,7 @@ pub const Context = struct {
     
     /// MLIR Type system
     pub const Type = struct {
-        handle: *c.c.MlirType,
+        handle: c.c.MlirType,
         
         const Self = @This();
         
@@ -391,13 +418,15 @@ pub const Context = struct {
         
         pub fn rankedTensorType(context: Context, shape: []const i64, element_type: Self) Self {
             _ = context;
-            const handle = c.c.rankedTensorTypeGet(@intCast(shape.len), shape, element_type.handle, null);
+            const null_attr = c.c.MlirAttribute{ .ptr = null };
+            const handle = c.c.rankedTensorTypeGet(@intCast(shape.len), shape.ptr, element_type.handle, null_attr);
             return Self{ .handle = handle };
         }
-        
+
         /// Create tensor type with shape and element type
         pub fn tensor(shape: []const i64, element_type: Self) Self {
-            const handle = c.c.rankedTensorTypeGet(@intCast(shape.len), shape, element_type.handle, null);
+            const null_attr = c.c.MlirAttribute{ .ptr = null };
+            const handle = c.c.rankedTensorTypeGet(@intCast(shape.len), shape.ptr, element_type.handle, null_attr);
             return Self{ .handle = handle };
         }
         
@@ -414,30 +443,47 @@ pub const Context = struct {
             }
             return null;
         }
-        
+
+        /// Check if this type is an integer type
+        pub fn isInteger(self: Self) bool {
+            return c.c.typeIsAInteger(self.handle);
+        }
+
+        /// Check if this type is an index type
+        pub fn isIndex(self: Self) bool {
+            return c.c.typeIsAIndex(self.handle);
+        }
+
+        /// Check if this type is equal to another type
+        pub fn isEqual(self: Self, other: Self) bool {
+            return c.c.mlirTypeEqual(self.handle, other.handle);
+        }
+
         /// Create a function type with given inputs and results
-        pub fn functionType(context: Context, inputs: []const Type, results: []const Type) Self {
-            var input_handles = std.ArrayList(*c.c.MlirType).init(std.heap.page_allocator);
-            defer input_handles.deinit();
-            
-            for (inputs) |input| {
-                input_handles.append(input.handle) catch unreachable;
+        /// UPDATED: Now accepts an allocator for temporary C-API array construction
+        pub fn functionType(allocator: std.mem.Allocator, context: Context, inputs: []const Type, results: []const Type) !Self {
+            // Use the provided allocator (safe Zig GPA) instead of c_allocator
+            var input_handles = try allocator.alloc(c.c.MlirType, inputs.len);
+            defer allocator.free(input_handles);
+
+            for (inputs, 0..) |input, i| {
+                input_handles[i] = input.handle;
             }
-            
-            var result_handles = std.ArrayList(*c.c.MlirType).init(std.heap.page_allocator);
-            defer result_handles.deinit();
-            
-            for (results) |result| {
-                result_handles.append(result.handle) catch unreachable;
+
+            var result_handles = try allocator.alloc(c.c.MlirType, results.len);
+            defer allocator.free(result_handles);
+
+            for (results, 0..) |result, i| {
+                result_handles[i] = result.handle;
             }
-            
-            return Self{ .handle = c.c.functionTypeGet(context.handle, input_handles.items, result_handles.items) };
+
+            return Self{ .handle = c.c.functionTypeGet(context.handle, @intCast(inputs.len), input_handles.ptr, @intCast(results.len), result_handles.ptr) };
         }
     };
 
     /// MLIR Value - represents SSA values in the IR
     pub const Value = struct {
-        handle: *c.c.MlirValue,
+        handle: c.c.MlirValue,
         
         const Self = @This();
         
@@ -455,7 +501,7 @@ pub const Context = struct {
     
     /// MLIR Attribute - represents compile-time constants and metadata
     pub const Attribute = struct {
-        handle: *c.c.MlirAttribute,
+        handle: c.c.MlirAttribute,
         
         const Self = @This();
         
@@ -482,15 +528,19 @@ pub const Context = struct {
         }
         
         /// Create a dense elements attribute by "splatting" a single value across all elements
-        pub fn denseElementsAttrSplat(shaped_type: Type, value: f64) Self {
-            return Self{ .handle = c.c.mlirDenseElementsAttrFloatSplatGet(shaped_type.handle, value) };
+        /// This version takes an attribute (e.g., integer attribute) as the element
+        pub fn denseElementsAttrSplat(shaped_type: Type, element: Self) Self {
+            return Self{ .handle = c.c.mlirDenseElementsAttrSplatGet(shaped_type.handle, element.handle) };
         }
-        
+
+        /// Create a dense elements attribute by "splatting" a float value across all elements
+        pub fn denseElementsAttrFloatSplat(shaped_type: Type, value: f64) Self {
+            return Self{ .handle = c.c.mlirDenseElementsAttrFloatSplatGet(shaped_type.handle, @floatCast(value)) };
+        }
+
         /// Create a dictionary attribute from named attributes.
         pub fn dictionary(context: Context, named_attrs: []const c.c.MlirNamedAttribute) Self {
-            // DEFINITIVE FIX: Use the correct wrapper function that properly unpacks the slice.
-            // The c.c.dictionaryAttrGet wrapper correctly converts the slice to length+pointer.
-            return Self{ .handle = c.c.dictionaryAttrGet(context.handle, named_attrs) };
+            return Self{ .handle = c.c.dictionaryAttrGet(context.handle, @intCast(named_attrs.len), named_attrs.ptr) };
         }
         
         /// Create a type attribute from a type
@@ -500,7 +550,16 @@ pub const Context = struct {
         
         /// Create a string attribute
         pub fn stringAttr(context: Context, value: []const u8) Self {
-            return Self{ .handle = c.c.stringAttrGet(context.handle, value) };
+            const value_ref = c.c.stringRefFromString(value);
+            return Self{ .handle = c.c.stringAttrGet(context.handle, value_ref) };
+        }
+        
+        /// Create a symbol reference attribute
+        /// SAFE FIX: Use stringRefFromString which respects length, not null terminator
+        pub fn symbolRefAttr(context: Context, value: []const u8) Self {
+            const str_ref = c.c.stringRefFromString(value);
+            const handle = c.c.mlirSymbolRefAttrGet(context.handle, str_ref, 0, null);
+            return Self{ .handle = handle };
         }
         
         /// Create a boolean attribute
@@ -561,19 +620,21 @@ pub const Context = struct {
 
 
     /// MLIR Location - source location information
+    /// FIXED: Now holds the struct directly (value type) instead of pointer
     pub const Location = struct {
-        handle: *c.c.MlirLocation,
-        
+        handle: c.c.MlirLocation,
+
         const Self = @This();
-        
+
         pub fn unknown(context: Context) Self {
+            // locationUnknownGet returns struct by value
             return Self{ .handle = c.c.locationUnknownGet(context.handle) };
         }
     };
 
     /// MLIR RankedTensorType - for tensor type introspection
     pub const RankedTensorType = struct {
-        handle: *c.c.MlirType,
+        handle: c.c.MlirType,
         
         const Self = @This();
         
@@ -606,7 +667,7 @@ pub const Context = struct {
 
     /// MLIR FunctionType - for function type introspection
     pub const FunctionType = struct {
-        handle: *c.c.MlirType,
+        handle: c.c.MlirType,
         
         const Self = @This();
         

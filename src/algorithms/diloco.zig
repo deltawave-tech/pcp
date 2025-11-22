@@ -91,10 +91,10 @@ pub const DiLoCo = struct {
         while (maybe_op) |op| {
             if (std.mem.eql(u8, op.getName(), "func.func")) {
                 // It's a function, check its name
-                const sym_name_attr = c.operationGetAttributeByName(op.handle, "sym_name");
-                if (@intFromPtr(sym_name_attr) != 0 and c.attributeIsAString(sym_name_attr)) {
-                    const string_attr = @as(*c.MlirStringAttribute, @ptrCast(sym_name_attr));
-                    const func_name_ref = c.stringAttributeGetValue(string_attr);
+                const sym_name_ref = c.stringRefFromString("sym_name");
+                const sym_name_attr = c.operationGetAttributeByName(op.handle, sym_name_ref);
+                if (@intFromPtr(sym_name_attr.ptr) != 0 and c.attributeIsAString(sym_name_attr)) {
+                    const func_name_ref = c.stringAttributeGetValue(sym_name_attr);
                     const func_name = c.fromStringRef(func_name_ref);
                     if (std.mem.eql(u8, func_name, name)) {
                         return op; // Found it!
@@ -145,6 +145,11 @@ pub const DiLoCo = struct {
             try introspected_shapes.append(shape);
         }
         const parameter_shapes = try introspected_shapes.toOwnedSlice();
+        // Add errdefer to cleanup parameter_shapes if subsequent allocations fail
+        errdefer {
+            for (parameter_shapes) |s| allocator.free(s);
+            allocator.free(parameter_shapes);
+        }
         std.debug.print("✓ Introspection complete. Found {} trainable parameter tensors.\n", .{parameter_shapes.len});
 
         // Extract data input shapes (the last num_data_inputs)
@@ -153,7 +158,7 @@ pub const DiLoCo = struct {
             for (data_shapes.items) |s| allocator.free(s);
             data_shapes.deinit();
         }
-        
+
         for (num_params..func_type.getNumInputs()) |i| {
             const input_type = func_type.getInput(i);
             const ranked_type = input_type.as(mlir.RankedTensorType) orelse return error.DataInputIsNotATensor;
@@ -161,6 +166,10 @@ pub const DiLoCo = struct {
             try data_shapes.append(shape);
         }
         const data_input_shapes = try data_shapes.toOwnedSlice();
+        errdefer {
+            for (data_input_shapes) |s| allocator.free(s);
+            allocator.free(data_input_shapes);
+        }
         std.debug.print("✓ Found {} data input shapes.\n", .{data_input_shapes.len});
 
         // === END NEW SECTION ===
@@ -452,8 +461,9 @@ pub const DiLoCo = struct {
         }
 
         // 3. Get the 'value' attribute, which must be a DenseElementsAttr
-        const value_attr = c.operationGetAttributeByName(defining_op.handle, "value");
-        if (@intFromPtr(value_attr) == 0 or !c.mlirAttributeIsADenseElements(value_attr)) {
+        const value_ref = c.stringRefFromString("value");
+        const value_attr = c.operationGetAttributeByName(defining_op.handle, value_ref);
+        if (@intFromPtr(value_attr.ptr) == 0 or !c.mlirAttributeIsADenseElements(value_attr)) {
             return error.InvalidConstantAttribute;
         }
 
@@ -522,7 +532,8 @@ pub const DiLoCo = struct {
         // 5. IMPORTANT: Change the name to avoid conflicts (e.g., with our future 'main' orchestrator)
         const new_fn_name = "model_forward_pass";
         const new_name_attr = mlir.Attribute.stringAttr(builder.ctx, new_fn_name);
-        c.operationSetAttributeByName(cloned_forward_fn.handle, "sym_name", new_name_attr.handle);
+        const sym_name_attr_ref = c.stringRefFromString("sym_name");
+        c.operationSetAttributeByName(cloned_forward_fn.handle, sym_name_attr_ref, new_name_attr.handle);
 
         // 6. Add the cloned function to our main module.
         builder.module_body.appendOwnedOperation(cloned_forward_fn);
@@ -550,19 +561,21 @@ pub const DiLoCo = struct {
             try main_input_types.append(forward_fn_type.getInput(i));
         }
 
-        // Main outputs = all gradients of the forward function's inputs + the final loss
+        // Main outputs = updated parameters (only the parameter inputs) + the final loss
         const grad_fn_type = grad_fn_op.getType().as(mlir.FunctionType) orelse return error.NotAFunctionType;
         var main_output_types = std.ArrayList(mlir.Type).init(self.allocator);
         defer main_output_types.deinit();
 
-        // Add gradient types for each of the forward function's inputs
-        for (0..(grad_fn_type.getNumResults())) |i| {
-            try main_output_types.append(grad_fn_type.getResult(i));
+        const num_params = self.parameter_shapes.len;
+
+        // Return updated parameters (same types as parameter inputs)
+        for (0..num_params) |i| {
+            try main_output_types.append(forward_fn_type.getInput(i));
         }
         // Add the loss type (the single output of the forward function)
         try main_output_types.append(forward_fn_type.getResult(0));
 
-        const main_func_type = mlir.Type.functionType(builder.ctx, main_input_types.items, main_output_types.items);
+        const main_func_type = try mlir.Type.functionType(builder.allocator, builder.ctx, main_input_types.items, main_output_types.items);
 
         // 4.2: Create the 'main' function
         const main_result = try builder.createFunction("main", main_func_type);
@@ -601,18 +614,36 @@ pub const DiLoCo = struct {
             .attributes = &.{.{ "callee", grad_callee_attr }},
         });
 
-        // 4.6: Return all gradients and the loss from 'main'
+        // 4.6: Apply optimizer updates to get new parameters
+        // The worker should return updated parameters, not gradients!
+        std.debug.print("Adding optimizer update step to worker graph...\n", .{});
+
         var final_return_values = std.ArrayList(mlir.Value).init(self.allocator);
         defer final_return_values.deinit();
 
-        // Add all results from the grad call
-        for (0..grad_call_op.getNumResults()) |i| {
-            try final_return_values.append(grad_call_op.getResult(i));
+        // For each parameter: new_param = param - lr * grad
+        for (0..num_params) |i| {
+            const param_val = main_func_args[i];
+            const grad_val = grad_call_op.getResult(i);
+
+            // Convert to tensors for ops API
+            const param_tensor = try builder.newTensor(param_val);
+            const grad_tensor = try builder.newTensor(grad_val);
+
+            // Simple SGD update: new_param = param - lr * grad
+            const lr_const = try ops.constant(builder, @as(f64, @floatCast(self.config.base_config.learning_rate)), &.{}, self.element_type);
+            const scaled_grad = try ops.multiply(builder, lr_const, grad_tensor);
+            const new_param_tensor = try ops.subtract(builder, param_tensor, scaled_grad);
+
+            try final_return_values.append(new_param_tensor.value);
         }
-        // Add the loss
+
+        // Add the loss as the final return value
         try final_return_values.append(loss_val);
 
         _ = try builder.createAndAttach("func.return", final_return_values.items, &.{}, .{});
+
+        std.debug.print("✓ Worker graph now returns updated parameters + loss\n", .{});
 
         // === PHASE 5: FINALIZE AND SERIALIZE ===
         std.debug.print("✓ Final worker graph constructed successfully.\n", .{});
@@ -686,9 +717,20 @@ pub const DiLoCo = struct {
             try total_param_bytes.appendSlice(tensor_data);
         }
 
-        // Serialize batch data as raw bytes (u32 tokens -> bytes)
-        const input_ids_bytes = std.mem.sliceAsBytes(batch.x);
-        const targets_bytes = std.mem.sliceAsBytes(batch.y);
+        // --- FIX START ---
+        // Convert u32 batch data to i64 for IREE
+        // The model expects tensor<...xi64>, but batch.x is []u32.
+        const input_ids_i64 = try self.allocator.alloc(i64, batch.x.len);
+        defer self.allocator.free(input_ids_i64);
+        for (batch.x, 0..) |val, i| input_ids_i64[i] = @intCast(val);
+
+        const targets_i64 = try self.allocator.alloc(i64, batch.y.len);
+        defer self.allocator.free(targets_i64);
+        for (batch.y, 0..) |val, i| targets_i64[i] = @intCast(val);
+
+        const input_ids_bytes = std.mem.sliceAsBytes(input_ids_i64);
+        const targets_bytes = std.mem.sliceAsBytes(targets_i64);
+        // --- FIX END ---
 
         // VALIDATION: Check that we have valid data before serialization
         if (total_param_bytes.items.len == 0) {

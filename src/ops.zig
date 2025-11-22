@@ -3,8 +3,11 @@ const mlir = @import("mlir.zig");
 const mlir_ctx = @import("mlir_ctx.zig"); // Import complete MLIR context
 const tensor = @import("tensor.zig");
 const hlo = @import("mlir/dialects/stablehlo.zig");
+const c = @import("mlir/c.zig").c;
 
 const Tensor = tensor.Tensor(void); // DataType is encoded in mlir.Type
+const Shape = tensor.Shape;
+const DType = tensor.DType;
 
 /// MLIRBuilder is a stateful object that constructs the MLIR graph
 /// MLIR operation creation
@@ -106,12 +109,12 @@ pub const MLIRBuilder = struct {
     /// Create a constant tensor from host data - for tensor creation
     pub fn createConstant(self: *Self, host_data: []const u8, mlir_type: mlir.Type, shape: tensor.Shape) !mlir.Value {
         _ = shape; // Will be used later for validation
-        
+
         // Create dense elements attribute from host data
         const attr = mlir.Attribute.denseElementsAttr(self.ctx, mlir_type, host_data);
 
-        // Create the constant operation with proper attributes
-        const constant_op = mlir.Operation.create(self.ctx, "stablehlo.constant", .{
+        // Pass self.allocator to Operation.create
+        const constant_op = try mlir.Operation.create(self.allocator, self.ctx, "stablehlo.constant", .{
             .attributes = &.{.{ "value", attr }},
             .results = &.{mlir_type},
             .location = self.loc,
@@ -119,14 +122,14 @@ pub const MLIRBuilder = struct {
 
         // Use the robust "create and append" pattern
         self.insertion_block.appendOwnedOperation(constant_op);
-        
+
         // Return the result value
         return constant_op.getResult(0);
     }
 
     /// Create a generic operation using the MLIR C API
     pub fn createOp(self: *Self, op_name: []const u8, operands: []const mlir.Value, result_type: mlir.Type) !mlir.Operation {
-        return mlir.Operation.create(self.ctx, op_name, .{
+        return mlir.Operation.create(self.allocator, self.ctx, op_name, .{
             .operands = operands,
             .results = &.{result_type},
             .location = self.loc,
@@ -134,7 +137,6 @@ pub const MLIRBuilder = struct {
     }
     
     /// Creates an MLIR operation, appends it to the current block, and returns the operation handle.
-    /// This is the primary method for building the graph safely.
     pub fn createAndAttach(
         self: *Self,
         op_name: []const u8,
@@ -144,16 +146,29 @@ pub const MLIRBuilder = struct {
             attributes: []const struct { []const u8, mlir.Attribute } = &.{},
         },
     ) !mlir.Operation {
-        const op = mlir.Operation.create(self.ctx, op_name, .{
+        std.debug.print("DEBUG: createAndAttach entering for {s}\n", .{op_name});
+
+        // Pass self.allocator to Operation.create
+        const op = try mlir.Operation.create(self.allocator, self.ctx, op_name, .{
             .operands = operands,
             .results = result_types,
             .attributes = options.attributes,
             .location = self.loc,
         });
 
-        // Use the designated insertion block instead of accessing module regions directly
+        std.debug.print("DEBUG: createAndAttach operation created: 0x{x}\n", .{@intFromPtr(op.handle.ptr)});
+
+        // DEBUG: Verification disabled to isolate if verifier triggers the invalid pointer crash
+        // if (!op.verify()) {
+        //    std.log.err("Failed to verify operation: {s}", .{op_name});
+        //    op.dump();
+        //    return error.OperationVerificationFailed;
+        // }
+        // std.debug.print("DEBUG: createAndAttach verify passed\n", .{});
+
         self.insertion_block.appendOwnedOperation(op);
-        
+        std.debug.print("DEBUG: createAndAttach appended operation\n", .{});
+
         return op;
     }
     
@@ -165,64 +180,66 @@ pub const MLIRBuilder = struct {
         return mlir.Block{ .handle = block_handle };
     }
 
-    /// Creates a complete, well-formed `func.func` operation with an empty body,
-    /// attaches it to the module, and returns the function's entry block for population.
-    /// This abstracts away the unsafe C API for function creation.
+    /// Creates a complete, well-formed `func.func` operation
     pub fn createFunction(
         self: *Self,
         name: []const u8,
         func_type: mlir.Type,
     ) !struct { func_op: mlir.Operation, entry_block: mlir.Block } {
         std.log.info("MLIRBuilder.createFunction: Creating function '{s}'...", .{name});
-        const c_api = @import("mlir/c.zig").c;
 
-        // 1. Create the operation state WITHOUT a region initially.
-        // This prevents the verifier from complaining about an un-nested function.
-        var state = c_api.operationStateGet("func.func", self.loc.handle);
-
-        // 2. Add the function's attributes (type and name).
-        // You are correct: sym_visibility is not needed for top-level functions.
+        // 1. Prepare Attributes
+        const func_type_id = c.mlirIdentifierGet(self.ctx.handle, c.stringRefFromString("function_type"));
+        const sym_name_id = c.mlirIdentifierGet(self.ctx.handle, c.stringRefFromString("sym_name"));
         const func_type_attr = mlir.Attribute.typeAttr(func_type);
         const sym_name_attr = mlir.Attribute.stringAttr(self.ctx, name);
 
-        const func_type_id = c_api.identifierGet(self.ctx.handle, "function_type");
-        const sym_name_id = c_api.identifierGet(self.ctx.handle, "sym_name");
-
-        var named_attrs = [_]c_api.MlirNamedAttribute{
+        var attr_handles = [_]c.MlirNamedAttribute{
             .{ .name = func_type_id, .attribute = func_type_attr.handle },
             .{ .name = sym_name_id, .attribute = sym_name_attr.handle },
         };
-        c_api.mlirOperationStateAddAttributes(&state, named_attrs.len, @ptrCast(&named_attrs[0]));
-        
-        // Add one region placeholder.
-        var regions = [_]*c_api.MlirRegion{c_api.regionCreate()};
-        c_api.operationStateAddOwnedRegions(&state, 1, @ptrCast(&regions[0]));
 
-        // 3. Create the function operation.
-        const func_op_handle = c_api.operationCreate(&state);
+        // 2. Prepare Region
+        const region = c.mlirRegionCreate();
+        var regions = [_]c.MlirRegion{region};
+
+        // 3. Create Operation using C++ Helper with Packed Args
+        const name_ref = c.stringRefFromString("func.func");
+
+        const op_args = c.PcpOpArgs{
+            .nResults = 0,
+            .results = null,
+            .nOperands = 0,
+            .operands = null,
+            .nAttributes = @intCast(attr_handles.len),
+            .attributes = &attr_handles,
+            .nRegions = @intCast(regions.len),
+            .regions = &regions,
+        };
+
+        const func_op_handle = c.pcpCreateOperation(
+            &name_ref,
+            &self.loc.handle,
+            &op_args
+        );
+
         const func_op = mlir.Operation{ .handle = func_op_handle };
-        
-        // 4. CRITICAL STEP: Immediately attach the (empty) function to the module's body.
+
+        // 4. Attach to module
         self.module_body.appendOwnedOperation(func_op);
 
-        // 5. Now, create and add the entry block to the function's region.
-        const region = func_op.getRegion(0);
+        // 5. Add entry block
+        const region_handle = func_op.getRegion(0);
         const entry_block = try createBlock();
-        c_api.regionAppendOwnedBlock(region.handle, entry_block.handle);
+        c.regionAppendOwnedBlock(region_handle.handle, entry_block.handle);
 
-        // 6. Add block arguments based on the function type.
-        std.log.info("MLIRBuilder.createFunction: Adding block arguments...", .{});
+        // 6. Add block arguments
         const func_type_wrapper = func_type.as(mlir.FunctionType) orelse return error.NotAFunctionType;
         const num_inputs = func_type_wrapper.getNumInputs();
         for (0..num_inputs) |i| {
             const input_type = func_type_wrapper.getInput(i);
             _ = entry_block.addArgument(input_type, self.loc);
         }
-        std.log.info("MLIRBuilder.createFunction: Block arguments added ({})", .{num_inputs});
-
-        std.log.info("MLIRBuilder.createFunction: Function '{s}' created and attached successfully.", .{name});
-        
-        // Note: Verification removed - will be done after function body is complete
 
         return .{ .func_op = func_op, .entry_block = entry_block };
     }
@@ -265,7 +282,7 @@ fn broadcastTensors(builder: *MLIRBuilder, a: Tensor, b: Tensor) !struct { Tenso
             try broadcast_dims.append(@intCast(i + rank_diff));
         }
 
-        const op = hlo.broadcast_in_dim(builder.ctx, a.value, target_shape, broadcast_dims.items, builder.loc);
+        const op = try hlo.broadcast_in_dim(builder.allocator, builder.ctx, a.value, target_shape, broadcast_dims.items, builder.loc);
         builder.insertion_block.appendOwnedOperation(op);  // <-- FIX: Append the broadcast op
         a_broadcasted = try builder.newTensor(op.getResult(0));
     }
@@ -280,7 +297,7 @@ fn broadcastTensors(builder: *MLIRBuilder, a: Tensor, b: Tensor) !struct { Tenso
             try broadcast_dims.append(@intCast(i + rank_diff));
         }
 
-        const op = hlo.broadcast_in_dim(builder.ctx, b.value, target_shape, broadcast_dims.items, builder.loc);
+        const op = try hlo.broadcast_in_dim(builder.allocator, builder.ctx, b.value, target_shape, broadcast_dims.items, builder.loc);
         builder.insertion_block.appendOwnedOperation(op);  // <-- FIX: Append the broadcast op
         b_broadcasted = try builder.newTensor(op.getResult(0));
     }
@@ -291,9 +308,9 @@ fn broadcastTensors(builder: *MLIRBuilder, a: Tensor, b: Tensor) !struct { Tenso
 /// Add two tensors element-wise using stablehlo.add with broadcasting support
 pub fn add(builder: *MLIRBuilder, a: Tensor, b: Tensor) !Tensor {
     const b_tensors = try broadcastTensors(builder, a, b);
-    
+
     // Use StableHLO dialect wrapper for clean operation creation
-    const operation = hlo.add(builder.ctx, b_tensors[0].value, b_tensors[1].value, builder.loc);
+    const operation = try hlo.add(builder.allocator, builder.ctx, b_tensors[0].value, b_tensors[1].value, builder.loc);
 
     // MUST use the helper that appends the operation
     return try builder.createAndAppendOp(operation);
@@ -302,9 +319,9 @@ pub fn add(builder: *MLIRBuilder, a: Tensor, b: Tensor) !Tensor {
 /// Subtract two tensors element-wise using stablehlo.subtract with broadcasting support
 pub fn subtract(builder: *MLIRBuilder, a: Tensor, b: Tensor) !Tensor {
     const b_tensors = try broadcastTensors(builder, a, b);
-    
+
     // Use StableHLO dialect wrapper for clean operation creation
-    const operation = hlo.subtract(builder.ctx, b_tensors[0].value, b_tensors[1].value, builder.loc);
+    const operation = try hlo.subtract(builder.allocator, builder.ctx, b_tensors[0].value, b_tensors[1].value, builder.loc);
 
     // MUST use the helper that appends the operation
     return try builder.createAndAppendOp(operation);
@@ -313,9 +330,9 @@ pub fn subtract(builder: *MLIRBuilder, a: Tensor, b: Tensor) !Tensor {
 /// Multiply two tensors element-wise using stablehlo.multiply with broadcasting support
 pub fn multiply(builder: *MLIRBuilder, a: Tensor, b: Tensor) !Tensor {
     const b_tensors = try broadcastTensors(builder, a, b);
-    
+
     // Use StableHLO dialect wrapper for clean operation creation
-    const operation = hlo.multiply(builder.ctx, b_tensors[0].value, b_tensors[1].value, builder.loc);
+    const operation = try hlo.multiply(builder.allocator, builder.ctx, b_tensors[0].value, b_tensors[1].value, builder.loc);
 
     // CRITICAL FIX: Use helper to append and return tensor
     return try builder.createAndAppendOp(operation);
@@ -465,7 +482,7 @@ pub fn transpose(builder: *MLIRBuilder, a: Tensor, permutation: []const i64) !Te
 /// Reshape a tensor using stablehlo.reshape
 pub fn reshape(builder: *MLIRBuilder, a: Tensor, new_shape: []const i64) !Tensor {
     // Use StableHLO dialect wrapper
-    const operation = hlo.reshape(builder.ctx, a.value, new_shape, builder.loc);
+    const operation = try hlo.reshape(builder.allocator, builder.ctx, a.value, new_shape, builder.loc);
 
     // MUST use the helper that appends the operation
     return try builder.createAndAppendOp(operation);
@@ -627,7 +644,7 @@ pub fn slice(builder: *MLIRBuilder, a: Tensor, start_indices: []const i64, limit
 /// Iota operation to create tensors with incrementing values along a dimension
 pub fn iota(builder: *MLIRBuilder, shape: []const i64, iota_dimension: i64, element_type: mlir.Type) !Tensor {
     // Use StableHLO dialect wrapper
-    const operation = hlo.iota(builder.ctx, shape, iota_dimension, element_type, builder.loc);
+    const operation = try hlo.iota(builder.allocator, builder.ctx, shape, iota_dimension, element_type, builder.loc);
 
     return try builder.createAndAppendOp(operation);
 }
@@ -636,7 +653,7 @@ pub fn iota(builder: *MLIRBuilder, shape: []const i64, iota_dimension: i64, elem
 pub fn compare(builder: *MLIRBuilder, lhs: Tensor, rhs: Tensor, direction: hlo.CompareDirection) !Tensor {
     // Determine compare_type based on element type
     const elem_type = lhs.value.getType().as(mlir.RankedTensorType).?.getElementType();
-    const compare_type = if (elem_type.handle == mlir.Type.i32Type(builder.ctx).handle) hlo.CompareType.SIGNED else hlo.CompareType.FLOAT; // Adjust as needed
+    const compare_type = if (@intFromPtr(elem_type.handle.ptr) == @intFromPtr(mlir.Type.i32Type(builder.ctx).handle.ptr)) hlo.CompareType.SIGNED else hlo.CompareType.FLOAT; // Adjust as needed
 
     const operation = hlo.compare(builder.ctx, lhs.value, rhs.value, direction, compare_type, builder.loc);
     return try builder.createAndAppendOp(operation);
@@ -645,7 +662,7 @@ pub fn compare(builder: *MLIRBuilder, lhs: Tensor, rhs: Tensor, direction: hlo.C
 /// Broadcast in dimension operation
 pub fn broadcastInDim(builder: *MLIRBuilder, operand: Tensor, target_shape: []const i64, broadcast_dimensions: []const i64) !Tensor {
     // Use StableHLO dialect wrapper
-    const operation = hlo.broadcast_in_dim(builder.ctx, operand.value, target_shape, broadcast_dimensions, builder.loc);
+    const operation = try hlo.broadcast_in_dim(builder.allocator, builder.ctx, operand.value, target_shape, broadcast_dimensions, builder.loc);
 
     return try builder.createAndAppendOp(operation);
 }
@@ -667,7 +684,7 @@ pub fn select(builder: *MLIRBuilder, pred: Tensor, on_true: Tensor, on_false: Te
     // Pred should be broadcast-compatible, but in our cases it's full shape
 
     // Create the operation with potentially broadcasted operands
-    const operation = hlo.select(builder.ctx, pred.value, on_true.value, on_false_final.value, builder.loc);
+    const operation = try hlo.select(builder.allocator, builder.ctx, pred.value, on_true.value, on_false_final.value, builder.loc);
 
     return try builder.createAndAppendOp(operation);
 }
@@ -688,10 +705,26 @@ pub fn log(builder: *MLIRBuilder, a: Tensor) !Tensor {
     return try builder.createAndAppendOp(operation);
 }
 
+/// Element-wise square root
+pub fn sqrt(builder: *MLIRBuilder, a: Tensor) !Tensor {
+    // Use StableHLO dialect wrapper
+    const operation = hlo.sqrt(builder.ctx, a.value, builder.loc);
+
+    return try builder.createAndAppendOp(operation);
+}
+
+/// Element-wise power operation
+pub fn power(builder: *MLIRBuilder, base: Tensor, exponent: Tensor) !Tensor {
+    // Note: This may require broadcasting `base` and `exponent`
+    const b_tensors = try broadcastTensors(builder, base, exponent);
+    const operation = hlo.power(builder.ctx, b_tensors[0].value, b_tensors[1].value, builder.loc);
+    return try builder.createAndAppendOp(operation);
+}
+
 /// Type conversion operation
 pub fn convert(builder: *MLIRBuilder, a: Tensor, target_type: mlir.Type) !Tensor {
     // Use StableHLO dialect wrapper
-    const operation = hlo.convert(builder.ctx, a.value, target_type, builder.loc);
+    const operation = try hlo.convert(builder.allocator, builder.ctx, a.value, target_type, builder.loc);
 
     return try builder.createAndAppendOp(operation);
 }
@@ -735,7 +768,7 @@ pub fn oneHot(builder: *MLIRBuilder, indices: Tensor, depth: i64, on_value: f64,
     // Convert indices to i64 if necessary
     const indices_elem_type = indices.value.getType().as(mlir.RankedTensorType).?.getElementType();
     var indices_for_compare = indices;
-    if (indices_elem_type.handle != iota_elem_type.handle) {
+    if (@intFromPtr(indices_elem_type.handle.ptr) != @intFromPtr(iota_elem_type.handle.ptr)) {
         const indices_i64_type = mlir.Type.rankedTensorType(ctx, indices_shape, iota_elem_type);
         indices_for_compare = try convert(builder, indices, indices_i64_type);
     }
@@ -773,17 +806,25 @@ pub fn oneHot(builder: *MLIRBuilder, indices: Tensor, depth: i64, on_value: f64,
 /// This is now the single source of truth for creating constants.
 pub fn constant(builder: *MLIRBuilder, value: f64, shape: []const i64, element_type: mlir.Type) !Tensor {
     const tensor_type = mlir.Type.rankedTensorType(builder.ctx, shape, element_type);
-    
-    // Create a dense attribute for the value. For a scalar, this is simple.
-    // For a tensor, it broadcasts the value across the shape.
-    const attr = mlir.Attribute.denseElementsAttrSplat(tensor_type, value);
 
-    const constant_op = hlo.constant(builder.ctx, .{
+    var attr: mlir.Attribute = undefined;
+
+    if (element_type.isInteger() or element_type.isIndex()) {
+        // Handle Integer/Index types
+        const i_val: i64 = @intFromFloat(value);
+        const element_attr = mlir.Attribute.integerAttr(builder.ctx, i_val, element_type);
+        attr = mlir.Attribute.denseElementsAttrSplat(tensor_type, element_attr);
+    } else {
+        // Handle Float types
+        // Use the specific FloatSplat for floats to ensure correct bit representation
+        attr = mlir.Attribute.denseElementsAttrFloatSplat(tensor_type, value);
+    }
+
+    const constant_op = try hlo.constant(builder.allocator, builder.ctx, .{
         .value = attr,
         .result_type = tensor_type,
     });
-    
-    // Use the reliable "create and append" pattern.
+
     return builder.createAndAppendOp(constant_op);
 }
 

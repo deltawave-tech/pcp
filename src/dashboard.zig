@@ -35,14 +35,14 @@ pub const Dashboard = struct {
                 self.should_quit = true;
                 break;
             }
-            
+
             // Get current metrics
             const metrics = monitoring.getMetrics();
-            
-            // Clear screen and render the UI
-            std.debug.print("\x1b[2J\x1b[H", .{});
+
+            // Move cursor to home and render the UI
+            std.debug.print("\x1b[H", .{});
             try self.render(metrics);
-            
+
             // Don't burn CPU, refresh every 500ms
             std.time.sleep(500 * std.time.ns_per_ms);
         }
@@ -51,7 +51,7 @@ pub const Dashboard = struct {
         std.debug.print("\x1b[?1049l\x1b[?25h", .{});
     }
     
-    /// Check for quit key (simplified - just runs for a fixed time for demo)
+    /// Check for quit key (simplified)
     fn checkForQuit(self: *Self) bool {
         _ = self;
         // For now, just return false - in a real implementation, this would check stdin
@@ -61,9 +61,12 @@ pub const Dashboard = struct {
     
     /// Render the TUI dashboard
     fn render(_: *Self, metrics: monitoring.TrainingMetrics) !void {
-        
+
         var buf: [256]u8 = undefined;
-        
+
+        // Clear from cursor to end of screen to avoid artifacts
+        std.debug.print("\x1b[0J", .{});
+
         // Title with colors
         std.debug.print("\x1b[1;36m🪐 Planetary Compute Protocol - Dashboard\x1b[0m\n\n", .{});
         
@@ -110,7 +113,6 @@ pub const Dashboard = struct {
         
         // Instructions
         std.debug.print("\x1b[37mPress Ctrl+C to quit | Updates every 500ms\x1b[0m\n", .{});
-        std.debug.print("\x1b[33mNote: Dashboard runs for 30 seconds in demo mode\x1b[0m\n", .{});
     }
     
     /// Draw a simple bordered box with title
@@ -226,31 +228,30 @@ pub fn runDashboard() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
-    
+
     var dashboard = Dashboard.init(allocator) catch |err| {
         std.log.err("Failed to initialize dashboard: {}", .{err});
         return;
     };
     defer dashboard.deinit();
-    
-    // Run for 30 seconds in demo mode (since we don't have full input handling)
-    const start_time = std.time.timestamp();
-    const demo_duration = 30; // seconds
-    
-    while (std.time.timestamp() - start_time < demo_duration) {
+
+    // Hide cursor and use a stable position (don't use alternate screen to avoid interfering with logs)
+    std.debug.print("\x1b[?25l", .{}); // Hide cursor
+    defer std.debug.print("\x1b[?25h", .{}); // Restore cursor at end
+
+    // Run continuously (Ctrl+C to quit)
+    while (true) {
         // Get current metrics
         const metrics = monitoring.getMetrics();
-        
-        // Clear screen and render the UI
-        std.debug.print("\x1b[2J\x1b[H", .{});
+
+        // Move cursor to home and render (without clearing entire screen buffer)
+        std.debug.print("\x1b[H", .{}); // Move cursor to home position
         dashboard.render(metrics) catch |err| {
             std.log.err("Dashboard render error: {}", .{err});
             break;
         };
-        
+
         // Don't burn CPU, refresh every 500ms
         std.time.sleep(500 * std.time.ns_per_ms);
     }
-    
-    std.debug.print("\x1b[2J\x1b[H\x1b[32mDashboard demo completed!\x1b[0m\n", .{});
 }

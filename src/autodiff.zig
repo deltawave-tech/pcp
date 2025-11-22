@@ -848,7 +848,6 @@ fn gatherVJP(
     primals: []const mlir.Value,
     adjoints: []const mlir.Value,
 ) ![]mlir.Value {
-    _ = original_op;
     const grad_out = adjoints[0];
     const operand = primals[0];      // Embedding table [Vocab, Embed]
     const start_indices = primals[1]; // Indices [Batch, Seq]
@@ -864,11 +863,6 @@ fn gatherVJP(
     const indices_type = start_indices.getType().as(mlir.RankedTensorType) orelse return error.InvalidTensorType;
     const grad_out_type = grad_out.getType().as(mlir.RankedTensorType) orelse return error.InvalidTensorType;
 
-    const vocab_size = operand_type.getDimension(0);
-    std.debug.print("DEBUG gatherVJP: vocab_size={}, operand_rank={}, indices_rank={}, grad_out_rank={}\n", .{
-        vocab_size, operand_type.getRank(), indices_type.getRank(), grad_out_type.getRank()
-    });
-
     // Convert indices to i64 if needed
     const indices_elem_type = indices_type.getElementType();
     const indices_i64 = if (indices_elem_type.isInteger()) start_indices else blk: {
@@ -882,6 +876,154 @@ fn gatherVJP(
         const convert_op = try builder.createAndAttach("stablehlo.convert", &.{start_indices}, &.{indices_i64_type}, .{});
         break :blk convert_op.getResult(0);
     };
+
+    // --- FIX FOR VECTOR INDICES START ---
+    const dim_numbers_attr = c.mlirOperationGetAttributeByName(original_op.handle, c.stringRefFromString("dimension_numbers"));
+    const slice_sizes_attr = c.mlirOperationGetAttributeByName(original_op.handle, c.stringRefFromString("slice_sizes"));
+
+    if (@intFromPtr(dim_numbers_attr.ptr) != 0 and @intFromPtr(slice_sizes_attr.ptr) != 0) {
+        const operand_rank = operand_type.getRank();
+        var slice_volume: i64 = 1;
+        var total_elements: i64 = 1;
+        for (0..operand_rank) |i| {
+            slice_volume *= c.denseI64ArrayGetElement(slice_sizes_attr, @intCast(i));
+            total_elements *= operand_type.getDimension(i);
+        }
+
+        const index_vector_dim = c.stablehloGatherDimensionNumbersGetIndexVectorDim(dim_numbers_attr);
+        const indices_rank = indices_type.getRank();
+
+        // Check for vector index gather that produces scalars (collapses all dims)
+        if (slice_volume == 1 and index_vector_dim < @as(i64, @intCast(indices_rank)) and indices_type.getDimension(@intCast(index_vector_dim)) > 1) {
+            std.debug.print("DEBUG gatherVJP: Detected Scalar Gather with Vector Indices. Using Linearization.\n", .{});
+
+            // 1. Linearize Indices
+            const map_size = c.stablehloGatherDimensionNumbersGetStartIndexMapSize(dim_numbers_attr);
+
+            // Calculate strides
+            var strides = try builder.allocator.alloc(i64, operand_rank);
+            defer builder.allocator.free(strides);
+            var current_stride: i64 = 1;
+            var i: usize = operand_rank;
+            while (i > 0) {
+                i -= 1;
+                strides[i] = current_stride;
+                current_stride *= operand_type.getDimension(i);
+            }
+
+            // Shape of indices after removing vector dim
+            var linear_index_shape = try builder.allocator.alloc(i64, indices_rank - 1);
+            defer builder.allocator.free(linear_index_shape);
+            var dim_idx: usize = 0;
+            for (0..indices_rank) |d| {
+                if (d != @as(usize, @intCast(index_vector_dim))) {
+                    linear_index_shape[dim_idx] = indices_type.getDimension(d);
+                    dim_idx += 1;
+                }
+            }
+
+            // Accumulate linear index
+            var linear_indices: ?mlir.Value = null;
+
+            for (0..@as(usize, @intCast(map_size))) |k| {
+                // Slice indices at index_vector_dim = k
+                var start = try builder.allocator.alloc(i64, indices_rank);
+                defer builder.allocator.free(start);
+                var limit = try builder.allocator.alloc(i64, indices_rank);
+                defer builder.allocator.free(limit);
+                var slice_strides = try builder.allocator.alloc(i64, indices_rank);
+                defer builder.allocator.free(slice_strides);
+
+                for (0..indices_rank) |d| {
+                    start[d] = 0;
+                    limit[d] = indices_type.getDimension(d);
+                    slice_strides[d] = 1;
+                }
+                start[@intCast(index_vector_dim)] = @intCast(k);
+                limit[@intCast(index_vector_dim)] = @intCast(k + 1);
+
+                const slice_op = try hlo.slice(builder.allocator, builder.ctx, indices_i64, start, limit, slice_strides, builder.loc);
+                builder.insertion_block.appendOwnedOperation(slice_op);
+
+                const reshape_op = try hlo.reshape(builder.allocator, builder.ctx, slice_op.getResult(0), linear_index_shape, builder.loc);
+                builder.insertion_block.appendOwnedOperation(reshape_op);
+                const component = reshape_op.getResult(0);
+
+                const operand_dim_idx = c.stablehloGatherDimensionNumbersGetStartIndexMapElem(dim_numbers_attr, @intCast(k));
+                const dim_stride = strides[@intCast(operand_dim_idx)];
+
+                // Create constant stride tensor
+                const stride_tensor = try ops.constant(builder, @floatFromInt(dim_stride), linear_index_shape, mlir.Type.i64Type(builder.ctx));
+
+                const scaled_comp_op = try hlo.multiply(builder.allocator, builder.ctx, component, stride_tensor.value, builder.loc);
+                builder.insertion_block.appendOwnedOperation(scaled_comp_op);
+                const scaled_comp = scaled_comp_op.getResult(0);
+
+                if (linear_indices) |acc| {
+                    const add_op = try hlo.add(builder.allocator, builder.ctx, acc, scaled_comp, builder.loc);
+                    builder.insertion_block.appendOwnedOperation(add_op);
+                    linear_indices = add_op.getResult(0);
+                } else {
+                    linear_indices = scaled_comp;
+                }
+            }
+
+            // 2. OneHot & MatMul
+            // Flatten linear indices to [N]
+            var n_elements: i64 = 1;
+            for (linear_index_shape) |d| n_elements *= d;
+
+            const flat_indices_shape = [_]i64{n_elements};
+            const flat_reshape_op = try hlo.reshape(builder.allocator, builder.ctx, linear_indices.?, &flat_indices_shape, builder.loc);
+            builder.insertion_block.appendOwnedOperation(flat_reshape_op);
+
+            const one_hot_flat = try ops.oneHot(
+                builder,
+                try builder.newTensor(flat_reshape_op.getResult(0)),
+                total_elements,
+                1.0, 0.0, -1,
+                grad_out_type.getElementType()
+            );
+
+            // Flatten GradOut to [N, 1]
+            const grad_flat_shape = [_]i64{n_elements, 1};
+            const grad_flat_op = try hlo.reshape(builder.allocator, builder.ctx, grad_out, &grad_flat_shape, builder.loc);
+            builder.insertion_block.appendOwnedOperation(grad_flat_op);
+
+            // MatMul: [N, Total]^T @ [N, 1] -> [Total, 1] (Contract dim 0 of LHS with dim 0 of RHS)
+            // OneHot is [N, Total]. Contract N.
+            const dot_dims = hlo.DotDimensionNumbersAttribute{
+                .lhs_batching_dimensions = &.{},
+                .rhs_batching_dimensions = &.{},
+                .lhs_contracting_dimensions = &.{0},
+                .rhs_contracting_dimensions = &.{0},
+            };
+
+            const grad_table_op = try hlo.dot_general(
+                builder.allocator,
+                builder.ctx,
+                one_hot_flat.value,
+                grad_flat_op.getResult(0),
+                .{ .dot_dimension_numbers = dot_dims }
+            );
+            builder.insertion_block.appendOwnedOperation(grad_table_op);
+
+            // Reshape to Operand Shape
+            const operand_shape = try operand_type.getShape(builder.allocator);
+            defer builder.allocator.free(operand_shape);
+            const final_op = try hlo.reshape(builder.allocator, builder.ctx, grad_table_op.getResult(0), operand_shape, builder.loc);
+            builder.insertion_block.appendOwnedOperation(final_op);
+
+            try result.append(final_op.getResult(0));
+            return result.toOwnedSlice();
+        }
+    }
+    // --- FIX END ---
+
+    const vocab_size = operand_type.getDimension(0);
+    std.debug.print("DEBUG gatherVJP: vocab_size={}, operand_rank={}, indices_rank={}, grad_out_rank={}\n", .{
+        vocab_size, operand_type.getRank(), indices_type.getRank(), grad_out_type.getRank()
+    });
 
     // Create one-hot: [Batch, Seq] -> [Batch, Seq, Vocab]
     std.debug.print("DEBUG gatherVJP: About to create one-hot tensor...\n", .{});

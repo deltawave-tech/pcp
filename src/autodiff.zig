@@ -661,12 +661,13 @@ fn gatherVJP(
         };
 
         const scatter_op = try hlo.scatter(builder.allocator, builder.ctx, zero_tensor.getResult(0), start_indices, grad_out, scatter_dim_numbers, builder.loc);
+        builder.insertion_block.appendOwnedOperation(scatter_op);
         try result.append(scatter_op.getResult(0));
     }
-    
+
     // Gradient for start_indices: typically zero (indices don't have gradients)
     // We don't add anything for start_indices as they're typically integers
-    
+
     return result.toOwnedSlice();
 }
 

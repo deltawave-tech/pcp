@@ -1027,19 +1027,56 @@ pub fn scatter(
     dimension_numbers: ScatterDimensionNumbersAttribute,
     loc: mlir.Location,
 ) !mlir.Operation {
-    const dim_numbers_attr = dimension_numbers.asAttr(ctx);
+    const c_api = @import("../c.zig").c;
 
-    // Result type is the same as the operand type
+    // Get the element type for the update computation
+    const operand_type = operand.getType().as(mlir.RankedTensorType).?;
+    const element_type = operand_type.getElementType();
+    const scalar_type = mlir.Type.tensor(&.{}, element_type);
+
+    // Create the update body region with an add operation (for gradient accumulation)
+    const body_region = c_api.regionCreate();
+    const body_block = mlir.Block{ .handle = c_api.blockCreate(0, @constCast(@ptrCast(&[_]c_api.MlirType{})), @constCast(@ptrCast(&[_]*c_api.MlirLocation{}))) };
+    c_api.regionAppendOwnedBlock(body_region, body_block.handle);
+
+    // Add arguments: (existing_value, update_value) -> combined_value
+    const lhs_arg = body_block.addArgument(scalar_type, loc);
+    const rhs_arg = body_block.addArgument(scalar_type, loc);
+    const add_op = try add(allocator, ctx, lhs_arg, rhs_arg, loc);
+    c_api.blockAppendOwnedOperation(body_block.handle, add_op.handle);
+    const return_op = try mlir.Operation.create(allocator, ctx, "stablehlo.return", .{ .operands = &.{add_op.getResult(0)} });
+    c_api.blockAppendOwnedOperation(body_block.handle, return_op.handle);
+
+    // Build the scatter operation using pcpCreateOperation
+    const dim_numbers_attr = dimension_numbers.asAttr(ctx);
     const result_type = operand.getType();
 
-    return mlir.Operation.create(allocator, ctx, "stablehlo.scatter", .{
-        .operands = &.{ operand, scatter_indices, updates },
-        .results = &.{result_type},
-        .attributes = &.{
-            .{ "scatter_dimension_numbers", dim_numbers_attr },
-        },
-        .location = loc,
-    });
+    var operands = [_]c_api.MlirValue{ operand.handle, scatter_indices.handle, updates.handle };
+    var results = [_]c_api.MlirType{ result_type.handle };
+    var regions = [_]c_api.MlirRegion{ body_region };
+
+    const scatter_dim_numbers_ref = c_api.stringRefFromString("scatter_dimension_numbers");
+    const scatter_dim_numbers_id = c_api.identifierGet(ctx.handle, scatter_dim_numbers_ref);
+    var named_attrs = [_]c_api.MlirNamedAttribute{
+        .{ .name = scatter_dim_numbers_id, .attribute = dim_numbers_attr.handle }
+    };
+
+    const name_ref = c_api.stringRefFromString("stablehlo.scatter");
+
+    const op_args = c_api.PcpOpArgs{
+        .nResults = 1,
+        .results = &results,
+        .nOperands = 3,
+        .operands = &operands,
+        .nAttributes = 1,
+        .attributes = &named_attrs,
+        .nRegions = 1,
+        .regions = &regions,
+    };
+
+    const handle = c_api.pcpCreateOperation(&name_ref, &loc.handle, &op_args);
+
+    return mlir.Operation{ .handle = handle };
 }
 
 /// Creates a stablehlo.pad operation

@@ -644,7 +644,7 @@ pub fn slice(builder: *MLIRBuilder, a: Tensor, start_indices: []const i64, limit
 /// Iota operation to create tensors with incrementing values along a dimension
 pub fn iota(builder: *MLIRBuilder, shape: []const i64, iota_dimension: i64, element_type: mlir.Type) !Tensor {
     // Use StableHLO dialect wrapper
-    const operation = hlo.iota(builder.ctx, shape, iota_dimension, element_type, builder.loc);
+    const operation = try hlo.iota(builder.allocator, builder.ctx, shape, iota_dimension, element_type, builder.loc);
 
     return try builder.createAndAppendOp(operation);
 }
@@ -653,7 +653,7 @@ pub fn iota(builder: *MLIRBuilder, shape: []const i64, iota_dimension: i64, elem
 pub fn compare(builder: *MLIRBuilder, lhs: Tensor, rhs: Tensor, direction: hlo.CompareDirection) !Tensor {
     // Determine compare_type based on element type
     const elem_type = lhs.value.getType().as(mlir.RankedTensorType).?.getElementType();
-    const compare_type = if (elem_type.handle == mlir.Type.i32Type(builder.ctx).handle) hlo.CompareType.SIGNED else hlo.CompareType.FLOAT; // Adjust as needed
+    const compare_type = if (@intFromPtr(elem_type.handle.ptr) == @intFromPtr(mlir.Type.i32Type(builder.ctx).handle.ptr)) hlo.CompareType.SIGNED else hlo.CompareType.FLOAT; // Adjust as needed
 
     const operation = hlo.compare(builder.ctx, lhs.value, rhs.value, direction, compare_type, builder.loc);
     return try builder.createAndAppendOp(operation);
@@ -662,7 +662,7 @@ pub fn compare(builder: *MLIRBuilder, lhs: Tensor, rhs: Tensor, direction: hlo.C
 /// Broadcast in dimension operation
 pub fn broadcastInDim(builder: *MLIRBuilder, operand: Tensor, target_shape: []const i64, broadcast_dimensions: []const i64) !Tensor {
     // Use StableHLO dialect wrapper
-    const operation = hlo.broadcast_in_dim(builder.ctx, operand.value, target_shape, broadcast_dimensions, builder.loc);
+    const operation = try hlo.broadcast_in_dim(builder.allocator, builder.ctx, operand.value, target_shape, broadcast_dimensions, builder.loc);
 
     return try builder.createAndAppendOp(operation);
 }
@@ -684,7 +684,7 @@ pub fn select(builder: *MLIRBuilder, pred: Tensor, on_true: Tensor, on_false: Te
     // Pred should be broadcast-compatible, but in our cases it's full shape
 
     // Create the operation with potentially broadcasted operands
-    const operation = hlo.select(builder.ctx, pred.value, on_true.value, on_false_final.value, builder.loc);
+    const operation = try hlo.select(builder.allocator, builder.ctx, pred.value, on_true.value, on_false_final.value, builder.loc);
 
     return try builder.createAndAppendOp(operation);
 }
@@ -724,7 +724,7 @@ pub fn power(builder: *MLIRBuilder, base: Tensor, exponent: Tensor) !Tensor {
 /// Type conversion operation
 pub fn convert(builder: *MLIRBuilder, a: Tensor, target_type: mlir.Type) !Tensor {
     // Use StableHLO dialect wrapper
-    const operation = hlo.convert(builder.ctx, a.value, target_type, builder.loc);
+    const operation = try hlo.convert(builder.allocator, builder.ctx, a.value, target_type, builder.loc);
 
     return try builder.createAndAppendOp(operation);
 }
@@ -768,7 +768,7 @@ pub fn oneHot(builder: *MLIRBuilder, indices: Tensor, depth: i64, on_value: f64,
     // Convert indices to i64 if necessary
     const indices_elem_type = indices.value.getType().as(mlir.RankedTensorType).?.getElementType();
     var indices_for_compare = indices;
-    if (indices_elem_type.handle != iota_elem_type.handle) {
+    if (@intFromPtr(indices_elem_type.handle.ptr) != @intFromPtr(iota_elem_type.handle.ptr)) {
         const indices_i64_type = mlir.Type.rankedTensorType(ctx, indices_shape, iota_elem_type);
         indices_for_compare = try convert(builder, indices, indices_i64_type);
     }

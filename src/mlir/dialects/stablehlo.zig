@@ -330,16 +330,19 @@ pub fn compare(ctx: mlir.Context, lhs: mlir.Value, rhs: mlir.Value, direction: C
     };
 
     // Create operation using pcpCreateOperation with packed args
-    var operands = [_]*c.c.MlirValue{ lhs.handle, rhs.handle };
-    var result_types = [_]*c.c.MlirType{ result_type.handle };
+    var lhs_handle = lhs.handle;
+    var rhs_handle = rhs.handle;
+    var result_type_handle = result_type.handle;
+    var operands = [_]*c.c.MlirValue{ &lhs_handle, &rhs_handle };
+    var result_types = [_]*c.c.MlirType{ &result_type_handle };
 
     const name_ref = c.c.stringRefFromString("stablehlo.compare");
 
     const op_args = c.c.PcpOpArgs{
         .nResults = 1,
-        .results = &result_types,
+        .results = @ptrCast(&result_types),
         .nOperands = 2,
-        .operands = &operands,
+        .operands = @ptrCast(&operands),
         .nAttributes = @intCast(named_attrs.len),
         .attributes = &named_attrs,
         .nRegions = 0,
@@ -388,8 +391,8 @@ pub const CompareType = enum {
 };
 
 /// Creates a stablehlo.select operation
-pub fn select(ctx: mlir.Context, pred: mlir.Value, on_true: mlir.Value, on_false: mlir.Value, loc: mlir.Location) mlir.Operation {
-    return mlir.Operation.create(ctx, "stablehlo.select", .{
+pub fn select(allocator: std.mem.Allocator, ctx: mlir.Context, pred: mlir.Value, on_true: mlir.Value, on_false: mlir.Value, loc: mlir.Location) !mlir.Operation {
+    return mlir.Operation.create(allocator, ctx, "stablehlo.select", .{
         .operands = &.{ pred, on_true, on_false },
         .results = &.{on_true.getType()},
         .location = loc,
@@ -776,11 +779,11 @@ pub fn slice(ctx: mlir.Context, operand: mlir.Value, start_indices: []const i64,
 }
 
 /// Creates a stablehlo.iota operation
-pub fn iota(ctx: mlir.Context, shape: []const i64, iota_dimension: i64, element_type: mlir.Type, loc: mlir.Location) mlir.Operation {
+pub fn iota(allocator: std.mem.Allocator, ctx: mlir.Context, shape: []const i64, iota_dimension: i64, element_type: mlir.Type, loc: mlir.Location) !mlir.Operation {
     const iota_dimension_attr = mlir.Attribute.integerAttr(ctx, iota_dimension, mlir.Type.i64Type(ctx));
     const result_type = mlir.Type.tensor(shape, element_type);
-    
-    return mlir.Operation.create(ctx, "stablehlo.iota", .{
+
+    return mlir.Operation.create(allocator, ctx, "stablehlo.iota", .{
         .operands = &.{},
         .results = &.{result_type},
         .attributes = &.{.{ "iota_dimension", iota_dimension_attr }},
@@ -836,8 +839,8 @@ pub fn one_hot(ctx: mlir.Context, indices: mlir.Value, depth: i64, on_value: f32
 }
 
 /// Creates a stablehlo.convert operation
-pub fn convert(ctx: mlir.Context, operand: mlir.Value, result_type: mlir.Type, loc: mlir.Location) mlir.Operation {
-    return mlir.Operation.create(ctx, "stablehlo.convert", .{
+pub fn convert(allocator: std.mem.Allocator, ctx: mlir.Context, operand: mlir.Value, result_type: mlir.Type, loc: mlir.Location) !mlir.Operation {
+    return mlir.Operation.create(allocator, ctx, "stablehlo.convert", .{
         .operands = &.{operand},
         .results = &.{result_type},
         .location = loc,

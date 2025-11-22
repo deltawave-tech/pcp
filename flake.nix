@@ -19,9 +19,13 @@
           config.allowUnfree = true;
         };
         lib = pkgs.lib;
+        # zig is LLVM based. In order to ensure ABI compatibility, we have base our builds on
+        # LLVM/clang.  The following is the `pkgs` set based on LLVM.
         pkgsLLVM = if pkgs.stdenv.isLinux then pkgs.pkgsLLVM else pkgs;
-        llvmPkg = pkgsLLVM.llvmPackages_git;
+        # The actual LLVM package we are using for building.
+        llvmPkg = pkgsLLVM.llvmPackages_21;
         zls = pkgs.zlspkgs.zls;
+        # Patch mlir to also contain mlir-pdll
         mlirPkg = llvmPkg.mlir.overrideAttrs (old: {
           postInstall = (old.postInstall or "") + ''
             cp -v bin/mlir-pdll $out/bin
@@ -129,7 +133,6 @@
             (lib.cmakeBool "IREE_ENABLE_SPLIT_DWARF" true)
             (lib.cmakeBool "IREE_ENABLE_THIN_ARCHIVES" true)
             (lib.cmakeBool "IREE_ENABLE_LLD" true)
-
           ];
           meta = {
             description = "IREE SDK built from source";
@@ -137,5 +140,6 @@
             platforms = [ "aarch64-darwin" "x86_64-darwin" "x86_64-linux" ];
           };
         };
+        packages.stdenv = pkgsLLVM.stdenv;
       });
 }

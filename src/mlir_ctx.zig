@@ -37,8 +37,8 @@ const GPU_MAPPING_SCRIPT =
 /// MLIR Context wrapper for StableHLO → GPU → SPIR-V pipeline
 pub const MLIRContext = struct {
     allocator: Allocator,
-    context: *c.MlirContext,
-    registry: ?*c.MlirDialectRegistry,
+    context: c.MlirContext,
+    registry: ?c.MlirDialectRegistry,
     
     // --- REMOVED ---
     // pass_manager: mlir.PassManager, // <-- This field is the source of the state bug. Remove it.
@@ -76,10 +76,12 @@ pub const MLIRContext = struct {
 
         // Now, our check will succeed because we have explicitly loaded the dialect.
         std.debug.print("Checking if stablehlo.constant operation is registered...\n", .{});
-        if (!c.contextIsRegisteredOperation(context, "stablehlo.constant")) {
+        const constant_name = c.stringRefFromString("stablehlo.constant");
+        if (!c.contextIsRegisteredOperation(context, constant_name)) {
             // Try alternative operation names
             std.debug.print("stablehlo.constant not found, trying stablehlo.add...\n", .{});
-            if (!c.contextIsRegisteredOperation(context, "stablehlo.add")) {
+            const add_name = c.stringRefFromString("stablehlo.add");
+            if (!c.contextIsRegisteredOperation(context, add_name)) {
                 std.log.err("FATAL: Stablehlo dialect not registered. Check IREE build and linking.", .{});
                 return error.DialectRegistrationFailed;
             }
@@ -381,20 +383,20 @@ pub fn serializeMLIRModule(allocator: Allocator, module: mlir.Module) ![]u8 {
     };
     
     const writeToArrayList = struct {
-        fn callback(data_ptr: [*]const u8, data_len: usize, userData: ?*anyopaque) callconv(.C) void {
+        fn callback(string_ref: c.MlirStringRef, userData: ?*anyopaque) callconv(.C) void {
             const context = @as(*SerializationContext, @ptrCast(@alignCast(userData.?)));
-            const data = data_ptr[0..data_len];
-            
-            // Debug: std.debug.print("MLIR serialization callback: appending {} bytes (total so far: {})\n", .{ data_len, context.buffer.items.len });
-            
+            const data = c.fromStringRef(string_ref);
+
+            // Debug: std.debug.print("MLIR serialization callback: appending {} bytes (total so far: {})\n", .{ data.len, context.buffer.items.len });
+
             // Add bounds checking to prevent buffer overflow
-            if (data_len > 100 * 1024 * 1024) { // 100MB sanity check
-                std.debug.print("ERROR: MLIR serialization data chunk too large: {} bytes\n", .{data_len});
+            if (data.len > 100 * 1024 * 1024) { // 100MB sanity check
+                std.debug.print("ERROR: MLIR serialization data chunk too large: {} bytes\n", .{data.len});
                 context.error_flag.* = true;
                 return;
             }
             context.buffer.appendSlice(data) catch |err| {
-                std.debug.print("ERROR: Failed to append MLIR data chunk of {} bytes: {}\n", .{ data_len, err });
+                std.debug.print("ERROR: Failed to append MLIR data chunk of {} bytes: {}\n", .{ data.len, err });
                 context.error_flag.* = true;
                 return;
             };
@@ -404,11 +406,11 @@ pub fn serializeMLIRModule(allocator: Allocator, module: mlir.Module) ![]u8 {
     // Debug: std.debug.print("serializeMLIRModule: About to call mlirOperationPrint...\n", .{});
     // Add null checks
     const module_op = module.op();
-    if (@intFromPtr(module_op.handle) == 0) {
+    if (@intFromPtr(module_op.handle.ptr) == 0) {
         std.debug.print("ERROR: Module operation handle is null\n", .{});
         return error.NullModuleHandle;
     }
-    
+
     c.mlirOperationPrint(module_op.handle, writeToArrayList, &ctx);
     // Debug: std.debug.print("serializeMLIRModule: mlirOperationPrint completed, buffer size: {}\n", .{buffer.items.len});
     

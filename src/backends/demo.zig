@@ -267,6 +267,8 @@ fn buildDemoTrainingModule(builder: *ops.MLIRBuilder, description: []const u8) !
     builder.module_body.appendOwnedOperation(forward_func);
     
     // Add a comment attribute to identify this as a demo module
+    const c = @import("../mlir/c.zig").c;
     const comment_attr = mlir.Attribute.stringAttr(builder.ctx, description);
-    _ = @import("../mlir/c.zig").c.operationSetAttributeByName(builder.module.op().handle, "demo.comment", comment_attr.handle);
+    const attr_name_ref = c.stringRefFromString("demo.comment");
+    _ = c.operationSetAttributeByName(builder.module.op().handle, attr_name_ref, comment_attr.handle);
 }

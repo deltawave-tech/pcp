@@ -156,7 +156,7 @@ pub const MLIRBuilder = struct {
             .location = self.loc,
         });
 
-        std.debug.print("DEBUG: createAndAttach operation created: 0x{x}\n", .{@intFromPtr(op.handle)});
+        std.debug.print("DEBUG: createAndAttach operation created: 0x{x}\n", .{@intFromPtr(op.handle.ptr)});
 
         // DEBUG: Verification disabled to isolate if verifier triggers the invalid pointer crash
         // if (!op.verify()) {
@@ -201,7 +201,7 @@ pub const MLIRBuilder = struct {
 
         // 2. Prepare Region
         const region = c.mlirRegionCreate();
-        var regions = [_]*c.MlirRegion{region};
+        var regions = [_]c.MlirRegion{region};
 
         // 3. Create Operation using C++ Helper with Packed Args
         const name_ref = c.stringRefFromString("func.func");

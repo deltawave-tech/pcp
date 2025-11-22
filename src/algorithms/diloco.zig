@@ -91,10 +91,10 @@ pub const DiLoCo = struct {
         while (maybe_op) |op| {
             if (std.mem.eql(u8, op.getName(), "func.func")) {
                 // It's a function, check its name
-                const sym_name_attr = c.operationGetAttributeByName(op.handle, "sym_name");
-                if (@intFromPtr(sym_name_attr) != 0 and c.attributeIsAString(sym_name_attr)) {
-                    const string_attr = @as(*c.MlirStringAttribute, @ptrCast(sym_name_attr));
-                    const func_name_ref = c.stringAttributeGetValue(string_attr);
+                const sym_name_ref = c.stringRefFromString("sym_name");
+                const sym_name_attr = c.operationGetAttributeByName(op.handle, sym_name_ref);
+                if (@intFromPtr(sym_name_attr.ptr) != 0 and c.attributeIsAString(sym_name_attr)) {
+                    const func_name_ref = c.stringAttributeGetValue(sym_name_attr);
                     const func_name = c.fromStringRef(func_name_ref);
                     if (std.mem.eql(u8, func_name, name)) {
                         return op; // Found it!
@@ -461,8 +461,9 @@ pub const DiLoCo = struct {
         }
 
         // 3. Get the 'value' attribute, which must be a DenseElementsAttr
-        const value_attr = c.operationGetAttributeByName(defining_op.handle, "value");
-        if (@intFromPtr(value_attr) == 0 or !c.mlirAttributeIsADenseElements(value_attr)) {
+        const value_ref = c.stringRefFromString("value");
+        const value_attr = c.operationGetAttributeByName(defining_op.handle, value_ref);
+        if (@intFromPtr(value_attr.ptr) == 0 or !c.mlirAttributeIsADenseElements(value_attr)) {
             return error.InvalidConstantAttribute;
         }
 
@@ -531,7 +532,8 @@ pub const DiLoCo = struct {
         // 5. IMPORTANT: Change the name to avoid conflicts (e.g., with our future 'main' orchestrator)
         const new_fn_name = "model_forward_pass";
         const new_name_attr = mlir.Attribute.stringAttr(builder.ctx, new_fn_name);
-        c.operationSetAttributeByName(cloned_forward_fn.handle, "sym_name", new_name_attr.handle);
+        const sym_name_attr_ref = c.stringRefFromString("sym_name");
+        c.operationSetAttributeByName(cloned_forward_fn.handle, sym_name_attr_ref, new_name_attr.handle);
 
         // 6. Add the cloned function to our main module.
         builder.module_body.appendOwnedOperation(cloned_forward_fn);

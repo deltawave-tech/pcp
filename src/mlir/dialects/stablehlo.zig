@@ -147,7 +147,7 @@ pub fn reduce_max(
 
     // 3. Create the reduction body (region -> block)
     const body_region = c_api.regionCreate();
-    const body_block = mlir.Block{ .handle = c_api.blockCreate(0, @constCast(@ptrCast(&[_]*c_api.MlirType{})), @constCast(@ptrCast(&[_]*c_api.MlirLocation{}))) };
+    const body_block = mlir.Block{ .handle = c_api.blockCreate(0, @constCast(@ptrCast(&[_]c_api.MlirType{})), @constCast(@ptrCast(&[_]*c_api.MlirLocation{}))) };
     c_api.regionAppendOwnedBlock(body_region, body_block.handle);
 
     // 4. Add arguments and the 'maximum' operation to the body
@@ -159,12 +159,13 @@ pub fn reduce_max(
     c_api.blockAppendOwnedOperation(body_block.handle, return_op.handle);
 
     // 5. Build the final stablehlo.reduce operation using pcpCreateOperation
-    var operands = [_]*c_api.MlirValue{ operand.handle, init_value.handle };
-    var results = [_]*c_api.MlirType{ result_type.handle };
-    var regions = [_]*c_api.MlirRegion{ body_region };
+    var operands = [_]c_api.MlirValue{ operand.handle, init_value.handle };
+    var results = [_]c_api.MlirType{ result_type.handle };
+    var regions = [_]c_api.MlirRegion{ body_region };
 
     const dimensions_attr = mlir.Attribute.denseI64ArrayAttr(ctx, dimensions);
-    const attr_name_id = c_api.identifierGet(ctx.handle, "dimensions");
+    const dimensions_ref = c_api.stringRefFromString("dimensions");
+    const attr_name_id = c_api.identifierGet(ctx.handle, dimensions_ref);
     var named_attrs = [_]c_api.MlirNamedAttribute{
         .{ .name = attr_name_id, .attribute = dimensions_attr.handle }
     };
@@ -233,7 +234,7 @@ pub fn reduce_sum(
 
     // 3. Create the reduction body (region -> block)
     const body_region = c_api.regionCreate();
-    const body_block = mlir.Block{ .handle = c_api.blockCreate(0, @constCast(@ptrCast(&[_]*c_api.MlirType{})), @constCast(@ptrCast(&[_]*c_api.MlirLocation{}))) };
+    const body_block = mlir.Block{ .handle = c_api.blockCreate(0, @constCast(@ptrCast(&[_]c_api.MlirType{})), @constCast(@ptrCast(&[_]*c_api.MlirLocation{}))) };
     c_api.regionAppendOwnedBlock(body_region, body_block.handle);
 
     // 4. Add arguments and the 'add' operation to the body
@@ -245,12 +246,13 @@ pub fn reduce_sum(
     c_api.blockAppendOwnedOperation(body_block.handle, return_op.handle);
 
     // 5. Build the final stablehlo.reduce operation using pcpCreateOperation
-    var operands = [_]*c_api.MlirValue{ operand.handle, init_value.handle };
-    var results = [_]*c_api.MlirType{ result_type.handle };
-    var regions = [_]*c_api.MlirRegion{ body_region };
+    var operands = [_]c_api.MlirValue{ operand.handle, init_value.handle };
+    var results = [_]c_api.MlirType{ result_type.handle };
+    var regions = [_]c_api.MlirRegion{ body_region };
 
     const dimensions_attr = mlir.Attribute.denseI64ArrayAttr(ctx, dimensions);
-    const attr_name_id = c_api.identifierGet(ctx.handle, "dimensions");
+    const dimensions_ref = c_api.stringRefFromString("dimensions");
+    const attr_name_id = c_api.identifierGet(ctx.handle, dimensions_ref);
     var named_attrs = [_]c_api.MlirNamedAttribute{
         .{ .name = attr_name_id, .attribute = dimensions_attr.handle }
     };
@@ -304,8 +306,10 @@ pub fn compare(ctx: mlir.Context, lhs: mlir.Value, rhs: mlir.Value, direction: C
     const type_attr = mlir.Attribute{ .handle = type_attr_handle };
 
     // Attributes
-    const direction_id = c.c.identifierGet(ctx.handle, "comparison_direction");
-    const type_id = c.c.identifierGet(ctx.handle, "compare_type");
+    const comparison_direction_ref = c.c.stringRefFromString("comparison_direction");
+    const direction_id = c.c.identifierGet(ctx.handle, comparison_direction_ref);
+    const compare_type_ref = c.c.stringRefFromString("compare_type");
+    const type_id = c.c.identifierGet(ctx.handle, compare_type_ref);
     var named_attrs = [_]c.c.MlirNamedAttribute{
         .{ .name = direction_id, .attribute = direction_attr.handle },
         .{ .name = type_id, .attribute = type_attr.handle },
@@ -895,12 +899,15 @@ pub fn gather(
     const dim_numbers_attr = mlir.Attribute{ .handle = dim_numbers_attr_handle };
 
     // Add indices_are_sorted
-    const sorted_id = c.c.identifierGet(ctx.handle, "indices_are_sorted");
+    const indices_are_sorted_ref = c.c.stringRefFromString("indices_are_sorted");
+    const sorted_id = c.c.identifierGet(ctx.handle, indices_are_sorted_ref);
     const sorted_attr = mlir.Attribute.boolAttr(ctx, false);
 
     // named_attrs now includes sorted
-    const gather_dim_numbers_id = c.c.identifierGet(ctx.handle, "dimension_numbers");
-    const slice_sizes_id = c.c.identifierGet(ctx.handle, "slice_sizes");
+    const dimension_numbers_ref = c.c.stringRefFromString("dimension_numbers");
+    const gather_dim_numbers_id = c.c.identifierGet(ctx.handle, dimension_numbers_ref);
+    const slice_sizes_ref = c.c.stringRefFromString("slice_sizes");
+    const slice_sizes_id = c.c.identifierGet(ctx.handle, slice_sizes_ref);
     var named_attrs = [_]c.c.MlirNamedAttribute{
         .{ .name = gather_dim_numbers_id, .attribute = dim_numbers_attr.handle },
         .{ .name = slice_sizes_id, .attribute = slice_sizes_attr.handle },
@@ -947,10 +954,14 @@ pub const ScatterDimensionNumbersAttribute = struct {
         const index_vector_dim_attr = mlir.Attribute.integerAttr(ctx, self.index_vector_dim, mlir.Type.i64Type(ctx));
 
         // Create identifiers for attribute names
-        const update_window_id = c.c.identifierGet(ctx.handle, "update_window_dims");
-        const inserted_window_id = c.c.identifierGet(ctx.handle, "inserted_window_dims");
-        const scatter_dims_id = c.c.identifierGet(ctx.handle, "scatter_dims_to_operand_dims");
-        const index_vec_id = c.c.identifierGet(ctx.handle, "index_vector_dim");
+        const update_window_dims_ref = c.c.stringRefFromString("update_window_dims");
+    const update_window_id = c.c.identifierGet(ctx.handle, update_window_dims_ref);
+        const inserted_window_dims_ref = c.c.stringRefFromString("inserted_window_dims");
+    const inserted_window_id = c.c.identifierGet(ctx.handle, inserted_window_dims_ref);
+        const scatter_dims_to_operand_dims_ref = c.c.stringRefFromString("scatter_dims_to_operand_dims");
+    const scatter_dims_id = c.c.identifierGet(ctx.handle, scatter_dims_to_operand_dims_ref);
+        const index_vector_dim_ref = c.c.stringRefFromString("index_vector_dim");
+    const index_vec_id = c.c.identifierGet(ctx.handle, index_vector_dim_ref);
 
         // Create named attributes
         const named_attrs = [_]c.c.MlirNamedAttribute{

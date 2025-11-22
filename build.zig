@@ -220,6 +220,11 @@ fn addIreeIncludes(mod: *std.Build.Module, b: *std.Build, iree_config: IreeConfi
     mod.addIncludePath(.{ .cwd_relative = source_dir });
     mod.addIncludePath(.{ .cwd_relative = b.fmt("{s}/include", .{build_dir}) });
     mod.addIncludePath(.{ .cwd_relative = b.fmt("{s}/runtime/src", .{source_dir}) });
+    // Add MLIR C API headers for @cImport auto-generation
+    mod.addIncludePath(.{ .cwd_relative = b.fmt("{s}/third_party/llvm-project/mlir/include", .{source_dir}) });
+    mod.addIncludePath(.{ .cwd_relative = b.fmt("{s}/llvm-project/tools/mlir/include", .{build_dir}) });
+    // Add our unified header directory
+    mod.addIncludePath(b.path("src/mlir/include"));
 }
 
 // REFACTORED: Add IREE dependencies to a target
@@ -238,6 +243,11 @@ fn addIreeDependencies(target: *std.Build.Step.Compile, b: *std.Build, iree_conf
     target.addIncludePath(.{ .cwd_relative = source_dir });
     target.addIncludePath(.{ .cwd_relative = b.fmt("{s}/include", .{build_dir}) });
     target.addIncludePath(.{ .cwd_relative = b.fmt("{s}/runtime/src", .{source_dir}) });
+    // Add MLIR C API headers for @cImport auto-generation
+    target.addIncludePath(.{ .cwd_relative = b.fmt("{s}/third_party/llvm-project/mlir/include", .{source_dir}) });
+    target.addIncludePath(.{ .cwd_relative = b.fmt("{s}/llvm-project/tools/mlir/include", .{build_dir}) });
+    // Add our unified header directory
+    target.addIncludePath(b.path("src/mlir/include"));
 
     // --- Library Paths ---
     // Use resolved paths from IREE detection

@@ -88,12 +88,12 @@ pub fn buildGradientGraph(
     std.debug.print("Building gradient graph from forward function...\n", .{});
     
     // Derive the gradient function name from the forward function name
-    const forward_fn_name_attr = c.operationGetAttributeByName(forward_fn.handle, "sym_name");
-    if (@intFromPtr(forward_fn_name_attr) == 0 or !c.attributeIsAString(forward_fn_name_attr)) {
+    const sym_name_ref = c.stringRefFromString("sym_name");
+    const forward_fn_name_attr = c.operationGetAttributeByName(forward_fn.handle, sym_name_ref);
+    if (@intFromPtr(forward_fn_name_attr.ptr) == 0 or !c.attributeIsAString(forward_fn_name_attr)) {
         return error.MissingOrInvalidSymName;
     }
-    const string_attr = @as(*c.MlirStringAttribute, @ptrCast(forward_fn_name_attr));
-    const forward_fn_name_ref = c.stringAttributeGetValue(string_attr);
+    const forward_fn_name_ref = c.stringAttributeGetValue(forward_fn_name_attr);
     const forward_fn_name = c.fromStringRef(forward_fn_name_ref);
     const grad_fn_name = try std.fmt.allocPrint(allocator, "{s}_grad", .{forward_fn_name});
     defer allocator.free(grad_fn_name);
@@ -334,9 +334,9 @@ fn divideVJP(
 
     // Verify handles are not obviously null/garbage
     std.debug.print("DEBUG: divideVJP inputs: grad_out=0x{x}, a=0x{x}, b=0x{x}\n", .{
-        @intFromPtr(grad_out.handle),
-        @intFromPtr(a.handle),
-        @intFromPtr(b.handle)
+        @intFromPtr(grad_out.handle.ptr),
+        @intFromPtr(a.handle.ptr),
+        @intFromPtr(b.handle.ptr)
     });
 
     var result = std.ArrayList(mlir.Value).init(builder.allocator);
@@ -398,8 +398,9 @@ fn transposeVJP(builder: *MLIRBuilder, original_op: mlir.Operation, primals: []c
     const a = primals[0];
     var result = std.ArrayList(mlir.Value).init(builder.allocator);
 
-    const permutation_attr = c.operationGetAttributeByName(original_op.handle, "permutation");
-    if (@intFromPtr(permutation_attr) == 0) return error.MissingPermutationAttribute;
+    const permutation_ref = c.stringRefFromString("permutation");
+    const permutation_attr = c.operationGetAttributeByName(original_op.handle, permutation_ref);
+    if (@intFromPtr(permutation_attr.ptr) == 0) return error.MissingPermutationAttribute;
 
     const input_type = a.getType().as(mlir.RankedTensorType).?;
     const rank = input_type.getRank();
@@ -446,7 +447,7 @@ fn matmulVJP(
     
     // Parse the original operation's dot_dimension_numbers attribute
     const dot_dim_attr = c.mlirOperationGetAttributeByName(original_op.handle, c.stringRefCreateFromCString("dot_dimension_numbers"));
-    if (@intFromPtr(dot_dim_attr) == 0) {
+    if (@intFromPtr(dot_dim_attr.ptr) == 0) {
         return error.MissingDotDimensionNumbersAttribute;
     }
     
@@ -576,9 +577,10 @@ fn reduceSumVJP(builder: *MLIRBuilder, original_op: mlir.Operation, primals: []c
 
     if (!isValueFromConstantOp(input)) {
         const original_shape_type = input.getType();
-        const dimensions_attr = c.operationGetAttributeByName(original_op.handle, "dimensions");
+        const dimensions_ref = c.stringRefFromString("dimensions");
+        const dimensions_attr = c.operationGetAttributeByName(original_op.handle, dimensions_ref);
 
-        if (@intFromPtr(dimensions_attr) != 0) {
+        if (@intFromPtr(dimensions_attr.ptr) != 0) {
             var broadcast_dims = std.ArrayList(i64).init(builder.allocator);
             defer broadcast_dims.deinit();
 
@@ -709,7 +711,7 @@ fn sliceVJP(
         const start_indices_attr = c.mlirOperationGetAttributeByName(original_op.handle, c.stringRefCreateFromCString("start_indices"));
         const limit_indices_attr = c.mlirOperationGetAttributeByName(original_op.handle, c.stringRefCreateFromCString("limit_indices"));
 
-        if (@intFromPtr(start_indices_attr) == 0 or @intFromPtr(limit_indices_attr) == 0) {
+        if (@intFromPtr(start_indices_attr.ptr) == 0 or @intFromPtr(limit_indices_attr.ptr) == 0) {
             return error.MissingSliceAttribute;
         }
 

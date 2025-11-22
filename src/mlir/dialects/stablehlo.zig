@@ -330,19 +330,16 @@ pub fn compare(ctx: mlir.Context, lhs: mlir.Value, rhs: mlir.Value, direction: C
     };
 
     // Create operation using pcpCreateOperation with packed args
-    var lhs_handle = lhs.handle;
-    var rhs_handle = rhs.handle;
-    var result_type_handle = result_type.handle;
-    var operands = [_]*c.c.MlirValue{ &lhs_handle, &rhs_handle };
-    var result_types = [_]*c.c.MlirType{ &result_type_handle };
+    var operands = [_]c.c.MlirValue{ lhs.handle, rhs.handle };
+    var result_types = [_]c.c.MlirType{ result_type.handle };
 
     const name_ref = c.c.stringRefFromString("stablehlo.compare");
 
     const op_args = c.c.PcpOpArgs{
         .nResults = 1,
-        .results = @ptrCast(&result_types),
+        .results = &result_types,
         .nOperands = 2,
-        .operands = @ptrCast(&operands),
+        .operands = &operands,
         .nAttributes = @intCast(named_attrs.len),
         .attributes = &named_attrs,
         .nRegions = 0,

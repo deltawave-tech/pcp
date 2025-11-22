@@ -161,6 +161,9 @@ fn broadcastOperands(builder: *MLIRBuilder, lhs: mlir.Value, rhs: mlir.Value) !s
                           else if (lhs_dim == 1) rhs_dim
                           else if (rhs_dim == 1) lhs_dim
                           else {
+            std.debug.print("ERROR: Incompatible shapes for broadcast!\n", .{});
+            std.debug.print("  lhs_shape: {any}, rhs_shape: {any}\n", .{lhs_shape, rhs_shape});
+            std.debug.print("  Conflict at dimension {}: lhs_dim={}, rhs_dim={}\n", .{i, lhs_dim, rhs_dim});
             builder.allocator.free(result_shape);
             return error.IncompatibleShapesForBroadcast;
         };
@@ -857,13 +860,18 @@ fn gatherVJP(
     const grad_out_type = grad_out.getType().as(mlir.RankedTensorType) orelse return error.InvalidTensorType;
 
     const vocab_size = operand_type.getDimension(0);
+    std.debug.print("DEBUG gatherVJP: vocab_size={}, operand_rank={}, indices_rank={}, grad_out_rank={}\n", .{
+        vocab_size, operand_type.getRank(), indices_type.getRank(), grad_out_type.getRank()
+    });
 
     // Convert indices to i64 if needed
     const indices_elem_type = indices_type.getElementType();
     const indices_i64 = if (indices_elem_type.isInteger()) start_indices else blk: {
+        const indices_shape = try indices_type.getShape(builder.allocator);
+        defer builder.allocator.free(indices_shape);
         const indices_i64_type = mlir.Type.rankedTensorType(
             builder.ctx,
-            try indices_type.getShape(builder.allocator),
+            indices_shape,
             mlir.Type.i64Type(builder.ctx)
         );
         const convert_op = try builder.createAndAttach("stablehlo.convert", &.{start_indices}, &.{indices_i64_type}, .{});
@@ -871,6 +879,7 @@ fn gatherVJP(
     };
 
     // Create one-hot: [Batch, Seq] -> [Batch, Seq, Vocab]
+    std.debug.print("DEBUG gatherVJP: About to create one-hot tensor...\n", .{});
     const one_hot = try ops.oneHot(
         builder,
         try builder.newTensor(indices_i64),
@@ -878,30 +887,60 @@ fn gatherVJP(
         1.0, 0.0, -1,
         grad_out_type.getElementType()
     );
+    std.debug.print("DEBUG gatherVJP: One-hot created, rank={}\n", .{one_hot.shape.rank()});
 
-    // Contract on batch/seq dims to get [Vocab, Embed]
-    const one_hot_rank = one_hot.shape.rank();
-
-    var contracting_dims = std.ArrayList(i64).init(builder.allocator);
-    defer contracting_dims.deinit();
-
-    for (0..(one_hot_rank - 1)) |i| {
-        try contracting_dims.append(@intCast(i));
+    // Flatten one_hot to [N, Vocab] where N is product of all dims except last
+    const one_hot_type = one_hot.value.getType().as(mlir.RankedTensorType) orelse return error.InvalidTensorType;
+    const one_hot_shape = try one_hot_type.getShape(builder.allocator);
+    defer builder.allocator.free(one_hot_shape);
+    var n_dims: i64 = 1;
+    for (0..(one_hot_shape.len - 1)) |i| {
+        n_dims *= one_hot_shape[i];
     }
+    const vocab_dim = one_hot_shape[one_hot_shape.len - 1];
 
+    const one_hot_flat_shape = [_]i64{ n_dims, vocab_dim };
+    const one_hot_flat_type = mlir.Type.rankedTensorType(
+        builder.ctx,
+        &one_hot_flat_shape,
+        one_hot_type.getElementType()
+    );
+    const one_hot_flat_op = try builder.createAndAttach("stablehlo.reshape", &.{one_hot.value}, &.{one_hot_flat_type}, .{});
+    const one_hot_flat = one_hot_flat_op.getResult(0);
+
+    // grad_out should be reshaped to [N, Embed] where N matches one_hot's N
+    // Since one_hot was created from indices, N should be the product of indices shape
+    const grad_out_shape = try grad_out_type.getShape(builder.allocator);
+    defer builder.allocator.free(grad_out_shape);
+
+    const embed_dim = grad_out_shape[grad_out_shape.len - 1];
+
+    // grad_out should be [n_dims, embed_dim] to match one_hot's [n_dims, vocab_dim]
+    const grad_out_flat_shape = [_]i64{ n_dims, embed_dim };
+    const grad_out_flat_type = mlir.Type.rankedTensorType(
+        builder.ctx,
+        &grad_out_flat_shape,
+        grad_out_type.getElementType()
+    );
+    const grad_out_flat_op = try builder.createAndAttach("stablehlo.reshape", &.{grad_out}, &.{grad_out_flat_type}, .{});
+    const grad_out_flat = grad_out_flat_op.getResult(0);
+
+    std.debug.print("DEBUG gatherVJP: Flattened shapes - one_hot: [{}, {}], grad_out: [{}, {}]\n", .{n_dims, vocab_dim, n_dims, embed_dim});
+
+    // Now do dot_general: [N, Vocab]^T @ [N, Embed] = [Vocab, Embed]
     const dot_dims = hlo.DotDimensionNumbersAttribute{
         .lhs_batching_dimensions = &.{},
         .rhs_batching_dimensions = &.{},
-        .lhs_contracting_dimensions = contracting_dims.items,
-        .rhs_contracting_dimensions = contracting_dims.items,
+        .lhs_contracting_dimensions = &.{0}, // Contract on N dimension
+        .rhs_contracting_dimensions = &.{0}, // Contract on N dimension
     };
 
     // Grad_table = OneHot^T @ Grad_out
     const grad_table_op = try hlo.dot_general(
         builder.allocator,
         builder.ctx,
-        one_hot.value,
-        grad_out,
+        one_hot_flat,
+        grad_out_flat,
         .{ .dot_dimension_numbers = dot_dims }
     );
 
@@ -1029,19 +1068,23 @@ fn broadcastInDimVJP(
         var dims_to_reduce = std.ArrayList(i64).init(builder.allocator);
         defer dims_to_reduce.deinit();
 
-        // Simple logic: reduce the leading dimensions that were added by broadcast
-        // This works for cases where broadcast adds dimensions at the front
-        for (0..(grad_out_rank - input_rank)) |i| {
-            try dims_to_reduce.append(@intCast(i));
-        }
+        // Handle case where grad_out_rank >= input_rank (normal broadcast case)
+        if (grad_out_rank >= input_rank) {
+            // Simple logic: reduce the leading dimensions that were added by broadcast
+            // This works for cases where broadcast adds dimensions at the front
+            for (0..(grad_out_rank - input_rank)) |i| {
+                try dims_to_reduce.append(@intCast(i));
+            }
 
-        // Also reduce dimensions where the input dimension is 1 but output dimension is larger
-        for (0..input_rank) |i| {
-            const input_dim_idx = (grad_out_rank - input_rank) + i;
-            if (input_shape[i] == 1 and grad_out_shape[input_dim_idx] > 1) {
-                try dims_to_reduce.append(@intCast(input_dim_idx));
+            // Also reduce dimensions where the input dimension is 1 but output dimension is larger
+            for (0..input_rank) |i| {
+                const input_dim_idx = (grad_out_rank - input_rank) + i;
+                if (input_shape[i] == 1 and grad_out_shape[input_dim_idx] > 1) {
+                    try dims_to_reduce.append(@intCast(input_dim_idx));
+                }
             }
         }
+        // If grad_out_rank < input_rank, no dimensions to reduce (gradient passes through)
 
         // Create a tensor wrapper for grad_out
         const grad_out_tensor = try builder.newTensor(grad_out);
@@ -1254,16 +1297,51 @@ fn addInputGradients(
         const operand = op.getOperand(i);
         const grad = input_gradients[i];
 
+        // Ensure gradient matches operand shape using reduceGradient
+        const grad_matched = try reduceGradient(builder, grad, operand);
+
         // If a gradient for this operand already exists, add the new one to it.
-        // Must broadcast to handle shape mismatches
         if (adjoint_map.get(operand)) |existing_grad| {
-            const add_broadcast = try broadcastOperands(builder, existing_grad, grad);
+            const op_name = op.getName();
+            std.debug.print("DEBUG addInputGradients: Adding gradients for operand {} of operation: {s}\n", .{i, op_name});
+
+            // Debug: print shapes
+            const operand_type = operand.getType().as(mlir.RankedTensorType);
+            if (operand_type) |ot| {
+                const operand_shape = try ot.getShape(builder.allocator);
+                defer builder.allocator.free(operand_shape);
+                std.debug.print("  Operand shape: {any}\n", .{operand_shape});
+            }
+            const existing_grad_type = existing_grad.getType().as(mlir.RankedTensorType);
+            if (existing_grad_type) |egt| {
+                const existing_grad_shape = try egt.getShape(builder.allocator);
+                defer builder.allocator.free(existing_grad_shape);
+                std.debug.print("  Existing grad shape: {any}\n", .{existing_grad_shape});
+            }
+            const grad_matched_type = grad_matched.getType().as(mlir.RankedTensorType);
+            if (grad_matched_type) |gmt| {
+                const grad_matched_shape = try gmt.getShape(builder.allocator);
+                defer builder.allocator.free(grad_matched_shape);
+                std.debug.print("  New grad shape (after reduceGradient): {any}\n", .{grad_matched_shape});
+            }
+
+            // Ensure existing gradient matches operand shape
+            // Get operand shape
+            const operand_ranked_type = operand.getType().as(mlir.RankedTensorType) orelse return error.NotRankedTensor;
+            const operand_shape_arr = try operand_ranked_type.getShape(builder.allocator);
+            defer builder.allocator.free(operand_shape_arr);
+
+            // Broadcast existing_grad to operand shape if needed
+            const existing_grad_matched = try broadcastToShape(builder, existing_grad, operand_shape_arr);
+
+            // Both gradients should now match operand shape, so broadcast should work
+            const add_broadcast = try broadcastOperands(builder, existing_grad_matched, grad_matched);
             defer builder.allocator.free(add_broadcast.shape);
             const add_type = add_broadcast.lhs.getType();
             const sum_op = try builder.createAndAttach("stablehlo.add", &.{ add_broadcast.lhs, add_broadcast.rhs }, &.{add_type}, .{});
             try adjoint_map.put(operand, sum_op.getResult(0));
         } else {
-            try adjoint_map.put(operand, grad);
+            try adjoint_map.put(operand, grad_matched);
         }
     }
 }

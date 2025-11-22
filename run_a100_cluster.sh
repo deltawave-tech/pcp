@@ -4,11 +4,10 @@
 export PATH=$PATH:/opt/zig
 
 # 0. Setup
-# Ensure data exists
-if [ ! -f "tiny_shakespeare.txt" ]; then
-    echo "Downloading dataset..."
-    curl -O https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt
-    mv input.txt tiny_shakespeare.txt
+# Verify dataset exists
+if [ ! -f "data/tiny_shakespeare.txt" ]; then
+    echo "💣 Error: Dataset not found at data/tiny_shakespeare.txt"
+    exit 1
 fi
 
 # 1. Build the project

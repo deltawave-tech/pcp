@@ -23,9 +23,9 @@ pub fn main() !void {
 
 fn testTokenizerRoundTrip(allocator: std.mem.Allocator) !void {
     std.debug.print("Running Tokenizer round-trip test...\n", .{});
-    
-    // Ensure tiny_shakespeare.txt exists
-    var tokenizer = try CharTokenizer.initFromFile(allocator, "tiny_shakespeare.txt");
+
+    // Dataset expected at data/tiny_shakespeare.txt
+    var tokenizer = try CharTokenizer.initFromFile(allocator, "data/tiny_shakespeare.txt");
     defer tokenizer.deinit();
     
     const text_in = "hello world";
@@ -44,11 +44,11 @@ fn testTokenizerRoundTrip(allocator: std.mem.Allocator) !void {
 
 fn testDataLoaderBatch(allocator: std.mem.Allocator) !void {
     std.debug.print("Running DataLoader batch correctness test...\n", .{});
-    
+
     const batch_size = 4;
     const block_size = 8;
 
-    var loader = try DataLoader.init(allocator, "tiny_shakespeare.txt");
+    var loader = try DataLoader.init(allocator, "data/tiny_shakespeare.txt");
     defer loader.deinit();
 
     const batch = try loader.getBatch(batch_size, block_size);
@@ -79,8 +79,8 @@ fn testDataLoaderBatch(allocator: std.mem.Allocator) !void {
 test "Tokenizer round-trip" {
     const allocator = std.testing.allocator;
 
-    // Ensure tiny_shakespeare.txt exists
-    var tokenizer = try CharTokenizer.initFromFile(allocator, "tiny_shakespeare.txt");
+    // Dataset expected at data/tiny_shakespeare.txt
+    var tokenizer = try CharTokenizer.initFromFile(allocator, "data/tiny_shakespeare.txt");
     defer tokenizer.deinit();
     
     const text_in = "hello world";
@@ -98,7 +98,7 @@ test "DataLoader getBatch correctness" {
     const batch_size = 4;
     const block_size = 8;
 
-    var loader = try DataLoader.init(allocator, "tiny_shakespeare.txt");
+    var loader = try DataLoader.init(allocator, "data/tiny_shakespeare.txt");
     defer loader.deinit();
 
     const batch = try loader.getBatch(batch_size, block_size);

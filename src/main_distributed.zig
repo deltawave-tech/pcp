@@ -150,8 +150,8 @@ fn runShepherd(allocator: Allocator, args: Args) !void {
 
     // Initialize the DataLoader for real training data
     print("Loading Tiny Shakespeare dataset...\n", .{});
-    // Ensure tiny_shakespeare.txt exists in working directory!
-    var data_loader = try @import("data_loader.zig").DataLoader.init(allocator, "tiny_shakespeare.txt");
+    // Dataset expected at data/tiny_shakespeare.txt
+    var data_loader = try @import("data_loader.zig").DataLoader.init(allocator, "data/tiny_shakespeare.txt");
     defer data_loader.deinit();
     print("🌙 Dataset loaded with {} tokens\n", .{data_loader.tokens.len});
 

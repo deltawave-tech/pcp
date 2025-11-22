@@ -35,8 +35,8 @@ pub fn multiply(allocator: std.mem.Allocator, ctx: mlir.Context, lhs: mlir.Value
 }
 
 /// Creates a stablehlo.divide operation for element-wise division
-pub fn divide(ctx: mlir.Context, lhs: mlir.Value, rhs: mlir.Value, loc: mlir.Location) mlir.Operation {
-    return mlir.Operation.create(ctx, "stablehlo.divide", .{
+pub fn divide(allocator: std.mem.Allocator, ctx: mlir.Context, lhs: mlir.Value, rhs: mlir.Value, loc: mlir.Location) !mlir.Operation {
+    return mlir.Operation.create(allocator, ctx, "stablehlo.divide", .{
         .operands = &.{ lhs, rhs },
         .results = &.{lhs.getType()},
         .location = loc,
@@ -44,8 +44,8 @@ pub fn divide(ctx: mlir.Context, lhs: mlir.Value, rhs: mlir.Value, loc: mlir.Loc
 }
 
 /// Creates a stablehlo.negate operation for element-wise negation
-pub fn negate(ctx: mlir.Context, operand: mlir.Value, loc: mlir.Location) mlir.Operation {
-    return mlir.Operation.create(ctx, "stablehlo.negate", .{
+pub fn negate(allocator: std.mem.Allocator, ctx: mlir.Context, operand: mlir.Value, loc: mlir.Location) !mlir.Operation {
+    return mlir.Operation.create(allocator, ctx, "stablehlo.negate", .{
         .operands = &.{operand},
         .results = &.{operand.getType()},
         .location = loc,
@@ -607,13 +607,13 @@ pub fn concatenate(ctx: mlir.Context, operands: []const mlir.Value, dimension: i
 }
 
 /// Creates a stablehlo.reduce operation (simplified version)
-pub fn reduce(ctx: mlir.Context, operand: mlir.Value, init_value: mlir.Value, dimensions: []const i64, loc: mlir.Location) mlir.Operation {
+pub fn reduce(allocator: std.mem.Allocator, ctx: mlir.Context, operand: mlir.Value, init_value: mlir.Value, dimensions: []const i64, loc: mlir.Location) !mlir.Operation {
     const input_type = operand.getType().as(mlir.RankedTensorType).?;
-    
+
     // Calculate result shape (remove reduced dimensions)
-    var result_dims = std.ArrayList(i64).init(std.heap.page_allocator);
+    var result_dims = std.ArrayList(i64).init(allocator);
     defer result_dims.deinit();
-    
+
     for (0..input_type.getRank()) |i| {
         const i_i64 = @as(i64, @intCast(i));
         var is_reduced = false;
@@ -624,14 +624,14 @@ pub fn reduce(ctx: mlir.Context, operand: mlir.Value, init_value: mlir.Value, di
             }
         }
         if (!is_reduced) {
-            result_dims.append(input_type.getDimension(i)) catch @panic("OOM");
+            try result_dims.append(input_type.getDimension(i));
         }
     }
-    
+
     const result_type = mlir.Type.tensor(result_dims.items, input_type.getElementType());
     const dimensions_attr = mlir.Attribute.denseI64ArrayAttr(ctx, dimensions);
-    
-    return mlir.Operation.create(ctx, "stablehlo.reduce", .{
+
+    return mlir.Operation.create(allocator, ctx, "stablehlo.reduce", .{
         .operands = &.{ operand, init_value },
         .results = &.{result_type},
         .attributes = &.{.{ "dimensions", dimensions_attr }},

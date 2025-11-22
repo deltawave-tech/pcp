@@ -79,6 +79,125 @@ fn isValueFromConstantOp(value: mlir.Value) bool {
     return false;
 }
 
+/// Broadcast a value to a target shape using broadcast_in_dim
+fn broadcastToShape(builder: *MLIRBuilder, value: mlir.Value, target_shape: []const i64) !mlir.Value {
+    const value_type = value.getType().as(mlir.RankedTensorType) orelse return error.NotRankedTensor;
+    const value_shape = try value_type.getShape(builder.allocator);
+    defer builder.allocator.free(value_shape);
+
+    // Check if broadcasting is needed
+    var needs_broadcast = false;
+    if (value_shape.len != target_shape.len) {
+        needs_broadcast = true;
+    } else {
+        for (value_shape, target_shape) |v, t| {
+            if (v != t) {
+                needs_broadcast = true;
+                break;
+            }
+        }
+    }
+
+    if (!needs_broadcast) {
+        return value;
+    }
+
+    // Create target type
+    const element_type = value_type.getElementType();
+    const ctx = mlir.Context{ .handle = c.mlirTypeGetContext(value.getType().handle) };
+    const target_type = mlir.Type.rankedTensorType(ctx, target_shape, element_type);
+
+    // Compute broadcast_dimensions attribute
+    // Maps dimensions of the value to dimensions of the target
+    var broadcast_dims = std.ArrayList(i64).init(builder.allocator);
+    defer broadcast_dims.deinit();
+
+    // Align from the right
+    const rank_diff = target_shape.len - value_shape.len;
+    for (0..value_shape.len) |i| {
+        try broadcast_dims.append(@intCast(rank_diff + i));
+    }
+
+    const broadcast_dims_attr = mlir.Attribute.denseI64ArrayAttr(builder.ctx, broadcast_dims.items);
+    const broadcast_op = try builder.createAndAttach("stablehlo.broadcast_in_dim",
+        &.{value},
+        &.{target_type},
+        .{ .attributes = &.{.{ "broadcast_dimensions", broadcast_dims_attr }} }
+    );
+
+    return broadcast_op.getResult(0);
+}
+
+/// Compute broadcasted shape and broadcast operands to that shape for StableHLO operations
+/// StableHLO requires explicit broadcasting - operands must have identical shapes AND types
+fn broadcastOperands(builder: *MLIRBuilder, lhs: mlir.Value, rhs: mlir.Value) !struct { lhs: mlir.Value, rhs: mlir.Value, shape: []const i64 } {
+    const lhs_type = lhs.getType().as(mlir.RankedTensorType) orelse return error.NotRankedTensor;
+    const rhs_type = rhs.getType().as(mlir.RankedTensorType) orelse return error.NotRankedTensor;
+
+    const lhs_shape = try lhs_type.getShape(builder.allocator);
+    defer builder.allocator.free(lhs_shape);
+    const rhs_shape = try rhs_type.getShape(builder.allocator);
+    defer builder.allocator.free(rhs_shape);
+
+    const lhs_elem_type = lhs_type.getElementType();
+    const rhs_elem_type = rhs_type.getElementType();
+
+    const lhs_rank = lhs_shape.len;
+    const rhs_rank = rhs_shape.len;
+    const result_rank = @max(lhs_rank, rhs_rank);
+
+    // Compute broadcasted shape
+    const result_shape = try builder.allocator.alloc(i64, result_rank);
+
+    var i: usize = 0;
+    while (i < result_rank) : (i += 1) {
+        const lhs_idx = if (i < lhs_rank) lhs_rank - 1 - i else null;
+        const rhs_idx = if (i < rhs_rank) rhs_rank - 1 - i else null;
+
+        const lhs_dim = if (lhs_idx) |idx| lhs_shape[idx] else 1;
+        const rhs_dim = if (rhs_idx) |idx| rhs_shape[idx] else 1;
+
+        const result_dim = if (lhs_dim == rhs_dim) lhs_dim
+                          else if (lhs_dim == 1) rhs_dim
+                          else if (rhs_dim == 1) lhs_dim
+                          else {
+            builder.allocator.free(result_shape);
+            return error.IncompatibleShapesForBroadcast;
+        };
+
+        result_shape[result_rank - 1 - i] = result_dim;
+    }
+
+    // Handle element type conversion if needed (promote to common type)
+    // For simplicity, if types differ, use rhs's type (usually the gradient type)
+    var lhs_converted = lhs;
+    const rhs_converted = rhs;
+
+    // Check if element types match using proper MLIR type equality
+    const types_match = lhs_elem_type.isEqual(rhs_elem_type);
+
+    if (!types_match) {
+        std.debug.print("DEBUG broadcastOperands: Element types differ, converting lhs\n", .{});
+        std.debug.print("  lhs_shape: {any}, rhs_shape: {any}, result_shape: {any}\n", .{lhs_shape, rhs_shape, result_shape});
+        // Convert lhs to rhs's element type (keeping lhs's original shape)
+        const ctx = mlir.Context{ .handle = c.mlirTypeGetContext(lhs.getType().handle) };
+        const lhs_converted_type = mlir.Type.rankedTensorType(ctx, lhs_shape, rhs_elem_type);
+        std.debug.print("  Creating convert [broadcastOperands]: input_shape={any} output_shape={any}\n", .{lhs_shape, lhs_shape});
+        const convert_op = try builder.createAndAttach("stablehlo.convert", &.{lhs}, &.{lhs_converted_type}, .{});
+        lhs_converted = convert_op.getResult(0);
+        std.debug.print("  Convert created successfully, now broadcasting\n", .{});
+    }
+
+    // Broadcast operands to the common shape
+    std.debug.print("DEBUG broadcastOperands: Broadcasting lhs to {any}\n", .{result_shape});
+    const broadcasted_lhs = try broadcastToShape(builder, lhs_converted, result_shape);
+    std.debug.print("DEBUG broadcastOperands: Broadcasting rhs to {any}\n", .{result_shape});
+    const broadcasted_rhs = try broadcastToShape(builder, rhs_converted, result_shape);
+    std.debug.print("DEBUG broadcastOperands: Done\n", .{});
+
+    return .{ .lhs = broadcasted_lhs, .rhs = broadcasted_rhs, .shape = result_shape };
+}
+
 /// Main automatic differentiation function - transforms forward graph to gradient graph
 pub fn buildGradientGraph(
     allocator: Allocator,
@@ -244,15 +363,19 @@ fn addVJP(
     adjoints: []const mlir.Value,
 ) ![]mlir.Value {
     _ = original_op;
-    _ = primals;
     const grad_out = adjoints[0];
+    const a = primals[0];
+    const b = primals[1];
 
     var result = std.ArrayList(mlir.Value).init(builder.allocator);
     defer result.deinit();
 
-    // Gradient for both inputs is just the output gradient.
-    try result.append(grad_out);
-    try result.append(grad_out);
+    // Gradient for both inputs is the output gradient, but reduced to match their shapes
+    const grad_a = try reduceGradient(builder, grad_out, a);
+    try result.append(grad_a);
+
+    const grad_b = try reduceGradient(builder, grad_out, b);
+    try result.append(grad_b);
 
     return result.toOwnedSlice();
 }
@@ -266,20 +389,21 @@ fn subtractVJP(
 ) ![]mlir.Value {
     _ = original_op;
     const grad_out = adjoints[0];
+    const a = primals[0];
+    const b = primals[1];
+
     var result = std.ArrayList(mlir.Value).init(builder.allocator);
     defer result.deinit();
-    
-    // da = grad_out
-    if (primals.len > 0) {
-        try result.append(grad_out);
-    }
-    
-    // db = -grad_out
-    if (primals.len > 1) {
-        const neg_grad = try builder.createAndAttach("stablehlo.negate", &.{grad_out}, &.{grad_out.getType()}, .{});
-        try result.append(neg_grad.getResult(0));
-    }
-    
+
+    // da = grad_out, reduced to match a's shape
+    const grad_a = try reduceGradient(builder, grad_out, a);
+    try result.append(grad_a);
+
+    // db = -grad_out, reduced to match b's shape
+    const neg_grad = try builder.createAndAttach("stablehlo.negate", &.{grad_out}, &.{grad_out.getType()}, .{});
+    const grad_b = try reduceGradient(builder, neg_grad.getResult(0), b);
+    try result.append(grad_b);
+
     return result.toOwnedSlice();
 }
 
@@ -294,22 +418,87 @@ fn multiplyVJP(
     const grad_out = adjoints[0];
     const a = primals[0]; // Primal 'a' - NOW VALID IN THIS SCOPE
     const b = primals[1]; // Primal 'b' - NOW VALID IN THIS SCOPE
-    
+
     var result = std.ArrayList(mlir.Value).init(builder.allocator);
     defer result.deinit();
-    
-    // da = grad_out * b
-    const grad_a = try builder.createAndAttach("stablehlo.multiply", &.{ grad_out, b }, &.{grad_out.getType()}, .{});
-    try result.append(grad_a.getResult(0));
-    
-    // db = grad_out * a  
-    const grad_b = try builder.createAndAttach("stablehlo.multiply", &.{ grad_out, a }, &.{grad_out.getType()}, .{});
-    try result.append(grad_b.getResult(0));
-    
+
+    // da = grad_out * b with explicit broadcasting
+    const grad_a_broadcast = try broadcastOperands(builder, grad_out, b);
+    defer builder.allocator.free(grad_a_broadcast.shape);
+    const grad_a_type = grad_a_broadcast.lhs.getType();
+    const grad_a_raw = try builder.createAndAttach("stablehlo.multiply", &.{ grad_a_broadcast.lhs, grad_a_broadcast.rhs }, &.{grad_a_type}, .{});
+
+    // Reduce to match a's shape if broadcasting occurred
+    const grad_a = try reduceGradient(builder, grad_a_raw.getResult(0), a);
+    try result.append(grad_a);
+
+    // db = grad_out * a with explicit broadcasting
+    const grad_b_broadcast = try broadcastOperands(builder, grad_out, a);
+    defer builder.allocator.free(grad_b_broadcast.shape);
+    const grad_b_type = grad_b_broadcast.lhs.getType();
+    const grad_b_raw = try builder.createAndAttach("stablehlo.multiply", &.{ grad_b_broadcast.lhs, grad_b_broadcast.rhs }, &.{grad_b_type}, .{});
+
+    // Reduce to match b's shape if broadcasting occurred
+    const grad_b = try reduceGradient(builder, grad_b_raw.getResult(0), b);
+    try result.append(grad_b);
+
     return result.toOwnedSlice();
 }
 
 /// VJP rule for division: da = grad_out / b, db = -grad_out * a / (b * b)
+/// Helper to reduce gradient to match primal shape (handles broadcasting)
+fn reduceGradient(builder: *MLIRBuilder, grad: mlir.Value, target_shape: mlir.Value) !mlir.Value {
+    const grad_type = grad.getType().as(mlir.RankedTensorType) orelse return grad;
+    const target_type = target_shape.getType().as(mlir.RankedTensorType) orelse return grad;
+
+    const grad_shape = try grad_type.getShape(builder.allocator);
+    defer builder.allocator.free(grad_shape);
+    const target_shape_arr = try target_type.getShape(builder.allocator);
+    defer builder.allocator.free(target_shape_arr);
+
+    // If shapes match, no reduction needed
+    if (grad_shape.len == target_shape_arr.len) {
+        var match = true;
+        for (grad_shape, target_shape_arr) |g, t| {
+            if (g != t) {
+                match = false;
+                break;
+            }
+        }
+        if (match) return grad;
+    }
+
+    // Find dimensions to reduce
+    var reduce_dims = std.ArrayList(i64).init(builder.allocator);
+    defer reduce_dims.deinit();
+
+    // Handle rank mismatch - reduce leading dimensions
+    const rank_diff = @as(i64, @intCast(grad_shape.len)) - @as(i64, @intCast(target_shape_arr.len));
+    if (rank_diff > 0) {
+        for (0..@intCast(rank_diff)) |i| {
+            try reduce_dims.append(@intCast(i));
+        }
+    }
+
+    // Handle size-1 dimensions in target (broadcasted dimensions)
+    if (rank_diff >= 0) {
+        for (target_shape_arr, 0..) |t_dim, i| {
+            const grad_idx = @as(usize, @intCast(@as(i64, @intCast(i)) + rank_diff));
+            if (grad_idx < grad_shape.len and t_dim == 1 and grad_shape[grad_idx] != 1) {
+                try reduce_dims.append(@as(i64, @intCast(grad_idx)));
+            }
+        }
+    }
+
+    if (reduce_dims.items.len == 0) return grad;
+
+    // Use ops.reduceSum which properly creates the reduction region
+    const grad_tensor = try builder.newTensor(grad);
+    const reduced_tensor = try ops.reduceSum(builder, grad_tensor, reduce_dims.items, false);
+
+    return reduced_tensor.value;
+}
+
 fn divideVJP(
     builder: *MLIRBuilder,
     original_op: mlir.Operation,
@@ -332,38 +521,44 @@ fn divideVJP(
     const a = primals[0];
     const b = primals[1];
 
-    // Verify handles are not obviously null/garbage
-    std.debug.print("DEBUG: divideVJP inputs: grad_out=0x{x}, a=0x{x}, b=0x{x}\n", .{
-        @intFromPtr(grad_out.handle.ptr),
-        @intFromPtr(a.handle.ptr),
-        @intFromPtr(b.handle.ptr)
-    });
-
     var result = std.ArrayList(mlir.Value).init(builder.allocator);
     errdefer result.deinit();
 
-    std.debug.print("DEBUG: divideVJP: creating grad_a (div)\n", .{});
-    // da = grad_out / b
-    const grad_a = try builder.createAndAttach("stablehlo.divide", &.{ grad_out, b }, &.{grad_out.getType()}, .{});
+    std.debug.print("DEBUG: divideVJP: computing grad_a\n", .{});
+    // da = grad_out / b with explicit broadcasting
+    const grad_a_broadcast = try broadcastOperands(builder, grad_out, b);
+    defer builder.allocator.free(grad_a_broadcast.shape);
+    const grad_a_type = grad_a_broadcast.lhs.getType();
+    const grad_a_raw = try builder.createAndAttach("stablehlo.divide", &.{ grad_a_broadcast.lhs, grad_a_broadcast.rhs }, &.{grad_a_type}, .{});
 
-    std.debug.print("DEBUG: divideVJP: appending grad_a\n", .{});
-    try result.append(grad_a.getResult(0));
+    // Reduce to match a's shape if broadcasting occurred
+    const grad_a = try reduceGradient(builder, grad_a_raw.getResult(0), a);
+    try result.append(grad_a);
 
-    std.debug.print("DEBUG: divideVJP: creating a_times_grad (mul)\n", .{});
+    std.debug.print("DEBUG: divideVJP: computing grad_b\n", .{});
     // db = -grad_out * a / (b * b)
-    const a_times_grad = try builder.createAndAttach("stablehlo.multiply", &.{ a, grad_out }, &.{grad_out.getType()}, .{});
 
-    std.debug.print("DEBUG: divideVJP: creating b_squared (mul)\n", .{});
+    // a * grad_out with explicit broadcasting
+    const a_times_grad_broadcast = try broadcastOperands(builder, a, grad_out);
+    defer builder.allocator.free(a_times_grad_broadcast.shape);
+    const a_times_grad_type = a_times_grad_broadcast.lhs.getType();
+    const a_times_grad = try builder.createAndAttach("stablehlo.multiply", &.{ a_times_grad_broadcast.lhs, a_times_grad_broadcast.rhs }, &.{a_times_grad_type}, .{});
+
+    // b * b (no broadcasting needed, both operands are b)
     const b_squared = try builder.createAndAttach("stablehlo.multiply", &.{ b, b }, &.{b.getType()}, .{});
 
-    std.debug.print("DEBUG: divideVJP: creating positive_grad_b (div)\n", .{});
-    const positive_grad_b = try builder.createAndAttach("stablehlo.divide", &.{ a_times_grad.getResult(0), b_squared.getResult(0) }, &.{grad_out.getType()}, .{});
+    // (a * grad_out) / (b * b) with explicit broadcasting
+    const div_operands_broadcast = try broadcastOperands(builder, a_times_grad.getResult(0), b_squared.getResult(0));
+    defer builder.allocator.free(div_operands_broadcast.shape);
+    const div_operands_type = div_operands_broadcast.lhs.getType();
+    const positive_grad_b_raw = try builder.createAndAttach("stablehlo.divide", &.{ div_operands_broadcast.lhs, div_operands_broadcast.rhs }, &.{div_operands_type}, .{});
 
-    std.debug.print("DEBUG: divideVJP: creating grad_b (neg)\n", .{});
-    const grad_b = try builder.createAndAttach("stablehlo.negate", &.{ positive_grad_b.getResult(0) }, &.{grad_out.getType()}, .{});
+    // Negate
+    const positive_grad_b_neg = try builder.createAndAttach("stablehlo.negate", &.{ positive_grad_b_raw.getResult(0) }, &.{div_operands_type}, .{});
 
-    std.debug.print("DEBUG: divideVJP: appending grad_b\n", .{});
-    try result.append(grad_b.getResult(0));
+    // Reduce to match b's shape if broadcasting occurred
+    const grad_b = try reduceGradient(builder, positive_grad_b_neg.getResult(0), b);
+    try result.append(grad_b);
 
     std.debug.print("DEBUG: divideVJP: converting to owned slice\n", .{});
     const slice = try result.toOwnedSlice();
@@ -630,17 +825,16 @@ fn gatherVJP(
     primals: []const mlir.Value,
     adjoints: []const mlir.Value,
 ) ![]mlir.Value {
-    _ = original_op;
     const grad_out = adjoints[0];
     const operand = primals[0];      // Original operand (e.g., embedding table)
     const start_indices = primals[1]; // Indices used for gathering
-    
+
     var result = std.ArrayList(mlir.Value).init(builder.allocator);
-    
+
     // Gradient for operand: scatter grad_out back to the original positions
     if (!isValueFromConstantOp(operand)) {
         const original_shape_type = operand.getType();
-        
+
         // Create zero tensor with original shape using proper constant creation
         const ranked_type = original_shape_type.as(mlir.RankedTensorType) orelse return error.InvalidTensorType;
         const shape = try ranked_type.getShape(builder.allocator);
@@ -651,48 +845,49 @@ fn gatherVJP(
         builder.insertion_block.appendOwnedOperation(zero_constant_op);
         const zero_tensor = zero_constant_op;
 
-        // Get shapes to determine if we need to reshape
-        const indices_type = start_indices.getType().as(mlir.RankedTensorType) orelse return error.InvalidTensorType;
-        const grad_out_type = grad_out.getType().as(mlir.RankedTensorType) orelse return error.InvalidTensorType;
-        const indices_shape = try indices_type.getShape(builder.allocator);
-        defer builder.allocator.free(indices_shape);
-        const grad_out_shape = try grad_out_type.getShape(builder.allocator);
-        defer builder.allocator.free(grad_out_shape);
+        // Extract gather dimension numbers from the original gather operation
+        const dim_numbers_attr_ref = c.stringRefFromString("dimension_numbers");
+        const dim_numbers_attr = c.operationGetAttributeByName(original_op.handle, dim_numbers_attr_ref);
 
-        // Determine the expected updates shape for scatter
-        // With index_vector_dim = 2 and indices [1, 8], they expand to [1, 8, 1]
-        // Expected updates shape: [batch_dims..., update_window_dims...] = [1, 8, n_embd]
-        const expected_updates_rank = indices_shape.len + 1; // [1, 8, n_embd] = rank 3
-
-        // Reshape grad_out if necessary to match expected updates shape
-        var reshaped_grad_out = grad_out;
-        if (grad_out_type.getRank() != expected_updates_rank) {
-            // Need to reshape from [seq_len, n_embd] to [batch, seq_len, n_embd]
-            var expected_shape = std.ArrayList(i64).init(builder.allocator);
-            defer expected_shape.deinit();
-
-            // Add batch dimensions from indices
-            for (indices_shape) |dim| {
-                try expected_shape.append(dim);
-            }
-            // Add embedding dimension from grad_out
-            try expected_shape.append(grad_out_shape[grad_out_shape.len - 1]);
-
-            const reshape_op = try hlo.reshape(builder.allocator, builder.ctx, grad_out, expected_shape.items, builder.loc);
-            builder.insertion_block.appendOwnedOperation(reshape_op);
-            reshaped_grad_out = reshape_op.getResult(0);
+        if (@intFromPtr(dim_numbers_attr.ptr) == 0) {
+            return error.MissingDimensionNumbersAttribute;
         }
 
-        // Use proper stablehlo.scatter operation with dimension numbers
-        // For embedding lookup, scatter must match gather's dimension numbers
+        // Extract gather dimension numbers components
+        const offset_dims_size = c.stablehloGatherDimensionNumbersGetOffsetDimsSize(dim_numbers_attr);
+        const collapsed_slice_dims_size = c.stablehloGatherDimensionNumbersGetCollapsedSliceDimsSize(dim_numbers_attr);
+        const start_index_map_size = c.stablehloGatherDimensionNumbersGetStartIndexMapSize(dim_numbers_attr);
+        const index_vector_dim = c.stablehloGatherDimensionNumbersGetIndexVectorDim(dim_numbers_attr);
+
+        // Extract offset_dims (becomes update_window_dims for scatter)
+        var update_window_dims = try builder.allocator.alloc(i64, @intCast(offset_dims_size));
+        defer builder.allocator.free(update_window_dims);
+        for (0..@intCast(offset_dims_size)) |i| {
+            update_window_dims[i] = c.stablehloGatherDimensionNumbersGetOffsetDimsElem(dim_numbers_attr, @intCast(i));
+        }
+
+        // Extract collapsed_slice_dims (becomes inserted_window_dims for scatter)
+        var inserted_window_dims = try builder.allocator.alloc(i64, @intCast(collapsed_slice_dims_size));
+        defer builder.allocator.free(inserted_window_dims);
+        for (0..@intCast(collapsed_slice_dims_size)) |i| {
+            inserted_window_dims[i] = c.stablehloGatherDimensionNumbersGetCollapsedSliceDimsElem(dim_numbers_attr, @intCast(i));
+        }
+
+        // Extract start_index_map (becomes scatter_dims_to_operand_dims for scatter)
+        var scatter_dims_to_operand_dims = try builder.allocator.alloc(i64, @intCast(start_index_map_size));
+        defer builder.allocator.free(scatter_dims_to_operand_dims);
+        for (0..@intCast(start_index_map_size)) |i| {
+            scatter_dims_to_operand_dims[i] = c.stablehloGatherDimensionNumbersGetStartIndexMapElem(dim_numbers_attr, @intCast(i));
+        }
+
         const scatter_dim_numbers = hlo.ScatterDimensionNumbersAttribute{
-            .update_window_dims = &[_]i64{2}, // n_embd dimension at position 2
-            .inserted_window_dims = &[_]i64{0}, // vocab_size dimension doesn't appear in updates
-            .scatter_dims_to_operand_dims = &[_]i64{0}, // indices map to dimension 0 of operand
-            .index_vector_dim = 2, // index vector is at dimension 2 (trailing dim of indices)
+            .update_window_dims = update_window_dims,
+            .inserted_window_dims = inserted_window_dims,
+            .scatter_dims_to_operand_dims = scatter_dims_to_operand_dims,
+            .index_vector_dim = index_vector_dim,
         };
 
-        const scatter_op = try hlo.scatter(builder.allocator, builder.ctx, zero_tensor.getResult(0), start_indices, reshaped_grad_out, scatter_dim_numbers, builder.loc);
+        const scatter_op = try hlo.scatter(builder.allocator, builder.ctx, zero_tensor.getResult(0), start_indices, grad_out, scatter_dim_numbers, builder.loc);
         builder.insertion_block.appendOwnedOperation(scatter_op);
         try result.append(scatter_op.getResult(0));
     }
@@ -1047,8 +1242,12 @@ fn addInputGradients(
         const grad = input_gradients[i];
         
         // If a gradient for this operand already exists, add the new one to it.
+        // Must broadcast to handle shape mismatches
         if (adjoint_map.get(operand)) |existing_grad| {
-            const sum_op = try builder.createAndAttach("stablehlo.add", &.{ existing_grad, grad }, &.{grad.getType()}, .{});
+            const add_broadcast = try broadcastOperands(builder, existing_grad, grad);
+            defer builder.allocator.free(add_broadcast.shape);
+            const add_type = add_broadcast.lhs.getType();
+            const sum_op = try builder.createAndAttach("stablehlo.add", &.{ add_broadcast.lhs, add_broadcast.rhs }, &.{add_type}, .{});
             try adjoint_map.put(operand, sum_op.getResult(0));
         } else {
             try adjoint_map.put(operand, grad);
@@ -1143,10 +1342,15 @@ fn expVJP(
     // but recomputing is safe and correct.
     const exp_a = try builder.createAndAttach("stablehlo.exponential", &.{a}, &.{a.getType()}, .{});
 
-    // grad_in = grad_out * exp(a)
-    const grad_in = try builder.createAndAttach("stablehlo.multiply", &.{grad_out, exp_a.getResult(0)}, &.{grad_out.getType()}, .{});
+    // grad_in = grad_out * exp(a) with explicit broadcasting
+    const grad_in_broadcast = try broadcastOperands(builder, grad_out, exp_a.getResult(0));
+    defer builder.allocator.free(grad_in_broadcast.shape);
+    const grad_in_type = grad_in_broadcast.lhs.getType();
+    const grad_in_raw = try builder.createAndAttach("stablehlo.multiply", &.{grad_in_broadcast.lhs, grad_in_broadcast.rhs}, &.{grad_in_type}, .{});
 
-    try result.append(grad_in.getResult(0));
+    // Reduce to match a's shape if broadcasting occurred
+    const grad_in = try reduceGradient(builder, grad_in_raw.getResult(0), a);
+    try result.append(grad_in);
     return result.toOwnedSlice();
 }
 
@@ -1164,10 +1368,15 @@ fn logVJP(
     var result = std.ArrayList(mlir.Value).init(builder.allocator);
     defer result.deinit();
 
-    // grad_in = grad_out / a
-    const grad_in = try builder.createAndAttach("stablehlo.divide", &.{grad_out, a}, &.{grad_out.getType()}, .{});
+    // grad_in = grad_out / a with explicit broadcasting
+    const grad_in_broadcast = try broadcastOperands(builder, grad_out, a);
+    defer builder.allocator.free(grad_in_broadcast.shape);
+    const grad_in_type = grad_in_broadcast.lhs.getType();
+    const grad_in_raw = try builder.createAndAttach("stablehlo.divide", &.{grad_in_broadcast.lhs, grad_in_broadcast.rhs}, &.{grad_in_type}, .{});
 
-    try result.append(grad_in.getResult(0));
+    // Reduce to match a's shape if broadcasting occurred
+    const grad_in = try reduceGradient(builder, grad_in_raw.getResult(0), a);
+    try result.append(grad_in);
     return result.toOwnedSlice();
 }
 
@@ -1193,14 +1402,27 @@ fn rsqrtVJP(builder: *MLIRBuilder, original_op: mlir.Operation, primals: []const
     const neg_half_tensor = try ops.constant(builder, -0.5, shape, elem_type);
     const neg_half = neg_half_tensor.value;
 
-    const term1 = try builder.createAndAttach("stablehlo.multiply", &.{grad_out, neg_half}, &.{tensor_type}, .{});
-    const final_grad = try builder.createAndAttach("stablehlo.multiply", &.{term1.getResult(0), cub.getResult(0)}, &.{tensor_type}, .{});
+    // term1 = grad_out * neg_half with explicit broadcasting
+    const term1_broadcast = try broadcastOperands(builder, grad_out, neg_half);
+    defer builder.allocator.free(term1_broadcast.shape);
+    const term1_type = term1_broadcast.lhs.getType();
+    const term1 = try builder.createAndAttach("stablehlo.multiply", &.{term1_broadcast.lhs, term1_broadcast.rhs}, &.{term1_type}, .{});
 
-    try result.append(final_grad.getResult(0));
+    // final_grad = term1 * cub with explicit broadcasting
+    const final_grad_broadcast = try broadcastOperands(builder, term1.getResult(0), cub.getResult(0));
+    defer builder.allocator.free(final_grad_broadcast.shape);
+    const final_grad_type = final_grad_broadcast.lhs.getType();
+    const final_grad_raw = try builder.createAndAttach("stablehlo.multiply", &.{final_grad_broadcast.lhs, final_grad_broadcast.rhs}, &.{final_grad_type}, .{});
+
+    // Reduce to match a's shape if broadcasting occurred
+    const final_grad = try reduceGradient(builder, final_grad_raw.getResult(0), a);
+    try result.append(final_grad);
     return result.toOwnedSlice();
 }
 
 /// VJP rule for convert: cast gradient back to input type
+/// NOTE: The gradient shape might differ from primal shape due to operations after the convert.
+/// We need to first match shapes via broadcast/reduce, then convert element type.
 fn convertVJP(
     builder: *MLIRBuilder,
     original_op: mlir.Operation,
@@ -1214,9 +1436,37 @@ fn convertVJP(
     var result = std.ArrayList(mlir.Value).init(builder.allocator);
     defer result.deinit();
 
-    // Convert gradient back to input type
-    const input_type = input.getType();
-    const convert_op = try builder.createAndAttach("stablehlo.convert", &.{grad_out}, &.{input_type}, .{});
+    // First, reduce/broadcast gradient to match input shape
+    const grad_reshaped = try reduceGradient(builder, grad_out, input);
+
+    // Get shapes to verify they match
+    const grad_reshaped_type = grad_reshaped.getType().as(mlir.RankedTensorType) orelse return error.NotRankedTensor;
+    const grad_reshaped_shape = try grad_reshaped_type.getShape(builder.allocator);
+    defer builder.allocator.free(grad_reshaped_shape);
+
+    const input_type_ranked = input.getType().as(mlir.RankedTensorType) orelse return error.NotRankedTensor;
+    const input_shape = try input_type_ranked.getShape(builder.allocator);
+    defer builder.allocator.free(input_shape);
+
+    // If shapes still don't match, reshape to match input shape
+    // Note: At this point shapes should only differ by size-1 dimensions
+    var grad_shape_matched = grad_reshaped;
+    if (grad_reshaped_shape.len != input_shape.len or !std.mem.eql(i64, grad_reshaped_shape, input_shape)) {
+        std.debug.print("DEBUG convertVJP: Shapes differ after reduce, reshaping {any} -> {any}\n", .{grad_reshaped_shape, input_shape});
+        // Use reshape for shape adjustments (adding/removing size-1 dimensions)
+        const grad_reshaped_elem_type = grad_reshaped_type.getElementType();
+        const ctx = mlir.Context{ .handle = c.mlirTypeGetContext(grad_reshaped.getType().handle) };
+        const reshape_type = mlir.Type.rankedTensorType(ctx, input_shape, grad_reshaped_elem_type);
+        const reshape_op = try builder.createAndAttach("stablehlo.reshape", &.{grad_reshaped}, &.{reshape_type}, .{});
+        grad_shape_matched = reshape_op.getResult(0);
+    }
+
+    // Then convert element type to match input (shapes must match at this point)
+    const input_elem_type = input_type_ranked.getElementType();
+    const ctx = mlir.Context{ .handle = c.mlirTypeGetContext(input.getType().handle) };
+    const target_type = mlir.Type.rankedTensorType(ctx, input_shape, input_elem_type);
+
+    const convert_op = try builder.createAndAttach("stablehlo.convert", &.{grad_shape_matched}, &.{target_type}, .{});
 
     try result.append(convert_op.getResult(0));
     return result.toOwnedSlice();

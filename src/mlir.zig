@@ -454,6 +454,11 @@ pub const Context = struct {
             return c.c.typeIsAIndex(self.handle);
         }
 
+        /// Check if this type is equal to another type
+        pub fn isEqual(self: Self, other: Self) bool {
+            return c.c.mlirTypeEqual(self.handle, other.handle);
+        }
+
         /// Create a function type with given inputs and results
         /// UPDATED: Now accepts an allocator for temporary C-API array construction
         pub fn functionType(allocator: std.mem.Allocator, context: Context, inputs: []const Type, results: []const Type) !Self {

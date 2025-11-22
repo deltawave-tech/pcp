@@ -223,6 +223,9 @@ fn addIreeIncludes(mod: *std.Build.Module, b: *std.Build, iree_config: IreeConfi
     // Add MLIR C API headers for @cImport auto-generation
     mod.addIncludePath(.{ .cwd_relative = b.fmt("{s}/third_party/llvm-project/mlir/include", .{source_dir}) });
     mod.addIncludePath(.{ .cwd_relative = b.fmt("{s}/llvm-project/tools/mlir/include", .{build_dir}) });
+    // Add StableHLO C API headers
+    mod.addIncludePath(.{ .cwd_relative = b.fmt("{s}/third_party/stablehlo", .{source_dir}) });
+    mod.addIncludePath(.{ .cwd_relative = b.fmt("{s}/llvm-external-projects/stablehlo", .{build_dir}) });
     // Add our unified header directory
     mod.addIncludePath(b.path("src/mlir/include"));
 }
@@ -246,6 +249,9 @@ fn addIreeDependencies(target: *std.Build.Step.Compile, b: *std.Build, iree_conf
     // Add MLIR C API headers for @cImport auto-generation
     target.addIncludePath(.{ .cwd_relative = b.fmt("{s}/third_party/llvm-project/mlir/include", .{source_dir}) });
     target.addIncludePath(.{ .cwd_relative = b.fmt("{s}/llvm-project/tools/mlir/include", .{build_dir}) });
+    // Add StableHLO C API headers
+    target.addIncludePath(.{ .cwd_relative = b.fmt("{s}/third_party/stablehlo", .{source_dir}) });
+    target.addIncludePath(.{ .cwd_relative = b.fmt("{s}/llvm-external-projects/stablehlo", .{build_dir}) });
     // Add our unified header directory
     target.addIncludePath(b.path("src/mlir/include"));
 
@@ -272,8 +278,13 @@ fn addIreeDependencies(target: *std.Build.Step.Compile, b: *std.Build, iree_conf
         .file = b.path("src/mlir/pass_anchors.cpp"),
         .flags = &.{"-std=c++17"},
     });
-    
-    // Add include paths needed by pass_anchors.cpp
+    // Add StableHLO CAPI for attribute access
+    dialect_anchors_lib.addCSourceFile(.{
+        .file = .{ .cwd_relative = b.fmt("{s}/third_party/stablehlo/stablehlo/integrations/c/StablehloAttributes.cpp", .{source_dir}) },
+        .flags = &.{"-std=c++17"},
+    });
+
+    // Add include paths needed by pass_anchors.cpp and StableHLO CAPI
     // Use resolved paths from IREE detection
     dialect_anchors_lib.addIncludePath(.{ .cwd_relative = b.fmt("{s}/third_party/llvm-project/mlir/include", .{source_dir}) });
     dialect_anchors_lib.addIncludePath(.{ .cwd_relative = b.fmt("{s}/third_party/llvm-project/llvm/include", .{source_dir}) });

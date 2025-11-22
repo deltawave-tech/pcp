@@ -12,7 +12,7 @@
 #include "mlir-c/Dialect/SCF.h"
 #include "mlir-c/RegisterEverything.h"
 
-// StableHLO headers are typically registered via dialect registry
-// and operations are created via string-based API
+// StableHLO C API
+#include "stablehlo/integrations/c/StablehloAttributes.h"
 
 #endif // PCP_API_H

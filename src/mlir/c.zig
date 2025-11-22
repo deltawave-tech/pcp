@@ -193,6 +193,8 @@ pub const c = struct {
     pub const mlirDenseI64ArrayGet = mlir_c.mlirDenseI64ArrayGet;
     pub const mlirDenseI64ArrayGetElement = mlir_c.mlirDenseI64ArrayGetElement;
     pub const denseI64ArrayGetElement = mlir_c.mlirDenseI64ArrayGetElement;
+    pub const mlirDenseArrayGetNumElements = mlir_c.mlirDenseArrayGetNumElements;
+    pub const denseArrayGetNumElements = mlir_c.mlirDenseArrayGetNumElements;
     pub const mlirUnitAttrGet = mlir_c.mlirUnitAttrGet;
     pub const mlirDictionaryAttrGet = mlir_c.mlirDictionaryAttrGet;
     pub const dictionaryAttrGet = mlir_c.mlirDictionaryAttrGet;
@@ -237,6 +239,8 @@ pub const c = struct {
     pub const typeIsAInteger = mlir_c.mlirTypeIsAInteger;
     pub const mlirTypeIsAIndex = mlir_c.mlirTypeIsAIndex;
     pub const typeIsAIndex = mlir_c.mlirTypeIsAIndex;
+    pub const mlirTypeEqual = mlir_c.mlirTypeEqual;
+    pub const typeEqual = mlir_c.mlirTypeEqual;
 
     pub const mlirValueGetType = mlir_c.mlirValueGetType;
     pub const valueGetType = mlir_c.mlirValueGetType;
@@ -244,6 +248,16 @@ pub const c = struct {
     pub const valueDump = mlir_c.mlirValueDump;
     pub const mlirValueIsAOpResult = mlir_c.mlirValueIsAOpResult;
     pub const mlirOpResultGetOwner = mlir_c.mlirOpResultGetOwner;
+
+    // StableHLO Gather Dimension Numbers
+    pub const stablehloAttributeIsAGatherDimensionNumbers = mlir_c.stablehloAttributeIsAGatherDimensionNumbers;
+    pub const stablehloGatherDimensionNumbersGetOffsetDimsSize = mlir_c.stablehloGatherDimensionNumbersGetOffsetDimsSize;
+    pub const stablehloGatherDimensionNumbersGetOffsetDimsElem = mlir_c.stablehloGatherDimensionNumbersGetOffsetDimsElem;
+    pub const stablehloGatherDimensionNumbersGetCollapsedSliceDimsSize = mlir_c.stablehloGatherDimensionNumbersGetCollapsedSliceDimsSize;
+    pub const stablehloGatherDimensionNumbersGetCollapsedSliceDimsElem = mlir_c.stablehloGatherDimensionNumbersGetCollapsedSliceDimsElem;
+    pub const stablehloGatherDimensionNumbersGetStartIndexMapSize = mlir_c.stablehloGatherDimensionNumbersGetStartIndexMapSize;
+    pub const stablehloGatherDimensionNumbersGetStartIndexMapElem = mlir_c.stablehloGatherDimensionNumbersGetStartIndexMapElem;
+    pub const stablehloGatherDimensionNumbersGetIndexVectorDim = mlir_c.stablehloGatherDimensionNumbersGetIndexVectorDim;
 
     // Helper functions
     pub fn stringRefFromString(str: []const u8) MlirStringRef {

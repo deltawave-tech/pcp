@@ -143,12 +143,49 @@ fn detectCapnp(b: *std.Build) CapnpConfig {
     return config;
 }
 
-// NEW: Function to detect IREE installation (Corrected and Cleaned)
+// NEW: Function to detect IREE installation (Refactored for Nix compatibility)
 fn detectIree(b: *std.Build) IreeConfig {
     var config = IreeConfig{};
     const build_root_path = b.build_root.path orelse ".";
 
-    // 1. Prioritize an environment variable for the IREE base directory
+    // 1. Check for explicit IREE_SOURCE_DIR and IREE_BUILD_DIR
+    const explicit_source = std.process.getEnvVarOwned(b.allocator, "IREE_SOURCE_DIR") catch null;
+    const explicit_build = std.process.getEnvVarOwned(b.allocator, "IREE_BUILD_DIR") catch null;
+
+    if (explicit_source != null or explicit_build != null) {
+        // If either is set, both must be set
+        if (explicit_source == null or explicit_build == null) {
+            if (explicit_source) |s| b.allocator.free(s);
+            if (explicit_build) |b_dir| b.allocator.free(b_dir);
+            std.debug.print("ERROR: Both IREE_SOURCE_DIR and IREE_BUILD_DIR must be set together.\n", .{});
+            return config;
+        }
+
+        const source_path = explicit_source.?;
+        const build_path = explicit_build.?;
+
+        // Verify paths exist
+        if (std.fs.cwd().access(source_path, .{})) |_| {
+            if (std.fs.cwd().access(build_path, .{})) |_| {
+                config.enabled = true;
+                config.source_dir = source_path; // Transfer ownership
+                config.build_dir = build_path; // Transfer ownership
+                std.debug.print("Found IREE via explicit env vars.\n  Source (IREE_SOURCE_DIR): {s}\n  Build (IREE_BUILD_DIR):   {s}\n", .{ source_path, build_path });
+                return config;
+            } else |_| {
+                std.debug.print("ERROR: IREE_BUILD_DIR path does not exist: {s}\n", .{build_path});
+            }
+        } else |_| {
+            std.debug.print("ERROR: IREE_SOURCE_DIR path does not exist: {s}\n", .{source_path});
+        }
+
+        // Cleanup on failure
+        b.allocator.free(source_path);
+        b.allocator.free(build_path);
+        return config;
+    }
+
+    // 2. BACKWARD COMPATIBILITY: Check for IREE_DIR (expects iree/ and iree-build/ subdirs)
     if (std.process.getEnvVarOwned(b.allocator, "IREE_DIR") catch null) |iree_dir| {
         defer b.allocator.free(iree_dir);
         std.debug.print("Attempting to find IREE via IREE_DIR: {s}\n", .{iree_dir});
@@ -170,7 +207,7 @@ fn detectIree(b: *std.Build) IreeConfig {
             if (std.fs.cwd().access(build_path, .{})) |_| {
                 config.enabled = true;
                 config.source_dir = source_path; // Transfer ownership
-                config.build_dir = build_path;   // Transfer ownership
+                config.build_dir = build_path; // Transfer ownership
                 std.debug.print("Found IREE via IREE_DIR.\n  Source: {s}\n  Build:  {s}\n", .{ source_path, build_path });
                 // We don't free source_path/build_path here because we are giving ownership to the config struct
                 return config;
@@ -183,7 +220,7 @@ fn detectIree(b: *std.Build) IreeConfig {
         std.debug.print("IREE_DIR was set, but 'iree' or 'iree-build' not found. Falling back.\n", .{});
     }
 
-    // 2. Fallback to relative path (sibling directories)
+    // 3. FALLBACK: Try relative path (sibling directories)
     const parent_dir = std.fs.path.dirname(build_root_path) orelse "..";
     const relative_source_path = std.fs.path.join(b.allocator, &[_][]const u8{ parent_dir, "iree" }) catch return config;
     const relative_build_path = std.fs.path.join(b.allocator, &[_][]const u8{ parent_dir, "iree-build" }) catch {
@@ -195,7 +232,7 @@ fn detectIree(b: *std.Build) IreeConfig {
         if (std.fs.cwd().access(relative_build_path, .{})) |_| {
             config.enabled = true;
             config.source_dir = relative_source_path; // Transfer ownership
-            config.build_dir = relative_build_path;   // Transfer ownership
+            config.build_dir = relative_build_path; // Transfer ownership
             std.debug.print("Found IREE via relative path.\n  Source: {s}\n  Build:  {s}\n", .{ relative_source_path, relative_build_path });
             return config;
         } else |_| {}
@@ -205,7 +242,7 @@ fn detectIree(b: *std.Build) IreeConfig {
     b.allocator.free(relative_source_path);
     b.allocator.free(relative_build_path);
 
-    std.debug.print("IREE not found via IREE_DIR or relative path ('../iree'). Please set IREE_DIR or check your directory structure.\n", .{});
+    std.debug.print("IREE not found. Set IREE_SOURCE_DIR and IREE_BUILD_DIR, or IREE_DIR, or use relative path ('../iree').\n", .{});
 
     return config;
 }
@@ -299,22 +336,22 @@ fn addIreeDependencies(target: *std.Build.Step.Compile, b: *std.Build, iree_conf
 
     // --- Link All Required Libraries ---
     target.linkSystemLibrary("stdc++");
-    
+
     // Core IREE
     target.linkSystemLibrary("IREECompiler");
     target.linkSystemLibrary("iree_runtime_unified");
-    
+
     // FlatCC Dependency
     target.linkSystemLibrary("flatcc_parsing");
-    
+
     // MLIR libraries needed for the dialect registration in pass_anchors
     target.linkSystemLibrary("MLIRFuncDialect");
     target.linkSystemLibrary("MLIRArithDialect");
     target.linkSystemLibrary("StablehloOps");
-    
+
     // IREE HAL driver initialization (enables use_all_available_drivers)
     target.linkSystemLibrary("iree_hal_drivers_drivers");
-    
+
     // CPU/Local-sync driver
     target.linkSystemLibrary("iree_hal_drivers_local_sync_sync_driver");
     target.linkSystemLibrary("iree_hal_drivers_local_sync_registration_registration");
@@ -350,7 +387,7 @@ fn addCapnpDependencies(target: *std.Build.Step.Compile, b: *std.Build, capnp_co
         std.debug.print("==> Cap'n Proto not found for '{s}', skipping linkage.\n", .{target.name});
         return;
     }
-    
+
     std.debug.print("==> Adding Cap'n Proto bridge for '{s}'\n", .{target.name});
 
     // Add include path for the executable itself to find capnp_bridge.h
@@ -362,7 +399,7 @@ fn addCapnpDependencies(target: *std.Build.Step.Compile, b: *std.Build, capnp_co
     }
     target.linkSystemLibrary("capnp");
     target.linkSystemLibrary("kj");
-    
+
     // Also link the C++ source files directly into the executable
     target.addCSourceFiles(.{
         .files = &.{
@@ -387,17 +424,8 @@ pub fn build(b: *std.Build) void {
     // Detect dependencies
     const capnp_config = detectCapnp(b);
     const iree_config = detectIree(b); // NEW
-    std.debug.print("==> Cap'n Proto detected: enabled={}, include={s}, lib={s}\n", .{
-        capnp_config.enabled,
-        capnp_config.include_dir orelse "null",
-        capnp_config.lib_dir orelse "null"
-    });
-    std.debug.print("==> IREE detected: enabled={}, source={s}, build={s}\n", .{
-        iree_config.enabled,
-        iree_config.source_dir orelse "null",
-        iree_config.build_dir orelse "null"
-    });
-
+    std.debug.print("==> Cap'n Proto detected: enabled={}, include={s}, lib={s}\n", .{ capnp_config.enabled, capnp_config.include_dir orelse "null", capnp_config.lib_dir orelse "null" });
+    std.debug.print("==> IREE detected: enabled={}, source={s}, build={s}\n", .{ iree_config.enabled, iree_config.source_dir orelse "null", iree_config.build_dir orelse "null" });
 
     // Create the main PCP module
     std.debug.print("==> Creating PCP module\n", .{});
@@ -405,13 +433,13 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/main.zig"),
     });
     addIreeIncludes(pcp_module, b, iree_config); // REFACTORED
-    
+
     // Add network include path for @cImport in capnp_zig_wrapper.zig
     pcp_module.addIncludePath(b.path("src/network"));
     if (capnp_config.include_dir) |include_dir| {
         pcp_module.addIncludePath(.{ .cwd_relative = include_dir });
     }
-    
+
     std.debug.print("==> PCP module created successfully\n", .{});
 
     // Create the GPT-2 module
@@ -443,15 +471,9 @@ pub fn build(b: *std.Build) void {
         }
     }
 
-
     // GPT-2 training example executable removed - obsolete
 
-
     // MLIR verification test removed - superseded by isolated_vjp_tests.zig
-
-
-
-
 
     // M3 Pipeline Test - tests complete MLIR → SPIR-V → MSL → Metal pipeline
     const m3_pipeline_test = b.addExecutable(.{
@@ -464,7 +486,6 @@ pub fn build(b: *std.Build) void {
 
     // IREE dependencies
     addIreeDependencies(m3_pipeline_test, b, iree_config); // REFACTORED
-
 
     const run_m3_pipeline_test_cmd = b.addRunArtifact(m3_pipeline_test);
     run_m3_pipeline_test_cmd.step.dependOn(&m3_pipeline_test.step);
@@ -503,8 +524,6 @@ pub fn build(b: *std.Build) void {
 
     const run_cuda_pipeline_test_step = b.step("run-cuda-pipeline-test", "Test IREE CUDA pipeline on NVIDIA GPU");
     run_cuda_pipeline_test_step.dependOn(&run_cuda_pipeline_test_cmd.step);
-
-
 
     // Distributed training system executable (main_distributed.zig)
     std.debug.print("==> Creating distributed training executable\n", .{});
@@ -624,7 +643,6 @@ pub fn build(b: *std.Build) void {
 
     // IREE dependencies
     addIreeDependencies(isolated_vjp_tests, b, iree_config); // REFACTORED
-
 
     // Install the test executable
     //b.installArtifact(isolated_vjp_tests);

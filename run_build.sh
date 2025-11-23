@@ -2,12 +2,14 @@
 
 LOG="build-$(date -Iseconds).log"
 
-echo "# --------- #" > "${LOG}"
-echo "# flake.nix #" > "${LOG}"
-echo "# --------- #" > "${LOG}"
-cat flake.nix > "${LOG}"
+echo "############################################################" > "${LOG}"
+echo "# --------- #" >> "${LOG}"
+echo "# flake.nix #" >> "${LOG}"
+echo "# --------- #" >> "${LOG}"
+cat flake.nix >> "${LOG}"
 
-echo "# -------------- #"
-echo "# Starting build #"
-echo "# -------------- #"
-nix build -L -v '.#iree-sdk' 2>&1 | tee "${LOG}"
+echo "############################################################" >> "${LOG}"
+echo "# -------------- #" >> "${LOG}"
+echo "# Starting build #" >> "${LOG}"
+echo "# -------------- #" >> "${LOG}"
+nix build -L -v '.#pcp' 2>&1 | tee --append "${LOG}"

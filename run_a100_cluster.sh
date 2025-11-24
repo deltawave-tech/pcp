@@ -44,16 +44,18 @@ SHEPHERD_PID=$!
 # Give Shepherd time to bind port and load model
 sleep 3
 
-# 3. Start Worker 1 (CUDA)
-echo "Starting Worker 1 (CUDA)..."
+# 3. Start Worker 1 (CPU)
+echo "Starting Worker 1 (CPU)..."
 $EXE --worker \
-     --connect 127.0.0.1:8090 &
+     --connect 127.0.0.1:8090 \
+     --backend cpu &
 WORKER1_PID=$!
 
 # 4. Start Worker 2 (CUDA)
 echo "Starting Worker 2 (CUDA)..."
 $EXE --worker \
-     --connect 127.0.0.1:8090 &
+     --connect 127.0.0.1:8090 \
+     --backend cuda &
 WORKER2_PID=$!
 
 # Wait for Shepherd to finish (it exits after training loop completes)

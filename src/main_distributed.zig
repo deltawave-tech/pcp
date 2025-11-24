@@ -30,6 +30,7 @@ const Args = struct {
     port: u16,
     workers: usize,
     model_path: ?[]const u8,
+    backend: ?backend_selection.Backend,
 
     const Mode = enum {
         shepherd,
@@ -44,6 +45,7 @@ const Args = struct {
                 .port = 8080,
                 .workers = 2,
                 .model_path = null,
+                .backend = null,
             };
         }
 
@@ -52,6 +54,7 @@ const Args = struct {
         var port: u16 = 8080;
         var workers: usize = 2;
         var model_path: ?[]const u8 = null;
+        var backend: ?backend_selection.Backend = null;
 
         var i: usize = 1;
         while (i < args.len) {
@@ -92,6 +95,25 @@ const Args = struct {
                 if (i < args.len) {
                     model_path = args[i];
                 }
+            } else if (std.mem.eql(u8, args[i], "--backend")) {
+                i += 1;
+                if (i < args.len) {
+                    const backend_str = args[i];
+                    if (std.mem.eql(u8, backend_str, "cpu")) {
+                        backend = .cpu;
+                    } else if (std.mem.eql(u8, backend_str, "cuda")) {
+                        backend = .cuda;
+                    } else if (std.mem.eql(u8, backend_str, "metal")) {
+                        backend = .metal;
+                    } else if (std.mem.eql(u8, backend_str, "vulkan")) {
+                        backend = .vulkan;
+                    } else if (std.mem.eql(u8, backend_str, "rocm")) {
+                        backend = .rocm;
+                    } else {
+                        print("Unknown backend: {s}\n", .{backend_str});
+                        return error.InvalidBackend;
+                    }
+                }
             }
             i += 1;
         }
@@ -102,6 +124,7 @@ const Args = struct {
             .port = port,
             .workers = workers,
             .model_path = model_path,
+            .backend = backend,
         };
     }
 
@@ -115,6 +138,7 @@ const Args = struct {
         print("  --port <port>        Port to bind/connect to (default: 8080)\n", .{});
         print("  --workers <count>    Number of workers to wait for (default: 2)\n", .{});
         print("  --model <path>       Path to MLIR model file (Shepherd only)\n", .{});
+        print("  --backend <type>     Backend to use: cpu, cuda, metal, vulkan, rocm (default: auto)\n", .{});
         print("  --help               Show this help message\n", .{});
     }
 };
@@ -201,7 +225,7 @@ fn runWorker(allocator: Allocator, args: Args) !void {
     print("🐉 Starting Worker...\n", .{});
     print("   Connecting to: {s}:{}\n", .{ args.host, args.port });
 
-    const backend = backend_selection.Backend.selectDefault();
+    const backend = args.backend orelse backend_selection.Backend.selectDefault();
     print("   Backend: {s}\n", .{backend.toString()});
 
     const worker_backend_instance = try backend_selection.createWorkerBackend(allocator, backend);

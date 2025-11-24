@@ -105,10 +105,10 @@ pub const Worker = struct {
         try self.client.connect(master_host, master_port);
         std.log.info("Connected to Shepherd at {s}:{}", .{ master_host, master_port });
         
-        // NEW: Determine our backend type at compile time
-        const my_backend = backend_selection.Backend.selectDefault();
+        // Get our backend type from the backend instance
+        const my_backend = self.backend.getBackendType();
 
-        // NEW: Create a JSON object for the payload
+        // Create a JSON object for the payload
         var payload_map = std.json.ObjectMap.init(self.allocator);
         try payload_map.put("backend", std.json.Value{ .string = my_backend.toString() });
         const payload = std.json.Value{ .object = payload_map };

@@ -244,6 +244,7 @@ pub const IreeBackend = struct {
             .ptr = self,
             .vtable = &.{
                 .executeTrainingStep = executeTrainingStepInterface,
+                .getBackendType = getBackendTypeInterface,
                 .deinit = deinitInterface,
             },
         };
@@ -267,6 +268,11 @@ pub const IreeBackend = struct {
         }
 
         return self.execute(artifact, "main", data, shapes, dtypes);
+    }
+
+    fn getBackendTypeInterface(ptr: *anyopaque) backend_selection.Backend {
+        const self: *Self = @ptrCast(@alignCast(ptr));
+        return self.backend;
     }
 
     fn deinitInterface(ptr: *anyopaque) void {

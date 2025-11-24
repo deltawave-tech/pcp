@@ -23,6 +23,98 @@ pub const MessageEnvelope = struct {
     pub fn fromJsonString(json_str: []u8, allocator: Allocator) json.ParseError(json.Scanner)!json.Parsed(MessageEnvelope) {
         return try json.parseFromSlice(MessageEnvelope, allocator, json_str, .{});
     }
+
+    /// Deep clone a MessageEnvelope with owned copies of all string/JSON data
+    pub fn clone(self: Self, allocator: Allocator) !Self {
+        // Clone string fields
+        const msg_type_copy = try allocator.dupe(u8, self.msg_type);
+        errdefer allocator.free(msg_type_copy);
+
+        const recipient_service_copy = try allocator.dupe(u8, self.recipient_service);
+        errdefer allocator.free(recipient_service_copy);
+
+        const sender_service_copy = try allocator.dupe(u8, self.sender_service);
+        errdefer allocator.free(sender_service_copy);
+
+        // Deep clone JSON value
+        const data_copy = try cloneJsonValue(self.data, allocator);
+
+        return Self{
+            .recipient_node = self.recipient_node,
+            .recipient_service = recipient_service_copy,
+            .sender_node = self.sender_node,
+            .sender_service = sender_service_copy,
+            .msg_type = msg_type_copy,
+            .msg_id = self.msg_id,
+            .data = data_copy,
+        };
+    }
+
+    /// Free owned copies created by clone()
+    pub fn deinitClone(self: Self, allocator: Allocator) void {
+        allocator.free(self.msg_type);
+        allocator.free(self.recipient_service);
+        allocator.free(self.sender_service);
+        freeJsonValue(self.data, allocator);
+    }
+
+    /// Helper to deep clone a JSON value
+    fn cloneJsonValue(value: std.json.Value, allocator: Allocator) !std.json.Value {
+        return switch (value) {
+            .null => .null,
+            .bool => |b| .{ .bool = b },
+            .integer => |i| .{ .integer = i },
+            .float => |f| .{ .float = f },
+            .number_string => |s| .{ .number_string = try allocator.dupe(u8, s) },
+            .string => |s| .{ .string = try allocator.dupe(u8, s) },
+            .array => |arr| {
+                var new_array = std.json.Array.init(allocator);
+                errdefer new_array.deinit();
+                for (arr.items) |item| {
+                    try new_array.append(try cloneJsonValue(item, allocator));
+                }
+                return .{ .array = new_array };
+            },
+            .object => |obj| {
+                var new_obj = std.json.ObjectMap.init(allocator);
+                errdefer new_obj.deinit();
+                var it = obj.iterator();
+                while (it.next()) |entry| {
+                    const key_copy = try allocator.dupe(u8, entry.key_ptr.*);
+                    const value_copy = try cloneJsonValue(entry.value_ptr.*, allocator);
+                    try new_obj.put(key_copy, value_copy);
+                }
+                return .{ .object = new_obj };
+            },
+        };
+    }
+
+    /// Helper to free a cloned JSON value
+    fn freeJsonValue(value: std.json.Value, allocator: Allocator) void {
+        switch (value) {
+            .null, .bool, .integer, .float => {},
+            .number_string => |s| allocator.free(s),
+            .string => |s| allocator.free(s),
+            .array => |arr| {
+                for (arr.items) |item| {
+                    freeJsonValue(item, allocator);
+                }
+                // Need to cast to mutable to call deinit
+                var arr_mut = arr;
+                arr_mut.deinit();
+            },
+            .object => |obj| {
+                // Need to cast to mutable to iterate and deinit
+                var obj_mut = obj;
+                var it = obj_mut.iterator();
+                while (it.next()) |entry| {
+                    allocator.free(entry.key_ptr.*);
+                    freeJsonValue(entry.value_ptr.*, allocator);
+                }
+                obj_mut.deinit();
+            },
+        }
+    }
     
     /// Create MessageEnvelope with binary data (Base64 encoded)
     pub fn createWithBinaryData(

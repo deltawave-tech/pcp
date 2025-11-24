@@ -353,11 +353,13 @@ pub const DiLoCo = struct {
         // 5. Distribute the compiled artifacts AND the data input shapes
         std.log.info("Distributing compiled artifacts and input shapes to workers...", .{});
 
-        // Lock worker_pool to safely iterate over workers
+        // Copy worker list to avoid holding mutex while sending messages
         self.coordinator.worker_pool_mutex.lock();
-        defer self.coordinator.worker_pool_mutex.unlock();
+        const worker_list = try self.allocator.dupe(shepherd.WorkerConnection, self.coordinator.worker_pool.items);
+        self.coordinator.worker_pool_mutex.unlock();
+        defer self.allocator.free(worker_list);
 
-        for (self.coordinator.worker_pool.items) |worker| {
+        for (worker_list) |worker| {
             const vmfb_bytes = compiled_artifacts.get(worker.backend).?;
 
             const b64_len = std.base64.standard.Encoder.calcSize(vmfb_bytes.len);
@@ -373,7 +375,7 @@ pub const DiLoCo = struct {
             try payload.put("parameter_shapes", param_shapes_json);
             try payload.put("data_input_shapes", data_shapes_json);
 
-            // Send the combined payload in a single message
+            // Send the combined payload in a single message (sendToWorker will lock internally)
             try self.coordinator.sendToWorker(worker.node_id, MessageType.INITIALIZE_GRAPH, .{ .object = payload });
         }
         
@@ -809,7 +811,13 @@ pub const DiLoCo = struct {
     /// Collect results from workers after inner loop using Cap'n Proto
     fn collectWorkerResults(self: *Self) !ArrayList(WorkerResult) {
         const responses = try self.coordinator.collectFromWorkers(MessageType.INNER_LOOP_COMPLETE);
-        defer responses.deinit();
+        defer {
+            // Clean up cloned messages
+            for (responses.items) |*msg| {
+                msg.deinitClone(self.allocator);
+            }
+            responses.deinit();
+        }
 
         var results = ArrayList(WorkerResult).init(self.allocator);
         var arena = std.heap.ArenaAllocator.init(self.allocator);

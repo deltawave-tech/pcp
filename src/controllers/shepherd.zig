@@ -69,6 +69,9 @@ pub const Shepherd = struct {
     algorithm: ?*training_algorithm.TrainingAlgorithm, // Training algorithm interface
     executor: ?Executor, // Generic execution backend for algorithms
     compiled_artifacts: std.AutoHashMap(Backend, []const u8), // Cache: Backend -> VMFB bytes
+    // Message queue for collecting worker results
+    result_queue: ArrayList(MessageEnvelope),
+    result_queue_mutex: std.Thread.Mutex,
 
     const Self = @This();
 
@@ -83,6 +86,8 @@ pub const Shepherd = struct {
             .algorithm = null,
             .executor = null,
             .compiled_artifacts = std.AutoHashMap(Backend, []const u8).init(allocator),
+            .result_queue = ArrayList(MessageEnvelope).init(allocator),
+            .result_queue_mutex = std.Thread.Mutex{},
         };
     }
     
@@ -103,6 +108,12 @@ pub const Shepherd = struct {
             self.allocator.free(vmfb_bytes.*);
         }
         self.compiled_artifacts.deinit();
+
+        // Clean up result queue (free cloned messages)
+        for (self.result_queue.items) |*msg| {
+            msg.deinitClone(self.allocator);
+        }
+        self.result_queue.deinit();
 
         // Clean up executor if owned
         if (self.executor) |executor| {
@@ -168,18 +179,22 @@ pub const Shepherd = struct {
 
         std.log.info("Worker connecting with backend: {s}", .{worker_backend.toString()});
 
-        // Assign new NodeId
+        // Assign new NodeId and add worker to pool (both protected by mutex)
+        self.worker_pool_mutex.lock();
         const assigned_node_id = self.next_node_id;
         self.next_node_id += 1;
 
-        // Add worker to pool, now including its backend (protected by mutex)
         const worker = WorkerConnection.init(assigned_node_id, stream, worker_backend);
-        self.worker_pool_mutex.lock();
-        defer self.worker_pool_mutex.unlock();
-        try self.worker_pool.append(worker);
+        self.worker_pool.append(worker) catch |err| {
+            self.worker_pool_mutex.unlock();
+            std.log.err("Failed to append worker {}: {}", .{ assigned_node_id, err });
+            return;
+        };
 
-        // Update monitoring (still holding mutex)
-        monitoring.setWorkerCount(self.worker_pool.items.len);
+        // Update monitoring while still holding mutex
+        const worker_count = self.worker_pool.items.len;
+        self.worker_pool_mutex.unlock();
+        monitoring.setWorkerCount(worker_count);
 
         std.log.info("Worker {} connected", .{assigned_node_id});
         
@@ -248,10 +263,18 @@ pub const Shepherd = struct {
     }
     
     /// Handle inner loop completion from worker
-    fn handleInnerLoopComplete(_: *Self, _: NodeId, _: MessageEnvelope) !void {
-        // TODO: Process the parameters from the message
-        // This would involve deserializing the model parameters and 
-        // adding them to the parameter aggregation
+    fn handleInnerLoopComplete(self: *Self, worker_id: NodeId, msg: MessageEnvelope) !void {
+        std.log.info("Worker {} sent INNER_LOOP_COMPLETE result", .{worker_id});
+
+        // Clone the message to own the data (msg contains pointers to temporary buffers)
+        const msg_clone = try msg.clone(self.allocator);
+        errdefer msg_clone.deinitClone(self.allocator);
+
+        // Add the cloned message to the result queue for collection by the main thread
+        self.result_queue_mutex.lock();
+        defer self.result_queue_mutex.unlock();
+
+        try self.result_queue.append(msg_clone);
     }
     
     /// Remove a worker from the pool
@@ -398,24 +421,59 @@ pub const Shepherd = struct {
     }
     
     /// Collect responses from all workers
-    pub fn collectFromWorkers(self: *Self, _: []const u8) !ArrayList(MessageEnvelope) {
-        const responses = ArrayList(MessageEnvelope).init(self.allocator);
-        var received_count: usize = 0;
-
+    pub fn collectFromWorkers(self: *Self, expected_msg_type: []const u8) !ArrayList(MessageEnvelope) {
         // Get worker count under mutex
         self.worker_pool_mutex.lock();
         const worker_count = self.worker_pool.items.len;
         self.worker_pool_mutex.unlock();
 
-        // This is a simplified version - in practice, you'd need more sophisticated
-        // handling with timeouts, error recovery, etc.
-        while (received_count < worker_count) {
-            // In a real implementation, you'd use select/poll or async I/O
-            // For now, this is a placeholder
-            std.time.sleep(10 * std.time.ns_per_ms);
-            received_count += 1; // Placeholder
+        std.log.info("Collecting results from {} workers...", .{worker_count});
+
+        // Poll the result queue until we have messages from all workers
+        const max_wait_seconds: i64 = 30; // 30 second timeout
+        const start_time = std.time.timestamp();
+
+        while (true) {
+            self.result_queue_mutex.lock();
+            const current_count = self.result_queue.items.len;
+            self.result_queue_mutex.unlock();
+
+            if (current_count >= worker_count) {
+                break;
+            }
+
+            // Check for timeout
+            const elapsed = std.time.timestamp() - start_time;
+            if (elapsed > max_wait_seconds) {
+                std.log.err("Timeout waiting for worker results: got {}/{} after {} seconds",
+                    .{current_count, worker_count, elapsed});
+                return error.CollectionTimeout;
+            }
+
+            // Sleep briefly before checking again
+            std.time.sleep(50 * std.time.ns_per_ms); // 50ms polling interval
         }
-        
+
+        // Drain the queue and return results
+        self.result_queue_mutex.lock();
+        defer self.result_queue_mutex.unlock();
+
+        var responses = ArrayList(MessageEnvelope).init(self.allocator);
+
+        // Verify all messages are of the expected type
+        for (self.result_queue.items) |msg| {
+            if (!std.mem.eql(u8, msg.msg_type, expected_msg_type)) {
+                std.log.warn("Unexpected message type: {s}, expected: {s}",
+                    .{msg.msg_type, expected_msg_type});
+                continue;
+            }
+            try responses.append(msg);
+        }
+
+        // Clear the queue for the next collection
+        self.result_queue.clearRetainingCapacity();
+
+        std.log.info("Collected {} results from workers", .{responses.items.len});
         return responses;
     }
     

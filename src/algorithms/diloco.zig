@@ -888,9 +888,17 @@ pub const DiLoCo = struct {
             const averaged_tensor = try self.createTensorFromArrayWithShape(param_slice, shape);
             defer averaged_tensor.deinit();
 
+            // Debug: Log shapes before subtraction
+            const master_dims = try param_tensor.shape.getDims(self.allocator);
+            defer self.allocator.free(master_dims);
+            std.log.info("Parameter {}: averaged shape = {any}, master shape = {any}", .{i, shape, master_dims});
+
             // Compute gradients (difference between averaged and master parameters)
             const gradient_tensor = try ops.subtract(self.mlir_builder, averaged_tensor, param_tensor.*);
             defer gradient_tensor.deinit();
+
+            // Reset velocity for this parameter (each parameter needs its own velocity state)
+            try self.nesterov_optimizer.resetVelocity();
 
             // Apply Nesterov momentum update using MLIR optimizer
             const updated_param = try self.nesterov_optimizer.update(param_tensor.*, gradient_tensor);

@@ -63,6 +63,7 @@ pub const Shepherd = struct {
     allocator: Allocator,
     server: ?TcpServer,
     worker_pool: ArrayList(WorkerConnection),
+    worker_pool_mutex: std.Thread.Mutex, // Protect worker_pool from concurrent access
     next_node_id: NodeId,
     is_running: bool,
     algorithm: ?*training_algorithm.TrainingAlgorithm, // Training algorithm interface
@@ -76,6 +77,7 @@ pub const Shepherd = struct {
             .allocator = allocator,
             .server = null,
             .worker_pool = ArrayList(WorkerConnection).init(allocator),
+            .worker_pool_mutex = std.Thread.Mutex{},
             .next_node_id = 1, // Start from 1, 0 is reserved for coordinator
             .is_running = false,
             .algorithm = null,
@@ -165,18 +167,20 @@ pub const Shepherd = struct {
             else .cpu; // Default to cpu
 
         std.log.info("Worker connecting with backend: {s}", .{worker_backend.toString()});
-        
+
         // Assign new NodeId
         const assigned_node_id = self.next_node_id;
         self.next_node_id += 1;
-        
-        // Add worker to pool, now including its backend
+
+        // Add worker to pool, now including its backend (protected by mutex)
         const worker = WorkerConnection.init(assigned_node_id, stream, worker_backend);
+        self.worker_pool_mutex.lock();
+        defer self.worker_pool_mutex.unlock();
         try self.worker_pool.append(worker);
-        
-        // Update monitoring
+
+        // Update monitoring (still holding mutex)
         monitoring.setWorkerCount(self.worker_pool.items.len);
-        
+
         std.log.info("Worker {} connected", .{assigned_node_id});
         
         // Send JoinAccept response
@@ -252,6 +256,9 @@ pub const Shepherd = struct {
     
     /// Remove a worker from the pool
     fn removeWorker(self: *Self, worker_id: NodeId) void {
+        self.worker_pool_mutex.lock();
+        defer self.worker_pool_mutex.unlock();
+
         for (self.worker_pool.items, 0..) |worker, i| {
             if (worker.node_id == worker_id) {
                 _ = self.worker_pool.swapRemove(i);
@@ -262,9 +269,11 @@ pub const Shepherd = struct {
             }
         }
     }
-    
+
     /// Get current number of connected workers
-    pub fn getWorkerCount(self: Self) usize {
+    pub fn getWorkerCount(self: *Self) usize {
+        self.worker_pool_mutex.lock();
+        defer self.worker_pool_mutex.unlock();
         return self.worker_pool.items.len;
     }
     
@@ -313,13 +322,21 @@ pub const Shepherd = struct {
     /// Start training once we have enough workers
     pub fn startTraining(self: *Self, required_workers: usize) !void {
         std.log.info("Waiting for {} workers to join...", .{required_workers});
-        
-        // Wait for enough workers
-        while (self.worker_pool.items.len < required_workers) {
+
+        // Wait for enough workers (check under mutex)
+        while (true) {
+            self.worker_pool_mutex.lock();
+            const current_count = self.worker_pool.items.len;
+            self.worker_pool_mutex.unlock();
+
+            if (current_count >= required_workers) break;
             std.time.sleep(100 * std.time.ns_per_ms); // 100ms polling
         }
-        
-        std.log.info("Got {} workers, starting training...", .{self.worker_pool.items.len});
+
+        self.worker_pool_mutex.lock();
+        const worker_count = self.worker_pool.items.len;
+        self.worker_pool_mutex.unlock();
+        std.log.info("Got {} workers, starting training...", .{worker_count});
         
         if (self.algorithm) |algo| {
             try algo.run();
@@ -332,7 +349,10 @@ pub const Shepherd = struct {
     /// Broadcast a message to all workers
     pub fn broadcastToWorkers(self: *Self, msg_type: []const u8, data: std.json.Value) !void {
         var msg_id: u8 = 1;
-        
+
+        self.worker_pool_mutex.lock();
+        defer self.worker_pool_mutex.unlock();
+
         for (self.worker_pool.items) |worker| {
             const msg = tcp_stream.createMessage(
                 0, // coordinator node_id
@@ -343,18 +363,21 @@ pub const Shepherd = struct {
                 msg_id,
                 data,
             );
-            
+
             TcpStreamManager.send(worker.stream, msg, self.allocator) catch |err| {
                 std.log.err("Failed to send message to worker {}: {}", .{ worker.node_id, err });
             };
-            
+
             msg_id += 1;
         }
-        
+
     }
 
     /// Send a message to a specific worker by its NodeId
     pub fn sendToWorker(self: *Self, node_id: NodeId, msg_type: []const u8, data: std.json.Value) !void {
+        self.worker_pool_mutex.lock();
+        defer self.worker_pool_mutex.unlock();
+
         for (self.worker_pool.items) |worker| {
             if (worker.node_id == node_id) {
                 const msg = tcp_stream.createMessage(
@@ -364,7 +387,7 @@ pub const Shepherd = struct {
                     1, // message id can be improved later
                     data,
                 );
-                
+
                 TcpStreamManager.send(worker.stream, msg, self.allocator) catch |err| {
                     std.log.err("Failed to send message to worker {}: {}", .{ worker.node_id, err });
                 };
@@ -378,10 +401,15 @@ pub const Shepherd = struct {
     pub fn collectFromWorkers(self: *Self, _: []const u8) !ArrayList(MessageEnvelope) {
         const responses = ArrayList(MessageEnvelope).init(self.allocator);
         var received_count: usize = 0;
-        
+
+        // Get worker count under mutex
+        self.worker_pool_mutex.lock();
+        const worker_count = self.worker_pool.items.len;
+        self.worker_pool_mutex.unlock();
+
         // This is a simplified version - in practice, you'd need more sophisticated
         // handling with timeouts, error recovery, etc.
-        while (received_count < self.worker_pool.items.len) {
+        while (received_count < worker_count) {
             // In a real implementation, you'd use select/poll or async I/O
             // For now, this is a placeholder
             std.time.sleep(10 * std.time.ns_per_ms);

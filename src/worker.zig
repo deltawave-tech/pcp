@@ -38,11 +38,12 @@ pub const Worker = struct {
     
     // Backend abstraction - handles all MLIR compilation and execution
     backend: WorkerBackend,
-    
-    // NEW: Cached VMFB binary from graph initialization
+
+    // NEW: Cached VMFB binary and shapes from graph initialization
     cached_vmfb: ?[]u8,
-    cached_data_input_shapes: ?[][]i64, // NEW FIELD
-    
+    cached_parameter_shapes: ?[][]i64,
+    cached_data_input_shapes: ?[][]i64,
+
     const Self = @This();
     
     pub fn init(allocator: Allocator, backend: WorkerBackend) !Self {
@@ -54,6 +55,7 @@ pub const Worker = struct {
             .is_running = false,
             .backend = backend,
             .cached_vmfb = null,
+            .cached_parameter_shapes = null,
             .cached_data_input_shapes = null,
         };
     }
@@ -64,11 +66,15 @@ pub const Worker = struct {
         if (self.cached_vmfb) |vmfb| {
             self.allocator.free(vmfb);
         }
+        if (self.cached_parameter_shapes) |shapes| {
+            for (shapes) |s| self.allocator.free(s);
+            self.allocator.free(shapes);
+        }
         if (self.cached_data_input_shapes) |shapes| {
             for (shapes) |s| self.allocator.free(s);
             self.allocator.free(shapes);
         }
-        
+
         self.client.deinit();
         self.backend.deinit();
     }
@@ -158,12 +164,16 @@ pub const Worker = struct {
         std.log.info("Worker {} exiting main loop", .{self.node_id.?});
     }
     
-    /// Handles the one-time setup message, caching the VMFB binary and data input shapes
+    /// Handles the one-time setup message, caching the VMFB binary and shapes
     fn handleInitializeGraph(self: *Self, msg: MessageEnvelope) !void {
         // Free any old data
         if (self.cached_vmfb) |vmfb| {
             self.allocator.free(vmfb);
             self.cached_vmfb = null;
+        }
+        if (self.cached_parameter_shapes) |shapes| {
+            for (shapes) |s| self.allocator.free(s);
+            self.cached_parameter_shapes = null;
         }
         if (self.cached_data_input_shapes) |shapes| {
             for (shapes) |s| self.allocator.free(s);
@@ -187,8 +197,38 @@ pub const Worker = struct {
         const vmfb_bytes = try self.allocator.alloc(u8, decoded_len);
         try std.base64.standard.Decoder.decode(vmfb_bytes, vmfb_string);
         self.cached_vmfb = vmfb_bytes;
-        
-        // 3. Parse and cache the data input shapes
+
+        // 3. Parse and cache the parameter shapes
+        const param_shapes_json = payload.get("parameter_shapes") orelse return error.MissingParameterShapesField;
+        const param_shapes_array = switch (param_shapes_json) {
+            .array => |arr| arr,
+            else => return error.InvalidParameterShapesFormat,
+        };
+
+        var param_shapes_list = std.ArrayList([]i64).init(self.allocator);
+        errdefer {
+            for (param_shapes_list.items) |s| self.allocator.free(s);
+            param_shapes_list.deinit();
+        }
+
+        for (param_shapes_array.items) |shape_val| {
+            const dim_array = switch (shape_val) {
+                .array => |arr| arr,
+                else => return error.InvalidParameterShapeFormat,
+            };
+            var dim_list = std.ArrayList(i64).init(self.allocator);
+            for (dim_array.items) |dim_val| {
+                const dim = switch (dim_val) {
+                    .integer => |i| i,
+                    else => return error.InvalidParameterDimensionFormat,
+                };
+                try dim_list.append(dim);
+            }
+            try param_shapes_list.append(try dim_list.toOwnedSlice());
+        }
+        self.cached_parameter_shapes = try param_shapes_list.toOwnedSlice();
+
+        // 4. Parse and cache the data input shapes
         const shapes_json = payload.get("data_input_shapes") orelse return error.MissingShapesField;
         const shapes_array = switch (shapes_json) {
             .array => |arr| arr,
@@ -218,21 +258,25 @@ pub const Worker = struct {
         }
         self.cached_data_input_shapes = try shapes_list.toOwnedSlice();
 
-        std.log.info("Worker {} cached VMFB and {} data input shapes.", .{ self.node_id.?, self.cached_data_input_shapes.?.len });
+        std.log.info("Worker {} cached VMFB, {} parameter shapes, and {} data input shapes.", .{ self.node_id.?, self.cached_parameter_shapes.?.len, self.cached_data_input_shapes.?.len });
     }
     
     /// Handle StartInnerLoop command from Shepherd using Cap'n Proto
     fn handleStartInnerLoop(self: *Self, msg: MessageEnvelope) !void {
         self.state = .training;
 
-        // 1. Ensure the VMFB has been cached.
+        // 1. Ensure the VMFB and shapes have been cached.
         const vmfb = self.cached_vmfb orelse {
             std.log.err("Received StartInnerLoop before graph was initialized.", .{});
             return error.GraphNotInitialized;
         };
-        const shapes = self.cached_data_input_shapes orelse {
-            std.log.err("Received StartInnerLoop before shapes were initialized.", .{});
-            return error.ShapesNotInitialized;
+        const param_shapes = self.cached_parameter_shapes orelse {
+            std.log.err("Received StartInnerLoop before parameter shapes were initialized.", .{});
+            return error.ParameterShapesNotInitialized;
+        };
+        const data_shapes = self.cached_data_input_shapes orelse {
+            std.log.err("Received StartInnerLoop before data shapes were initialized.", .{});
+            return error.DataShapesNotInitialized;
         };
 
         // 2. The payload is Base64-encoded Cap'n Proto data
@@ -274,25 +318,61 @@ pub const Worker = struct {
             return error.EmptyTargets;
         }
 
-        // 6. Package inputs for the backend: [master_params, input_ids, targets]
-        var inputs_array = [_][]const u8{ params_bytes, input_ids_bytes, targets_bytes };
-        const inputs: [][]const u8 = &inputs_array;
+        // 6. Split the concatenated params_bytes into individual parameter tensors
+        var param_tensors = try self.allocator.alloc([]const u8, param_shapes.len);
+        defer self.allocator.free(param_tensors);
 
-        // 7. Execute using the backend. The backend's vtable now points to
-        //    a function that expects the VMFB bytes and shapes.
-        // Convert [][]i64 to [][]const i64
-        var const_shapes = try self.allocator.alloc([]const i64, shapes.len);
-        defer self.allocator.free(const_shapes);
-        for (shapes, 0..) |shape, i| {
-            const_shapes[i] = shape;
+        var offset: usize = 0;
+        for (param_shapes, 0..) |shape, i| {
+            // Calculate size of this parameter tensor
+            var size: usize = @sizeOf(f32); // All params are f32
+            for (shape) |dim| {
+                size *= @intCast(dim);
+            }
+
+            // Extract slice from concatenated buffer
+            if (offset + size > params_bytes.len) {
+                std.log.err("Parameter buffer too small: expected {} bytes, got {}", .{ offset + size, params_bytes.len });
+                return error.ParameterBufferTooSmall;
+            }
+            param_tensors[i] = params_bytes[offset .. offset + size];
+            offset += size;
         }
-        const outputs = try self.backend.executeTrainingStep(vmfb, inputs, const_shapes);
+
+        // 7. Package ALL inputs for the backend: [6 params + input_ids + targets]
+        var inputs_list = std.ArrayList([]const u8).init(self.allocator);
+        defer inputs_list.deinit();
+
+        // Add all parameter tensors
+        for (param_tensors) |pt| {
+            try inputs_list.append(pt);
+        }
+        // Add data inputs
+        try inputs_list.append(input_ids_bytes);
+        try inputs_list.append(targets_bytes);
+
+        const inputs = try inputs_list.toOwnedSlice();
+        defer self.allocator.free(inputs);
+
+        // 8. Combine parameter shapes and data shapes for the backend call
+        var all_shapes = try self.allocator.alloc([]const i64, param_shapes.len + data_shapes.len);
+        defer self.allocator.free(all_shapes);
+
+        for (param_shapes, 0..) |shape, i| {
+            all_shapes[i] = shape;
+        }
+        for (data_shapes, 0..) |shape, i| {
+            all_shapes[param_shapes.len + i] = shape;
+        }
+
+        // 9. Execute using the backend
+        const outputs = try self.backend.executeTrainingStep(vmfb, inputs, all_shapes);
         defer {
             for (outputs) |o| self.allocator.free(o);
             self.allocator.free(outputs);
         }
 
-        // 8. Extract updated parameters and loss from the backend's output
+        // 10. Extract updated parameters and loss from the backend's output
         const updated_params = if (outputs.len > 0) outputs[0] else &[_]u8{};
         var loss: f32 = 0.0;
         if (outputs.len > 1 and outputs[1].len >= @sizeOf(f32)) {

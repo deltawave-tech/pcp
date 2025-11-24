@@ -148,6 +148,10 @@ pub const MLIRContext = struct {
                 iree_compile_path,
                 temp_mlir_path,
                 target_arg,
+                // Disable vector distribution passes for CUDA to avoid distribution errors
+                // Both flags are needed to prevent the "failed to distribute" error
+                "--iree-codegen-llvmgpu-use-vector-distribution=false",
+                "--iree-codegen-llvmgpu-use-reduction-vector-distribution=false",
                 "-o",
                 temp_vmfb_path,
             },

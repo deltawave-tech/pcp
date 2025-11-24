@@ -292,14 +292,16 @@ pub const DiLoCo = struct {
 
         // 1. Wait for workers to connect (this logic is in Shepherd.startTraining,
         //    which calls this run() function. So by the time we are here, workers are present.)
-        
-        // 2. Identify unique backends in the connected worker pool
+
+        // 2. Identify unique backends in the connected worker pool (protected by mutex)
         var backend_set = std.AutoHashMap(backend_selection.Backend, void).init(self.allocator);
         defer backend_set.deinit();
 
+        self.coordinator.worker_pool_mutex.lock();
         for (self.coordinator.worker_pool.items) |worker| {
             try backend_set.put(worker.backend, {});
         }
+        self.coordinator.worker_pool_mutex.unlock();
 
         // 3. Compile the MLIR source once for EACH unique backend
         var compiled_artifacts = std.AutoHashMap(backend_selection.Backend, []const u8).init(self.allocator);
@@ -320,25 +322,41 @@ pub const DiLoCo = struct {
             const vmfb_bytes = try temp_mlir_ctx.compileToVMFB(
                 self.allocator,
                 self.worker_graph_mlir_source,
-                backend.toString(),
+                backend.toIreeCompilationTarget(),
             );
             try compiled_artifacts.put(backend, vmfb_bytes);
         }
         
-        // 4. Create the JSON payload for the data input shapes
-        var shape_array = std.json.Array.init(self.allocator);
-        defer shape_array.deinit();
+        // 4. Create the JSON payload for BOTH parameter shapes and data input shapes
+        var param_shape_array = std.json.Array.init(self.allocator);
+        defer param_shape_array.deinit();
+        for (self.parameter_shapes) |shape_slice| {
+            var dim_array = std.json.Array.init(self.allocator);
+            for (shape_slice) |dim| {
+                try dim_array.append(std.json.Value{ .integer = dim });
+            }
+            try param_shape_array.append(std.json.Value{ .array = dim_array });
+        }
+        const param_shapes_json = std.json.Value{ .array = param_shape_array };
+
+        var data_shape_array = std.json.Array.init(self.allocator);
+        defer data_shape_array.deinit();
         for (self.data_input_shapes) |shape_slice| {
             var dim_array = std.json.Array.init(self.allocator);
             for (shape_slice) |dim| {
                 try dim_array.append(std.json.Value{ .integer = dim });
             }
-            try shape_array.append(std.json.Value{ .array = dim_array });
+            try data_shape_array.append(std.json.Value{ .array = dim_array });
         }
-        const shapes_json = std.json.Value{ .array = shape_array };
+        const data_shapes_json = std.json.Value{ .array = data_shape_array };
 
         // 5. Distribute the compiled artifacts AND the data input shapes
         std.log.info("Distributing compiled artifacts and input shapes to workers...", .{});
+
+        // Lock worker_pool to safely iterate over workers
+        self.coordinator.worker_pool_mutex.lock();
+        defer self.coordinator.worker_pool_mutex.unlock();
+
         for (self.coordinator.worker_pool.items) |worker| {
             const vmfb_bytes = compiled_artifacts.get(worker.backend).?;
 
@@ -348,11 +366,12 @@ pub const DiLoCo = struct {
 
             const encoded_len = std.base64.standard.Encoder.encode(b64_encoded_vmfb, vmfb_bytes).len;
 
-            // Create a JSON object containing BOTH the vmfb and the shapes
+            // Create a JSON object containing vmfb, parameter shapes, and data input shapes
             var payload = std.json.ObjectMap.init(self.allocator);
             defer payload.deinit();
             try payload.put("vmfb", std.json.Value{ .string = b64_encoded_vmfb[0..encoded_len] });
-            try payload.put("data_input_shapes", shapes_json);
+            try payload.put("parameter_shapes", param_shapes_json);
+            try payload.put("data_input_shapes", data_shapes_json);
 
             // Send the combined payload in a single message
             try self.coordinator.sendToWorker(worker.node_id, MessageType.INITIALIZE_GRAPH, .{ .object = payload });
@@ -369,7 +388,7 @@ pub const DiLoCo = struct {
             const start_time = std.time.milliTimestamp();
 
             // Phase 0: Get a fresh batch of training data
-            const batch_size = 4;
+            const batch_size = 1; // Match model input shape tensor<1x8xi64>
             const block_size = 8;
             const batch = try self.data_loader.getBatch(batch_size, block_size);
             defer self.allocator.free(batch.x);

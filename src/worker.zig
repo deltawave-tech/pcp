@@ -44,6 +44,11 @@ pub const Worker = struct {
     cached_parameter_shapes: ?[][]i64,
     cached_data_input_shapes: ?[][]i64,
 
+    // NEW: AdamW optimizer state buffers (M and V) and timestep
+    m_states: ?[][]u8, // One buffer per parameter
+    v_states: ?[][]u8, // One buffer per parameter
+    timestep: f32,
+
     const Self = @This();
     
     pub fn init(allocator: Allocator, backend: WorkerBackend) !Self {
@@ -57,6 +62,9 @@ pub const Worker = struct {
             .cached_vmfb = null,
             .cached_parameter_shapes = null,
             .cached_data_input_shapes = null,
+            .m_states = null,
+            .v_states = null,
+            .timestep = 1.0,
         };
     }
     
@@ -73,6 +81,16 @@ pub const Worker = struct {
         if (self.cached_data_input_shapes) |shapes| {
             for (shapes) |s| self.allocator.free(s);
             self.allocator.free(shapes);
+        }
+
+        // Cleanup optimizer state buffers
+        if (self.m_states) |states| {
+            for (states) |s| self.allocator.free(s);
+            self.allocator.free(states);
+        }
+        if (self.v_states) |states| {
+            for (states) |s| self.allocator.free(s);
+            self.allocator.free(states);
         }
 
         self.client.deinit();
@@ -258,143 +276,226 @@ pub const Worker = struct {
         }
         self.cached_data_input_shapes = try shapes_list.toOwnedSlice();
 
-        std.log.info("Worker {} cached VMFB, {} parameter shapes, and {} data input shapes.", .{ self.node_id.?, self.cached_parameter_shapes.?.len, self.cached_data_input_shapes.?.len });
+        // 5. Allocate M and V state buffers (initialized to zero)
+        // Free old buffers if they exist
+        if (self.m_states) |states| {
+            for (states) |s| self.allocator.free(s);
+            self.allocator.free(states);
+        }
+        if (self.v_states) |states| {
+            for (states) |s| self.allocator.free(s);
+            self.allocator.free(states);
+        }
+
+        const num_params = self.cached_parameter_shapes.?.len;
+        const m_buffers = try self.allocator.alloc([]u8, num_params);
+        errdefer {
+            for (m_buffers) |buf| self.allocator.free(buf);
+            self.allocator.free(m_buffers);
+        }
+        const v_buffers = try self.allocator.alloc([]u8, num_params);
+        errdefer {
+            for (v_buffers) |buf| self.allocator.free(buf);
+            self.allocator.free(v_buffers);
+        }
+
+        // Allocate and zero-initialize each state buffer
+        for (self.cached_parameter_shapes.?, 0..) |shape, i| {
+            var size: usize = @sizeOf(f32); // f32 for all parameters
+            for (shape) |dim| {
+                size *= @intCast(dim);
+            }
+
+            m_buffers[i] = try self.allocator.alloc(u8, size);
+            @memset(m_buffers[i], 0);
+
+            v_buffers[i] = try self.allocator.alloc(u8, size);
+            @memset(v_buffers[i], 0);
+        }
+
+        self.m_states = m_buffers;
+        self.v_states = v_buffers;
+        self.timestep = 1.0; // Reset timestep
+
+        std.log.info("Worker {} cached VMFB, {} parameter shapes, {} data input shapes, and allocated optimizer state buffers.", .{ self.node_id.?, self.cached_parameter_shapes.?.len, self.cached_data_input_shapes.?.len });
     }
     
     /// Handle StartInnerLoop command from Shepherd using Cap'n Proto
+    /// Implements the tau-step inner loop with AdamW state management
     fn handleStartInnerLoop(self: *Self, msg: MessageEnvelope) !void {
         self.state = .training;
 
-        // 1. Ensure the VMFB and shapes have been cached.
-        const vmfb = self.cached_vmfb orelse {
-            std.log.err("Received StartInnerLoop before graph was initialized.", .{});
-            return error.GraphNotInitialized;
-        };
-        const param_shapes = self.cached_parameter_shapes orelse {
-            std.log.err("Received StartInnerLoop before parameter shapes were initialized.", .{});
-            return error.ParameterShapesNotInitialized;
-        };
-        const data_shapes = self.cached_data_input_shapes orelse {
-            std.log.err("Received StartInnerLoop before data shapes were initialized.", .{});
-            return error.DataShapesNotInitialized;
-        };
+        // 1. Ensure the VMFB, shapes, and optimizer states have been cached.
+        const vmfb = self.cached_vmfb orelse return error.GraphNotInitialized;
+        const param_shapes = self.cached_parameter_shapes orelse return error.ParameterShapesNotInitialized;
+        const data_shapes = self.cached_data_input_shapes orelse return error.DataShapesNotInitialized;
+        const m_states = self.m_states orelse return error.OptimizerStateNotInitialized;
+        const v_states = self.v_states orelse return error.OptimizerStateNotInitialized;
 
-        // 2. The payload is Base64-encoded Cap'n Proto data
+        // 2. Decode the Base64-encoded Cap'n Proto payload
         const b64_encoded_payload = switch (msg.data) {
             .string => |s| s,
             else => return error.InvalidMessageFormat,
         };
 
-        // 3. Base64-decode the payload to get the binary Cap'n Proto data
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
-        
+
         const capnp_len = try std.base64.standard.Decoder.calcSizeForSlice(b64_encoded_payload);
         const capnp_bytes = try arena.allocator().alloc(u8, capnp_len);
         try std.base64.standard.Decoder.decode(capnp_bytes, b64_encoded_payload);
 
-        // 4. Deserialize the binary data using Cap'n Proto
+        // 3. Deserialize the payload to get initial params and batch data
         const reader = try binary_protocol.WorkerPayload.Reader.init(capnp_bytes);
         defer reader.deinit();
-        const params_bytes = try reader.getParams();
+        const initial_params_bytes = try reader.getParams();
         const input_ids_bytes = try reader.getInputIds();
         const targets_bytes = try reader.getTargets();
 
-        // VALIDATION: Log deserialized sizes and validate data
-        std.log.info("Received params: {} bytes, inputs: {} bytes, targets: {} bytes", .{
-            params_bytes.len, input_ids_bytes.len, targets_bytes.len
+        std.log.info("Starting inner loop: params={} bytes, inputs={} bytes, targets={} bytes", .{
+            initial_params_bytes.len, input_ids_bytes.len, targets_bytes.len
         });
-        
-        if (params_bytes.len == 0) {
-            std.log.err("Empty parameters received in handleStartInnerLoop", .{});
-            return error.EmptyParameters;
-        }
-        if (input_ids_bytes.len == 0) {
-            std.log.err("Empty input_ids received in handleStartInnerLoop", .{});
-            return error.EmptyInputIds;
-        }
-        if (targets_bytes.len == 0) {
-            std.log.err("Empty targets received in handleStartInnerLoop", .{});
-            return error.EmptyTargets;
-        }
 
-        // 6. Split the concatenated params_bytes into individual parameter tensors
-        var param_tensors = try self.allocator.alloc([]const u8, param_shapes.len);
-        defer self.allocator.free(param_tensors);
+        // 4. Reset optimizer states (M and V to zero, timestep to 1.0)
+        // Per DiLoCo paper: "inner optimizer states are reset at the beginning of each inner loop"
+        for (m_states) |m_buf| @memset(m_buf, 0);
+        for (v_states) |v_buf| @memset(v_buf, 0);
+        self.timestep = 1.0;
+
+        // 5. Copy initial params into working buffers (we'll update these in the loop)
+        var current_params = try self.allocator.alloc([]u8, param_shapes.len);
+        defer {
+            for (current_params) |buf| self.allocator.free(buf);
+            self.allocator.free(current_params);
+        }
 
         var offset: usize = 0;
         for (param_shapes, 0..) |shape, i| {
-            // Calculate size of this parameter tensor
-            var size: usize = @sizeOf(f32); // All params are f32
-            for (shape) |dim| {
-                size *= @intCast(dim);
-            }
+            var size: usize = @sizeOf(f32);
+            for (shape) |dim| size *= @intCast(dim);
 
-            // Extract slice from concatenated buffer
-            if (offset + size > params_bytes.len) {
-                std.log.err("Parameter buffer too small: expected {} bytes, got {}", .{ offset + size, params_bytes.len });
-                return error.ParameterBufferTooSmall;
-            }
-            param_tensors[i] = params_bytes[offset .. offset + size];
+            if (offset + size > initial_params_bytes.len) return error.ParameterBufferTooSmall;
+
+            current_params[i] = try self.allocator.alloc(u8, size);
+            @memcpy(current_params[i], initial_params_bytes[offset .. offset + size]);
             offset += size;
         }
 
-        // 7. Package ALL inputs for the backend: [6 params + input_ids + targets]
-        var inputs_list = std.ArrayList([]const u8).init(self.allocator);
-        defer inputs_list.deinit();
+        // 6. Run the inner loop for tau steps
+        const tau: usize = 10; // DiLoCo default
+        var final_loss: f32 = 0.0;
 
-        // Add all parameter tensors
-        for (param_tensors) |pt| {
-            try inputs_list.append(pt);
+        for (0..tau) |step| {
+            std.log.info("Worker {} inner loop step {}/{}", .{ self.node_id.?, step + 1, tau });
+
+            // Build input list: [Params (N), Ms (N), Vs (N), Timestep (1), Data (D)]
+            var inputs_list = std.ArrayList([]const u8).init(self.allocator);
+            defer inputs_list.deinit();
+
+            // Add current parameters
+            for (current_params) |p| try inputs_list.append(p);
+
+            // Add M states
+            for (m_states) |m| try inputs_list.append(m);
+
+            // Add V states
+            for (v_states) |v| try inputs_list.append(v);
+
+            // Add timestep (as bytes of f32)
+            const timestep_bytes = std.mem.asBytes(&self.timestep);
+            try inputs_list.append(timestep_bytes);
+
+            // Add data inputs
+            try inputs_list.append(input_ids_bytes);
+            try inputs_list.append(targets_bytes);
+
+            const inputs = try inputs_list.toOwnedSlice();
+            defer self.allocator.free(inputs);
+
+            // Build shape list: [param_shapes (N), param_shapes (N), param_shapes (N), scalar, data_shapes (D)]
+            var all_shapes = std.ArrayList([]const i64).init(self.allocator);
+            defer all_shapes.deinit();
+
+            // Params, M, V shapes (3 * N)
+            for (0..3) |_| {
+                for (param_shapes) |shape| try all_shapes.append(shape);
+            }
+
+            // Timestep shape (scalar)
+            const scalar_shape = &[_]i64{};
+            try all_shapes.append(scalar_shape);
+
+            // Data shapes
+            for (data_shapes) |shape| try all_shapes.append(shape);
+
+            const shapes_slice = try all_shapes.toOwnedSlice();
+            defer self.allocator.free(shapes_slice);
+
+            // Execute the training step
+            const outputs = try self.backend.executeTrainingStep(vmfb, inputs, shapes_slice);
+            defer {
+                for (outputs) |o| self.allocator.free(o);
+                self.allocator.free(outputs);
+            }
+
+            // Parse outputs: [Params (N), Ms (N), Vs (N), Loss (1)]
+            // Expected: 3*N + 1 outputs
+            const expected_outputs = param_shapes.len * 3 + 1;
+            if (outputs.len != expected_outputs) {
+                std.log.err("Expected {} outputs, got {}", .{ expected_outputs, outputs.len });
+                return error.UnexpectedOutputCount;
+            }
+
+            const num_params = param_shapes.len;
+
+            // Update current_params with new_params from outputs[0..N]
+            for (0..num_params) |i| {
+                @memcpy(current_params[i], outputs[i]);
+            }
+
+            // Update m_states with new_m from outputs[N..2N]
+            for (0..num_params) |i| {
+                @memcpy(m_states[i], outputs[num_params + i]);
+            }
+
+            // Update v_states with new_v from outputs[2N..3N]
+            for (0..num_params) |i| {
+                @memcpy(v_states[i], outputs[2 * num_params + i]);
+            }
+
+            // Extract loss from outputs[3N]
+            const loss_bytes = outputs[3 * num_params];
+            if (loss_bytes.len >= @sizeOf(f32)) {
+                final_loss = @as(f32, @bitCast(std.mem.readInt(u32, loss_bytes[0..4], .little)));
+            }
+
+            // Increment timestep for next iteration
+            self.timestep += 1.0;
         }
-        // Add data inputs
-        try inputs_list.append(input_ids_bytes);
-        try inputs_list.append(targets_bytes);
 
-        const inputs = try inputs_list.toOwnedSlice();
-        defer self.allocator.free(inputs);
+        std.log.info("Worker {} completed {} inner loop steps, final loss: {d:.4}", .{ self.node_id.?, tau, final_loss });
 
-        // 8. Combine parameter shapes and data shapes for the backend call
-        var all_shapes = try self.allocator.alloc([]const i64, param_shapes.len + data_shapes.len);
-        defer self.allocator.free(all_shapes);
+        // 7. After tau steps, send back the final parameters and loss
+        // Concatenate final parameters
+        var final_params_bytes = std.ArrayList(u8).init(self.allocator);
+        defer final_params_bytes.deinit();
+        for (current_params) |p| try final_params_bytes.appendSlice(p);
 
-        for (param_shapes, 0..) |shape, i| {
-            all_shapes[i] = shape;
-        }
-        for (data_shapes, 0..) |shape, i| {
-            all_shapes[param_shapes.len + i] = shape;
-        }
-
-        // 9. Execute using the backend
-        const outputs = try self.backend.executeTrainingStep(vmfb, inputs, all_shapes);
-        defer {
-            for (outputs) |o| self.allocator.free(o);
-            self.allocator.free(outputs);
-        }
-
-        // 10. Extract updated parameters and loss from the backend's output
-        const updated_params = if (outputs.len > 0) outputs[0] else &[_]u8{};
-        var loss: f32 = 0.0;
-        if (outputs.len > 1 and outputs[1].len >= @sizeOf(f32)) {
-            loss = @as(f32, @bitCast(std.mem.readInt(u32, outputs[1][0..4], .little)));
-        }
-
-        // 9. Create and serialize the Cap'n Proto ShepherdPayload
         const shepherd_payload = binary_protocol.ShepherdPayload{
-            .updated_params = updated_params,
-            .loss = loss,
+            .updated_params = final_params_bytes.items,
+            .loss = final_loss,
         };
         const response_capnp_bytes = try shepherd_payload.serialize(self.allocator);
         defer self.allocator.free(response_capnp_bytes);
 
-        // 10. Base64 encode the binary payload
+        // Base64 encode the response
         const b64_len = std.base64.standard.Encoder.calcSize(response_capnp_bytes.len);
         const response_b64_payload = try self.allocator.alloc(u8, b64_len);
         defer self.allocator.free(response_b64_payload);
-        
+
         const encoded_len = std.base64.standard.Encoder.encode(response_b64_payload, response_capnp_bytes).len;
 
-        // 11. Create and send the message
+        // Send the response
         const response = tcp_stream.createMessage(
             self.node_id.?,
             "worker",
@@ -404,9 +505,8 @@ pub const Worker = struct {
             msg.msg_id + 1,
             std.json.Value{ .string = response_b64_payload[0..encoded_len] },
         );
-        
+
         try self.client.send(response);
-        std.log.info("Worker {} completed inner loop", .{self.node_id.?});
         self.state = .connected;
     }
     

@@ -719,8 +719,8 @@ pub fn log(ctx: mlir.Context, operand: mlir.Value, loc: mlir.Location) mlir.Oper
 }
 
 /// Creates a stablehlo.sqrt operation
-pub fn sqrt(ctx: mlir.Context, operand: mlir.Value, loc: mlir.Location) mlir.Operation {
-    return mlir.Operation.create(ctx, "stablehlo.sqrt", .{
+pub fn sqrt(allocator: std.mem.Allocator, ctx: mlir.Context, operand: mlir.Value, loc: mlir.Location) !mlir.Operation {
+    return try mlir.Operation.create(allocator, ctx, "stablehlo.sqrt", .{
         .operands = &.{operand},
         .results = &.{operand.getType()},
         .location = loc,
@@ -728,8 +728,8 @@ pub fn sqrt(ctx: mlir.Context, operand: mlir.Value, loc: mlir.Location) mlir.Ope
 }
 
 /// Creates a stablehlo.power operation
-pub fn power(ctx: mlir.Context, lhs: mlir.Value, rhs: mlir.Value, loc: mlir.Location) mlir.Operation {
-    return mlir.Operation.create(ctx, "stablehlo.power", .{
+pub fn power(allocator: std.mem.Allocator, ctx: mlir.Context, lhs: mlir.Value, rhs: mlir.Value, loc: mlir.Location) !mlir.Operation {
+    return try mlir.Operation.create(allocator, ctx, "stablehlo.power", .{
         .operands = &.{ lhs, rhs },
         .results = &.{lhs.getType()},
         .location = loc,

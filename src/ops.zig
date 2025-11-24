@@ -341,9 +341,9 @@ pub fn multiply(builder: *MLIRBuilder, a: Tensor, b: Tensor) !Tensor {
 /// Divide two tensors element-wise using stablehlo.divide
 pub fn divide(builder: *MLIRBuilder, a: Tensor, b: Tensor) !Tensor {
     const b_tensors = try broadcastTensors(builder, a, b);
-    
+
     // Use StableHLO dialect wrapper for clean operation creation
-    const operation = hlo.divide(builder.ctx, b_tensors[0].value, b_tensors[1].value, builder.loc);
+    const operation = try hlo.divide(builder.allocator, builder.ctx, b_tensors[0].value, b_tensors[1].value, builder.loc);
 
     // CRITICAL FIX: Use helper to append and return tensor
     return try builder.createAndAppendOp(operation);
@@ -708,7 +708,7 @@ pub fn log(builder: *MLIRBuilder, a: Tensor) !Tensor {
 /// Element-wise square root
 pub fn sqrt(builder: *MLIRBuilder, a: Tensor) !Tensor {
     // Use StableHLO dialect wrapper
-    const operation = hlo.sqrt(builder.ctx, a.value, builder.loc);
+    const operation = try hlo.sqrt(builder.allocator, builder.ctx, a.value, builder.loc);
 
     return try builder.createAndAppendOp(operation);
 }
@@ -717,7 +717,7 @@ pub fn sqrt(builder: *MLIRBuilder, a: Tensor) !Tensor {
 pub fn power(builder: *MLIRBuilder, base: Tensor, exponent: Tensor) !Tensor {
     // Note: This may require broadcasting `base` and `exponent`
     const b_tensors = try broadcastTensors(builder, base, exponent);
-    const operation = hlo.power(builder.ctx, b_tensors[0].value, b_tensors[1].value, builder.loc);
+    const operation = try hlo.power(builder.allocator, builder.ctx, b_tensors[0].value, b_tensors[1].value, builder.loc);
     return try builder.createAndAppendOp(operation);
 }
 

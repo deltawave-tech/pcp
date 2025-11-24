@@ -252,20 +252,18 @@ pub const IreeBackend = struct {
     fn executeTrainingStepInterface(ptr: *anyopaque, artifact: []const u8, data: [][]const u8, shapes: [][]const i64) anyerror![][]u8 {
         const self: *Self = @ptrCast(@alignCast(ptr));
 
-        // Hardcode dtypes for all 8 inputs: 6 params (f32) + input_ids (i64) + targets (i64)
-        // This matches the model function signature in nano_stablehlo.mlir
+        // Assign dtypes for the new AdamW worker graph signature:
+        // [Params (N x f32), M_states (N x f32), V_states (N x f32), Timestep (1 x f32), Data (2 x i64)]
         var dtypes = try self.allocator.alloc(DType, data.len);
         defer self.allocator.free(dtypes);
 
-        // First 6 inputs are f32 parameters
-        var i: usize = 0;
-        while (i < data.len - 2 and i < 6) : (i += 1) {
-            dtypes[i] = .f32;
-        }
-        // Last 2 inputs are i64 data (input_ids, targets)
-        if (data.len >= 2) {
-            dtypes[data.len - 2] = .i64; // input_ids
-            dtypes[data.len - 1] = .i64; // targets
+        // All inputs except last 2 are f32 (params, M states, V states, timestep)
+        for (0..data.len) |i| {
+            if (i >= data.len - 2) {
+                dtypes[i] = .i64; // Last 2 are i64 data inputs
+            } else {
+                dtypes[i] = .f32; // Everything else is f32
+            }
         }
 
         return self.execute(artifact, "main", data, shapes, dtypes);

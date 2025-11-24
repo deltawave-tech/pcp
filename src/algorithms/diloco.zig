@@ -8,6 +8,10 @@ const shepherd = @import("../controllers/shepherd.zig");
 const message = @import("../network/message.zig");
 const binary_protocol = @import("../network/capnp_zig_wrapper.zig");
 const nesterov_mlir = @import("../optimizers/nesterov_mlir.zig");
+const adam_mlir = @import("../optimizers/adam_mlir.zig");
+const nesterov_host = @import("../optimizers/nesterov.zig");
+const NesterovHost = nesterov_host.Nesterov;
+const AdamMLIR = adam_mlir.AdamMLIR(f32);
 const autodiff = @import("../autodiff.zig");
 const ops = @import("../ops.zig");
 const mlir = @import("../mlir.zig");
@@ -60,7 +64,8 @@ pub const DiLoCo = struct {
 
     // MLIR infrastructure
     mlir_builder: *MLIRBuilder, // Now a pointer, as it's owned externally
-    nesterov_optimizer: *NesterovMLIR,
+    adam_optimizer: *AdamMLIR, // Inner optimizer for worker training graph (AdamW)
+    host_optimizer: NesterovHost, // Outer optimizer for master parameter updates (Nesterov)
     element_type: mlir.Type,
 
     // GPT-2 master parameters as multiple MLIR tensors
@@ -174,14 +179,28 @@ pub const DiLoCo = struct {
 
         // === END NEW SECTION ===
 
-        // Configure and create Nesterov optimizer
-        const nesterov_config = nesterov_mlir.NesterovMLIRConfiguration(f32){
+        // Configure and create AdamW optimizer for INNER loop (workers)
+        // Per DiLoCo paper: "the inner optimizer is AdamW"
+        const adam_config = adam_mlir.AdamMLIRConfiguration(f32){
             .learning_rate = config.base_config.learning_rate,
-            .momentum = config.nesterov_momentum,
+            .beta1 = 0.9,
+            .beta2 = 0.999,
+            .epsilon = 1e-8,
+            .weight_decay = 0.01, // AdamW weight decay
         };
 
-        const nesterov_optimizer = try allocator.create(NesterovMLIR);
-        nesterov_optimizer.* = try NesterovMLIR.init(allocator, mlir_builder, nesterov_config, element_type);
+        const adam_optimizer = try allocator.create(AdamMLIR);
+        adam_optimizer.* = try AdamMLIR.init(allocator, mlir_builder, adam_config, element_type);
+
+        // Initialize Host Optimizer for OUTER loop (master updates on CPU)
+        // Per DiLoCo paper: "the outer optimizer is Nesterov momentum"
+        var host_opt = NesterovHost.init(allocator, .{
+            .learning_rate = config.base_config.learning_rate,
+            .momentum = config.nesterov_momentum,
+        });
+
+        // Pre-allocate velocity buffers based on introspection
+        try host_opt.initParameters(parameter_shapes);
 
         // Create a partial instance to build the worker graph
         var partial_self = Self{
@@ -192,7 +211,8 @@ pub const DiLoCo = struct {
             .metrics = TrainingMetrics.init(),
             .current_epoch = 0,
             .mlir_builder = mlir_builder,
-            .nesterov_optimizer = nesterov_optimizer,
+            .adam_optimizer = adam_optimizer,
+            .host_optimizer = host_opt,
             .element_type = element_type,
             .master_parameters = null,
             .parameter_shapes = parameter_shapes,
@@ -213,7 +233,8 @@ pub const DiLoCo = struct {
             .metrics = TrainingMetrics.init(),
             .current_epoch = 0,
             .mlir_builder = mlir_builder,
-            .nesterov_optimizer = nesterov_optimizer,
+            .adam_optimizer = adam_optimizer,
+            .host_optimizer = host_opt,
             .element_type = element_type,
             .master_parameters = null,
             .parameter_shapes = parameter_shapes,
@@ -232,8 +253,11 @@ pub const DiLoCo = struct {
             self.allocator.free(params);
         }
 
-        self.nesterov_optimizer.deinit();
-        self.allocator.destroy(self.nesterov_optimizer);
+        self.adam_optimizer.deinit();
+        self.allocator.destroy(self.adam_optimizer);
+
+        // Deinit host optimizer
+        self.host_optimizer.deinit();
 
         // We no longer deinit the builder, as we don't own it.
 
@@ -403,8 +427,8 @@ pub const DiLoCo = struct {
             const worker_results = try self.collectWorkerResults();
             defer self.cleanupWorkerResults(worker_results);
 
-            // Phase 3: Update master parameters using MLIR Nesterov optimizer
-            try self.updateMasterParametersMLIR(worker_results);
+            // Phase 3: Update master parameters using host-side Nesterov optimizer
+            try self.updateMasterParameters(worker_results);
 
             // Update metrics
             self.metrics.outer_loop_count += 1;
@@ -564,11 +588,11 @@ pub const DiLoCo = struct {
         // === PHASE 3: APPLY AUTODIFF AND BUILD THE ORCHESTRATOR ===
         std.debug.print("Building gradient graph from the cloned forward function...\n", .{});
 
-        const grad_fn_op = try autodiff.buildGradientGraph(self.allocator, builder, cloned_forward_fn);
+        _ = try autodiff.buildGradientGraph(self.allocator, builder, cloned_forward_fn);
         const grad_fn_name = "model_forward_pass_grad"; // Name given by autodiff
 
         // === PHASE 4: CREATE THE MAIN ORCHESTRATOR FUNCTION ===
-        std.debug.print("Building the 'main' orchestrator function...\n", .{});
+        std.debug.print("Building the 'main' orchestrator function with AdamW state...\n", .{});
 
         // 4.1: INTROSPECT the forward function to define our main function's signature
         const forward_fn_type = cloned_forward_fn.getType().as(mlir.FunctionType) orelse return error.NotAFunctionType;
@@ -577,19 +601,42 @@ pub const DiLoCo = struct {
         var main_input_types = std.ArrayList(mlir.Type).init(self.allocator);
         defer main_input_types.deinit();
 
-        // Main inputs = all inputs of the forward function (params, data, etc.)
-        for (0..num_forward_inputs) |i| {
+        const num_params = self.parameter_shapes.len;
+
+        // Main inputs = Parameters (N) + M States (N) + V States (N) + Timestep (1) + Data inputs
+        // A. Parameters
+        for (0..num_params) |i| {
+            try main_input_types.append(forward_fn_type.getInput(i));
+        }
+        // B. M States (same shape as params)
+        for (0..num_params) |i| {
+            try main_input_types.append(forward_fn_type.getInput(i));
+        }
+        // C. V States (same shape as params)
+        for (0..num_params) |i| {
+            try main_input_types.append(forward_fn_type.getInput(i));
+        }
+        // D. Timestep (scalar tensor)
+        const scalar_type = mlir.Type.rankedTensorType(self.mlir_builder.ctx, &.{}, self.element_type);
+        try main_input_types.append(scalar_type);
+        // E. Data inputs (from original forward function, skipping parameters)
+        for (num_params..num_forward_inputs) |i| {
             try main_input_types.append(forward_fn_type.getInput(i));
         }
 
-        // Main outputs = updated parameters (only the parameter inputs) + the final loss
-        const grad_fn_type = grad_fn_op.getType().as(mlir.FunctionType) orelse return error.NotAFunctionType;
+        // Main outputs = Parameters (N) + M States (N) + V States (N) + Loss (1)
         var main_output_types = std.ArrayList(mlir.Type).init(self.allocator);
         defer main_output_types.deinit();
 
-        const num_params = self.parameter_shapes.len;
-
         // Return updated parameters (same types as parameter inputs)
+        for (0..num_params) |i| {
+            try main_output_types.append(forward_fn_type.getInput(i));
+        }
+        // Return updated M states
+        for (0..num_params) |i| {
+            try main_output_types.append(forward_fn_type.getInput(i));
+        }
+        // Return updated V states
         for (0..num_params) |i| {
             try main_output_types.append(forward_fn_type.getInput(i));
         }
@@ -603,68 +650,93 @@ pub const DiLoCo = struct {
         const main_block = main_result.entry_block;
         builder.setInsertionBlock(main_block); // Set insertion point to 'main'
 
-        // 4.3: Get all arguments for 'main'
+        // 4.3: Get all arguments for 'main' and slice them
         const main_func_args = try main_block.getArguments(self.allocator);
         defer self.allocator.free(main_func_args);
 
-        // 4.4: Call the forward function to get the loss
+        // Slice arguments: [Params (N), Ms (N), Vs (N), Timestep (1), Data (D)]
+        const params_in = main_func_args[0..num_params];
+        const m_in = main_func_args[num_params .. num_params * 2];
+        const v_in = main_func_args[num_params * 2 .. num_params * 3];
+        const timestep = main_func_args[num_params * 3];
+        const data_in = main_func_args[num_params * 3 + 1 ..]; // Data inputs
+
+        // 4.4: Call the forward function to get the loss (only params + data)
+        var forward_operands = std.ArrayList(mlir.Value).init(self.allocator);
+        defer forward_operands.deinit();
+        try forward_operands.appendSlice(params_in);
+        try forward_operands.appendSlice(data_in);
+
         const forward_callee_attr = mlir.Attribute.symbolRefAttr(builder.ctx, new_fn_name);
-        const forward_call_op = try builder.createAndAttach("func.call", main_func_args, &.{forward_fn_type.getResult(0)}, .{
+        const forward_call_op = try builder.createAndAttach("func.call", forward_operands.items, &.{forward_fn_type.getResult(0)}, .{
             .attributes = &.{.{ "callee", forward_callee_attr }},
         });
         const loss_val = forward_call_op.getResult(0);
 
-        // 4.5: Call the gradient function to get gradients
+        // 4.5: Call the gradient function to get gradients (params + data + loss_grad)
         var grad_operands = std.ArrayList(mlir.Value).init(self.allocator);
         defer grad_operands.deinit();
 
-        // Grad func inputs = forward func inputs + gradient of the output (loss)
-        try grad_operands.appendSlice(main_func_args);
+        try grad_operands.appendSlice(params_in);
+        try grad_operands.appendSlice(data_in);
         const one = try ops.constant(builder, 1.0, &.{}, loss_val.getType().as(mlir.RankedTensorType).?.getElementType());
         try grad_operands.append(one.value);
 
         // Prepare grad function result types
+        // Note: Autodiff returns gradients for ALL inputs (params + data), not just parameters
         var grad_result_types = std.ArrayList(mlir.Type).init(self.allocator);
         defer grad_result_types.deinit();
-        for (0..grad_fn_type.getNumResults()) |i| {
-            try grad_result_types.append(grad_fn_type.getResult(i));
-        }
+        for (params_in) |p| try grad_result_types.append(p.getType());
+        for (data_in) |d| try grad_result_types.append(d.getType());
 
         const grad_callee_attr = mlir.Attribute.symbolRefAttr(builder.ctx, grad_fn_name);
         const grad_call_op = try builder.createAndAttach("func.call", grad_operands.items, grad_result_types.items, .{
             .attributes = &.{.{ "callee", grad_callee_attr }},
         });
 
-        // 4.6: Apply optimizer updates to get new parameters
-        // The worker should return updated parameters, not gradients!
-        std.debug.print("Adding optimizer update step to worker graph...\n", .{});
+        // Note: grad_call_op returns [param_grads..., data_grads...]
+        // We only need the parameter gradients (first num_params results)
+
+        // 4.6: Apply AdamW optimizer updates to get new parameters and states
+        std.debug.print("Adding AdamW optimizer update step to worker graph...\n", .{});
 
         var final_return_values = std.ArrayList(mlir.Value).init(self.allocator);
         defer final_return_values.deinit();
 
-        // For each parameter: new_param = param - lr * grad
+        const timestep_tensor = try builder.newTensor(timestep);
+
+        // Collect results from optimizer updates
+        var new_params = std.ArrayList(mlir.Value).init(self.allocator);
+        var new_ms = std.ArrayList(mlir.Value).init(self.allocator);
+        var new_vs = std.ArrayList(mlir.Value).init(self.allocator);
+        defer new_params.deinit();
+        defer new_ms.deinit();
+        defer new_vs.deinit();
+
+        // For each parameter: apply AdamW optimizer update ONCE and collect all three outputs
         for (0..num_params) |i| {
-            const param_val = main_func_args[i];
-            const grad_val = grad_call_op.getResult(i);
+            const param_tensor = try builder.newTensor(params_in[i]);
+            const grad_tensor = try builder.newTensor(grad_call_op.getResult(i));
+            const m_tensor = try builder.newTensor(m_in[i]);
+            const v_tensor = try builder.newTensor(v_in[i]);
 
-            // Convert to tensors for ops API
-            const param_tensor = try builder.newTensor(param_val);
-            const grad_tensor = try builder.newTensor(grad_val);
+            // Apply AdamW update with all 5 parameters (returns new_params, new_m, new_v)
+            const result = try self.adam_optimizer.update(param_tensor, grad_tensor, m_tensor, v_tensor, timestep_tensor);
 
-            // Simple SGD update: new_param = param - lr * grad
-            const lr_const = try ops.constant(builder, @as(f64, @floatCast(self.config.base_config.learning_rate)), &.{}, self.element_type);
-            const scaled_grad = try ops.multiply(builder, lr_const, grad_tensor);
-            const new_param_tensor = try ops.subtract(builder, param_tensor, scaled_grad);
-
-            try final_return_values.append(new_param_tensor.value);
+            try new_params.append(result.new_params.value);
+            try new_ms.append(result.new_m.value);
+            try new_vs.append(result.new_v.value);
         }
 
-        // Add the loss as the final return value
+        // Return in order: params, M states, V states, loss
+        try final_return_values.appendSlice(new_params.items);
+        try final_return_values.appendSlice(new_ms.items);
+        try final_return_values.appendSlice(new_vs.items);
         try final_return_values.append(loss_val);
 
         _ = try builder.createAndAttach("func.return", final_return_values.items, &.{}, .{});
 
-        std.debug.print("✓ Worker graph now returns updated parameters + loss\n", .{});
+        std.debug.print("✓ Worker graph now returns updated parameters + M + V + loss\n", .{});
 
         // === PHASE 5: FINALIZE AND SERIALIZE ===
         std.debug.print("✓ Final worker graph constructed successfully.\n", .{});
@@ -856,63 +928,53 @@ pub const DiLoCo = struct {
         return results;
     }
 
-    /// Update master parameters using MLIR Nesterov optimizer
-    fn updateMasterParametersMLIR(self: *Self, worker_results: ArrayList(WorkerResult)) !void {
-        if (worker_results.items.len == 0) {
-            return error.NoWorkerResults;
-        }
+    /// Update master parameters using host-side pure-Zig Nesterov optimizer
+    fn updateMasterParameters(self: *Self, worker_results: ArrayList(WorkerResult)) !void {
+        if (worker_results.items.len == 0) return error.NoWorkerResults;
+        if (self.master_parameters == null) return error.ParametersNotInitialized;
+
+        // 1. Average workers
+        const averaged_bytes = try self.averageWorkerParameterBytes(worker_results);
+        defer self.allocator.free(averaged_bytes);
 
         const param_tensors = self.master_parameters.?;
-
-        // Split averaged worker parameters back into individual tensors and update each
-        const averaged_params_bytes = try self.averageWorkerParameterBytes(worker_results);
-        defer self.allocator.free(averaged_params_bytes);
-
-        // Convert concatenated bytes back to individual parameter tensors
         var byte_offset: usize = 0;
-        for (param_tensors, 0..) |*param_tensor, i| {
+
+        // 2. Update each parameter tensor
+        for (param_tensors, 0..) |*param_tensor_ptr, i| {
             const shape = self.parameter_shapes[i];
 
-            // Calculate size for this parameter tensor
+            // Calculate size info
             var element_count: usize = 1;
-            for (shape) |dim| {
-                element_count *= @intCast(dim);
-            }
-            const tensor_bytes = element_count * @sizeOf(f32);
+            for (shape) |dim| element_count *= @intCast(dim);
+            const tensor_size_bytes = element_count * @sizeOf(f32);
 
-            // Extract this tensor's data
-            const tensor_data_bytes = averaged_params_bytes[byte_offset .. byte_offset + tensor_bytes];
-            const param_slice: []const f32 = @alignCast(std.mem.bytesAsSlice(f32, tensor_data_bytes));
+            // Extract current Master Data (f32 slice)
+            // Note: extractTensorData allocates new memory
+            const master_bytes = try self.extractTensorData(param_tensor_ptr.*);
+            defer self.allocator.free(master_bytes);
 
-            // Create averaged tensor for this parameter
-            const averaged_tensor = try self.createTensorFromArrayWithShape(param_slice, shape);
-            defer averaged_tensor.deinit();
+            // Extract Averaged Data (f32 slice)
+            const avg_slice_bytes = averaged_bytes[byte_offset .. byte_offset + tensor_size_bytes];
 
-            // Debug: Log shapes before subtraction
-            const master_dims = try param_tensor.shape.getDims(self.allocator);
-            defer self.allocator.free(master_dims);
-            std.log.info("Parameter {}: averaged shape = {any}, master shape = {any}", .{i, shape, master_dims});
+            // Cast to f32 slices (with alignment)
+            const master_f32: []f32 = @alignCast(std.mem.bytesAsSlice(f32, master_bytes));
+            const avg_f32: []const f32 = @alignCast(std.mem.bytesAsSlice(f32, avg_slice_bytes));
 
-            // Compute gradients (difference between averaged and master parameters)
-            const gradient_tensor = try ops.subtract(self.mlir_builder, averaged_tensor, param_tensor.*);
-            defer gradient_tensor.deinit();
+            // 3. Delegate math to the clean NesterovHost struct
+            // This updates master_f32 IN-PLACE
+            try self.host_optimizer.update(i, master_f32, avg_f32);
 
-            // Reset velocity for this parameter (each parameter needs its own velocity state)
-            try self.nesterov_optimizer.resetVelocity();
+            // 4. Wrap the updated float data back into a new MLIR Constant Tensor
+            // This ensures the 'master_parameters' are always valid constants for the next broadcast
+            param_tensor_ptr.deinit(); // Free old symbolic handle
+            param_tensor_ptr.* = try self.createTensorFromArrayWithShape(master_f32, shape);
 
-            // Apply Nesterov momentum update using MLIR optimizer
-            const updated_param = try self.nesterov_optimizer.update(param_tensor.*, gradient_tensor);
-
-            // Replace this parameter with updated one
-            param_tensor.deinit();
-            param_tensor.* = updated_param;
-
-            byte_offset += tensor_bytes;
+            byte_offset += tensor_size_bytes;
         }
 
         // Update metrics
         self.metrics.loss = self.calculateAverageLoss(worker_results);
-
         std.log.info("Parameters updated, loss: {d:.4}", .{self.metrics.loss});
     }
 

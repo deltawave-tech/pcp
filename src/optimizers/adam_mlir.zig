@@ -1,4 +1,4 @@
-/// FILE: src/optimizers/adam_mlir.zig (Numerically Stable Version)
+/// FILE: src/optimizers/adam_mlir.zig (AdamW with Weight Decay)
 const std = @import("std");
 const mlir = @import("../mlir.zig");
 const ops = @import("../ops.zig");
@@ -7,13 +7,13 @@ const tensor = @import("../tensor.zig");
 const MLIRBuilder = ops.MLIRBuilder;
 const Tensor = tensor.Tensor(void);
 
-// AdamMLIRConfiguration remains the same
 pub fn AdamMLIRConfiguration(comptime DataType: type) type {
     return struct {
         learning_rate: DataType = 0.001,
         beta1: DataType = 0.9,
         beta2: DataType = 0.999,
         epsilon: DataType = 1e-8,
+        weight_decay: DataType = 0.01, // Added for AdamW
         pub fn default_configuration() @This() { return .{}; }
     };
 }
@@ -26,7 +26,7 @@ pub fn AdamMLIR(comptime T: type) type {
         builder: *MLIRBuilder,
         conf: ConfT,
         element_type: mlir.Type,
-        
+
         const Self = @This();
 
         pub fn init(allocator: std.mem.Allocator, builder: *MLIRBuilder, conf: ConfT, element_type: mlir.Type) !Self {
@@ -42,7 +42,8 @@ pub fn AdamMLIR(comptime T: type) type {
             _ = self; // Nothing to deinit in stateless version
         }
 
-        // The update function remains stateless.
+        /// Stateless update function for Graph construction.
+        /// Returns new values for {params, m, v} to be passed to the next step.
         pub fn update(
             self: *Self,
             params: Tensor,
@@ -51,41 +52,53 @@ pub fn AdamMLIR(comptime T: type) type {
             v_state: Tensor,
             timestep: Tensor,
         ) !struct { new_params: Tensor, new_m: Tensor, new_v: Tensor } {
-            const dims = try params.shape.getDims(self.builder.allocator);
-            defer self.builder.allocator.free(dims);
-            
-            // Create constants
-            const beta1 = try ops.constant(self.builder, @as(f64, @floatCast(self.conf.beta1)), dims, self.element_type);
-            const beta2 = try ops.constant(self.builder, @as(f64, @floatCast(self.conf.beta2)), dims, self.element_type);
-            const one = try ops.constant(self.builder, 1.0, dims, self.element_type);
-            const lr = try ops.constant(self.builder, @as(f64, @floatCast(self.conf.learning_rate)), dims, self.element_type);
-            const epsilon = try ops.constant(self.builder, @as(f64, @floatCast(self.conf.epsilon)), dims, self.element_type);
+            const b = self.builder;
+            const dims = try params.shape.getDims(b.allocator);
+            defer b.allocator.free(dims);
 
-            // Update m_state: m = beta1 * m + (1 - beta1) * g
-            const one_minus_beta1 = try ops.subtract(self.builder, one, beta1);
-            const new_m = try ops.add(self.builder, try ops.multiply(self.builder, beta1, m_state), try ops.multiply(self.builder, one_minus_beta1, grads));
+            // 1. Create Scalar Constants
+            const beta1 = try ops.constant(b, @as(f64, @floatCast(self.conf.beta1)), dims, self.element_type);
+            const beta2 = try ops.constant(b, @as(f64, @floatCast(self.conf.beta2)), dims, self.element_type);
+            const one = try ops.constant(b, 1.0, dims, self.element_type);
+            const lr = try ops.constant(b, @as(f64, @floatCast(self.conf.learning_rate)), dims, self.element_type);
+            const eps = try ops.constant(b, @as(f64, @floatCast(self.conf.epsilon)), dims, self.element_type);
+            const decay = try ops.constant(b, @as(f64, @floatCast(self.conf.weight_decay)), dims, self.element_type);
 
-            // Update v_state: v = beta2 * v + (1 - beta2) * g^2
-            const one_minus_beta2 = try ops.subtract(self.builder, one, beta2);
-            const grads_squared = try ops.multiply(self.builder, grads, grads);
-            const new_v = try ops.add(self.builder, try ops.multiply(self.builder, beta2, v_state), try ops.multiply(self.builder, one_minus_beta2, grads_squared));
+            // 2. Update m_state: m = beta1 * m + (1 - beta1) * g
+            const one_minus_beta1 = try ops.subtract(b, one, beta1);
+            const term1_m = try ops.multiply(b, beta1, m_state);
+            const term2_m = try ops.multiply(b, one_minus_beta1, grads);
+            const new_m = try ops.add(b, term1_m, term2_m);
 
-            // Bias correction
-            const beta1_pow_t = try ops.power(self.builder, beta1, timestep);
-            const beta2_pow_t = try ops.power(self.builder, beta2, timestep);
-            const m_hat_denom = try ops.subtract(self.builder, one, beta1_pow_t);
-            const v_hat_denom = try ops.subtract(self.builder, one, beta2_pow_t);
-            const m_hat = try ops.divide(self.builder, new_m, m_hat_denom);
-            const v_hat = try ops.divide(self.builder, new_v, v_hat_denom);
+            // 3. Update v_state: v = beta2 * v + (1 - beta2) * g^2
+            const one_minus_beta2 = try ops.subtract(b, one, beta2);
+            const term1_v = try ops.multiply(b, beta2, v_state);
+            const grads_sq = try ops.multiply(b, grads, grads);
+            const term2_v = try ops.multiply(b, one_minus_beta2, grads_sq);
+            const new_v = try ops.add(b, term1_v, term2_v);
 
-            // Use the direct stablehlo.sqrt operation
-            const sqrt_v_hat = try ops.sqrt(self.builder, v_hat);
+            // 4. Bias Correction
+            const beta1_pow = try ops.power(b, beta1, timestep);
+            const beta2_pow = try ops.power(b, beta2, timestep);
+            const m_corr_denom = try ops.subtract(b, one, beta1_pow);
+            const v_corr_denom = try ops.subtract(b, one, beta2_pow);
 
-            const final_denom = try ops.add(self.builder, sqrt_v_hat, epsilon);
-            const update_term = try ops.divide(self.builder, m_hat, final_denom);
-            const scaled_update = try ops.multiply(self.builder, lr, update_term);
-            const new_params = try ops.subtract(self.builder, params, scaled_update);
-            
+            const m_hat = try ops.divide(b, new_m, m_corr_denom);
+            const v_hat = try ops.divide(b, new_v, v_corr_denom);
+
+            // 5. AdamW Update
+            // denom = sqrt(v_hat) + epsilon
+            const sqrt_v = try ops.sqrt(b, v_hat);
+            const denom = try ops.add(b, sqrt_v, eps);
+
+            // step = lr * (m_hat / denom + weight_decay * params)
+            const ratio = try ops.divide(b, m_hat, denom);
+            const decay_term = try ops.multiply(b, decay, params); // AdamW specific
+            const combined = try ops.add(b, ratio, decay_term);
+
+            const scaled_step = try ops.multiply(b, lr, combined);
+            const new_params = try ops.subtract(b, params, scaled_step);
+
             return .{
                 .new_params = new_params,
                 .new_m = new_m,
@@ -137,12 +150,12 @@ pub fn AdamMLIRMap(comptime K: type, comptime DataType: type) type {
         }
 
         pub fn update(
-            self: *Self, 
-            key: K, 
-            params: Tensor, 
-            grads: Tensor, 
-            m_state: Tensor, 
-            v_state: Tensor, 
+            self: *Self,
+            key: K,
+            params: Tensor,
+            grads: Tensor,
+            m_state: Tensor,
+            v_state: Tensor,
             timestep: Tensor
         ) !struct { new_params: Tensor, new_m: Tensor, new_v: Tensor } {
             const optimizer = self.map.getPtr(key) orelse return error.OptimizerNotFound;

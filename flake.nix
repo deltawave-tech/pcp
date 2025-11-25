@@ -86,7 +86,8 @@
             llvmPkg.libllvm
             mlirPkg
             pkgs.capnproto
-            packages.iree-sdk
+            packages.iree-sdk.src
+            packages.iree-sdk.build
           ];
           dontConfigure = true;
           doCheck = true;
@@ -94,7 +95,8 @@
           zigCheckFlags = [ "--verbose" "--color" "off" ];
           zigInstallFlags = [ "--verbose" "--color" "off" ];
           CAPNP_DIR = "${pkgs.capnproto}";
-          IREE_SDK_DIR = "${packages.iree-sdk}";
+          IREE_SOURCE_DIR = "${packages.iree-sdk.src}";
+          IREE_BUILD_DIR = "${packages.iree-sdk.build}";
         };
         checks.pcp = packages.pcp;
 

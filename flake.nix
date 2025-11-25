@@ -59,6 +59,7 @@
             export ZIG_GLOBAL_CACHE_DIR="$(pwd)/.zig-cache"
             export CAPNP_DIR="${pkgs.capnproto}"
             export IREE_SOURCE_DIR="${packages.iree-sdk.src}"
+            export IREE_BUILD_DIR="${packages.iree-sdk.build}"
             ${lib.optionalString pkgs.stdenv.isDarwin ''
               export MACOSX_DEPLOYMENT_TARGET="11.0"
             ''}

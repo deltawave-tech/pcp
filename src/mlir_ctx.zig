@@ -142,19 +142,35 @@ pub const MLIRContext = struct {
         const target_arg = try std.fmt.allocPrint(allocator, "--iree-hal-target-backends={s}", .{iree_target});
         defer allocator.free(target_arg);
 
+        // Check if we're compiling for ROCm and need to add the HIP target
+        const is_rocm = std.mem.eql(u8, iree_target, "rocm");
+
+        var argv = std.ArrayList([]const u8).init(allocator);
+        defer argv.deinit();
+
+        try argv.appendSlice(&.{
+            iree_compile_path,
+            temp_mlir_path,
+            target_arg,
+            // Disable vector distribution passes for CUDA/ROCm to avoid distribution errors
+            // Both flags are needed to prevent the "failed to distribute" error
+            "--iree-codegen-llvmgpu-use-vector-distribution=false",
+            "--iree-codegen-llvmgpu-use-reduction-vector-distribution=false",
+        });
+
+        // Add HIP target for ROCm
+        if (is_rocm) {
+            try argv.append("--iree-hip-target=gfx942");
+        }
+
+        try argv.appendSlice(&.{
+            "-o",
+            temp_vmfb_path,
+        });
+
         const result = std.process.Child.run(.{
             .allocator = allocator,
-            .argv = &.{
-                iree_compile_path,
-                temp_mlir_path,
-                target_arg,
-                // Disable vector distribution passes for CUDA to avoid distribution errors
-                // Both flags are needed to prevent the "failed to distribute" error
-                "--iree-codegen-llvmgpu-use-vector-distribution=false",
-                "--iree-codegen-llvmgpu-use-reduction-vector-distribution=false",
-                "-o",
-                temp_vmfb_path,
-            },
+            .argv = argv.items,
         }) catch |err| {
             std.log.err("Failed to execute `iree-compile`: {s}", .{@errorName(err)});
             std.log.err("Ensure IREE is built correctly in the ../iree-build directory.", .{});

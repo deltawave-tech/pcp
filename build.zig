@@ -335,12 +335,19 @@ fn addIreeDependencies(target: *std.Build.Step.Compile, b: *std.Build, iree_conf
         target.linkSystemLibrary("iree_hal_drivers_vulkan_dynamic_symbols");
         target.linkSystemLibrary("iree_hal_drivers_vulkan_registration_registration");
 
-        // CUDA driver for Linux (NVIDIA GPUs)
-        target.addLibraryPath(.{ .cwd_relative = b.fmt("{s}/runtime/src/iree/hal/drivers/cuda", .{build_dir}) });
-        target.addLibraryPath(.{ .cwd_relative = b.fmt("{s}/runtime/src/iree/hal/drivers/cuda/registration", .{build_dir}) });
-        target.linkSystemLibrary("iree_hal_drivers_cuda_cuda");
-        target.linkSystemLibrary("iree_hal_drivers_cuda_dynamic_symbols");
-        target.linkSystemLibrary("iree_hal_drivers_cuda_registration_registration");
+        // CUDA driver for Linux (NVIDIA GPUs) - Commented out for ROCm build
+        // target.addLibraryPath(.{ .cwd_relative = b.fmt("{s}/runtime/src/iree/hal/drivers/cuda", .{build_dir}) });
+        // target.addLibraryPath(.{ .cwd_relative = b.fmt("{s}/runtime/src/iree/hal/drivers/cuda/registration", .{build_dir}) });
+        // target.linkSystemLibrary("iree_hal_drivers_cuda_cuda");
+        // target.linkSystemLibrary("iree_hal_drivers_cuda_dynamic_symbols");
+        // target.linkSystemLibrary("iree_hal_drivers_cuda_registration_registration");
+
+        // HIP driver for Linux (AMD ROCm GPUs)
+        target.addLibraryPath(.{ .cwd_relative = b.fmt("{s}/runtime/src/iree/hal/drivers/hip", .{build_dir}) });
+        target.addLibraryPath(.{ .cwd_relative = b.fmt("{s}/runtime/src/iree/hal/drivers/hip/registration", .{build_dir}) });
+        target.linkSystemLibrary("iree_hal_drivers_hip_hip");
+        target.linkSystemLibrary("iree_hal_drivers_hip_dynamic_symbols");
+        target.linkSystemLibrary("iree_hal_drivers_hip_registration_registration");
     }
 }
 
@@ -503,6 +510,22 @@ pub fn build(b: *std.Build) void {
 
     const run_cuda_pipeline_test_step = b.step("run-cuda-pipeline-test", "Test IREE CUDA pipeline on NVIDIA GPU");
     run_cuda_pipeline_test_step.dependOn(&run_cuda_pipeline_test_cmd.step);
+
+    // --- NEW: ROCm Pipeline Test ---
+    const rocm_pipeline_test = b.addExecutable(.{
+        .name = "rocm_pipeline_test",
+        .root_source_file = b.path("src/examples/rocm_pipeline_test.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    rocm_pipeline_test.root_module.addImport("pcp", pcp_module);
+    addIreeDependencies(rocm_pipeline_test, b, iree_config);
+
+    const run_rocm_pipeline_test_cmd = b.addRunArtifact(rocm_pipeline_test);
+    run_rocm_pipeline_test_cmd.step.dependOn(&rocm_pipeline_test.step);
+
+    const run_rocm_pipeline_test_step = b.step("run-rocm-pipeline-test", "Test IREE ROCm pipeline on AMD GPU");
+    run_rocm_pipeline_test_step.dependOn(&run_rocm_pipeline_test_cmd.step);
 
 
 

@@ -62,7 +62,7 @@ pub const Backend = enum {
             .metal => "metal", // IREE's Metal runtime driver name
             .cuda => "cuda",
             .vulkan => "vulkan",
-            .rocm => "rocm",
+            .rocm => "hip", // IREE uses 'hip' as the runtime driver name for ROCm
             .cpu => "local-sync", // IREE's CPU runtime driver name
         };
     }

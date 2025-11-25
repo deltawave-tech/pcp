@@ -109,7 +109,7 @@
             fetchSubmodules = true;
           };
           nativeBuildInputs =
-            [ pkgs.cmake pkgs.ninja pkgs.python3 pkgs.bintools ];
+            [ pkgs.cmake pkgs.ninja pkgs.python3 pkgs.bintools pkgs.patchelf ];
           # Mix together a couple of dependencies needed to build the CUDA layer.  See
           # 'build_tools/scripts/fetch_cuda_deps.sh'.
           postUnpack = ''
@@ -136,6 +136,7 @@
             # https://iree.dev/building-from-source/getting-started/#configuration-settings
             (lib.cmakeFeature "CMAKE_BUILD_TYPE" "RelWithDebInfo")
             (lib.cmakeFeature "CMAKE_AR" "ar")
+            (lib.cmakeBool "CMAKE_SKIP_INSTALL_RPATH" true)
 
             (lib.cmakeBool "IREE_ENABLE_ASSERTIONS" true)
             (lib.cmakeBool "IREE_ENABLE_SPLIT_DWARF" true)
@@ -159,6 +160,10 @@
           outputs = [ "out" "build" ];
           postInstall = ''
             mkdir -p $build
+            # Probably the call to patchelf is not needed
+            for f in iree-compile iree-lld iree-mlir-lsp-server iree-opt iree-reduce iree-run-mlir test-iree-compiler-api-test-binary; do
+              patchelf --remove-rpath /build/build/tools/$f
+            done
             cp -r /build/build/* $build/
           '';
 

@@ -110,6 +110,25 @@
           };
           nativeBuildInputs =
             [ pkgs.cmake pkgs.ninja pkgs.python3 pkgs.bintools ];
+          # Mix together a couple of dependencies needed to build the CUDA layer.  See
+          # 'build_tools/scripts/fetch_cuda_deps.sh'.
+          postUnpack = ''
+            set -e
+
+            echo "Copying needed cuda artifacts"
+            icd=/build/iree_cuda_deps
+            mkdir -p $icd
+            cp -r ${pkgs.cudaPackages_12_2.cuda_cccl.dev}/include $icd
+            chmod --recursive u+w $icd
+            cp -r ${pkgs.cudaPackages_12_2.cuda_cudart.dev}/include $icd
+            chmod --recursive u+w $icd
+            cp -r ${pkgs.cudaPackages_12_2.cuda_nvcc}/include $icd
+            chmod --recursive u+w $icd
+
+            mkdir -p $icd/nvvm/
+            cp -r ${pkgs.cudaPackages_12_2.cuda_nvcc}/nvvm/libdevice/ $icd/nvvm/
+            chmod u+w $icd
+          '';
           propagatedBuildInputs = [ llvmPkg.lld llvmPkg.libllvm ];
           buildInputs = [ pkgs.gtest ];
           cmakeFlags = [
@@ -122,7 +141,31 @@
             (lib.cmakeBool "IREE_ENABLE_SPLIT_DWARF" true)
             (lib.cmakeBool "IREE_ENABLE_THIN_ARCHIVES" true)
             (lib.cmakeBool "IREE_ENABLE_LLD" true)
+
+            (lib.cmakeFeature "CUDAToolkit_ROOT" "/build/iree_cuda_deps")
+            (lib.cmakeBool "IREE_HAL_DRIVER_CUDA" true)
+            (lib.cmakeBool "IREE_HAL_DRIVER_VULKAN" true)
+            (lib.cmakeBool "IREE_TARGET_BACKEND_CUDA" true)
+            "-B"
+            "/build/build"
           ];
+          ninjaFlags = [ "-C" "/build/build" ];
+
+          IREE_CUDA_DEPS_DIR = "/build/iree_cuda_deps";
+          preConfigure = ''
+            mkdir /build/build
+          '';
+
+          outputs = [ "out" "build" ];
+          postInstall = ''
+            mkdir -p $build
+            cp -r /build/build/* $build/
+          '';
+
+          # Prevent the `_multioutDevs` routine to perform any action. -- It tries to move
+          # `$build/lib/cmake` to `$out/lib/cmake` which produces a collision due to the already
+          # present `IREE` directory.
+          moveToDev = false;
           meta = {
             description = "IREE SDK built from source";
             homepage = "https://iree.dev/";

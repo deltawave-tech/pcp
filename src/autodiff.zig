@@ -4,201 +4,62 @@ const ops = @import("ops.zig");
 const tensor = @import("tensor.zig");
 const c = @import("mlir/c.zig").c;
 const hlo = @import("mlir/dialects/stablehlo.zig");
+const vjp_rules = @import("autodiff/vjp_rules.zig");
 
 const Allocator = std.mem.Allocator;
 const MLIRBuilder = ops.MLIRBuilder;
+const VJPFn = vjp_rules.VJPFn;
 
 /// MLIR-based Automatic Differentiation using Graph-to-Graph Transformation
 /// This implements reverse-mode AD on MLIR computation graphs using VJP rules
 
-/// Vector-Jacobian Product (VJP) function signature
-/// Takes the forward operation and output gradients, returns input gradients
-/// NEW: Also takes primals (operands of the forward op) that are already mapped to the gradient scope.
-/// And the original operation for accessing attributes when needed.
-const VJPFn = *const fn(
-    builder: *MLIRBuilder,
-    original_op: mlir.Operation,
-    primals: []const mlir.Value,
-    adjoints: []const mlir.Value,
-) anyerror![]mlir.Value;
-
 /// Runtime dispatch from operation name to VJP rule
 fn getVjpFn(op_name: []const u8) ?VJPFn {
     if (std.mem.eql(u8, op_name, "stablehlo.add")) {
-        return addVJP;
+        return vjp_rules.addVJP;
     } else if (std.mem.eql(u8, op_name, "stablehlo.subtract")) {
-        return subtractVJP;
+        return vjp_rules.subtractVJP;
     } else if (std.mem.eql(u8, op_name, "stablehlo.multiply")) {
-        return multiplyVJP;
+        return vjp_rules.multiplyVJP;
     } else if (std.mem.eql(u8, op_name, "stablehlo.divide")) {
-        return divideVJP;
+        return vjp_rules.divideVJP;
     } else if (std.mem.eql(u8, op_name, "stablehlo.negate")) {
-        return negateVJP;
+        return vjp_rules.negateVJP;
     } else if (std.mem.eql(u8, op_name, "stablehlo.transpose")) {
-        return transposeVJP;
+        return vjp_rules.transposeVJP;
     } else if (std.mem.eql(u8, op_name, "stablehlo.dot_general")) {
-        return matmulVJP;
+        return vjp_rules.matmulVJP;
     } else if (std.mem.eql(u8, op_name, "stablehlo.maximum")) {
-        return reluVJP; // ReLU implemented as max(x, 0)
+        return vjp_rules.reluVJP; // ReLU implemented as max(x, 0)
     } else if (std.mem.eql(u8, op_name, "stablehlo.constant")) {
-        return constantVJP;
+        return vjp_rules.constantVJP;
     } else if (std.mem.eql(u8, op_name, "stablehlo.reshape")) {
-        return reshapeVJP;
+        return vjp_rules.reshapeVJP;
     } else if (std.mem.eql(u8, op_name, "stablehlo.reduce_sum")) {
-        return reduceSumVJP;
+        return vjp_rules.reduceSumVJP;
     } else if (std.mem.eql(u8, op_name, "stablehlo.reduce")) {
-        return reduceGenericVJP;
+        return vjp_rules.reduceSumVJP;
     } else if (std.mem.eql(u8, op_name, "stablehlo.gather")) {
-        return gatherVJP;
+        return vjp_rules.gatherVJP;
     } else if (std.mem.eql(u8, op_name, "stablehlo.slice")) {
-        return sliceVJP;
+        return vjp_rules.sliceVJP;
     } else if (std.mem.eql(u8, op_name, "stablehlo.broadcast_in_dim")) {
-        return broadcastInDimVJP;
+        return vjp_rules.broadcastInDimVJP;
     } else if (std.mem.eql(u8, op_name, "stablehlo.exponential")) {
-        return expVJP;
+        return vjp_rules.expVJP;
     } else if (std.mem.eql(u8, op_name, "stablehlo.log")) {
-        return logVJP;
+        return vjp_rules.logVJP;
     } else if (std.mem.eql(u8, op_name, "stablehlo.rsqrt")) {
-        return rsqrtVJP;
+        return vjp_rules.rsqrtVJP;
     } else if (std.mem.eql(u8, op_name, "stablehlo.convert")) {
-        return convertVJP;
+        return vjp_rules.convertVJP;
     } else if (std.mem.eql(u8, op_name, "stablehlo.select")) {
-        return selectVJP;
+        return vjp_rules.selectVJP;
     } else if (std.mem.eql(u8, op_name, "func.return")) {
-        return returnVJP;
+        return vjp_rules.returnVJP;
     } else {
         return null;
     }
-}
-
-/// Check if an mlir.Value comes from a constant operation at compile time
-fn isValueFromConstantOp(value: mlir.Value) bool {
-    // In a full implementation, this would check if the defining op is stablehlo.constant
-    // For now, we'll assume all values are non-constant to be conservative
-    _ = value;
-    return false;
-}
-
-/// Broadcast a value to a target shape using broadcast_in_dim
-fn broadcastToShape(builder: *MLIRBuilder, value: mlir.Value, target_shape: []const i64) !mlir.Value {
-    const value_type = value.getType().as(mlir.RankedTensorType) orelse return error.NotRankedTensor;
-    const value_shape = try value_type.getShape(builder.allocator);
-    defer builder.allocator.free(value_shape);
-
-    // Check if broadcasting is needed
-    var needs_broadcast = false;
-    if (value_shape.len != target_shape.len) {
-        needs_broadcast = true;
-    } else {
-        for (value_shape, target_shape) |v, t| {
-            if (v != t) {
-                needs_broadcast = true;
-                break;
-            }
-        }
-    }
-
-    if (!needs_broadcast) {
-        return value;
-    }
-
-    // Create target type
-    const element_type = value_type.getElementType();
-    const ctx = mlir.Context{ .handle = c.mlirTypeGetContext(value.getType().handle) };
-    const target_type = mlir.Type.rankedTensorType(ctx, target_shape, element_type);
-
-    // Compute broadcast_dimensions attribute
-    // Maps dimensions of the value to dimensions of the target
-    var broadcast_dims = std.ArrayList(i64).init(builder.allocator);
-    defer broadcast_dims.deinit();
-
-    // Align from the right (NumPy broadcasting semantics)
-    const rank_diff = target_shape.len - value_shape.len;
-    for (0..value_shape.len) |i| {
-        try broadcast_dims.append(@intCast(rank_diff + i));
-    }
-
-    const broadcast_dims_attr = mlir.Attribute.denseI64ArrayAttr(builder.ctx, broadcast_dims.items);
-    const broadcast_op = try builder.createAndAttach("stablehlo.broadcast_in_dim",
-        &.{value},
-        &.{target_type},
-        .{ .attributes = &.{.{ "broadcast_dimensions", broadcast_dims_attr }} }
-    );
-
-    return broadcast_op.getResult(0);
-}
-
-/// Compute broadcasted shape and broadcast operands to that shape for StableHLO operations
-/// StableHLO requires explicit broadcasting - operands must have identical shapes AND types
-fn broadcastOperands(builder: *MLIRBuilder, lhs: mlir.Value, rhs: mlir.Value) !struct { lhs: mlir.Value, rhs: mlir.Value, shape: []const i64 } {
-    const lhs_type = lhs.getType().as(mlir.RankedTensorType) orelse return error.NotRankedTensor;
-    const rhs_type = rhs.getType().as(mlir.RankedTensorType) orelse return error.NotRankedTensor;
-
-    const lhs_shape = try lhs_type.getShape(builder.allocator);
-    defer builder.allocator.free(lhs_shape);
-    const rhs_shape = try rhs_type.getShape(builder.allocator);
-    defer builder.allocator.free(rhs_shape);
-
-    const lhs_elem_type = lhs_type.getElementType();
-    const rhs_elem_type = rhs_type.getElementType();
-
-    const lhs_rank = lhs_shape.len;
-    const rhs_rank = rhs_shape.len;
-    const result_rank = @max(lhs_rank, rhs_rank);
-
-    // Compute broadcasted shape
-    const result_shape = try builder.allocator.alloc(i64, result_rank);
-
-    var i: usize = 0;
-    while (i < result_rank) : (i += 1) {
-        const lhs_idx = if (i < lhs_rank) lhs_rank - 1 - i else null;
-        const rhs_idx = if (i < rhs_rank) rhs_rank - 1 - i else null;
-
-        const lhs_dim = if (lhs_idx) |idx| lhs_shape[idx] else 1;
-        const rhs_dim = if (rhs_idx) |idx| rhs_shape[idx] else 1;
-
-        const result_dim = if (lhs_dim == rhs_dim) lhs_dim
-                          else if (lhs_dim == 1) rhs_dim
-                          else if (rhs_dim == 1) lhs_dim
-                          else {
-            std.debug.print("ERROR: Incompatible shapes for broadcast!\n", .{});
-            std.debug.print("  lhs_shape: {any}, rhs_shape: {any}\n", .{lhs_shape, rhs_shape});
-            std.debug.print("  Conflict at dimension {}: lhs_dim={}, rhs_dim={}\n", .{i, lhs_dim, rhs_dim});
-            builder.allocator.free(result_shape);
-            return error.IncompatibleShapesForBroadcast;
-        };
-
-        result_shape[result_rank - 1 - i] = result_dim;
-    }
-
-    // Handle element type conversion if needed (promote to common type)
-    // For simplicity, if types differ, use rhs's type (usually the gradient type)
-    var lhs_converted = lhs;
-    const rhs_converted = rhs;
-
-    // Check if element types match using proper MLIR type equality
-    const types_match = lhs_elem_type.isEqual(rhs_elem_type);
-
-    if (!types_match) {
-        std.debug.print("DEBUG broadcastOperands: Element types differ, converting lhs\n", .{});
-        std.debug.print("  lhs_shape: {any}, rhs_shape: {any}, result_shape: {any}\n", .{lhs_shape, rhs_shape, result_shape});
-        // Convert lhs to rhs's element type (keeping lhs's original shape)
-        const ctx = mlir.Context{ .handle = c.mlirTypeGetContext(lhs.getType().handle) };
-        const lhs_converted_type = mlir.Type.rankedTensorType(ctx, lhs_shape, rhs_elem_type);
-        std.debug.print("  Creating convert [broadcastOperands]: input_shape={any} output_shape={any}\n", .{lhs_shape, lhs_shape});
-        const convert_op = try builder.createAndAttach("stablehlo.convert", &.{lhs}, &.{lhs_converted_type}, .{});
-        lhs_converted = convert_op.getResult(0);
-        std.debug.print("  Convert created successfully, now broadcasting\n", .{});
-    }
-
-    // Broadcast operands to the common shape
-    std.debug.print("DEBUG broadcastOperands: Broadcasting lhs to {any}\n", .{result_shape});
-    const broadcasted_lhs = try broadcastToShape(builder, lhs_converted, result_shape);
-    std.debug.print("DEBUG broadcastOperands: Broadcasting rhs to {any}\n", .{result_shape});
-    const broadcasted_rhs = try broadcastToShape(builder, rhs_converted, result_shape);
-    std.debug.print("DEBUG broadcastOperands: Done\n", .{});
-
-    return .{ .lhs = broadcasted_lhs, .rhs = broadcasted_rhs, .shape = result_shape };
 }
 
 /// Main automatic differentiation function - transforms forward graph to gradient graph
@@ -356,1110 +217,6 @@ fn processOperationVJP(
 
         try addInputGradients(builder, op, input_gradients, adjoint_map);
     }
-}
-
-/// VJP rule for addition: both inputs get the same gradient
-fn addVJP(
-    builder: *MLIRBuilder,
-    original_op: mlir.Operation,
-    primals: []const mlir.Value,
-    adjoints: []const mlir.Value,
-) ![]mlir.Value {
-    const grad_out_raw = adjoints[0];
-    const a = primals[0];
-    const b = primals[1];
-
-    const result_type = original_op.getResult(0).getType();
-    const result_ranked_type = result_type.as(mlir.RankedTensorType) orelse return error.InvalidTensorType;
-    const result_shape = try result_ranked_type.getShape(builder.allocator);
-    defer builder.allocator.free(result_shape);
-
-    const grad_out_type = grad_out_raw.getType().as(mlir.RankedTensorType) orelse return error.InvalidTensorType;
-    const grad_out_shape = try grad_out_type.getShape(builder.allocator);
-    defer builder.allocator.free(grad_out_shape);
-
-    var grad_out = grad_out_raw;
-    if (!std.mem.eql(i64, result_shape, grad_out_shape)) {
-        const reshape_op = try builder.createAndAttach("stablehlo.reshape", &.{grad_out_raw}, &.{result_type}, .{});
-        grad_out = reshape_op.getResult(0);
-    }
-
-    var result = std.ArrayList(mlir.Value).init(builder.allocator);
-    defer result.deinit();
-
-    const grad_a = try reduceGradient(builder, grad_out, a);
-    try result.append(grad_a);
-
-    const grad_b = try reduceGradient(builder, grad_out, b);
-    try result.append(grad_b);
-
-    return result.toOwnedSlice();
-}
-
-/// VJP rule for subtraction: da = grad_out, db = -grad_out
-fn subtractVJP(
-    builder: *MLIRBuilder,
-    original_op: mlir.Operation,
-    primals: []const mlir.Value,
-    adjoints: []const mlir.Value,
-) ![]mlir.Value {
-    const grad_out_raw = adjoints[0];
-    const a = primals[0];
-    const b = primals[1];
-
-    const result_type = original_op.getResult(0).getType();
-    const result_ranked_type = result_type.as(mlir.RankedTensorType) orelse return error.InvalidTensorType;
-    const result_shape = try result_ranked_type.getShape(builder.allocator);
-    defer builder.allocator.free(result_shape);
-
-    const grad_out_type = grad_out_raw.getType().as(mlir.RankedTensorType) orelse return error.InvalidTensorType;
-    const grad_out_shape = try grad_out_type.getShape(builder.allocator);
-    defer builder.allocator.free(grad_out_shape);
-
-    var grad_out = grad_out_raw;
-    if (!std.mem.eql(i64, result_shape, grad_out_shape)) {
-        const reshape_op = try builder.createAndAttach("stablehlo.reshape", &.{grad_out_raw}, &.{result_type}, .{});
-        grad_out = reshape_op.getResult(0);
-    }
-
-    var result = std.ArrayList(mlir.Value).init(builder.allocator);
-    defer result.deinit();
-
-    const grad_a = try reduceGradient(builder, grad_out, a);
-    try result.append(grad_a);
-
-    const neg_grad = try builder.createAndAttach("stablehlo.negate", &.{grad_out}, &.{grad_out.getType()}, .{});
-    const grad_b = try reduceGradient(builder, neg_grad.getResult(0), b);
-    try result.append(grad_b);
-
-    return result.toOwnedSlice();
-}
-
-/// VJP rule for multiplication: da = grad_out * b, db = grad_out * a
-fn multiplyVJP(
-    builder: *MLIRBuilder,
-    original_op: mlir.Operation,
-    primals: []const mlir.Value,
-    adjoints: []const mlir.Value,
-) ![]mlir.Value {
-    const grad_out_raw = adjoints[0];
-    const a = primals[0];
-    const b = primals[1];
-
-    const result_type = original_op.getResult(0).getType();
-    const result_ranked_type = result_type.as(mlir.RankedTensorType) orelse return error.InvalidTensorType;
-    const result_shape = try result_ranked_type.getShape(builder.allocator);
-    defer builder.allocator.free(result_shape);
-
-    const grad_out_type = grad_out_raw.getType().as(mlir.RankedTensorType) orelse return error.InvalidTensorType;
-    const grad_out_shape = try grad_out_type.getShape(builder.allocator);
-    defer builder.allocator.free(grad_out_shape);
-
-    var grad_out = grad_out_raw;
-    if (!std.mem.eql(i64, result_shape, grad_out_shape)) {
-        const reshape_op = try builder.createAndAttach("stablehlo.reshape", &.{grad_out_raw}, &.{result_type}, .{});
-        grad_out = reshape_op.getResult(0);
-    }
-
-    var result = std.ArrayList(mlir.Value).init(builder.allocator);
-    defer result.deinit();
-
-    const grad_a_broadcast = try broadcastOperands(builder, grad_out, b);
-    defer builder.allocator.free(grad_a_broadcast.shape);
-    const grad_a_type = grad_a_broadcast.lhs.getType();
-    const grad_a_raw = try builder.createAndAttach("stablehlo.multiply", &.{ grad_a_broadcast.lhs, grad_a_broadcast.rhs }, &.{grad_a_type}, .{});
-
-    const grad_a = try reduceGradient(builder, grad_a_raw.getResult(0), a);
-    try result.append(grad_a);
-
-    const grad_b_broadcast = try broadcastOperands(builder, grad_out, a);
-    defer builder.allocator.free(grad_b_broadcast.shape);
-    const grad_b_type = grad_b_broadcast.lhs.getType();
-    const grad_b_raw = try builder.createAndAttach("stablehlo.multiply", &.{ grad_b_broadcast.lhs, grad_b_broadcast.rhs }, &.{grad_b_type}, .{});
-
-    const grad_b = try reduceGradient(builder, grad_b_raw.getResult(0), b);
-    try result.append(grad_b);
-
-    return result.toOwnedSlice();
-}
-
-/// VJP rule for division: da = grad_out / b, db = -grad_out * a / (b * b)
-/// Helper to reduce gradient to match primal shape (handles broadcasting)
-fn reduceGradient(builder: *MLIRBuilder, grad: mlir.Value, target_shape: mlir.Value) !mlir.Value {
-    const grad_type = grad.getType().as(mlir.RankedTensorType) orelse return grad;
-    const target_type = target_shape.getType().as(mlir.RankedTensorType) orelse return grad;
-
-    const grad_shape = try grad_type.getShape(builder.allocator);
-    defer builder.allocator.free(grad_shape);
-    const target_shape_arr = try target_type.getShape(builder.allocator);
-    defer builder.allocator.free(target_shape_arr);
-
-    // If shapes match, no reduction needed
-    if (grad_shape.len == target_shape_arr.len) {
-        var match = true;
-        for (grad_shape, target_shape_arr) |g, t| {
-            if (g != t) {
-                match = false;
-                break;
-            }
-        }
-        if (match) return grad;
-    }
-
-    // Find dimensions to reduce
-    var reduce_dims = std.ArrayList(i64).init(builder.allocator);
-    defer reduce_dims.deinit();
-
-    // Handle rank mismatch - reduce leading dimensions
-    const rank_diff = @as(i64, @intCast(grad_shape.len)) - @as(i64, @intCast(target_shape_arr.len));
-    if (rank_diff > 0) {
-        for (0..@intCast(rank_diff)) |i| {
-            try reduce_dims.append(@intCast(i));
-        }
-    }
-
-    // Handle size-1 dimensions in target (broadcasted dimensions)
-    if (rank_diff >= 0) {
-        for (target_shape_arr, 0..) |t_dim, i| {
-            const grad_idx = @as(usize, @intCast(@as(i64, @intCast(i)) + rank_diff));
-            if (grad_idx < grad_shape.len and t_dim == 1 and grad_shape[grad_idx] != 1) {
-                try reduce_dims.append(@as(i64, @intCast(grad_idx)));
-            }
-        }
-    }
-
-    if (reduce_dims.items.len == 0) return grad;
-
-    // Use ops.reduceSum which properly creates the reduction region
-    const grad_tensor = try builder.newTensor(grad);
-    const reduced_tensor = try ops.reduceSum(builder, grad_tensor, reduce_dims.items, false);
-
-    // After reduction, reshape to match target shape exactly
-    const target_element_type = target_type.getElementType();
-    const result_type = mlir.Type.rankedTensorType(builder.ctx, target_shape_arr, target_element_type);
-    const reshape_op = try builder.createAndAttach("stablehlo.reshape", &.{reduced_tensor.value}, &.{result_type}, .{});
-
-    return reshape_op.getResult(0);
-}
-
-fn divideVJP(
-    builder: *MLIRBuilder,
-    original_op: mlir.Operation,
-    primals: []const mlir.Value,
-    adjoints: []const mlir.Value,
-) ![]mlir.Value {
-    std.debug.print("DEBUG: Entering divideVJP\n", .{});
-
-    if (adjoints.len < 1) {
-        std.debug.print("FATAL: divideVJP adjoints empty\n", .{});
-        return error.InvalidAdjoints;
-    }
-    if (primals.len < 2) {
-        std.debug.print("FATAL: divideVJP primals < 2\n", .{});
-        return error.InvalidPrimals;
-    }
-
-    const grad_out_raw = adjoints[0];
-    const a = primals[0];
-    const b = primals[1];
-
-    const result_type = original_op.getResult(0).getType();
-    const result_ranked_type = result_type.as(mlir.RankedTensorType) orelse return error.InvalidTensorType;
-    const result_shape = try result_ranked_type.getShape(builder.allocator);
-    defer builder.allocator.free(result_shape);
-
-    const grad_out_type = grad_out_raw.getType().as(mlir.RankedTensorType) orelse return error.InvalidTensorType;
-    const grad_out_shape = try grad_out_type.getShape(builder.allocator);
-    defer builder.allocator.free(grad_out_shape);
-
-    var grad_out = grad_out_raw;
-    if (!std.mem.eql(i64, result_shape, grad_out_shape)) {
-        const reshape_op = try builder.createAndAttach("stablehlo.reshape", &.{grad_out_raw}, &.{result_type}, .{});
-        grad_out = reshape_op.getResult(0);
-    }
-
-    var result = std.ArrayList(mlir.Value).init(builder.allocator);
-    errdefer result.deinit();
-
-    std.debug.print("DEBUG: divideVJP: computing grad_a\n", .{});
-    // da = grad_out / b with explicit broadcasting
-    const grad_a_broadcast = try broadcastOperands(builder, grad_out, b);
-    defer builder.allocator.free(grad_a_broadcast.shape);
-    const grad_a_type = grad_a_broadcast.lhs.getType();
-    const grad_a_raw = try builder.createAndAttach("stablehlo.divide", &.{ grad_a_broadcast.lhs, grad_a_broadcast.rhs }, &.{grad_a_type}, .{});
-
-    // Reduce to match a's shape if broadcasting occurred
-    const grad_a = try reduceGradient(builder, grad_a_raw.getResult(0), a);
-    try result.append(grad_a);
-
-    std.debug.print("DEBUG: divideVJP: computing grad_b\n", .{});
-    // db = -grad_out * a / (b * b)
-
-    // a * grad_out with explicit broadcasting
-    const a_times_grad_broadcast = try broadcastOperands(builder, a, grad_out);
-    defer builder.allocator.free(a_times_grad_broadcast.shape);
-    const a_times_grad_type = a_times_grad_broadcast.lhs.getType();
-    const a_times_grad = try builder.createAndAttach("stablehlo.multiply", &.{ a_times_grad_broadcast.lhs, a_times_grad_broadcast.rhs }, &.{a_times_grad_type}, .{});
-
-    // b * b (no broadcasting needed, both operands are b)
-    const b_squared = try builder.createAndAttach("stablehlo.multiply", &.{ b, b }, &.{b.getType()}, .{});
-
-    // (a * grad_out) / (b * b) with explicit broadcasting
-    const div_operands_broadcast = try broadcastOperands(builder, a_times_grad.getResult(0), b_squared.getResult(0));
-    defer builder.allocator.free(div_operands_broadcast.shape);
-    const div_operands_type = div_operands_broadcast.lhs.getType();
-    const positive_grad_b_raw = try builder.createAndAttach("stablehlo.divide", &.{ div_operands_broadcast.lhs, div_operands_broadcast.rhs }, &.{div_operands_type}, .{});
-
-    // Negate
-    const positive_grad_b_neg = try builder.createAndAttach("stablehlo.negate", &.{ positive_grad_b_raw.getResult(0) }, &.{div_operands_type}, .{});
-
-    // Reduce to match b's shape if broadcasting occurred
-    const grad_b = try reduceGradient(builder, positive_grad_b_neg.getResult(0), b);
-    try result.append(grad_b);
-
-    std.debug.print("DEBUG: divideVJP: converting to owned slice\n", .{});
-    const slice = try result.toOwnedSlice();
-
-    std.debug.print("DEBUG: divideVJP allocated slice len={} ptr={*}\n", .{slice.len, slice.ptr});
-    return slice;
-}
-
-/// VJP rule for negation: da = -grad_out
-fn negateVJP(
-    builder: *MLIRBuilder,
-    original_op: mlir.Operation,
-    primals: []const mlir.Value,
-    adjoints: []const mlir.Value,
-) ![]mlir.Value {
-    _ = primals;
-    const grad_out_raw = adjoints[0];
-
-    const result_type = original_op.getResult(0).getType();
-    const result_ranked_type = result_type.as(mlir.RankedTensorType) orelse return error.InvalidTensorType;
-    const result_shape = try result_ranked_type.getShape(builder.allocator);
-    defer builder.allocator.free(result_shape);
-
-    const grad_out_type = grad_out_raw.getType().as(mlir.RankedTensorType) orelse return error.InvalidTensorType;
-    const grad_out_shape = try grad_out_type.getShape(builder.allocator);
-    defer builder.allocator.free(grad_out_shape);
-
-    var grad_out = grad_out_raw;
-    if (!std.mem.eql(i64, result_shape, grad_out_shape)) {
-        const reshape_op = try builder.createAndAttach("stablehlo.reshape", &.{grad_out_raw}, &.{result_type}, .{});
-        grad_out = reshape_op.getResult(0);
-    }
-
-    var result = std.ArrayList(mlir.Value).init(builder.allocator);
-    defer result.deinit();
-
-    const grad_a = try builder.createAndAttach("stablehlo.negate", &.{grad_out}, &.{grad_out.getType()}, .{});
-    try result.append(grad_a.getResult(0));
-
-    return result.toOwnedSlice();
-}
-
-/// VJP rule for transpose: da = transpose(grad_out) with inverse permutation
-fn transposeVJP(builder: *MLIRBuilder, original_op: mlir.Operation, primals: []const mlir.Value, adjoints: []const mlir.Value) ![]mlir.Value {
-    const grad_out_raw = adjoints[0];
-    const a = primals[0];
-
-    const result_type = original_op.getResult(0).getType();
-    const result_ranked_type = result_type.as(mlir.RankedTensorType) orelse return error.InvalidTensorType;
-    const result_shape = try result_ranked_type.getShape(builder.allocator);
-    defer builder.allocator.free(result_shape);
-
-    const grad_out_type = grad_out_raw.getType().as(mlir.RankedTensorType) orelse return error.InvalidTensorType;
-    const grad_out_shape = try grad_out_type.getShape(builder.allocator);
-    defer builder.allocator.free(grad_out_shape);
-
-    var grad_out = grad_out_raw;
-    if (!std.mem.eql(i64, result_shape, grad_out_shape)) {
-        const reshape_op = try builder.createAndAttach("stablehlo.reshape", &.{grad_out_raw}, &.{result_type}, .{});
-        grad_out = reshape_op.getResult(0);
-    }
-
-    var result = std.ArrayList(mlir.Value).init(builder.allocator);
-
-    const permutation_ref = c.stringRefFromString("permutation");
-    const permutation_attr = c.operationGetAttributeByName(original_op.handle, permutation_ref);
-    if (@intFromPtr(permutation_attr.ptr) == 0) return error.MissingPermutationAttribute;
-
-    const input_type = a.getType().as(mlir.RankedTensorType).?;
-    const rank = input_type.getRank();
-    if (!c.attributeIsADenseI64Array(permutation_attr)) return error.InvalidPermutationAttributeType;
-
-    var permutation = try builder.allocator.alloc(i64, rank);
-    defer builder.allocator.free(permutation);
-    for (0..rank) |i| permutation[i] = c.denseI64ArrayGetElement(permutation_attr, @intCast(i));
-
-    var inv_permutation = try builder.allocator.alloc(i64, rank);
-    defer builder.allocator.free(inv_permutation);
-    for (permutation, 0..) |target_dim, source_dim| inv_permutation[@intCast(target_dim)] = @intCast(source_dim);
-
-    const inv_perm_attr = mlir.Attribute.denseI64ArrayAttr(builder.ctx, inv_permutation);
-
-    const transpose_op = try builder.createAndAttach("stablehlo.transpose",
-        &.{grad_out},
-        &.{a.getType()},
-        .{ .attributes = &.{.{ "permutation", inv_perm_attr }} }
-    );
-
-    try result.append(transpose_op.getResult(0));
-    return result.toOwnedSlice();
-}
-
-/// VJP rule for matrix multiplication
-/// For Y = A @ B, the gradients are:
-/// - dA = dY @ B^T
-/// - dB = A^T @ dY
-fn matmulVJP(
-    builder: *MLIRBuilder,
-    original_op: mlir.Operation,
-    primals: []const mlir.Value,
-    adjoints: []const mlir.Value,
-) ![]mlir.Value {
-    const grad_out_raw = adjoints[0];
-    const a = primals[0];
-    const b = primals[1];
-
-    const result_type = original_op.getResult(0).getType();
-    const result_ranked_type = result_type.as(mlir.RankedTensorType) orelse return error.InvalidTensorType;
-    const result_shape = try result_ranked_type.getShape(builder.allocator);
-    defer builder.allocator.free(result_shape);
-
-    const grad_out_type = grad_out_raw.getType().as(mlir.RankedTensorType) orelse return error.InvalidTensorType;
-    const grad_out_shape = try grad_out_type.getShape(builder.allocator);
-    defer builder.allocator.free(grad_out_shape);
-
-    var grad_out = grad_out_raw;
-    if (!std.mem.eql(i64, result_shape, grad_out_shape)) {
-        const reshape_op = try builder.createAndAttach("stablehlo.reshape", &.{grad_out_raw}, &.{result_type}, .{});
-        grad_out = reshape_op.getResult(0);
-    }
-
-    var result = std.ArrayList(mlir.Value).init(builder.allocator);
-    defer result.deinit();
-
-    const dot_dim_attr = c.mlirOperationGetAttributeByName(original_op.handle, c.stringRefCreateFromCString("dot_dimension_numbers"));
-    if (@intFromPtr(dot_dim_attr.ptr) == 0) {
-        return error.MissingDotDimensionNumbersAttribute;
-    }
-
-    const a_type = a.getType().as(mlir.RankedTensorType) orelse return error.NotRankedTensor;
-    const b_type = b.getType().as(mlir.RankedTensorType) orelse return error.NotRankedTensor;
-    const grad_out_ranked_type = grad_out.getType().as(mlir.RankedTensorType) orelse return error.NotRankedTensor;
-
-    const a_rank = a_type.getRank();
-    const b_rank = b_type.getRank();
-    const grad_rank = grad_out_ranked_type.getRank();
-
-    var batch_dims = std.ArrayList(i64).init(builder.allocator);
-    defer batch_dims.deinit();
-
-    const num_batch_dims = @min(@min(a_rank, b_rank), grad_rank) - 2;
-    for (0..num_batch_dims) |i| {
-        try batch_dims.append(@intCast(i));
-    }
-
-    const grad_a_dot_dims = hlo.DotDimensionNumbersAttribute{
-        .lhs_batching_dimensions = batch_dims.items,
-        .rhs_batching_dimensions = batch_dims.items,
-        .lhs_contracting_dimensions = &.{@intCast(grad_rank - 1)},
-        .rhs_contracting_dimensions = &.{@intCast(b_rank - 1)},
-    };
-    const grad_a_op = try hlo.dot_general(builder.allocator, builder.ctx, grad_out, b, .{ .dot_dimension_numbers = grad_a_dot_dims });
-    builder.insertion_block.appendOwnedOperation(grad_a_op);
-    try result.append(grad_a_op.getResult(0));
-
-    const grad_b_dot_dims = hlo.DotDimensionNumbersAttribute{
-        .lhs_batching_dimensions = batch_dims.items,
-        .rhs_batching_dimensions = batch_dims.items,
-        .lhs_contracting_dimensions = &.{@intCast(a_rank - 2)},
-        .rhs_contracting_dimensions = &.{@intCast(grad_rank - 2)},
-    };
-    const grad_b_op = try hlo.dot_general(builder.allocator, builder.ctx, a, grad_out, .{ .dot_dimension_numbers = grad_b_dot_dims });
-    builder.insertion_block.appendOwnedOperation(grad_b_op);
-    try result.append(grad_b_op.getResult(0));
-
-    return result.toOwnedSlice();
-}
-
-/// VJP rule for ReLU (max(x, 0)): gradient flows through only where x > 0
-fn reluVJP(
-    builder: *MLIRBuilder,
-    original_op: mlir.Operation,
-    primals: []const mlir.Value,
-    adjoints: []const mlir.Value,
-) ![]mlir.Value {
-    const grad_out_raw = adjoints[0];
-    const x = primals[0];
-
-    const result_type = original_op.getResult(0).getType();
-    const result_ranked_type = result_type.as(mlir.RankedTensorType) orelse return error.InvalidTensorType;
-    const result_shape = try result_ranked_type.getShape(builder.allocator);
-    defer builder.allocator.free(result_shape);
-
-    const grad_out_type = grad_out_raw.getType().as(mlir.RankedTensorType) orelse return error.InvalidTensorType;
-    const grad_out_shape = try grad_out_type.getShape(builder.allocator);
-    defer builder.allocator.free(grad_out_shape);
-
-    var grad_out = grad_out_raw;
-    if (!std.mem.eql(i64, result_shape, grad_out_shape)) {
-        const reshape_op = try builder.createAndAttach("stablehlo.reshape", &.{grad_out_raw}, &.{result_type}, .{});
-        grad_out = reshape_op.getResult(0);
-    }
-
-    var result = std.ArrayList(mlir.Value).init(builder.allocator);
-    defer result.deinit();
-
-    const zero_scalar = try builder.scalarConstant(0.0);
-    const x_type = x.getType().as(mlir.RankedTensorType).?;
-    const x_shape = try x_type.getShape(builder.allocator);
-    defer builder.allocator.free(x_shape);
-
-    const zero = try broadcastToShape(builder, zero_scalar.value, x_shape);
-
-    const i1_type = mlir.Type.i1Type(builder.ctx);
-    const mask_type = mlir.Type.rankedTensorType(builder.ctx, x_shape, i1_type);
-
-    const dir_str = "#stablehlo<comparison_direction GT>";
-    const dir_ref = c.stringRefFromString(dir_str);
-    const dir_attr = mlir.Attribute{ .handle = c.mlirAttributeParseGet(builder.ctx.handle, dir_ref) };
-
-    const type_str = "#stablehlo<comparison_type FLOAT>";
-    const type_ref = c.stringRefFromString(type_str);
-    const type_attr = mlir.Attribute{ .handle = c.mlirAttributeParseGet(builder.ctx.handle, type_ref) };
-
-    const mask_op = try builder.createAndAttach("stablehlo.compare", &.{ x, zero }, &.{mask_type}, .{
-        .attributes = &.{
-            .{ "comparison_direction", dir_attr },
-            .{ "compare_type", type_attr },
-        },
-    });
-    const mask = mask_op.getResult(0);
-
-    const zero_grad = try broadcastToShape(builder, zero_scalar.value, x_shape);
-    const grad_x = try builder.createAndAttach("stablehlo.select", &.{ mask, grad_out, zero_grad }, &.{grad_out.getType()}, .{});
-    try result.append(grad_x.getResult(0));
-
-    return result.toOwnedSlice();
-}
-
-/// VJP rule for constants: no gradient (constants don't have inputs)
-fn constantVJP(
-    builder: *MLIRBuilder,
-    original_op: mlir.Operation,
-    primals: []const mlir.Value,
-    adjoints: []const mlir.Value,
-) ![]mlir.Value {
-    _ = original_op;
-    _ = primals;
-    _ = adjoints;
-
-    // CRITICAL FIX: Allocate an empty slice using the builder's allocator.
-    // Returning &[_]mlir.Value{} returns a pointer to static/stack memory,
-    // which causes allocator.free() to crash with "invalid pointer".
-    const empty = try builder.allocator.alloc(mlir.Value, 0);
-    return empty;
-}
-
-/// VJP rule for reshape: da = reshape(grad_out, original_shape)
-fn reshapeVJP(
-    builder: *MLIRBuilder,
-    original_op: mlir.Operation,
-    primals: []const mlir.Value,
-    adjoints: []const mlir.Value,
-) ![]mlir.Value {
-    const grad_out_raw = adjoints[0];
-    const input = primals[0];
-
-    const result_type = original_op.getResult(0).getType();
-    const result_ranked_type = result_type.as(mlir.RankedTensorType) orelse return error.InvalidTensorType;
-    const result_shape = try result_ranked_type.getShape(builder.allocator);
-    defer builder.allocator.free(result_shape);
-
-    const grad_out_type = grad_out_raw.getType().as(mlir.RankedTensorType) orelse return error.InvalidTensorType;
-    const grad_out_shape = try grad_out_type.getShape(builder.allocator);
-    defer builder.allocator.free(grad_out_shape);
-
-    var grad_out = grad_out_raw;
-    if (!std.mem.eql(i64, result_shape, grad_out_shape)) {
-        const reshape_op = try builder.createAndAttach("stablehlo.reshape", &.{grad_out_raw}, &.{result_type}, .{});
-        grad_out = reshape_op.getResult(0);
-    }
-
-    var result = std.ArrayList(mlir.Value).init(builder.allocator);
-    defer result.deinit();
-
-    const original_shape_type = input.getType();
-    const grad_input = try builder.createAndAttach("stablehlo.reshape", &.{grad_out}, &.{original_shape_type}, .{});
-    try result.append(grad_input.getResult(0));
-
-    return result.toOwnedSlice();
-}
-
-fn reduceSumVJP(builder: *MLIRBuilder, original_op: mlir.Operation, primals: []const mlir.Value, adjoints: []const mlir.Value) ![]mlir.Value {
-    const grad_out_raw = adjoints[0];
-    const input = primals[0];
-
-    const result_type = original_op.getResult(0).getType();
-    const result_ranked_type = result_type.as(mlir.RankedTensorType) orelse return error.InvalidTensorType;
-    const result_shape = try result_ranked_type.getShape(builder.allocator);
-    defer builder.allocator.free(result_shape);
-
-    const grad_out_type = grad_out_raw.getType().as(mlir.RankedTensorType) orelse return error.InvalidTensorType;
-    const grad_out_shape = try grad_out_type.getShape(builder.allocator);
-    defer builder.allocator.free(grad_out_shape);
-
-    var grad_out = grad_out_raw;
-    if (!std.mem.eql(i64, result_shape, grad_out_shape)) {
-        const reshape_op = try builder.createAndAttach("stablehlo.reshape", &.{grad_out_raw}, &.{result_type}, .{});
-        grad_out = reshape_op.getResult(0);
-    }
-
-    var result = std.ArrayList(mlir.Value).init(builder.allocator);
-
-    if (!isValueFromConstantOp(input)) {
-        const original_shape_type = input.getType();
-        const dimensions_ref = c.stringRefFromString("dimensions");
-        const dimensions_attr = c.operationGetAttributeByName(original_op.handle, dimensions_ref);
-
-        if (@intFromPtr(dimensions_attr.ptr) != 0) {
-            var broadcast_dims = std.ArrayList(i64).init(builder.allocator);
-            defer broadcast_dims.deinit();
-
-            const grad_rank = result_ranked_type.getRank();
-
-            if (grad_rank == 0) {
-                const empty_dims: [0]i64 = .{};
-                const empty_broadcast_dims_attr = mlir.Attribute.denseI64ArrayAttr(builder.ctx, &empty_dims);
-                const broadcast_op = try builder.createAndAttach("stablehlo.broadcast_in_dim",
-                    &.{grad_out},
-                    &.{original_shape_type},
-                    .{ .attributes = &.{.{ "broadcast_dimensions", empty_broadcast_dims_attr }} }
-                );
-                try result.append(broadcast_op.getResult(0));
-            } else {
-                for (0..@intCast(grad_rank)) |i| try broadcast_dims.append(@intCast(i));
-                const broadcast_dims_attr = mlir.Attribute.denseI64ArrayAttr(builder.ctx, broadcast_dims.items);
-                const broadcast_op = try builder.createAndAttach("stablehlo.broadcast_in_dim",
-                    &.{grad_out},
-                    &.{original_shape_type},
-                    .{ .attributes = &.{.{ "broadcast_dimensions", broadcast_dims_attr }} }
-                );
-                try result.append(broadcast_op.getResult(0));
-            }
-        } else {
-            const grad_input = try builder.createAndAttach("stablehlo.broadcast", &.{grad_out}, &.{original_shape_type}, .{});
-            try result.append(grad_input.getResult(0));
-        }
-    }
-    return result.toOwnedSlice();
-}
-
-/// Generic reduce VJP that handles both sum and max reductions
-/// For softmax stability (exp(x - max(x))), the gradient flow through max is zero when summed,
-/// so using broadcast (sum-like) VJP is numerically equivalent in that context
-fn reduceGenericVJP(
-    builder: *MLIRBuilder,
-    original_op: mlir.Operation,
-    primals: []const mlir.Value,
-    adjoints: []const mlir.Value,
-) ![]mlir.Value {
-    // For now, we use reduceSumVJP (broadcast) for both sum and max reductions
-    // This is mathematically correct for sum, and numerically equivalent for max
-    // in the shifted-softmax context where the sum of gradients w.r.t max term is zero
-    return reduceSumVJP(builder, original_op, primals, adjoints);
-}
-
-/// VJP rule for gather: Replaces scatter with One-Hot + MatMul to avoid GPU atomics
-fn gatherVJP(
-    builder: *MLIRBuilder,
-    original_op: mlir.Operation,
-    primals: []const mlir.Value,
-    adjoints: []const mlir.Value,
-) ![]mlir.Value {
-    const grad_out_raw = adjoints[0];
-    const operand = primals[0];      // Embedding table [Vocab, Embed]
-    const start_indices = primals[1]; // Indices [Batch, Seq]
-
-    const result_type = original_op.getResult(0).getType();
-    const result_ranked_type = result_type.as(mlir.RankedTensorType) orelse return error.InvalidTensorType;
-    const result_shape = try result_ranked_type.getShape(builder.allocator);
-    defer builder.allocator.free(result_shape);
-
-    const grad_out_type = grad_out_raw.getType().as(mlir.RankedTensorType) orelse return error.InvalidTensorType;
-    const grad_out_shape = try grad_out_type.getShape(builder.allocator);
-    defer builder.allocator.free(grad_out_shape);
-
-    var grad_out = grad_out_raw;
-    if (!std.mem.eql(i64, result_shape, grad_out_shape)) {
-        const reshape_op = try builder.createAndAttach("stablehlo.reshape", &.{grad_out_raw}, &.{result_type}, .{});
-        grad_out = reshape_op.getResult(0);
-    }
-
-    var result = std.ArrayList(mlir.Value).init(builder.allocator);
-
-    if (isValueFromConstantOp(operand)) {
-        return result.toOwnedSlice();
-    }
-
-    // Get dimensions
-    const operand_type = operand.getType().as(mlir.RankedTensorType) orelse return error.InvalidTensorType;
-    const indices_type = start_indices.getType().as(mlir.RankedTensorType) orelse return error.InvalidTensorType;
-
-    // Convert indices to i64 if needed
-    const indices_elem_type = indices_type.getElementType();
-    const indices_i64 = if (indices_elem_type.isInteger()) start_indices else blk: {
-        const indices_shape = try indices_type.getShape(builder.allocator);
-        defer builder.allocator.free(indices_shape);
-        const indices_i64_type = mlir.Type.rankedTensorType(
-            builder.ctx,
-            indices_shape,
-            mlir.Type.i64Type(builder.ctx)
-        );
-        const convert_op = try builder.createAndAttach("stablehlo.convert", &.{start_indices}, &.{indices_i64_type}, .{});
-        break :blk convert_op.getResult(0);
-    };
-
-    // --- FIX FOR VECTOR INDICES START ---
-    const dim_numbers_attr = c.mlirOperationGetAttributeByName(original_op.handle, c.stringRefFromString("dimension_numbers"));
-    const slice_sizes_attr = c.mlirOperationGetAttributeByName(original_op.handle, c.stringRefFromString("slice_sizes"));
-
-    if (@intFromPtr(dim_numbers_attr.ptr) != 0 and @intFromPtr(slice_sizes_attr.ptr) != 0) {
-        const operand_rank = operand_type.getRank();
-        var slice_volume: i64 = 1;
-        var total_elements: i64 = 1;
-        for (0..operand_rank) |i| {
-            slice_volume *= c.denseI64ArrayGetElement(slice_sizes_attr, @intCast(i));
-            total_elements *= operand_type.getDimension(i);
-        }
-
-        const index_vector_dim = c.stablehloGatherDimensionNumbersGetIndexVectorDim(dim_numbers_attr);
-        const indices_rank = indices_type.getRank();
-
-        // Check for vector index gather that produces scalars (collapses all dims)
-        if (slice_volume == 1 and index_vector_dim < @as(i64, @intCast(indices_rank)) and indices_type.getDimension(@intCast(index_vector_dim)) > 1) {
-            std.debug.print("DEBUG gatherVJP: Detected Scalar Gather with Vector Indices. Using Linearization.\n", .{});
-
-            // 1. Linearize Indices
-            const map_size = c.stablehloGatherDimensionNumbersGetStartIndexMapSize(dim_numbers_attr);
-
-            // Calculate strides
-            var strides = try builder.allocator.alloc(i64, operand_rank);
-            defer builder.allocator.free(strides);
-            var current_stride: i64 = 1;
-            var i: usize = operand_rank;
-            while (i > 0) {
-                i -= 1;
-                strides[i] = current_stride;
-                current_stride *= operand_type.getDimension(i);
-            }
-
-            // Shape of indices after removing vector dim
-            var linear_index_shape = try builder.allocator.alloc(i64, indices_rank - 1);
-            defer builder.allocator.free(linear_index_shape);
-            var dim_idx: usize = 0;
-            for (0..indices_rank) |d| {
-                if (d != @as(usize, @intCast(index_vector_dim))) {
-                    linear_index_shape[dim_idx] = indices_type.getDimension(d);
-                    dim_idx += 1;
-                }
-            }
-
-            // Accumulate linear index
-            var linear_indices: ?mlir.Value = null;
-
-            for (0..@as(usize, @intCast(map_size))) |k| {
-                // Slice indices at index_vector_dim = k
-                var start = try builder.allocator.alloc(i64, indices_rank);
-                defer builder.allocator.free(start);
-                var limit = try builder.allocator.alloc(i64, indices_rank);
-                defer builder.allocator.free(limit);
-                var slice_strides = try builder.allocator.alloc(i64, indices_rank);
-                defer builder.allocator.free(slice_strides);
-
-                for (0..indices_rank) |d| {
-                    start[d] = 0;
-                    limit[d] = indices_type.getDimension(d);
-                    slice_strides[d] = 1;
-                }
-                start[@intCast(index_vector_dim)] = @intCast(k);
-                limit[@intCast(index_vector_dim)] = @intCast(k + 1);
-
-                const slice_op = try hlo.slice(builder.allocator, builder.ctx, indices_i64, start, limit, slice_strides, builder.loc);
-                builder.insertion_block.appendOwnedOperation(slice_op);
-
-                const reshape_op = try hlo.reshape(builder.allocator, builder.ctx, slice_op.getResult(0), linear_index_shape, builder.loc);
-                builder.insertion_block.appendOwnedOperation(reshape_op);
-                const component = reshape_op.getResult(0);
-
-                const operand_dim_idx = c.stablehloGatherDimensionNumbersGetStartIndexMapElem(dim_numbers_attr, @intCast(k));
-                const dim_stride = strides[@intCast(operand_dim_idx)];
-
-                // Create constant stride tensor
-                const stride_tensor = try ops.constant(builder, @floatFromInt(dim_stride), linear_index_shape, mlir.Type.i64Type(builder.ctx));
-
-                const scaled_comp_op = try hlo.multiply(builder.allocator, builder.ctx, component, stride_tensor.value, builder.loc);
-                builder.insertion_block.appendOwnedOperation(scaled_comp_op);
-                const scaled_comp = scaled_comp_op.getResult(0);
-
-                if (linear_indices) |acc| {
-                    const add_op = try hlo.add(builder.allocator, builder.ctx, acc, scaled_comp, builder.loc);
-                    builder.insertion_block.appendOwnedOperation(add_op);
-                    linear_indices = add_op.getResult(0);
-                } else {
-                    linear_indices = scaled_comp;
-                }
-            }
-
-            // 2. OneHot & MatMul
-            // Flatten linear indices to [N]
-            var n_elements: i64 = 1;
-            for (linear_index_shape) |d| n_elements *= d;
-
-            const flat_indices_shape = [_]i64{n_elements};
-            const flat_reshape_op = try hlo.reshape(builder.allocator, builder.ctx, linear_indices.?, &flat_indices_shape, builder.loc);
-            builder.insertion_block.appendOwnedOperation(flat_reshape_op);
-
-            const one_hot_flat = try ops.oneHot(
-                builder,
-                try builder.newTensor(flat_reshape_op.getResult(0)),
-                total_elements,
-                1.0, 0.0, -1,
-                grad_out_type.getElementType()
-            );
-
-            // Flatten GradOut to [N, 1]
-            const grad_flat_shape = [_]i64{n_elements, 1};
-            const grad_flat_op = try hlo.reshape(builder.allocator, builder.ctx, grad_out, &grad_flat_shape, builder.loc);
-            builder.insertion_block.appendOwnedOperation(grad_flat_op);
-
-            // MatMul: [N, Total]^T @ [N, 1] -> [Total, 1] (Contract dim 0 of LHS with dim 0 of RHS)
-            // OneHot is [N, Total]. Contract N.
-            const dot_dims = hlo.DotDimensionNumbersAttribute{
-                .lhs_batching_dimensions = &.{},
-                .rhs_batching_dimensions = &.{},
-                .lhs_contracting_dimensions = &.{0},
-                .rhs_contracting_dimensions = &.{0},
-            };
-
-            const grad_table_op = try hlo.dot_general(
-                builder.allocator,
-                builder.ctx,
-                one_hot_flat.value,
-                grad_flat_op.getResult(0),
-                .{ .dot_dimension_numbers = dot_dims }
-            );
-            builder.insertion_block.appendOwnedOperation(grad_table_op);
-
-            // Reshape to Operand Shape
-            const operand_shape = try operand_type.getShape(builder.allocator);
-            defer builder.allocator.free(operand_shape);
-            const final_op = try hlo.reshape(builder.allocator, builder.ctx, grad_table_op.getResult(0), operand_shape, builder.loc);
-            builder.insertion_block.appendOwnedOperation(final_op);
-
-            try result.append(final_op.getResult(0));
-            return result.toOwnedSlice();
-        }
-    }
-    // --- FIX END ---
-
-    const vocab_size = operand_type.getDimension(0);
-    std.debug.print("DEBUG gatherVJP: vocab_size={}, operand_rank={}, indices_rank={}, grad_out_rank={}\n", .{
-        vocab_size, operand_type.getRank(), indices_type.getRank(), grad_out_type.getRank()
-    });
-
-    // Create one-hot: [Batch, Seq] -> [Batch, Seq, Vocab]
-    std.debug.print("DEBUG gatherVJP: About to create one-hot tensor...\n", .{});
-    const one_hot = try ops.oneHot(
-        builder,
-        try builder.newTensor(indices_i64),
-        vocab_size,
-        1.0, 0.0, -1,
-        grad_out_type.getElementType()
-    );
-    std.debug.print("DEBUG gatherVJP: One-hot created, rank={}\n", .{one_hot.shape.rank()});
-
-    // Get one-hot shape - this determines N (number of index lookups)
-    const one_hot_type = one_hot.value.getType().as(mlir.RankedTensorType) orelse return error.InvalidTensorType;
-    const one_hot_shape = try one_hot_type.getShape(builder.allocator);
-    defer builder.allocator.free(one_hot_shape);
-
-    // Flatten one-hot to [N, Vocab] where N is product of all dims except last (vocab dim)
-    var n_dims: i64 = 1;
-    for (0..(one_hot_shape.len - 1)) |i| {
-        n_dims *= one_hot_shape[i];
-    }
-    const vocab_dim = one_hot_shape[one_hot_shape.len - 1];
-
-    std.debug.print("DEBUG gatherVJP: One-hot shape: {any}, n_dims={}\n", .{one_hot_shape, n_dims});
-
-    // Get embed_dim from grad_out shape (already extracted at top)
-    const embed_dim = grad_out_shape[grad_out_shape.len - 1];
-
-    // Flatten one_hot to [N, Vocab]
-    const one_hot_flat_shape = [_]i64{ n_dims, vocab_dim };
-    const one_hot_flat_type = mlir.Type.rankedTensorType(
-        builder.ctx,
-        &one_hot_flat_shape,
-        one_hot_type.getElementType()
-    );
-    const one_hot_flat_op = try builder.createAndAttach("stablehlo.reshape", &.{one_hot.value}, &.{one_hot_flat_type}, .{});
-    const one_hot_flat = one_hot_flat_op.getResult(0);
-
-    // Calculate total elements in grad_out
-    var grad_out_elements: i64 = 1;
-    for (grad_out_shape) |dim| {
-        grad_out_elements *= dim;
-    }
-    const expected_elements = n_dims * embed_dim;
-
-    std.debug.print("DEBUG gatherVJP: grad_out has {} elements, need {} for [N={}, Embed={}]\n", .{grad_out_elements, expected_elements, n_dims, embed_dim});
-
-    // If grad_out has fewer elements than expected, broadcast/reshape appropriately
-    const grad_out_flat: mlir.Value = if (grad_out_elements == expected_elements) blk: {
-        // Can directly reshape
-        const grad_out_flat_shape = [_]i64{ n_dims, embed_dim };
-        const grad_out_flat_type = mlir.Type.rankedTensorType(
-            builder.ctx,
-            &grad_out_flat_shape,
-            grad_out_type.getElementType()
-        );
-        const grad_out_flat_op = try builder.createAndAttach("stablehlo.reshape", &.{grad_out}, &.{grad_out_flat_type}, .{});
-        break :blk grad_out_flat_op.getResult(0);
-    } else blk2: {
-        // Need to broadcast grad_out to match n_dims
-        // First reshape grad_out to flatten all but last dim
-        var grad_n: i64 = 1;
-        for (0..(grad_out_shape.len - 1)) |i| {
-            grad_n *= grad_out_shape[i];
-        }
-
-        std.debug.print("DEBUG gatherVJP: Broadcasting grad_out from [{}, {}] to [{}, {}]\n", .{grad_n, embed_dim, n_dims, embed_dim});
-
-        // Broadcast to match n_dims
-        const broadcast_shape = [_]i64{ n_dims, embed_dim };
-
-        // Calculate broadcast dimensions
-        const broadcast_dims = [_]i64{0, 1}; // Broadcast along first two dimensions
-        const broadcast_op = try hlo.broadcast_in_dim(
-            builder.allocator,
-            builder.ctx,
-            grad_out,
-            &broadcast_shape,
-            &broadcast_dims,
-            builder.loc
-        );
-        builder.insertion_block.appendOwnedOperation(broadcast_op);
-        break :blk2 broadcast_op.getResult(0);
-    };
-
-    std.debug.print("DEBUG gatherVJP: Flattened shapes - one_hot: [{}, {}], grad_out: [{}, {}]\n", .{n_dims, vocab_dim, n_dims, embed_dim});
-
-    // Now do dot_general: [N, Vocab]^T @ [N, Embed] = [Vocab, Embed]
-    const dot_dims = hlo.DotDimensionNumbersAttribute{
-        .lhs_batching_dimensions = &.{},
-        .rhs_batching_dimensions = &.{},
-        .lhs_contracting_dimensions = &.{0}, // Contract on N dimension
-        .rhs_contracting_dimensions = &.{0}, // Contract on N dimension
-    };
-
-    // Grad_table = OneHot^T @ Grad_out
-    const grad_table_op = try hlo.dot_general(
-        builder.allocator,
-        builder.ctx,
-        one_hot_flat,
-        grad_out_flat,
-        .{ .dot_dimension_numbers = dot_dims }
-    );
-
-    builder.insertion_block.appendOwnedOperation(grad_table_op);
-    try result.append(grad_table_op.getResult(0));
-
-    return result.toOwnedSlice();
-}
-
-/// VJP rule for function return: just pass through the gradient
-fn returnVJP(
-    builder: *MLIRBuilder,
-    original_op: mlir.Operation,
-    primals: []const mlir.Value,
-    adjoints: []const mlir.Value,
-) ![]mlir.Value {
-    _ = original_op;
-    _ = primals;
-
-    // dupe allocates using allocator, so it returns safe pointer (even if empty? alloc(0) is safe)
-    // But to be ultra-safe with our defensive freeing:
-    if (adjoints.len == 0) {
-        return builder.allocator.alloc(mlir.Value, 0);
-    }
-    return builder.allocator.dupe(mlir.Value, adjoints);
-}
-
-/// VJP rule for slice: scatter gradient back to original tensor positions
-/// For slice(input, start_indices, limit_indices, strides):
-/// - grad_input = scatter zeros tensor with grad_out at sliced positions
-fn sliceVJP(
-    builder: *MLIRBuilder,
-    original_op: mlir.Operation,
-    primals: []const mlir.Value,
-    adjoints: []const mlir.Value,
-) ![]mlir.Value {
-    const grad_out_raw = adjoints[0];
-    const input = primals[0];
-
-    const result_type = original_op.getResult(0).getType();
-    const result_ranked_type = result_type.as(mlir.RankedTensorType) orelse return error.InvalidTensorType;
-    const result_shape = try result_ranked_type.getShape(builder.allocator);
-    defer builder.allocator.free(result_shape);
-
-    const grad_out_type = grad_out_raw.getType().as(mlir.RankedTensorType) orelse return error.InvalidTensorType;
-    const grad_out_shape = try grad_out_type.getShape(builder.allocator);
-    defer builder.allocator.free(grad_out_shape);
-
-    var grad_out = grad_out_raw;
-    if (!std.mem.eql(i64, result_shape, grad_out_shape)) {
-        const reshape_op = try builder.createAndAttach("stablehlo.reshape", &.{grad_out_raw}, &.{result_type}, .{});
-        grad_out = reshape_op.getResult(0);
-    }
-
-    var result = std.ArrayList(mlir.Value).init(builder.allocator);
-    defer result.deinit();
-
-    if (!isValueFromConstantOp(input)) {
-        const input_type = input.getType().as(mlir.RankedTensorType) orelse return error.InvalidTensorType;
-        const input_rank = input_type.getRank();
-
-        // Parse attributes from the original slice operation
-        const start_indices_attr = c.mlirOperationGetAttributeByName(original_op.handle, c.stringRefCreateFromCString("start_indices"));
-        const limit_indices_attr = c.mlirOperationGetAttributeByName(original_op.handle, c.stringRefCreateFromCString("limit_indices"));
-
-        if (@intFromPtr(start_indices_attr.ptr) == 0 or @intFromPtr(limit_indices_attr.ptr) == 0) {
-            return error.MissingSliceAttribute;
-        }
-
-        // Extract start indices for padding_low
-        var start_indices = try builder.allocator.alloc(i64, input_rank);
-        defer builder.allocator.free(start_indices);
-        for (0..input_rank) |i| {
-            start_indices[i] = c.denseI64ArrayGetElement(start_indices_attr, @intCast(i));
-        }
-
-        // Calculate padding_high = input_shape - limit_indices
-        var padding_high = try builder.allocator.alloc(i64, input_rank);
-        defer builder.allocator.free(padding_high);
-        for (0..input_rank) |i| {
-            const limit_index = c.denseI64ArrayGetElement(limit_indices_attr, @intCast(i));
-            padding_high[i] = input_type.getDimension(i) - limit_index;
-        }
-
-        // Interior padding is all zeros for the inverse of slice
-        const interior_padding = try builder.allocator.alloc(i64, input_rank);
-        defer builder.allocator.free(interior_padding);
-        @memset(interior_padding, 0);
-
-        // Create a scalar zero for the padding value
-        const zero_scalar_op = try hlo.scalarConstant(builder.allocator, builder.ctx, 0.0, input_type.getElementType());
-        builder.insertion_block.appendOwnedOperation(zero_scalar_op);
-        const zero_scalar = zero_scalar_op.getResult(0);
-
-        // Create the hlo.pad operation to expand grad_out back to input shape
-        const pad_op = try hlo.pad(builder.allocator, builder.ctx, grad_out, zero_scalar, start_indices, padding_high, interior_padding, builder.loc);
-        builder.insertion_block.appendOwnedOperation(pad_op);
-
-        try result.append(pad_op.getResult(0));
-
-        std.debug.print("✓ sliceVJP: Created gradient flow using pad operation\n", .{});
-    }
-
-    return result.toOwnedSlice();
-}
-
-/// VJP rule for broadcast_in_dim: The inverse of broadcasting is to sum the gradients
-/// back into the original, smaller shape.
-fn broadcastInDimVJP(
-    builder: *MLIRBuilder,
-    original_op: mlir.Operation,
-    primals: []const mlir.Value,
-    adjoints: []const mlir.Value,
-) ![]mlir.Value {
-    const grad_out_raw = adjoints[0];
-    const input = primals[0]; // The original, smaller tensor
-
-    const result_type = original_op.getResult(0).getType();
-    const result_ranked_type = result_type.as(mlir.RankedTensorType) orelse return error.InvalidTensorType;
-    const result_shape = try result_ranked_type.getShape(builder.allocator);
-    defer builder.allocator.free(result_shape);
-
-    const grad_out_type = grad_out_raw.getType().as(mlir.RankedTensorType) orelse return error.InvalidTensorType;
-    const grad_out_shape = try grad_out_type.getShape(builder.allocator);
-    defer builder.allocator.free(grad_out_shape);
-
-    var grad_out = grad_out_raw;
-    if (!std.mem.eql(i64, result_shape, grad_out_shape)) {
-        const reshape_op = try builder.createAndAttach("stablehlo.reshape", &.{grad_out_raw}, &.{result_type}, .{});
-        grad_out = reshape_op.getResult(0);
-    }
-
-    var result = std.ArrayList(mlir.Value).init(builder.allocator);
-    defer result.deinit();
-
-    // Only compute gradients for non-constant operands
-    if (!isValueFromConstantOp(input)) {
-        // The gradient of the input is the sum of the output gradients, reduced
-        // along the dimensions that were added by the broadcast.
-
-        const input_type = input.getType().as(mlir.RankedTensorType) orelse return error.InvalidTensorType;
-
-        const input_shape = try input_type.getShape(builder.allocator);
-        defer builder.allocator.free(input_shape);
-
-        const input_rank = input_shape.len;
-        const grad_out_rank = grad_out_shape.len;
-
-        // Find the dimensions that need to be reduced. These are all dimensions in the
-        // output shape that are not part of the input shape's broadcast mapping.
-        var dims_to_reduce = std.ArrayList(i64).init(builder.allocator);
-        defer dims_to_reduce.deinit();
-
-        // Handle case where grad_out_rank >= input_rank (normal broadcast case)
-        if (grad_out_rank >= input_rank) {
-            // Simple logic: reduce the leading dimensions that were added by broadcast
-            // This works for cases where broadcast adds dimensions at the front
-            for (0..(grad_out_rank - input_rank)) |i| {
-                try dims_to_reduce.append(@intCast(i));
-            }
-
-            // Also reduce dimensions where the input dimension is 1 but output dimension is larger
-            for (0..input_rank) |i| {
-                const input_dim_idx = (grad_out_rank - input_rank) + i;
-                if (input_shape[i] == 1 and grad_out_shape[input_dim_idx] > 1) {
-                    try dims_to_reduce.append(@intCast(input_dim_idx));
-                }
-            }
-        }
-        // If grad_out_rank < input_rank, no dimensions to reduce (gradient passes through)
-
-        // Create a tensor wrapper for grad_out
-        const grad_out_tensor = try builder.newTensor(grad_out);
-
-        // Create a reduce_sum op to get the gradient of the input
-        var grad_input_tensor: tensor.Tensor(void) = undefined;
-        if (dims_to_reduce.items.len > 0) {
-            grad_input_tensor = try ops.reduceSum(builder, grad_out_tensor, dims_to_reduce.items, false);
-        } else {
-            // If no dimensions to reduce, the gradient passes through unchanged
-            grad_input_tensor = grad_out_tensor;
-        }
-
-        try result.append(grad_input_tensor.value);
-
-        std.debug.print("✓ broadcastInDimVJP: Created gradient flow for broadcast_in_dim operation\n", .{});
-    }
-
-    return result.toOwnedSlice();
 }
 
 // Helper functions for graph traversal and manipulation
@@ -1654,7 +411,7 @@ fn addInputGradients(
         const grad = input_gradients[i];
 
         // Ensure gradient matches operand shape using reduceGradient
-        const grad_matched = try reduceGradient(builder, grad, operand);
+        const grad_matched = try ops.reduceGradient(builder, grad, operand);
 
         // If a gradient for this operand already exists, add the new one to it.
         if (adjoint_map.get(operand)) |existing_grad| {
@@ -1688,10 +445,10 @@ fn addInputGradients(
             defer builder.allocator.free(operand_shape_arr);
 
             // Broadcast existing_grad to operand shape if needed
-            const existing_grad_matched = try broadcastToShape(builder, existing_grad, operand_shape_arr);
+            const existing_grad_matched = try ops.broadcastToShape(builder, existing_grad, operand_shape_arr);
 
             // Both gradients should now match operand shape, so broadcast should work
-            const add_broadcast = try broadcastOperands(builder, existing_grad_matched, grad_matched);
+            const add_broadcast = try ops.broadcastOperands(builder, existing_grad_matched, grad_matched);
             defer builder.allocator.free(add_broadcast.shape);
             const add_type = add_broadcast.lhs.getType();
             const sum_op = try builder.createAndAttach("stablehlo.add", &.{ add_broadcast.lhs, add_broadcast.rhs }, &.{add_type}, .{});
@@ -1741,35 +498,6 @@ fn finalizeGradientFunction(allocator: Allocator, builder: *MLIRBuilder, gradien
     std.debug.print("Added func.return to gradient function with {} gradients\n", .{input_gradients.items.len});
 }
 
-/// High-level API for automatic differentiation
-pub const AutoDiff = struct {
-    allocator: Allocator,
-    builder: *MLIRBuilder,
-
-    pub fn init(allocator: Allocator, builder: *MLIRBuilder) AutoDiff {
-        return AutoDiff{
-            .allocator = allocator,
-            .builder = builder,
-        };
-    }
-
-    /// Create gradient function from forward function
-    pub fn grad(self: *AutoDiff, forward_fn: mlir.Operation) !mlir.Operation {
-        return buildGradientGraph(self.allocator, self.builder, forward_fn);
-    }
-
-    /// Compose forward and backward pass into a single training function
-    pub fn valueAndGrad(self: *AutoDiff, forward_fn: mlir.Operation) !mlir.Operation {
-        // Create function that returns both value and gradients
-        const grad_fn = try self.grad(forward_fn);
-
-        // In a real implementation, this would create a new function that calls both
-        // forward_fn and grad_fn and returns both results
-        _ = grad_fn;
-        return forward_fn; // Placeholder
-    }
-};
-
 /// VJP rule for exponential: da = grad_out * exp(a)
 fn expVJP(
     builder: *MLIRBuilder,
@@ -1800,12 +528,12 @@ fn expVJP(
 
     const exp_a = try builder.createAndAttach("stablehlo.exponential", &.{a}, &.{a.getType()}, .{});
 
-    const grad_in_broadcast = try broadcastOperands(builder, grad_out, exp_a.getResult(0));
+    const grad_in_broadcast = try ops.broadcastOperands(builder, grad_out, exp_a.getResult(0));
     defer builder.allocator.free(grad_in_broadcast.shape);
     const grad_in_type = grad_in_broadcast.lhs.getType();
     const grad_in_raw = try builder.createAndAttach("stablehlo.multiply", &.{grad_in_broadcast.lhs, grad_in_broadcast.rhs}, &.{grad_in_type}, .{});
 
-    const grad_in = try reduceGradient(builder, grad_in_raw.getResult(0), a);
+    const grad_in = try ops.reduceGradient(builder, grad_in_raw.getResult(0), a);
     try result.append(grad_in);
     return result.toOwnedSlice();
 }
@@ -1838,12 +566,12 @@ fn logVJP(
     var result = std.ArrayList(mlir.Value).init(builder.allocator);
     defer result.deinit();
 
-    const grad_in_broadcast = try broadcastOperands(builder, grad_out, a);
+    const grad_in_broadcast = try ops.broadcastOperands(builder, grad_out, a);
     defer builder.allocator.free(grad_in_broadcast.shape);
     const grad_in_type = grad_in_broadcast.lhs.getType();
     const grad_in_raw = try builder.createAndAttach("stablehlo.divide", &.{grad_in_broadcast.lhs, grad_in_broadcast.rhs}, &.{grad_in_type}, .{});
 
-    const grad_in = try reduceGradient(builder, grad_in_raw.getResult(0), a);
+    const grad_in = try ops.reduceGradient(builder, grad_in_raw.getResult(0), a);
     try result.append(grad_in);
     return result.toOwnedSlice();
 }
@@ -1879,17 +607,17 @@ fn rsqrtVJP(builder: *MLIRBuilder, original_op: mlir.Operation, primals: []const
     const neg_half_tensor = try ops.constant(builder, -0.5, a_shape, elem_type);
     const neg_half = neg_half_tensor.value;
 
-    const term1_broadcast = try broadcastOperands(builder, grad_out, neg_half);
+    const term1_broadcast = try ops.broadcastOperands(builder, grad_out, neg_half);
     defer builder.allocator.free(term1_broadcast.shape);
     const term1_type = term1_broadcast.lhs.getType();
     const term1 = try builder.createAndAttach("stablehlo.multiply", &.{term1_broadcast.lhs, term1_broadcast.rhs}, &.{term1_type}, .{});
 
-    const final_grad_broadcast = try broadcastOperands(builder, term1.getResult(0), cub.getResult(0));
+    const final_grad_broadcast = try ops.broadcastOperands(builder, term1.getResult(0), cub.getResult(0));
     defer builder.allocator.free(final_grad_broadcast.shape);
     const final_grad_type = final_grad_broadcast.lhs.getType();
     const final_grad_raw = try builder.createAndAttach("stablehlo.multiply", &.{final_grad_broadcast.lhs, final_grad_broadcast.rhs}, &.{final_grad_type}, .{});
 
-    const final_grad = try reduceGradient(builder, final_grad_raw.getResult(0), a);
+    const final_grad = try ops.reduceGradient(builder, final_grad_raw.getResult(0), a);
     try result.append(final_grad);
     return result.toOwnedSlice();
 }
@@ -1924,7 +652,7 @@ fn convertVJP(
     var result = std.ArrayList(mlir.Value).init(builder.allocator);
     defer result.deinit();
 
-    const grad_reshaped = try reduceGradient(builder, grad_out, input);
+    const grad_reshaped = try ops.reduceGradient(builder, grad_out, input);
 
     const grad_reshaped_type = grad_reshaped.getType().as(mlir.RankedTensorType) orelse return error.NotRankedTensor;
     const grad_reshaped_shape = try grad_reshaped_type.getShape(builder.allocator);

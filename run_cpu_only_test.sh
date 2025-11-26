@@ -1,16 +1,12 @@
 #!/bin/bash
 
-# Set PATH to include zig
 export PATH=$PATH:/opt/zig
 
-# 0. Setup
-# Verify dataset exists
 if [ ! -f "data/tiny_shakespeare.txt" ]; then
     echo "💣 Error: Dataset not found at data/tiny_shakespeare.txt"
     exit 1
 fi
 
-# 1. Build the project
 echo "⛓️ Building PCP Distributed..."
 zig build
 if [ $? -ne 0 ]; then
@@ -18,22 +14,17 @@ if [ $? -ne 0 ]; then
     exit 1
 fi
 
-# Path to the executable
 EXE="./zig-out/bin/main_distributed"
-# Use the NanoGPT model file
 MODEL_PATH="models/nanogpt_forward.mlir"
 
 if [ ! -f "$MODEL_PATH" ]; then
     echo "💣 Error: Model file $MODEL_PATH not found."
-    echo "Run your generate_model.py script first!"
     exit 1
 fi
 
-echo "🌙 Starting PCP A100 Cluster Test"
+echo "🌙 Starting PCP CPU-Only Test"
 echo "Model: $MODEL_PATH"
 
-# 2. Start Shepherd (Coordinator)
-# It will wait for 2 workers.
 echo "Starting Shepherd..."
 $EXE --shepherd \
      --port 8090 \
@@ -41,24 +32,20 @@ $EXE --shepherd \
      --model "$MODEL_PATH" &
 SHEPHERD_PID=$!
 
-# Give Shepherd time to bind port and load model
 sleep 3
 
-# 3. Start Worker 1 (CPU)
 echo "Starting Worker 1 (CPU)..."
 $EXE --worker \
      --connect 127.0.0.1:8090 \
      --backend cpu &
 WORKER1_PID=$!
 
-# 4. Start Worker 2 (CUDA)
-echo "Starting Worker 2 (CUDA)..."
+echo "Starting Worker 2 (CPU)..."
 $EXE --worker \
      --connect 127.0.0.1:8090 \
-     --backend cuda &
+     --backend cpu &
 WORKER2_PID=$!
 
-# Wait for Shepherd to finish (it exits after training loop completes)
 wait $SHEPHERD_PID
 
 echo "🌚 Training Complete. Cleaning up workers..."

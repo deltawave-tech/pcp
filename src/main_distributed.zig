@@ -190,7 +190,11 @@ fn runShepherd(allocator: Allocator, args: Args) !void {
     print("🌙 Dataset loaded with {} tokens\n", .{data_loader.tokens.len});
 
     var diloco_config = DiLoCoConfig.default();
-    // Apply model path if provided
+    diloco_config.base_config.batch_size = 64;
+    diloco_config.base_config.learning_rate = 0.0006;
+    diloco_config.tau = 50;
+    diloco_config.base_config.outer_loop_steps = 100;
+
     if (args.model_path) |path| {
         diloco_config.model_mlir_path = path;
         print("   Model: {s}\n", .{path});

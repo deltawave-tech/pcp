@@ -446,8 +446,7 @@ pub const DiLoCo = struct {
         for (0..self.config.base_config.outer_loop_steps) |_| {
             const start_time = std.time.milliTimestamp();
 
-            // Phase 0: Get a fresh batch of training data
-            const batch_size = 1; // Match model input shape tensor<1x8xi64>
+            const batch_size = 64;
             const block_size = 8;
             const batch = try self.data_loader.getBatch(batch_size, block_size);
             defer self.allocator.free(batch.x);

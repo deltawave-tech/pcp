@@ -14,7 +14,7 @@ if [ $? -ne 0 ]; then
     exit 1
 fi
 
-EXE="./zig-out/bin/main_distributed"
+EXE="./zig-out/bin/pcp"
 MODEL_PATH="models/nanogpt_forward.mlir"
 
 if [ ! -f "$MODEL_PATH" ]; then

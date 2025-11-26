@@ -38,7 +38,7 @@ if [ $? -ne 0 ]; then
 fi
 
 # Path to the executable
-EXE="./zig-out/bin/main_distributed"
+EXE="./zig-out/bin/pcp"
 # Use the nano GPT model
 MODEL_PATH="models/nano_stablehlo.mlir"
 

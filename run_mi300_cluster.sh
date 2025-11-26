@@ -19,7 +19,7 @@ if [ $? -ne 0 ]; then
 fi
 
 # Path to the executable
-EXE="./zig-out/bin/main_distributed"
+EXE="./zig-out/bin/pcp"
 # Use the model file you generated earlier
 MODEL_PATH="models/nano_stablehlo.mlir"
 

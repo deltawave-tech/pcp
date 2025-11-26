@@ -147,9 +147,13 @@
             (lib.cmakeBool "IREE_ENABLE_LLD" true)
 
             (lib.cmakeFeature "CUDAToolkit_ROOT" "/build/iree_cuda_deps")
+            (lib.cmakeFeature "IREE_TARGET_BACKEND_ROCM_DEVICE_BC_PATH"
+              "${packages.iree-amdgpu-device-libs}")
             (lib.cmakeBool "IREE_HAL_DRIVER_CUDA" true)
+            (lib.cmakeBool "IREE_HAL_DRIVER_HIP" true)
             (lib.cmakeBool "IREE_HAL_DRIVER_VULKAN" true)
             (lib.cmakeBool "IREE_TARGET_BACKEND_CUDA" true)
+            (lib.cmakeBool "IREE_TARGET_BACKEND_ROCM" true)
             "-B"
             "/build/build"
           ];
@@ -180,6 +184,8 @@
             platforms = [ "aarch64-darwin" "x86_64-darwin" "x86_64-linux" ];
           };
         };
+
+        # See ${packages.iree-sdk.src}/compiler/plugins/target/ROCM/CMakeLists.txt
         packages.iree-amdgpu-device-libs = pkgs.fetchzip {
           name = "iree-amdgpu-device-libs";
           url =

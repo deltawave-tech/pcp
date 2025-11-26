@@ -1,9 +1,9 @@
 const std = @import("std");
-const mlir = @import("mlir.zig");
-const mlir_ctx = @import("mlir_ctx.zig"); // Import complete MLIR context
+const mlir = @import("../mlir/wrapper.zig");
+const mlir_ctx = @import("../mlir/context.zig"); // Import complete MLIR context
 const tensor = @import("tensor.zig");
-const hlo = @import("mlir/dialects/stablehlo.zig");
-const c = @import("mlir/c.zig").c;
+const hlo = @import("../mlir/dialects/stablehlo.zig");
+const c = @import("../mlir/c.zig").c;
 
 const Tensor = tensor.Tensor(void); // DataType is encoded in mlir.Type
 const Shape = tensor.Shape;
@@ -99,9 +99,9 @@ pub const MLIRBuilder = struct {
 
     /// Add a block argument (function input)
     pub fn addBlockArgument(self: *Self, mlir_type: mlir.Type) !mlir.Value {
-        const body_block = @import("mlir/c.zig").c.moduleGetBody(self.module.handle);
+        const body_block = @import("../mlir/c.zig").c.moduleGetBody(self.module.handle);
         const arg_count = 0; // Add at end for now
-        const value_handle = @import("mlir/c.zig").c.blockAddArgument(body_block, arg_count, mlir_type.handle, self.loc.handle);
+        const value_handle = @import("../mlir/c.zig").c.blockAddArgument(body_block, arg_count, mlir_type.handle, self.loc.handle);
         return mlir.Value{ .handle = value_handle };
     }
 
@@ -174,7 +174,7 @@ pub const MLIRBuilder = struct {
     
     /// Create a new block (static helper function)
     pub fn createBlock() !mlir.Block {
-        const c_api = @import("mlir/c.zig").c;
+        const c_api = @import("../mlir/c.zig").c;
         // An empty block takes no arguments.
         const block_handle = c_api.blockCreate(0, @constCast(@ptrCast(&[_]*c_api.MlirType{})), @constCast(@ptrCast(&[_]*c_api.MlirLocation{})));
         return mlir.Block{ .handle = block_handle };
@@ -1033,7 +1033,7 @@ pub fn testMLIROpGeneration(allocator: std.mem.Allocator) !void {
     // Create MLIR context for this test
     var ctx = try mlir.Context.init();
     defer ctx.deinit();
-    const c_api = @import("mlir/c.zig").c;
+    const c_api = @import("../mlir/c.zig").c;
     c_api.mlirContextSetAllowUnregisteredDialects(ctx.handle, true);
     
     // Create MLIR builder

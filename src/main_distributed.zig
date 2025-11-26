@@ -7,15 +7,15 @@ const ArrayList = std.ArrayList;
 const Allocator = std.mem.Allocator;
 
 // Import our distributed training components
-const shepherd = @import("controllers/shepherd.zig");
-const worker = @import("worker.zig");
+const shepherd = @import("nodes/controllers/shepherd.zig");
+const worker = @import("nodes/workers/worker.zig");
 const diloco = @import("algorithms/diloco.zig");
 const training_algorithm = @import("algorithms/training_algorithm.zig");
-const backend_selection = @import("backend_selection.zig");
-const ops = @import("ops.zig");
-const mlir = @import("mlir.zig");
-const autodiff = @import("autodiff.zig");
-const dashboard = @import("dashboard.zig");
+const backend_selection = @import("backends/selection.zig");
+const ops = @import("core/ops.zig");
+const mlir = @import("mlir/wrapper.zig");
+const autodiff = @import("autodiff/engine.zig");
+const dashboard = @import("ui/dashboard.zig");
 
 const Shepherd = shepherd.Shepherd;
 const Worker = worker.Worker;
@@ -185,7 +185,7 @@ fn runShepherd(allocator: Allocator, args: Args) !void {
     // Initialize the DataLoader for real training data
     print("Loading Tiny Shakespeare dataset...\n", .{});
     // Dataset expected at data/tiny_shakespeare.txt
-    var data_loader = try @import("data_loader.zig").DataLoader.init(allocator, "data/tiny_shakespeare.txt");
+    var data_loader = try @import("data/loader.zig").DataLoader.init(allocator, "data/tiny_shakespeare.txt");
     defer data_loader.deinit();
     print("🌙 Dataset loaded with {} tokens\n", .{data_loader.tokens.len});
 

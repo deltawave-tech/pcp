@@ -4,11 +4,11 @@
 const std = @import("std");
 const net = std.net;
 const Allocator = std.mem.Allocator;
-const tcp_stream = @import("network/tcp_stream.zig");
-const message = @import("network/message.zig");
-const binary_protocol = @import("network/capnp_zig_wrapper.zig");
-const worker_backend = @import("backends/worker_backend.zig");
-const backend_selection = @import("backend_selection.zig");
+const tcp_stream = @import("../../network/tcp_stream.zig");
+const message = @import("../../network/message.zig");
+const binary_protocol = @import("../../network/capnp_zig_wrapper.zig");
+const worker_backend = @import("../../backends/worker_backend.zig");
+const backend_selection = @import("../../backends/selection.zig");
 
 const TcpClient = tcp_stream.TcpClient;
 const TcpStreamManager = tcp_stream.TcpStreamManager;

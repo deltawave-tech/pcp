@@ -4,7 +4,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const ArrayList = std.ArrayList;
 const training_algorithm = @import("training_algorithm.zig");
-const shepherd = @import("../controllers/shepherd.zig");
+const shepherd = @import("../nodes/controllers/shepherd.zig");
 const message = @import("../network/message.zig");
 const binary_protocol = @import("../network/capnp_zig_wrapper.zig");
 const nesterov_mlir = @import("../optimizers/nesterov_mlir.zig");
@@ -12,14 +12,14 @@ const adam_mlir = @import("../optimizers/adam_mlir.zig");
 const nesterov_host = @import("../optimizers/nesterov.zig");
 const NesterovHost = nesterov_host.Nesterov;
 const AdamMLIR = adam_mlir.AdamMLIR(f32);
-const autodiff = @import("../autodiff.zig");
-const ops = @import("../ops.zig");
-const mlir = @import("../mlir.zig");
-const tensor = @import("../tensor.zig");
+const autodiff = @import("../autodiff/engine.zig");
+const ops = @import("../core/ops.zig");
+const mlir = @import("../mlir/wrapper.zig");
+const tensor = @import("../core/tensor.zig");
 const execution = @import("../execution.zig");
-const monitoring = @import("../monitoring.zig");
-const data_loader = @import("../data_loader.zig");
-const backend_selection = @import("../backend_selection.zig");
+const monitoring = @import("../ui/monitoring.zig");
+const data_loader = @import("../data/loader.zig");
+const backend_selection = @import("../backends/selection.zig");
 
 const TrainingAlgorithm = training_algorithm.TrainingAlgorithm;
 const TrainingStatus = training_algorithm.TrainingStatus;
@@ -359,7 +359,7 @@ pub const DiLoCo = struct {
             compiled_artifacts.deinit();
         }
 
-        var temp_mlir_ctx = try @import("../mlir_ctx.zig").MLIRContext.init(self.allocator);
+        var temp_mlir_ctx = try @import("../mlir/context.zig").MLIRContext.init(self.allocator);
         defer temp_mlir_ctx.deinit();
 
         var config_it = config_set.keyIterator();
@@ -781,7 +781,7 @@ pub const DiLoCo = struct {
         }
         std.log.info("✓ Final module verification successful!", .{});
 
-        return try @import("../mlir_ctx.zig").serializeMLIRModule(self.allocator, builder.module);
+        return try @import("../mlir/context.zig").serializeMLIRModule(self.allocator, builder.module);
     }
 
 

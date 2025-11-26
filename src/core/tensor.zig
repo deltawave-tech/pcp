@@ -1,6 +1,6 @@
 const std = @import("std");
-const mlir = @import("mlir.zig");
-const mlir_ctx = @import("mlir_ctx.zig"); 
+const mlir = @import("../mlir/wrapper.zig");
+const mlir_ctx = @import("../mlir/context.zig"); 
 
 const Allocator = std.mem.Allocator;
 
@@ -237,31 +237,31 @@ pub fn Tensor(comptime T: type) type {
         }
 
         // --- MLIR-based operations ---
-        // These are wrappers around the standalone functions in ops_mlir.zig
+        // These are wrappers around the standalone functions in ops.zig
 
         pub fn add(self: Self, other: Self) !Self {
-            const ops = @import("ops.zig");
-            return try ops.add(self.builder, self, other);
+            const ops_mod = @import("ops.zig");
+            return try ops_mod.add(self.builder, self, other);
         }
 
         pub fn subtract(self: Self, other: Self) !Self {
-            const ops = @import("ops.zig");
-            return try ops.subtract(self.builder, self, other);
+            const ops_mod = @import("ops.zig");
+            return try ops_mod.subtract(self.builder, self, other);
         }
 
         pub fn multiply(self: Self, other: Self) !Self {
-            const ops = @import("ops.zig");
-            return try ops.multiply(self.builder, self, other);
+            const ops_mod = @import("ops.zig");
+            return try ops_mod.multiply(self.builder, self, other);
         }
 
         pub fn matmul(self: Self, other: Self) !Self {
-            const ops = @import("ops.zig");
-            return try ops.matmul(self.builder, self, other);
+            const ops_mod = @import("ops.zig");
+            return try ops_mod.matmul(self.builder, self, other);
         }
 
         pub fn relu(self: Self) !Self {
-            const ops = @import("ops.zig");
-            return try ops.relu(self.builder, self);
+            const ops_mod = @import("ops.zig");
+            return try ops_mod.relu(self.builder, self);
         }
 
         // Note: No more getScalar/setScalar - tensors are symbolic!

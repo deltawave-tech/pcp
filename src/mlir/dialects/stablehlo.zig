@@ -3,7 +3,7 @@
 
 const std = @import("std");
 const c = @import("../c.zig");
-const mlir = @import("../../mlir.zig");
+const mlir = @import("../wrapper.zig");
 
 // --- Operation Builders for the StableHLO Dialect ---
 
@@ -113,7 +113,7 @@ pub fn exponential(ctx: mlir.Context, operand: mlir.Value, loc: mlir.Location) m
 /// Creates a stablehlo.reduce operation with a 'maximum' body.
 pub fn reduce_max(
     ctx: mlir.Context,
-    builder: *const @import("../../ops.zig").MLIRBuilder, // Pass in the builder
+    builder: *const @import("../../core/ops.zig").MLIRBuilder, // Pass in the builder
     operand: mlir.Value,
     dimensions: []const i64,
     loc: mlir.Location,
@@ -199,7 +199,7 @@ pub fn reduce_max(
 /// Creates a generic stablehlo.reduce operation with a summation body.
 pub fn reduce_sum(
     ctx: mlir.Context,
-    builder: *const @import("../../ops.zig").MLIRBuilder, // Pass in the builder
+    builder: *const @import("../../core/ops.zig").MLIRBuilder, // Pass in the builder
     operand: mlir.Value,
     dimensions: []const i64,
     loc: mlir.Location,

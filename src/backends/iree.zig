@@ -17,8 +17,8 @@ const c = @cImport({
     @cInclude("iree/runtime/api.h");
 });
 const WorkerBackend = @import("worker_backend.zig").WorkerBackend;
-const backend_selection = @import("../backend_selection.zig");
-const mlir = @import("../mlir.zig");
+const backend_selection = @import("selection.zig");
+const mlir = @import("../mlir/wrapper.zig");
 const pcp = @import("../main.zig");
 const DType = pcp.tensor.DType;
 

@@ -1,6 +1,6 @@
 const std = @import("std");
-const mlir = @import("mlir.zig");
-const c = @import("mlir/c.zig").c;
+const mlir = @import("wrapper.zig");
+const c = @import("c.zig").c;
 
 const Allocator = std.mem.Allocator;
 

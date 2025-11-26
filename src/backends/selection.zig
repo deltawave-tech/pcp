@@ -6,21 +6,21 @@ const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 
 // Core interfaces
-const execution = @import("execution.zig");
-const worker_backend = @import("backends/worker_backend.zig");
+const execution = @import("../execution.zig");
+const worker_backend = @import("worker_backend.zig");
 
 // Algorithm implementations
-const diloco = @import("algorithms/diloco.zig");
-const shepherd = @import("controllers/shepherd.zig");
-const worker = @import("worker.zig");
+const diloco = @import("../algorithms/diloco.zig");
+const shepherd = @import("../nodes/controllers/shepherd.zig");
+const worker = @import("../nodes/workers/worker.zig");
 
 // Backend implementations
-const iree_backend = @import("backends/iree.zig");
+const iree_backend = @import("iree.zig");
 
 // NEW: Necessary imports for HostExecutor
-const mlir_ctx = @import("mlir_ctx.zig");
-const mlir = @import("mlir.zig");
-const tensor = @import("tensor.zig");
+const mlir_ctx = @import("../mlir/context.zig");
+const mlir = @import("../mlir/wrapper.zig");
+const tensor = @import("../core/tensor.zig");
 
 const Executor = execution.Executor;
 const WorkerBackend = worker_backend.WorkerBackend;

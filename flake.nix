@@ -167,8 +167,18 @@
           outputs = [ "out" "build" ];
           postInstall = ''
             mkdir -p $build
-            # Probably the call to patchelf is not needed
-            for f in iree-compile iree-lld iree-mlir-lsp-server iree-opt iree-reduce iree-run-mlir test-iree-compiler-api-test-binary; do
+            to_patch=(
+              iree-compile
+              iree-link
+              iree-lld
+              iree-mlir-lsp-server
+              iree-opt
+              iree-reduce
+              iree-run-mlir
+              test-iree-compiler-api-test-binary
+            )
+
+            for f in ''${to_patch[@]}; do
               patchelf --remove-rpath /build/build/tools/$f
             done
             cp -r /build/build/* $build/

@@ -1,128 +1,119 @@
 # PCP Documentation
 
-A comprehensive guide to the distributed MLIR-based tensor computation framework.
+Planetary Compute Protocol (PCP) is a high-performance, distributed tensor computation framework written in Zig. It enables decentralized training of Large Language Models (LLMs) using the DiLoCo (Distributed Low-Communication) algorithm.
+
+The system leverages MLIR (Multi-Level Intermediate Representation) for graph construction and IREE (Intermediate Representation Execution Environment) for universal hardware targeting (CUDA, ROCm, Metal, Vulkan, CPU).
 
 ## Table of Contents
 
-1. [Architecture Overview](#architecture-overview)
-2. [Distributed Training System](#distributed-training-system)
-3. [MLIR Integration](#mlir-integration)
-4. [Automatic Differentiation](#automatic-differentiation)
-5. [Backend Execution](#backend-execution)
-6. [Monitoring and Dashboard](#monitoring-and-dashboard)
-7. [API Reference](#api-reference)
+- [Architecture Overview](#architecture-overview)
+- [Distributed Training System](#distributed-training-system)
+- [MLIR & Compiler Pipeline](#mlir--compiler-pipeline)
+- [Automatic Differentiation](#automatic-differentiation)
+- [IREE Backend Execution](#iree-backend-execution)
+- [Networking Protocol](#networking-protocol)
+- [Monitoring](#monitoring)
+- [API & Usage](#api--usage)
 
 ## Architecture Overview
 
-PCP is a distributed training framework that combines models and algorithms to create MLIR computation graphs, then distributes them to workers for GPU execution:
+PCP separates the definition of computation (MLIR) from its execution (IREE). The coordinator ("Shepherd") constructs the training graph, compiles it to a platform-agnostic bytecode (VMFB), and distributes it to workers.
 
 ```
 ┌──────────────────────────────────────────────────────────────────────┐
-│                            Controller                                │
+│                      Shepherd (Coordinator)                          │
 ├──────────────────────────────────────────────────────────────────────┤
-│  ┌─────────┐ + ┌───────────┐ = ┌─────────────────────────────────┐   │
-│  │ Model   │   │ Algorithm │   │ MLIR Training Graph             │   │
-│  │         │   │           │   │ (Forward + Autodiff + Update)   │   │
-│  └─────────┘   └───────────┘   └─────────────────────────────────┘   │
+│  Model .mlir → MLIR Builder → Autodiff → Optimizer Injection         │
+│                                  ↓                                    │
+│                         IREE Compiler (iree-compile)                 │
+│                                  ↓                                    │
+│                    VMFB Bytecode + Initial Parameters                │
 └──────────────────────────────┬───────────────────────────────────────┘
-                               │ Serialize & Send
+                               │ TCP + Cap'n Proto
                                ▼
 ┌──────────────────────────────────────────────────────────────────────┐
-│                           Workers                                    │
+│                         Worker Nodes                                 │
 ├──────────────────────────────────────────────────────────────────────┤
-│ Receive MLIR → Compile to GPU → Execute → Send Results Back          │
+│  VMFB + Tensors → IREE Runtime → Hardware HAL (CUDA/Metal/ROCm)      │
+│                                  ↓                                    │
+│                     Updated Parameters → Network                      │
 └──────────────────────────────────────────────────────────────────────┘
 ```
 
 ### Core Layers
 
-1. **Distributed Coordination**: Shepherd coordinator manages worker nodes via TCP
-2. **MLIR Graph Construction**: Builds complete training graphs with autodiff
-3. **Backend Execution**: Cross-platform GPU execution via SPIR-V bridge
-4. **Real-time Monitoring**: TUI dashboard for training metrics and system status
+1. **Algorithm Layer**: Implements DiLoCo (Inner loop on workers, Outer loop on Shepherd)
+2. **MLIR Layer**: Manages StableHLO dialects, tensor shapes, and graph construction
+3. **Execution Layer**: Uses `iree-compile` for AOT compilation and `iree_runtime` for execution
+4. **Network Layer**: TCP framing with Cap'n Proto serialization for high-throughput tensor transfer
 
 ## Distributed Training System
 
 ### Shepherd Coordinator (`src/controllers/shepherd.zig`)
 
-The central coordinator that manages the distributed training process:
+The Shepherd acts as the master node. It holds the "true" model parameters and orchestrates the training lifecycle.
+
+**Key Responsibilities:**
+
+- **Graph Construction**: Loads the model MLIR, applies Autodiff, and injects the AdamW optimizer into the graph
+- **Compilation**: Invokes `iree-compile` to generate a `.vmfb` (Virtual Machine FlatBuffer) specific to the workers' target architecture
+- **Parameter Aggregation**: Receives updated parameters from workers, averages them, and applies the Nesterov Momentum update locally on the CPU
 
 ```zig
 var shepherd = Shepherd.init(allocator);
 defer shepherd.deinit();
 
 // Start TCP server and wait for workers
-try shepherd.startServer(8080);
-try shepherd.run();
+try shepherd.listen("0.0.0.0", 8080);
 ```
-
-**Key responsibilities:**
-- Combine models and algorithms into complete MLIR training graphs
-- Serialize MLIR modules and broadcast to workers
-- Collect training results and coordinate parameter updates
-- Manage distributed training lifecycle
 
 ### Worker Nodes (`src/worker.zig`)
 
-Execute MLIR training graphs on local hardware:
+Workers are "dumb" execution units. They do not know the model topology; they simply execute the VMFB provided by the Shepherd.
+
+**Characteristics:**
+
+- **State**: Maintains local AdamW optimizer states (M and V moments) which persist across inner loops
+- **Execution**: Runs the inner loop for τ steps (default 10) before syncing back to the Shepherd
+- **Hardware Agnostic**: The same worker code runs on NVIDIA (CUDA), AMD (ROCm), and Apple Silicon (Metal) by selecting the appropriate IREE driver at runtime
 
 ```zig
 var worker = Worker.init(allocator, backend);
 defer worker.deinit();
 
 // Connect to shepherd and enter training loop
-try worker.connect("127.0.0.1", 8080);
+try worker.connect("127.0.0.1", 8080, amd_target);
 try worker.run();
 ```
 
-**Worker execution flow:**
-1. Receive serialized MLIR module from shepherd
-2. Deserialize and compile to GPU (SPIR-V → Metal/CUDA)
-3. Execute training step with local data
-4. Send updated parameters back to shepherd
+### DiLoCo Algorithm (`src/algorithms/diloco.zig`)
 
-### Training Algorithms (`src/algorithms/`)
+PCP implements the DiLoCo algorithm to reduce communication overhead:
 
-PCP implements distributed training algorithms like DiLoCo:
+1. **Outer Loop**: Shepherd broadcasts parameters
+2. **Inner Loop**: Workers perform k steps of SGD/AdamW locally without communicating
+3. **Sync**: Workers send updated parameters back
+4. **Update**: Shepherd averages results and applies outer momentum
 
-```zig
-var diloco = try DiLoCo.init(allocator, &shepherd, config, executor);
-defer diloco.deinit();
+## MLIR & Compiler Pipeline
 
-// Start distributed training
-try diloco.run();
-```
+### Context Management (`src/mlir_ctx.zig`)
 
-## MLIR Integration
+PCP interacts with LLVM/MLIR via a C-API wrapper. It explicitly registers required dialects:
 
-### Compilation Pipeline
+- `stablehlo`: For tensor math operations
+- `func`: For function definitions
+- `arith`: For basic arithmetic
 
-```
-┌─────────┐   ┌─────────────┐   ┌───────┐   ┌─────────────────┐
-│StableHLO│ → │ GPU Dialect │ → │SPIR-V │ → │Metal/CUDA/CPU   │
-└─────────┘   └─────────────┘   └───────┘   └─────────────────┘
-```
+### The Compilation Flow
 
-### StableHLO Integration
-
-PCP integrates StableHLO as an external LLVM project with pass registration:
-
-```cpp
-// src/mlir/pass_anchors.cpp
-extern "C" void mlirForceLoadAllRequiredPasses() {
-    // StableHLO passes
-    mlir::stablehlo::registerAllPasses();
-
-    // Core MLIR passes for lowering pipeline
-    (void)mlir::createCanonicalizerPass;
-    (void)mlir::createConvertGpuOpsToSPIRVopsPass;
-    // ... additional passes
-}
-```
-
-### MLIR Context Management (`src/mlir_ctx.zig`)
-
-Manages MLIR contexts and module serialization/deserialization:
+1. **Introspection**: The system reads a user-provided `.mlir` file (e.g., `nanogpt_forward.mlir`) to determine input shapes
+2. **Graph Transformation**:
+   - Forward pass is cloned
+   - Backward pass is generated via `autodiff.zig`
+   - Optimizer update steps (AdamW) are appended to the MLIR graph
+3. **IREE Compilation**: The final module is serialized to text and passed to the `iree-compile` subprocess
+4. **Targeting**: Flags like `--iree-hal-target-backends=cuda` or `--iree-hip-target=gfx942` are applied automatically based on configuration
 
 ```zig
 pub const MLIRContext = struct {
@@ -130,43 +121,33 @@ pub const MLIRContext = struct {
 
     pub fn init(allocator: Allocator) !Self
     pub fn deinit(self: *Self) void
-    pub fn getContext(self: *Self) mlir.Context
+    pub fn compileToVMFB(
+        self: *Self,
+        allocator: Allocator,
+        mlir_source: []const u8,
+        iree_target: []const u8,
+        amd_target: ?[]const u8
+    ) ![]u8
 };
-
-// Serialize MLIR modules for network transmission
-pub fn serializeMLIRModule(allocator: Allocator, module: mlir.Module) ![]u8
-
-// Deserialize MLIR modules on worker nodes
-pub fn deserializeMLIRModule(allocator: Allocator, context: mlir.Context, data: []const u8) !mlir.Module
 ```
 
 ## Automatic Differentiation
 
-### Function-as-a-Unit Pattern
+PCP includes a custom reverse-mode automatic differentiation engine located in `src/autodiff.zig`.
 
-PCP uses a Function-as-a-Unit approach where complete training functions are differentiated:
+### VJP (Vector-Jacobian Product) Rules
 
-```zig
-// Create forward+loss function that autodiff can process
-fn buildForwardAndLossFunction(builder: *MLIRBuilder) !mlir.Operation {
-    // Define function: func(params, inputs, targets) -> (loss)
-    const func_op = mlir.Operation.create(builder.ctx, "func.func", .{
-        .attributes = &.{
-            .{ "function_type", mlir.Attribute.typeAttr(func_type) },
-            .{ "sym_name", mlir.Attribute.stringAttr(builder.ctx, "forward_and_loss_fn") },
-        },
-    });
+The engine transforms a forward MLIR graph into a gradient graph by walking backward from the return statement. It supports a wide range of StableHLO operations:
 
-    // Build forward computation and loss calculation inside function
-    // ...
+**Supported Operations:**
 
-    return func_op;
-}
-```
+- **Math**: `add`, `subtract`, `multiply`, `divide`, `power`, `negate`, `exp`, `log`, `rsqrt`, `tanh`
+- **Matrix**: `dot_general` (MatMul with batching support)
+- **Manipulation**: `reshape`, `transpose`, `broadcast_in_dim`, `slice`, `concatenate`
+- **Reduction**: `reduce_sum`, `reduce_max`
+- **Advanced**: `gather` (embedding lookup), `select` (masking), `convert`
 
-### Gradient Graph Generation (`src/autodiff.zig`)
-
-The autodiff system generates gradient functions automatically:
+The AD engine uses a "Function-as-a-Unit" pattern, generating a dedicated `*_grad` function within the MLIR module.
 
 ```zig
 // Generate gradient function from forward function
@@ -176,178 +157,182 @@ pub fn buildGradientGraph(
     forward_fn: mlir.Operation
 ) !void {
     // Apply autodiff transformation to create gradient function
-    // The result is a new func.func that computes gradients
 }
 ```
 
-### Complete Training Graph Construction
+## IREE Backend Execution
 
-Training algorithms build complete MLIR modules with forward, gradient, and update logic:
+PCP uses the IREE Runtime (`src/backends/iree.zig`) for robust, production-grade execution across all hardware targets.
 
-```zig
-// Build complete worker training graph
-fn buildWorkerTrainingGraph(self: *DiLoCo) ![]u8 {
-    // 1. Create forward+loss function
-    const forward_fn = try self.buildForwardAndLossFunction(&builder);
+### WorkerBackend Interface
 
-    // 2. Differentiate to create gradient function
-    _ = try autodiff.buildGradientGraph(self.allocator, &builder, forward_fn);
-
-    // 3. Create main orchestration function that calls both
-    const main_func = try self.buildMainFunction(&builder);
-
-    // 4. Serialize complete module for workers
-    return try serializeMLIRModule(self.allocator, builder.module);
-}
-```
-
-## Backend Execution
-
-### Backend Abstraction (`src/backends/worker_backend.zig`)
-
-PCP provides a backend-agnostic interface for executing MLIR modules:
+The `WorkerBackend` struct provides a generic interface:
 
 ```zig
-pub const WorkerBackend = struct {
-    ptr: *anyopaque,
-    vtable: *const VTable,
-
-    pub const VTable = struct {
-        executeTrainingStep: *const fn(ptr: *anyopaque, mlir_module: mlir.Module, inputs: [][]const u8) anyerror![][]u8,
-        deinit: *const fn(ptr: *anyopaque) void,
-    };
+pub const VTable = struct {
+    executeTrainingStep: *const fn(
+        ptr: *anyopaque,
+        artifact: []const u8,    // VMFB bytes
+        inputs: [][]const u8,    // Raw tensor bytes
+        shapes: [][]const i64    // Tensor dimensions
+    ) anyerror![][]u8,
+    deinit: *const fn(ptr: *anyopaque) void,
 };
 ```
 
-### Metal Backend (`src/backends/metal.zig`)
+### IREE Implementation
 
-Cross-platform GPU execution through SPIR-V bridge:
+The `IreeBackend` handles:
+
+- **Instance & Device Creation**: Initializes drivers (`cuda`, `hip`, `vulkan`, `local-sync`)
+- **Session Management**: Loads VMFB modules
+- **Tensor Marshalling**: Zero-copy (where possible) transfer of data between Host and Device using `iree_hal_buffer_view`
+
+**Supported Backends:**
+
+- **CUDA**: NVIDIA GPUs
+- **ROCm/HIP**: AMD GPUs (MI300X, MI250X, MI100)
+- **Metal**: Apple Silicon
+- **Vulkan**: Cross-platform
+- **CPU**: Fallback (local-sync driver)
+
+### Per-Worker Compilation
+
+The Shepherd compiles separate VMFB artifacts for each unique `(backend, amd_target)` combination. This enables heterogeneous clusters where workers with different GPU architectures participate in the same training session.
+
+## Networking Protocol
+
+PCP uses a hybrid networking approach for maximum efficiency:
+
+### 1. Control Plane (JSON)
+
+Lightweight messages (Join requests, Heartbeats, Status updates) are sent as JSON objects wrapped in a framing protocol.
+
+### 2. Data Plane (Cap'n Proto)
+
+Heavy tensor data (Model parameters, Gradients) is serialized using Cap'n Proto (`src/network/protocol.capnp`).
+
+**Benefits:**
+
+- **Zero-Copy Deserialization**: Cap'n Proto allows reading data directly from the network buffer
+- **Base64 Wrapping**: Binary Cap'n Proto payloads are Base64 encoded and embedded in the JSON envelope for simplified socket handling
+
+**Message Envelope Structure:**
 
 ```zig
-pub const MetalBackend = struct {
-    // Execution flow: MLIR → SPIR-V → Metal Shading Language → MTLLibrary
-    pub fn executeTrainingStep(
-        self: *Self,
-        mlir_module: mlir.Module,
-        inputs: [][]const u8
-    ) ![][]u8 {
-        // 1. Lower MLIR to SPIR-V
-        const spirv_binary = try self.lowerToSPIRV(mlir_module);
-
-        // 2. Cross-compile SPIR-V to MSL using SPIRV-Cross
-        const msl_source = try self.spirvToMSL(spirv_binary);
-
-        // 3. Compile MSL to Metal library and execute
-        return try self.executeOnMetal(msl_source, inputs);
-    }
+pub const MessageEnvelope = struct {
+    sender_node: NodeId,
+    recipient_node: NodeId,
+    msg_type: []const u8,        // e.g., "InnerLoopComplete"
+    data: std.json.Value,        // Contains Base64 encoded Cap'n Proto blob
 };
 ```
 
-### SPIR-V Bridge (`src/mlir/spirv_bridge.cpp`)
-
-Handles MLIR to SPIR-V translation and cross-compilation:
-
-```cpp
-// Lower MLIR module to SPIR-V binary
-extern "C" bool mlirLowerToSPIRV(
-    MlirModule module,
-    uint8_t** spirv_data,
-    size_t* spirv_size
-);
-
-// Cross-compile SPIR-V to Metal Shading Language
-extern "C" bool spirvCrossCompileToMSL(
-    const uint8_t* spirv_data,
-    size_t spirv_size,
-    char** msl_source
-);
-```
-
-## Monitoring and Dashboard
+## Monitoring
 
 ### TUI Dashboard (`src/dashboard.zig`)
 
-Real-time training monitoring with terminal user interface:
+A terminal-based dashboard runs on a separate thread in the Shepherd process. It renders:
+
+- **Status Box**: Current state (Initializing, Running, Completed)
+- **Workers Table**: ID, Backend (CUDA/ROCm/CPU), IP Address, and Status
+- **Metrics**: Loss history graph, Throughput (Tokens/sec), Epoch time
 
 ```zig
 pub const Dashboard = struct {
     pub fn init(allocator: Allocator) !Self
-    pub fn start(self: *Self) !void
-    pub fn stop(self: *Self) void
-
-    // Updates displayed in real-time
-    pub fn updateTrainingStatus(self: *Self, status: TrainingStatus) void
-    pub fn updateMetrics(self: *Self, epoch: u64, loss: f32, workers: u32) void
-    pub fn updateEpochTime(self: *Self, time_ms: u64) void
+    pub fn runDashboard() !void
 };
 ```
 
-**Dashboard features:**
-- Real-time training metrics (loss, epoch time, worker count)
-- System resource monitoring
-- Training algorithm status
-- Network connectivity status
-- MLIR compilation and execution logs
+### Metrics Collection (`src/monitoring.zig`)
 
-### Monitoring System (`src/monitoring.zig`)
-
-Centralized metrics collection and reporting:
+A thread-safe global monitor (`TrainingMonitor`) aggregates statistics from the Shepherd controller without blocking the training loop.
 
 ```zig
 // Global monitoring state
 pub fn setStatus(status: TrainingStatus) void
 pub fn setMetrics(epoch: u64, loss: f32, worker_count: u32) void
-pub fn setEpochTime(time_ms: u64) void
-pub fn setModelInfo(param_count: usize, learning_rate: f32) void
-
-// Retrieve current metrics
-pub fn getMetrics() TrainingMetrics
-pub fn getStatus() TrainingStatus
+pub fn setWorkerInfo(workers: []const WorkerInfo) void
 ```
 
-## API Reference
+## API & Usage
 
-### Running Distributed Training
+### Directory Structure
 
-Start a distributed training session with shepherd and workers:
+| Path | Description |
+|------|-------------|
+| `src/algorithms/` | Implementation of DiLoCo and generic training interfaces |
+| `src/backends/` | `iree.zig` (Runtime wrapper) and `worker_backend.zig` (Interface) |
+| `src/controllers/` | `shepherd.zig` - Main coordination logic |
+| `src/mlir/` | StableHLO dialect wrappers and C-API bindings |
+| `src/network/` | TCP stream handling and Cap'n Proto bridges |
+| `src/optimizers/` | `adam_mlir.zig` (Device-side) and `nesterov.zig` (Host-side) |
+| `src/autodiff.zig` | The custom AD engine |
+| `src/mlir_ctx.zig` | MLIR context and IREE compilation interface |
+
+### CLI Arguments
+
+**Shepherd:**
 
 ```bash
-# Terminal 1: Start shepherd coordinator
-zig run src/main_distributed.zig -- --shepherd --workers 2
-
-# Terminal 2: Start first worker
-zig run src/main_distributed.zig -- --worker --connect 127.0.0.1:8080
-
-# Terminal 3: Start second worker
-zig run src/main_distributed.zig -- --worker --connect 127.0.0.1:8080
+# Start the master node
+./zig-out/bin/main_distributed --shepherd \
+    --model src/models/nanogpt_forward.mlir \
+    --workers 2 \
+    --host 0.0.0.0 \
+    --port 8080
 ```
 
-### Key File Structure
+**Worker (Auto-detect backend):**
 
-```
-src/
-├── controllers/shepherd.zig      # Distributed training coordinator
-├── worker.zig                    # Worker node implementation
-├── algorithms/diloco.zig          # DiLoCo distributed training algorithm
-├── backends/                     # Hardware execution backends
-│   ├── worker_backend.zig        # Backend abstraction interface
-│   └── metal.zig                 # Metal GPU backend
-├── mlir/                         # MLIR integration layer
-│   ├── c.zig                     # MLIR C API bindings
-│   ├── pass_anchors.cpp          # StableHLO pass registration
-│   └── spirv_bridge.cpp          # SPIR-V compilation bridge
-├── autodiff.zig                  # Function-as-a-Unit autodiff
-├── dashboard.zig                 # TUI monitoring dashboard
-├── monitoring.zig                # Metrics collection system
-└── execution.zig                 # Backend execution abstraction
+```bash
+./zig-out/bin/main_distributed --worker \
+    --connect <SHEPHERD_IP>:8080
 ```
 
-### Development Workflow
+**Worker (Specific backend):**
+
+```bash
+# CPU Worker
+./zig-out/bin/main_distributed --worker \
+    --connect <SHEPHERD_IP>:8080 \
+    --backend cpu
+
+# CUDA Worker (NVIDIA)
+./zig-out/bin/main_distributed --worker \
+    --connect <SHEPHERD_IP>:8080 \
+    --backend cuda
+
+# ROCm Worker (AMD MI300X)
+./zig-out/bin/main_distributed --worker \
+    --connect <SHEPHERD_IP>:8080 \
+    --backend rocm \
+    --amd-target gfx942
+```
+
+### Running Tests
+
+```bash
+# Verify CPU Pipeline
+zig build run-cpu-pipeline-test
+
+# Verify CUDA Pipeline (requires NVIDIA GPU)
+zig build run-cuda-pipeline-test
+
+# Verify ROCm Pipeline (requires AMD GPU)
+zig build run-rocm-pipeline-test
+
+# Mixed cluster test script
+./run_mi300_cluster.sh
+```
+
+## Development Workflow
 
 1. **Model Development**: Create models that generate MLIR computation graphs
 2. **Algorithm Integration**: Implement training algorithms that combine models with autodiff
-3. **Backend Testing**: Verify GPU execution through SPIR-V bridge
-4. **Distributed Deployment**: Scale training across multiple worker nodes
+3. **Backend Testing**: Verify execution through IREE runtime on target hardware
+4. **Distributed Deployment**: Scale training across multiple worker nodes with heterogeneous hardware
 5. **Monitoring**: Use TUI dashboard for real-time training observation
 
-This documentation covers the current distributed MLIR-based training architecture. The system is designed for scalable, cross-platform ML training with real-time monitoring and GPU acceleration.
+This documentation covers the current distributed MLIR-based training architecture with IREE backend execution. The system is designed for scalable, cross-platform ML training with real-time monitoring and GPU acceleration across NVIDIA, AMD, and Apple hardware.

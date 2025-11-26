@@ -41,20 +41,44 @@ IREE handles the entire lowering pipeline from a high-level dialect to a hardwar
 ```
 .
 └── src
-    ├── algorithms/              # Distributed training algorithms and interfaces (DiLoCo).
-    ├── backends/                # Hardware execution backends (IREE, Demo).
-    ├── controllers/             # The Shepherd coordinator node.
-    ├── examples/                # Usage examples and component tests.
-    ├── mlir/                    # MLIR C-API wrappers, dialect definitions, and bridges.
-    ├── models/                  # Model definitions (GPT-2) as MLIR graphs.
-    ├── network/                 # TCP communication and messaging protocol (Cap'n Proto).
-    ├── optimizers/              # MLIR-based optimizers (Adam, Nesterov).
-    ├── autodiff.zig             # VJP-based automatic differentiation engine.
-    ├── main_distributed.zig     # Entry point for the distributed system.
-    ├── mlir.zig, mlir_ctx.zig   # Core MLIR context and API wrappers.
-    ├── ops.zig                  # MLIR operation graph-building functions.
-    ├── tensor.zig               # The symbolic Tensor data structure.
-    └── worker.zig               # The worker compute node.
+    ├── algorithms/              # Distributed training logic
+    │   ├── diloco.zig          # DiLoCo implementation (Inner/Outer loops)
+    │   └── training_algorithm.zig
+    ├── backends/                # Hardware execution backends
+    │   ├── iree.zig            # IREE runtime integration
+    │   └── worker_backend.zig  # Generic backend interface
+    ├── controllers/             # Coordination logic
+    │   └── shepherd.zig        # The Shepherd (Master node) implementation
+    ├── examples/                # Integration tests and pipelines
+    │   ├── cpu_pipeline_test.zig
+    │   ├── cuda_pipeline_test.zig
+    │   ├── rocm_pipeline_test.zig
+    │   └── ...
+    ├── mlir/                    # MLIR Dialects and C-API Wrappers
+    │   ├── dialects/
+    │   │   └── stablehlo.zig   # Safe wrappers for StableHLO ops
+    │   ├── include/            # C++ headers for MLIR integration
+    │   ├── c.zig               # Auto-generated C imports
+    │   └── pass_anchors.cpp    # Dialect registration hooks
+    ├── network/                 # Networking layer
+    │   ├── broker.zig          # Internal message routing
+    │   ├── capnp_bridge.cpp    # C++ bridge for Cap'n Proto
+    │   ├── protocol.capnp      # Protocol definition
+    │   └── tcp_stream.zig      # TCP framing and socket management
+    ├── optimizers/              # Optimizer implementations
+    │   ├── adam_mlir.zig       # AdamW implemented in MLIR (runs on Worker)
+    │   ├── nesterov.zig        # Nesterov (Host/Zig implementation)
+    │   └── nesterov_mlir.zig   # Nesterov (MLIR implementation)
+    ├── autodiff.zig             # Reverse-mode Automatic Differentiation
+    ├── backend_selection.zig   # Compile-time/Runtime backend logic
+    ├── dashboard.zig           # TUI Monitoring Dashboard
+    ├── data_loader.zig         # Tokenizer and Batching
+    ├── execution.zig           # Generic executor interfaces
+    ├── main_distributed.zig    # CLI Entry point
+    ├── mlir_ctx.zig            # MLIR Context management & Compiler invocation
+    ├── ops.zig                 # MLIR Operation Builder
+    ├── tensor.zig              # Symbolic Tensor abstraction
+    └── worker.zig              # Worker node state machine
 ```
 
 ## Building the Project
@@ -147,4 +171,126 @@ For Linux with NVIDIA GPU (testing CUDA backend):
 
 ```sh
 zig build run-cuda-pipeline-test
+```
+
+For Linux with AMD GPU (testing ROCm backend):
+
+```sh
+zig build run-rocm-pipeline-test
+```
+
+## Usage
+
+The distributed training system consists of one Shepherd (coordinator) and multiple Workers (compute nodes).
+
+### Starting the Shepherd
+
+The Shepherd coordinates training, aggregates gradients, and manages the global model state.
+
+```sh
+./zig-out/bin/main_distributed \
+  --shepherd \
+  --host 0.0.0.0 \
+  --port 8080 \
+  --workers 2 \
+  --model ./src/models/nanogpt_forward.mlir
+```
+
+**Flags:**
+- `--host`: Interface to bind to (default: 127.0.0.1)
+- `--port`: TCP port to listen on (default: 8080)
+- `--workers`: Number of workers to wait for before starting training
+- `--model`: Path to the StableHLO MLIR model file
+
+### Starting Workers
+
+Workers connect to the Shepherd, compile the MLIR graph for their specific hardware, and perform the inner training loops.
+
+#### CPU Worker
+
+```sh
+./zig-out/bin/main_distributed \
+  --worker \
+  --connect <SHEPHERD_IP>:8080 \
+  --backend cpu
+```
+
+#### NVIDIA GPU (CUDA)
+
+```sh
+./zig-out/bin/main_distributed \
+  --worker \
+  --connect <SHEPHERD_IP>:8080 \
+  --backend cuda
+```
+
+#### Apple Silicon (Metal)
+
+```sh
+./zig-out/bin/main_distributed \
+  --worker \
+  --connect <SHEPHERD_IP>:8080 \
+  --backend metal
+```
+
+#### AMD GPU (ROCm)
+
+For AMD GPUs, you must specify the target architecture using the `--amd-target` flag:
+
+- MI300X: `gfx942`
+- MI250X: `gfx90a`
+- MI210: `gfx90a`
+- MI100: `gfx908`
+
+```sh
+./zig-out/bin/main_distributed \
+  --worker \
+  --connect <SHEPHERD_IP>:8080 \
+  --backend rocm \
+  --amd-target gfx942
+```
+
+### Example: Mixed Hardware Cluster
+
+You can run workers with different hardware backends in the same training session. The Shepherd will compile separate VMFB artifacts for each unique (backend, amd_target) combination.
+
+```sh
+# Terminal 1: Start Shepherd
+./zig-out/bin/main_distributed --shepherd --workers 3
+
+# Terminal 2: CPU Worker
+./zig-out/bin/main_distributed --worker --backend cpu
+
+# Terminal 3: CUDA Worker
+./zig-out/bin/main_distributed --worker --backend cuda
+
+# Terminal 4: AMD MI300X Worker
+./zig-out/bin/main_distributed --worker --backend rocm --amd-target gfx942
+```
+
+Alternatively, use the provided test script for AMD clusters:
+
+```sh
+./run_mi300_cluster.sh
+```
+
+## Running Tests
+
+Pipeline tests verify the MLIR-to-Hardware toolchain without running a full distributed session.
+
+```sh
+# Verify CPU Pipeline
+zig build run-cpu-pipeline-test
+
+# Verify CUDA Pipeline (requires NVIDIA GPU)
+zig build run-cuda-pipeline-test
+
+# Verify ROCm Pipeline (requires AMD GPU)
+zig build run-rocm-pipeline-test
+
+# Verify Optimizer Numerics
+zig test src/examples/mlir_optimizer_test.zig
+
+# Verify Autodiff Gradients
+zig test src/examples/isolated_vjp_tests.zig
 ```

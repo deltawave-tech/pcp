@@ -34,16 +34,20 @@ pub const WorkerConnection = struct {
     last_heartbeat: i64, // timestamp
     backend: Backend,
     status: WorkerStatus,
+    address: net.Address,  // Worker's network address
+    amd_target: ?[]const u8,  // AMD GPU target architecture (e.g., gfx942 for MI300X)
 
     const Self = @This();
 
-    pub fn init(node_id: NodeId, stream: net.Stream, backend: Backend) Self {
+    pub fn init(node_id: NodeId, stream: net.Stream, backend: Backend, address: net.Address, amd_target: ?[]const u8) Self {
         return Self{
             .node_id = node_id,
             .stream = stream,
             .last_heartbeat = std.time.timestamp(),
             .backend = backend,
             .status = .Connected,
+            .address = address,
+            .amd_target = amd_target,
         };
     }
     
@@ -131,24 +135,24 @@ pub const Shepherd = struct {
         // Start accepting connections
         while (self.is_running) {
             if (self.server) |*server| {
-                const stream = server.accept() catch |err| {
+                const connection = server.accept() catch |err| {
                     std.log.err("Failed to accept connection: {}", .{err});
                     continue;
                 };
-                
-                // Handle connection in a new thread
-                const thread = std.Thread.spawn(.{}, handleWorkerConnection, .{ self, stream }) catch |err| {
+
+                // Handle connection in a new thread, passing both stream and address
+                const thread = std.Thread.spawn(.{}, handleWorkerConnection, .{ self, connection.stream, connection.address }) catch |err| {
                     std.log.err("Failed to spawn worker handler thread: {}", .{err});
-                    stream.close();
+                    connection.stream.close();
                     continue;
                 };
                 thread.detach();
             }
         }
     }
-    
+
     /// Handle a new worker connection
-    fn handleWorkerConnection(self: *Self, stream: net.Stream) !void {
+    fn handleWorkerConnection(self: *Self, stream: net.Stream, worker_address: net.Address) !void {
         defer stream.close();
         
         // Wait for JoinRequest from worker
@@ -171,20 +175,32 @@ pub const Shepherd = struct {
         // NEW: Parse the backend from the join request's data payload
         const data_obj = join_msg.data.object;
         const backend_str = data_obj.get("backend").?.string;
-        
+
         const worker_backend = if (std.mem.eql(u8, backend_str, "cuda")) backend_selection.Backend.cuda
             else if (std.mem.eql(u8, backend_str, "rocm")) backend_selection.Backend.rocm
             else if (std.mem.eql(u8, backend_str, "metal")) backend_selection.Backend.metal
             else .cpu; // Default to cpu
 
+        // Parse AMD target if present
+        const amd_target: ?[]const u8 = if (data_obj.get("amd_target")) |target_val|
+            switch (target_val) {
+                .string => |s| s,
+                else => null,
+            }
+        else
+            null;
+
         std.log.info("Worker connecting with backend: {s}", .{worker_backend.toString()});
+        if (amd_target) |target| {
+            std.log.info("  AMD target: {s}", .{target});
+        }
 
         // Assign new NodeId and add worker to pool (both protected by mutex)
         self.worker_pool_mutex.lock();
         const assigned_node_id = self.next_node_id;
         self.next_node_id += 1;
 
-        const worker = WorkerConnection.init(assigned_node_id, stream, worker_backend);
+        const worker = WorkerConnection.init(assigned_node_id, stream, worker_backend, worker_address, amd_target);
         self.worker_pool.append(worker) catch |err| {
             self.worker_pool_mutex.unlock();
             std.log.err("Failed to append worker {}: {}", .{ assigned_node_id, err });
@@ -195,6 +211,7 @@ pub const Shepherd = struct {
         const worker_count = self.worker_pool.items.len;
         self.worker_pool_mutex.unlock();
         monitoring.setWorkerCount(worker_count);
+        self.updateWorkerInfo();
 
         std.log.info("Worker {} connected", .{assigned_node_id});
         
@@ -234,6 +251,7 @@ pub const Shepherd = struct {
                 self.removeWorker(worker_id);
                 // Update monitoring after worker removal
                 monitoring.setWorkerCount(self.worker_pool.items.len);
+                self.updateWorkerInfo();
                 return;
             };
             defer msg_result.parsed.deinit();
@@ -288,6 +306,7 @@ pub const Shepherd = struct {
                 std.log.info("Worker {} disconnected", .{worker_id});
                 // Update monitoring after worker removal
                 monitoring.setWorkerCount(self.worker_pool.items.len);
+                self.updateWorkerInfo();
                 return;
             }
         }
@@ -299,7 +318,55 @@ pub const Shepherd = struct {
         defer self.worker_pool_mutex.unlock();
         return self.worker_pool.items.len;
     }
-    
+
+    /// Update worker information in monitoring system
+    pub fn updateWorkerInfo(self: *Self) void {
+        self.worker_pool_mutex.lock();
+        defer self.worker_pool_mutex.unlock();
+
+        // Create worker info array (static allocation is fine since we copy immediately)
+        var worker_info_buf: [16]monitoring.WorkerInfo = undefined;
+        var count: usize = 0;
+
+        for (self.worker_pool.items) |worker| {
+            if (count >= worker_info_buf.len) break;
+
+            // Format IP address from stored address
+            var ip_buf: [64]u8 = undefined;
+            const ip_str = std.fmt.bufPrint(&ip_buf, "{}", .{worker.address}) catch "unknown";
+
+            // Get backend and status strings
+            const backend_str = worker.backend.toString();
+            const status_str = switch (worker.status) {
+                .Connected => "Connected",
+                .GraphInitialized => "Initialized",
+                .Training => "Training",
+            };
+
+            // Create WorkerInfo with proper string copying
+            var info = monitoring.WorkerInfo{
+                .node_id = worker.node_id,
+                .backend = [_]u8{0} ** 16,
+                .backend_len = @min(backend_str.len, 16),
+                .ip_address = [_]u8{0} ** 64,
+                .ip_len = @min(ip_str.len, 64),
+                .status = [_]u8{0} ** 16,
+                .status_len = @min(status_str.len, 16),
+            };
+
+            // Copy strings into fixed buffers
+            @memcpy(info.backend[0..info.backend_len], backend_str[0..info.backend_len]);
+            @memcpy(info.ip_address[0..info.ip_len], ip_str[0..info.ip_len]);
+            @memcpy(info.status[0..info.status_len], status_str[0..info.status_len]);
+
+            worker_info_buf[count] = info;
+            count += 1;
+        }
+
+        // Update monitoring with worker info (monitoring will copy the data)
+        monitoring.setWorkerInfo(worker_info_buf[0..count]);
+    }
+
     /// Set the training algorithm
     pub fn setAlgorithm(self: *Self, algorithm: *training_algorithm.TrainingAlgorithm) void {
         self.algorithm = algorithm;
@@ -313,33 +380,6 @@ pub const Shepherd = struct {
     /// Get the executor for algorithms to use
     pub fn getExecutor(self: *Self) ?Executor {
         return self.executor;
-    }
-
-    /// Get or compile VMFB artifact for a specific backend
-    /// Caches compiled artifacts to avoid recompilation for workers with the same backend
-    pub fn getArtifact(self: *Self, backend: Backend, mlir_source: []const u8) ![]const u8 {
-        // Check if we have a cached artifact for this backend
-        if (self.compiled_artifacts.get(backend)) |vmfb| {
-            std.log.info("Using cached VMFB for backend: {s}", .{backend.toString()});
-            return vmfb;
-        }
-
-        std.log.info("Compiling VMFB for backend: {s}...", .{backend.toString()});
-
-        // Compile MLIR to VMFB for the target backend
-        const target = backend.toIreeCompilationTarget();
-        const mlir_ctx = @import("../mlir_ctx.zig");
-        const vmfb = try mlir_ctx.MLIRContext.compileToVMFBStatic(
-            self.allocator,
-            mlir_source,
-            target
-        );
-
-        // Cache the compiled artifact
-        try self.compiled_artifacts.put(backend, vmfb);
-        std.log.info("VMFB compiled and cached for backend: {s} ({} bytes)", .{backend.toString(), vmfb.len});
-
-        return vmfb;
     }
 
     /// Start training once we have enough workers

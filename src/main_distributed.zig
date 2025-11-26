@@ -31,6 +31,7 @@ const Args = struct {
     workers: usize,
     model_path: ?[]const u8,
     backend: ?backend_selection.Backend,
+    amd_target: ?[]const u8,
 
     const Mode = enum {
         shepherd,
@@ -46,6 +47,7 @@ const Args = struct {
                 .workers = 2,
                 .model_path = null,
                 .backend = null,
+                .amd_target = null,
             };
         }
 
@@ -55,6 +57,7 @@ const Args = struct {
         var workers: usize = 2;
         var model_path: ?[]const u8 = null;
         var backend: ?backend_selection.Backend = null;
+        var amd_target: ?[]const u8 = null;
 
         var i: usize = 1;
         while (i < args.len) {
@@ -114,6 +117,11 @@ const Args = struct {
                         return error.InvalidBackend;
                     }
                 }
+            } else if (std.mem.eql(u8, args[i], "--amd-target")) {
+                i += 1;
+                if (i < args.len) {
+                    amd_target = args[i];
+                }
             }
             i += 1;
         }
@@ -125,6 +133,7 @@ const Args = struct {
             .workers = workers,
             .model_path = model_path,
             .backend = backend,
+            .amd_target = amd_target,
         };
     }
 
@@ -139,6 +148,7 @@ const Args = struct {
         print("  --workers <count>    Number of workers to wait for (default: 2)\n", .{});
         print("  --model <path>       Path to MLIR model file (Shepherd only)\n", .{});
         print("  --backend <type>     Backend to use: cpu, cuda, metal, vulkan, rocm (default: auto)\n", .{});
+        print("  --amd-target <arch>  AMD GPU target architecture (e.g., gfx942 for MI300X)\n", .{});
         print("  --help               Show this help message\n", .{});
     }
 };
@@ -228,13 +238,17 @@ fn runWorker(allocator: Allocator, args: Args) !void {
     const backend = args.backend orelse backend_selection.Backend.selectDefault();
     print("   Backend: {s}\n", .{backend.toString()});
 
+    if (args.amd_target) |amd_target| {
+        print("   AMD Target: {s}\n", .{amd_target});
+    }
+
     const worker_backend_instance = try backend_selection.createWorkerBackend(allocator, backend);
 
     var worker_instance = try Worker.init(allocator, worker_backend_instance);
     defer worker_instance.deinit();
 
-    // Connect to shepherd
-    try worker_instance.connect(args.host, args.port);
+    // Connect to shepherd with AMD target info
+    try worker_instance.connect(args.host, args.port, args.amd_target);
 
     print("🌙 Connected to Shepherd with ID: {}\n", .{worker_instance.getNodeId().?});
 

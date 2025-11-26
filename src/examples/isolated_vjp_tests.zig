@@ -57,7 +57,7 @@ pub const ExecutionHelper = struct {
         defer self.allocator.free(mlir_source);
 
         // This call might fail. `try` will correctly propagate the error.
-        const vmfb_binary = try mlir_context.compileToVMFB(self.allocator, mlir_source, backend.toIreeCompilationTarget());
+        const vmfb_binary = try mlir_context.compileToVMFB(self.allocator, mlir_source, backend.toIreeCompilationTarget(), null);
         defer self.allocator.free(vmfb_binary);
 
         var iree_backend = try IreeBackend.init(self.allocator, backend);

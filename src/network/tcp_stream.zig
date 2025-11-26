@@ -128,20 +128,28 @@ pub const TcpServer = struct {
         self.listener.deinit();
     }
     
-    /// Accept a new connection and return the stream
-    pub fn accept(self: *Self) !net.Stream {
+    pub const Connection = struct {
+        stream: net.Stream,
+        address: net.Address,
+    };
+
+    /// Accept a new connection and return both the stream and address
+    pub fn accept(self: *Self) !Connection {
         const connection = try self.listener.accept();
         std.log.debug("Accepted new connection from {}", .{connection.address});
-        return connection.stream;
+        return .{
+            .stream = connection.stream,
+            .address = connection.address,
+        };
     }
     
     /// Accept connections and call handler for each one in a new thread
     pub fn acceptLoop(self: *Self, handler: *const fn (net.Stream, Allocator) anyerror!void) !void {
         while (true) {
-            const stream = try self.accept();
-            
+            const connection = try self.accept();
+
             // Spawn a new thread to handle the connection
-            const thread = try std.Thread.spawn(.{}, handler, .{ stream, self.allocator });
+            const thread = try std.Thread.spawn(.{}, handler, .{ connection.stream, self.allocator });
             thread.detach(); // Don't wait for thread to complete
         }
     }

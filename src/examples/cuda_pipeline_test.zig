@@ -34,7 +34,7 @@ pub fn main() !void {
     const target_backend = backend_selection.Backend.cuda;
     std.debug.print("Compiling MLIR to VMFB for backend: {s}...\n", .{target_backend.toIreeCompilationTarget()});
 
-    const vmfb_binary = try mlir_context.compileToVMFB(allocator, stablehlo_module_str, target_backend.toIreeCompilationTarget());
+    const vmfb_binary = try mlir_context.compileToVMFB(allocator, stablehlo_module_str, target_backend.toIreeCompilationTarget(), null);
     defer allocator.free(vmfb_binary);
     std.debug.print("✓ Compiled to VMFB artifact ({} bytes)\n", .{vmfb_binary.len});
 

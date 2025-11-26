@@ -74,13 +74,48 @@ pub const Dashboard = struct {
         drawBox("Status", 40);
         std.debug.print("  \x1b[37mWorkers Connected:\x1b[0m \x1b[32m{}\x1b[0m\n", .{metrics.workers_connected});
         std.debug.print("  \x1b[37mTraining Status:\x1b[0m  \x1b[32m{s}\x1b[0m\n", .{metrics.training_status.toString()});
-        
+
         const param_formatted = monitoring.formatBytes(metrics.total_parameters * 4); // Assume f32 params
         const param_str = try std.fmt.bufPrint(&buf, "{d:.1} {s}", .{ param_formatted.value, param_formatted.unit });
         std.debug.print("  \x1b[37mModel Size:\x1b[0m       \x1b[32m{s}\x1b[0m\n", .{param_str});
         std.debug.print("\n", .{});
-        
-        // Metrics Section  
+
+        // Workers Section
+        drawBox("Connected Workers", 80);
+        if (metrics.worker_info_count > 0) {
+            std.debug.print("  \x1b[90m┌────┬──────────┬──────────────────────────┬─────────────┐\x1b[0m\n", .{});
+            std.debug.print("  \x1b[90m│\x1b[0m \x1b[1;37mID\x1b[0m \x1b[90m│\x1b[0m \x1b[1;37mBackend\x1b[0m  \x1b[90m│\x1b[0m \x1b[1;37mIP Address\x1b[0m               \x1b[90m│\x1b[0m \x1b[1;37mStatus\x1b[0m      \x1b[90m│\x1b[0m\n", .{});
+            std.debug.print("  \x1b[90m├────┼──────────┼──────────────────────────┼─────────────┤\x1b[0m\n", .{});
+
+            for (0..metrics.worker_info_count) |i| {
+                const worker = metrics.worker_info[i];
+                const backend = worker.getBackend();
+                const ip_address = worker.getIpAddress();
+                const status = worker.getStatus();
+
+                const status_color = if (std.mem.eql(u8, status, "Training"))
+                    "\x1b[32m"  // Green for Training
+                else if (std.mem.eql(u8, status, "Initialized"))
+                    "\x1b[33m"  // Yellow for Initialized
+                else
+                    "\x1b[35m"; // Magenta for Connected
+
+                std.debug.print("  \x1b[90m│\x1b[0m \x1b[36m{d:2}\x1b[0m \x1b[90m│\x1b[0m \x1b[35m{s:<8}\x1b[0m \x1b[90m│\x1b[0m \x1b[37m{s:<24}\x1b[0m \x1b[90m│\x1b[0m {s}{s:<11}\x1b[0m \x1b[90m│\x1b[0m\n", .{
+                    worker.node_id,
+                    backend,
+                    ip_address,
+                    status_color,
+                    status,
+                });
+            }
+
+            std.debug.print("  \x1b[90m└────┴──────────┴──────────────────────────┴─────────────┘\x1b[0m\n", .{});
+        } else {
+            std.debug.print("  \x1b[90mNo workers connected yet...\x1b[0m\n", .{});
+        }
+        std.debug.print("\n", .{});
+
+        // Metrics Section
         drawBox("Metrics", 40);
         std.debug.print("  \x1b[37mOuter Loop Step:\x1b[0m  \x1b[32m{}\x1b[0m\n", .{metrics.outer_loop_step});
         

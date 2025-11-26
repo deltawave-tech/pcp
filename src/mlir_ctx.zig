@@ -119,7 +119,8 @@ pub const MLIRContext = struct {
     }
     
     /// Compiles an MLIR module to a VMFB artifact using the IREE compiler.
-    pub fn compileToVMFB(self: *Self, allocator: Allocator, mlir_source: []const u8, iree_target: []const u8) ![]u8 {
+    /// amd_target: Optional AMD GPU target architecture (e.g., "gfx942" for MI300X)
+    pub fn compileToVMFB(self: *Self, allocator: Allocator, mlir_source: []const u8, iree_target: []const u8, amd_target: ?[]const u8) ![]u8 {
         _ = self; // Not using self directly
 
         // 1. No need to serialize anymore, we already have the source!
@@ -142,19 +143,38 @@ pub const MLIRContext = struct {
         const target_arg = try std.fmt.allocPrint(allocator, "--iree-hal-target-backends={s}", .{iree_target});
         defer allocator.free(target_arg);
 
+        // Check if we need to add HIP target for ROCm/AMD GPUs
+        const is_rocm = std.mem.eql(u8, iree_target, "rocm") or std.mem.eql(u8, iree_target, "hip");
+
+        // Build argv dynamically to conditionally include HIP target
+        var argv = std.ArrayList([]const u8).init(allocator);
+        defer argv.deinit();
+
+        // Allocate HIP target argument if needed (must persist until argv is used)
+        var hip_target_arg: ?[]u8 = null;
+        defer if (hip_target_arg) |arg| allocator.free(arg);
+
+        try argv.append(iree_compile_path);
+        try argv.append(temp_mlir_path);
+        try argv.append(target_arg);
+
+        // Add HIP target for AMD GPUs if specified
+        if (is_rocm and amd_target != null) {
+            hip_target_arg = try std.fmt.allocPrint(allocator, "--iree-hip-target={s}", .{amd_target.?});
+            try argv.append(hip_target_arg.?);
+            std.log.info("Compiling for AMD target: {s}", .{amd_target.?});
+        }
+
+        // Disable vector distribution passes for CUDA to avoid distribution errors
+        // Both flags are needed to prevent the "failed to distribute" error
+        try argv.append("--iree-codegen-llvmgpu-use-vector-distribution=false");
+        try argv.append("--iree-codegen-llvmgpu-use-reduction-vector-distribution=false");
+        try argv.append("-o");
+        try argv.append(temp_vmfb_path);
+
         const result = std.process.Child.run(.{
             .allocator = allocator,
-            .argv = &.{
-                iree_compile_path,
-                temp_mlir_path,
-                target_arg,
-                // Disable vector distribution passes for CUDA to avoid distribution errors
-                // Both flags are needed to prevent the "failed to distribute" error
-                "--iree-codegen-llvmgpu-use-vector-distribution=false",
-                "--iree-codegen-llvmgpu-use-reduction-vector-distribution=false",
-                "-o",
-                temp_vmfb_path,
-            },
+            .argv = argv.items,
         }) catch |err| {
             std.log.err("Failed to execute `iree-compile`: {s}", .{@errorName(err)});
             std.log.err("Ensure IREE is built correctly in the ../iree-build directory.", .{});

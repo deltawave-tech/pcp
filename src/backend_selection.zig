@@ -132,7 +132,7 @@ const HostExecutor = struct {
 
         // 3. Compile to VMFB for CPU (llvm-cpu)
         // The Shepherd runs locally on the CPU, so we target llvm-cpu
-        const vmfb = try self.context.compileToVMFB(self.allocator, mlir_source, "llvm-cpu");
+        const vmfb = try self.context.compileToVMFB(self.allocator, mlir_source, "llvm-cpu", null);
         defer self.allocator.free(vmfb);
 
         // 4. Execute using the internal IREE backend

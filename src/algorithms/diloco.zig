@@ -317,38 +317,67 @@ pub const DiLoCo = struct {
         // 1. Wait for workers to connect (this logic is in Shepherd.startTraining,
         //    which calls this run() function. So by the time we are here, workers are present.)
 
-        // 2. Identify unique backends in the connected worker pool (protected by mutex)
-        var backend_set = std.AutoHashMap(backend_selection.Backend, void).init(self.allocator);
-        defer backend_set.deinit();
+        // 2. Identify unique (backend, amd_target) combinations in the connected worker pool
+        // We need a struct to use as a hashmap key
+        const WorkerConfig = struct {
+            backend: backend_selection.Backend,
+            amd_target: ?[]const u8,
+
+            pub fn hash(ctx: @This(), hasher: anytype) void {
+                std.hash.autoHash(hasher, ctx.backend);
+                if (ctx.amd_target) |target| {
+                    hasher.update(target);
+                }
+            }
+
+            pub fn eql(ctx: @This(), other: @This()) bool {
+                if (ctx.backend != other.backend) return false;
+                if (ctx.amd_target == null and other.amd_target == null) return true;
+                if (ctx.amd_target == null or other.amd_target == null) return false;
+                return std.mem.eql(u8, ctx.amd_target.?, other.amd_target.?);
+            }
+        };
+
+        var config_set = std.HashMap(WorkerConfig, void, std.hash_map.AutoContext(WorkerConfig), std.hash_map.default_max_load_percentage).init(self.allocator);
+        defer config_set.deinit();
 
         self.coordinator.worker_pool_mutex.lock();
         for (self.coordinator.worker_pool.items) |worker| {
-            try backend_set.put(worker.backend, {});
+            const config = WorkerConfig{
+                .backend = worker.backend,
+                .amd_target = worker.amd_target,
+            };
+            try config_set.put(config, {});
         }
         self.coordinator.worker_pool_mutex.unlock();
 
-        // 3. Compile the MLIR source once for EACH unique backend
-        var compiled_artifacts = std.AutoHashMap(backend_selection.Backend, []const u8).init(self.allocator);
+        // 3. Compile the MLIR source once for EACH unique (backend, amd_target) combination
+        var compiled_artifacts = std.HashMap(WorkerConfig, []const u8, std.hash_map.AutoContext(WorkerConfig), std.hash_map.default_max_load_percentage).init(self.allocator);
         defer {
             var it = compiled_artifacts.iterator();
             while (it.next()) |entry| self.allocator.free(entry.value_ptr.*);
             compiled_artifacts.deinit();
         }
-        
+
         var temp_mlir_ctx = try @import("../mlir_ctx.zig").MLIRContext.init(self.allocator);
         defer temp_mlir_ctx.deinit();
 
-        var backend_it = backend_set.keyIterator();
-        while (backend_it.next()) |backend_ptr| {
-            const backend = backend_ptr.*;
-            std.log.info("Compiling worker graph for backend: {s}", .{backend.toString()});
+        var config_it = config_set.keyIterator();
+        while (config_it.next()) |config_ptr| {
+            const config = config_ptr.*;
+            if (config.amd_target) |target| {
+                std.log.info("Compiling worker graph for backend: {s} with AMD target: {s}", .{config.backend.toString(), target});
+            } else {
+                std.log.info("Compiling worker graph for backend: {s}", .{config.backend.toString()});
+            }
 
             const vmfb_bytes = try temp_mlir_ctx.compileToVMFB(
                 self.allocator,
                 self.worker_graph_mlir_source,
-                backend.toIreeCompilationTarget(),
+                config.backend.toIreeCompilationTarget(),
+                config.amd_target,
             );
-            try compiled_artifacts.put(backend, vmfb_bytes);
+            try compiled_artifacts.put(config, vmfb_bytes);
         }
         
         // 4. Create the JSON payload for BOTH parameter shapes and data input shapes
@@ -384,7 +413,11 @@ pub const DiLoCo = struct {
         defer self.allocator.free(worker_list);
 
         for (worker_list) |worker| {
-            const vmfb_bytes = compiled_artifacts.get(worker.backend).?;
+            const worker_config = WorkerConfig{
+                .backend = worker.backend,
+                .amd_target = worker.amd_target,
+            };
+            const vmfb_bytes = compiled_artifacts.get(worker_config).?;
 
             const b64_len = std.base64.standard.Encoder.calcSize(vmfb_bytes.len);
             const b64_encoded_vmfb = try self.allocator.alloc(u8, b64_len);

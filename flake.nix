@@ -73,13 +73,13 @@
           nativeBuildInputs = [
             llvmPkg.libllvm.dev
             mlirPkg.dev
-            pkgs.zig
+            pkgs.zig_0_13
             pkgs.pkg-config
             llvmPkg.lld
             llvmPkg.clang-tools
             llvmPkg.bintools
             llvmPkg.libcxx.dev
-            pkgs.zig.hook
+            pkgs.zig_0_13.hook
           ] ++ lib.optionals pkgs.stdenv.isDarwin [ pkgs.apple-sdk_15 ];
           buildInputs = [
             llvmPkg.libcxx

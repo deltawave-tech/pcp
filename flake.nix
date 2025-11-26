@@ -180,6 +180,12 @@
             platforms = [ "aarch64-darwin" "x86_64-darwin" "x86_64-linux" ];
           };
         };
-        packages.stdenv = pkgsLLVM.stdenv;
+        packages.iree-amdgpu-device-libs = pkgs.fetchzip {
+          name = "iree-amdgpu-device-libs";
+          url =
+            "https://github.com/shark-infra/amdgpu-device-libs/releases/download/v20231101/amdgpu-device-libs-llvm-6086c272a3a59eb0b6b79dcbe00486bf4461856a.tgz";
+          hash = "sha256-jCv8pg3oXFVSfvgcSenwxsC/jkyN+dWTwosSAAFEvCo=";
+          stripRoot = false;
+        };
       });
 }

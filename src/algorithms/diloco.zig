@@ -443,7 +443,7 @@ pub const DiLoCo = struct {
         monitoring.setStatus(.running);
 
         // Main outer loop
-        for (0..self.config.base_config.outer_loop_steps) |_| {
+        for (0..self.config.base_config.outer_loop_steps) |step| {
             const start_time = std.time.milliTimestamp();
 
             const batch_size = 64;
@@ -461,6 +461,11 @@ pub const DiLoCo = struct {
 
             // Phase 3: Update master parameters using host-side Nesterov optimizer
             try self.updateMasterParameters(worker_results);
+
+            // Save checkpoint every 10 steps or at the end
+            if ((step + 1) % 10 == 0 or (step + 1) == self.config.base_config.outer_loop_steps) {
+                try self.saveCheckpoint(step + 1);
+            }
 
             // Update metrics
             self.metrics.outer_loop_count += 1;
@@ -576,6 +581,47 @@ pub const DiLoCo = struct {
 
         // 5. Return a duplicate of the data for the caller to own
         return result;
+    }
+
+    /// Save current master parameters to a binary file
+    fn saveCheckpoint(self: *Self, step: usize) !void {
+        var path_buf: [64]u8 = undefined;
+        const path = try std.fmt.bufPrint(&path_buf, "checkpoint_{d}.bin", .{step});
+
+        std.log.info("Saving checkpoint to {s}...", .{path});
+        const file = try std.fs.cwd().createFile(path, .{});
+        defer file.close();
+        var writer = file.writer();
+
+        // 1. Header
+        try writer.writeAll("PCPCHECK");
+        try writer.writeInt(u32, 1, .little); // Version
+
+        if (self.master_parameters) |params| {
+            // 2. Number of tensors
+            try writer.writeInt(u32, @intCast(params.len), .little);
+
+            for (params) |t| {
+                // 3a. Write Shape info
+                const rank = t.shape.rank();
+                try writer.writeInt(u8, @intCast(rank), .little);
+
+                const dims = try t.shape.getDims(self.allocator);
+                defer self.allocator.free(dims);
+                for (dims) |d| {
+                    try writer.writeInt(i64, d, .little);
+                }
+
+                // 3b. Write Data
+                const raw_bytes = try self.extractTensorData(t);
+                defer self.allocator.free(raw_bytes);
+
+                // Write size of data block followed by data
+                try writer.writeInt(u64, @intCast(raw_bytes.len), .little);
+                try writer.writeAll(raw_bytes);
+            }
+        }
+        std.log.info("✓ Checkpoint saved.", .{});
     }
 
     /// Build the complete worker training graph as MLIR module using loaded .mlir file

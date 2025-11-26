@@ -719,8 +719,8 @@ pub fn log(ctx: mlir.Context, operand: mlir.Value, loc: mlir.Location) mlir.Oper
 }
 
 /// Creates a stablehlo.sqrt operation
-pub fn sqrt(ctx: mlir.Context, operand: mlir.Value, loc: mlir.Location) mlir.Operation {
-    return mlir.Operation.create(ctx, "stablehlo.sqrt", .{
+pub fn sqrt(allocator: std.mem.Allocator, ctx: mlir.Context, operand: mlir.Value, loc: mlir.Location) !mlir.Operation {
+    return try mlir.Operation.create(allocator, ctx, "stablehlo.sqrt", .{
         .operands = &.{operand},
         .results = &.{operand.getType()},
         .location = loc,
@@ -728,8 +728,8 @@ pub fn sqrt(ctx: mlir.Context, operand: mlir.Value, loc: mlir.Location) mlir.Ope
 }
 
 /// Creates a stablehlo.power operation
-pub fn power(ctx: mlir.Context, lhs: mlir.Value, rhs: mlir.Value, loc: mlir.Location) mlir.Operation {
-    return mlir.Operation.create(ctx, "stablehlo.power", .{
+pub fn power(allocator: std.mem.Allocator, ctx: mlir.Context, lhs: mlir.Value, rhs: mlir.Value, loc: mlir.Location) !mlir.Operation {
+    return try mlir.Operation.create(allocator, ctx, "stablehlo.power", .{
         .operands = &.{ lhs, rhs },
         .results = &.{lhs.getType()},
         .location = loc,
@@ -746,24 +746,24 @@ pub fn tanh(ctx: mlir.Context, operand: mlir.Value, loc: mlir.Location) mlir.Ope
 }
 
 /// Creates a stablehlo.slice operation
-pub fn slice(ctx: mlir.Context, operand: mlir.Value, start_indices: []const i64, limit_indices: []const i64, strides: []const i64, loc: mlir.Location) mlir.Operation {
+pub fn slice(allocator: std.mem.Allocator, ctx: mlir.Context, operand: mlir.Value, start_indices: []const i64, limit_indices: []const i64, strides: []const i64, loc: mlir.Location) !mlir.Operation {
     const start_attr = mlir.Attribute.denseI64ArrayAttr(ctx, start_indices);
     const limit_attr = mlir.Attribute.denseI64ArrayAttr(ctx, limit_indices);
     const strides_attr = mlir.Attribute.denseI64ArrayAttr(ctx, strides);
-    
+
     // Calculate result shape
     const input_type = operand.getType().as(mlir.RankedTensorType) orelse unreachable;
-    var result_dims = std.ArrayList(i64).init(std.heap.page_allocator);
+    var result_dims = std.ArrayList(i64).init(allocator);
     defer result_dims.deinit();
-    
+
     for (start_indices, limit_indices, strides) |start, limit, stride| {
         const dim_size = @divFloor(limit - start + stride - 1, stride);
-        result_dims.append(dim_size) catch unreachable;
+        try result_dims.append(dim_size);
     }
-    
+
     const result_type = mlir.Type.tensor(result_dims.items, input_type.getElementType());
-    
-    return mlir.Operation.create(ctx, "stablehlo.slice", .{
+
+    return mlir.Operation.create(allocator, ctx, "stablehlo.slice", .{
         .operands = &.{operand},
         .results = &.{result_type},
         .attributes = &.{

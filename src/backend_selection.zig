@@ -40,7 +40,7 @@ pub const Backend = enum {
     pub fn selectDefault() Backend {
         return switch (builtin.os.tag) {
             .macos, .ios => .metal,
-            .linux => .cuda, // Assume CUDA availability on Linux
+            .linux => .cpu, // Testing CPU backend to isolate CUDA runtime issue
             else => .cpu,
         };
     }

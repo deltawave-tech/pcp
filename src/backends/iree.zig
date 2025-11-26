@@ -126,15 +126,27 @@ pub const IreeBackend = struct {
         input_shapes: [][]const i64,
         input_dtypes: ?[]const DType
     ) ![][]u8 {
-        // 1. Load the .vmfb module into the session
-        // NOTE: In a real app, you would load this once and cache it. For now, we load it on every call.
+        // 1. Create a fresh session for this execution to avoid module accumulation
+        var temp_session: ?*c.iree_runtime_session_t = null;
+        var session_options: c.iree_runtime_session_options_t = undefined;
+        c.iree_runtime_session_options_initialize(&session_options);
+        try ireeCheck(c.iree_runtime_session_create_with_device(
+            self.instance.?,
+            &session_options,
+            self.device.?,
+            c.iree_runtime_instance_host_allocator(self.instance.?),
+            &temp_session,
+        ));
+        defer c.iree_runtime_session_release(temp_session.?);
+
+        // 2. Load the .vmfb module into the temporary session
         try ireeCheck(c.iree_runtime_session_append_bytecode_module_from_memory(
-            self.session.?,
+            temp_session.?,
             .{ .data = vmfb_bytes.ptr, .data_length = vmfb_bytes.len },
             c.iree_allocator_null(), // We don't own the flatbuffer data
         ));
 
-        // 2. Initialize a call to the specified function
+        // 3. Initialize a call to the specified function
         var call: c.iree_runtime_call_t = undefined;
 
         // IREE expects the format "module.<function_name>"
@@ -142,7 +154,7 @@ pub const IreeBackend = struct {
         defer self.allocator.free(full_fn_name);
 
         const fn_name_view = c.iree_string_view_t{ .data = full_fn_name.ptr, .size = full_fn_name.len };
-        try ireeCheck(c.iree_runtime_call_initialize_by_name(self.session.?, fn_name_view, &call));
+        try ireeCheck(c.iree_runtime_call_initialize_by_name(temp_session.?, fn_name_view, &call));
         defer c.iree_runtime_call_deinitialize(&call);
 
         // 3. Create IREE buffer views from input data using the simpler allocate_buffer_copy API
@@ -162,8 +174,8 @@ pub const IreeBackend = struct {
             // Create buffer view directly from data - much simpler than manual mapping!
             var buffer_view: ?*c.iree_hal_buffer_view_t = null;
             try ireeCheck(c.iree_hal_buffer_view_allocate_buffer_copy(
-                c.iree_runtime_session_device(self.session.?),
-                c.iree_runtime_session_device_allocator(self.session.?),
+                c.iree_runtime_session_device(temp_session.?),
+                c.iree_runtime_session_device_allocator(temp_session.?),
                 @intCast(shape_slice.len),
                 iree_shape.ptr,
                 element_type, // Use dynamic type
@@ -195,6 +207,7 @@ pub const IreeBackend = struct {
         
         const outputs = c.iree_runtime_call_outputs(&call);
         const output_count = c.iree_vm_list_size(outputs);
+        std.debug.print("[DEBUG] IREE execution completed. Output count: {}\n", .{output_count});
         var i: c.iree_host_size_t = 0;
         while (i < output_count) : (i += 1) {
             var output_buffer_view: ?*c.iree_hal_buffer_view_t = null;
@@ -204,11 +217,12 @@ pub const IreeBackend = struct {
             // Get the buffer from the view and copy its data
             const output_buffer = c.iree_hal_buffer_view_buffer(output_buffer_view.?);
             const buffer_byte_length = c.iree_hal_buffer_byte_length(output_buffer);
+            std.debug.print("[DEBUG] Output {}: buffer_byte_length = {} bytes\n", .{i, buffer_byte_length});
             
             // Allocate output data and read from buffer
             const output_data = try self.allocator.alloc(u8, @intCast(buffer_byte_length));
             try ireeCheck(c.iree_hal_device_transfer_d2h(
-                c.iree_runtime_session_device(self.session.?),
+                c.iree_runtime_session_device(temp_session.?),
                 output_buffer,
                 0, // source_offset
                 output_data.ptr, // target_buffer
@@ -230,6 +244,7 @@ pub const IreeBackend = struct {
             .ptr = self,
             .vtable = &.{
                 .executeTrainingStep = executeTrainingStepInterface,
+                .getBackendType = getBackendTypeInterface,
                 .deinit = deinitInterface,
             },
         };
@@ -237,9 +252,27 @@ pub const IreeBackend = struct {
 
     fn executeTrainingStepInterface(ptr: *anyopaque, artifact: []const u8, data: [][]const u8, shapes: [][]const i64) anyerror![][]u8 {
         const self: *Self = @ptrCast(@alignCast(ptr));
-        // Note: In the future, the worker protocol should include type info.
-        // For now, assuming f32 defaults in the interface is consistent with previous behavior.
-        return self.execute(artifact, "main", data, shapes, null);
+
+        // Assign dtypes for the new AdamW worker graph signature:
+        // [Params (N x f32), M_states (N x f32), V_states (N x f32), Timestep (1 x f32), Data (2 x i64)]
+        var dtypes = try self.allocator.alloc(DType, data.len);
+        defer self.allocator.free(dtypes);
+
+        // All inputs except last 2 are f32 (params, M states, V states, timestep)
+        for (0..data.len) |i| {
+            if (i >= data.len - 2) {
+                dtypes[i] = .i64; // Last 2 are i64 data inputs
+            } else {
+                dtypes[i] = .f32; // Everything else is f32
+            }
+        }
+
+        return self.execute(artifact, "main", data, shapes, dtypes);
+    }
+
+    fn getBackendTypeInterface(ptr: *anyopaque) backend_selection.Backend {
+        const self: *Self = @ptrCast(@alignCast(ptr));
+        return self.backend;
     }
 
     fn deinitInterface(ptr: *anyopaque) void {

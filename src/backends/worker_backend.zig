@@ -1,4 +1,5 @@
 const std = @import("std");
+const backend_selection = @import("../backend_selection.zig");
 
 /// Generic worker backend interface for executing compiled training artifacts.
 /// This interface is completely MLIR-agnostic.
@@ -18,7 +19,10 @@ pub const WorkerBackend = struct {
             inputs_data: [][]const u8,
             input_shapes: [][]const i64,
         ) anyerror![][]u8,
-        
+
+        /// Get the backend type
+        getBackendType: *const fn(ptr: *anyopaque) backend_selection.Backend,
+
         /// Clean up backend resources.
         deinit: *const fn(ptr: *anyopaque) void,
     };
@@ -27,7 +31,12 @@ pub const WorkerBackend = struct {
     pub fn executeTrainingStep(self: WorkerBackend, artifact: []const u8, data: [][]const u8, shapes: [][]const i64) ![][]u8 {
         return self.vtable.executeTrainingStep(self.ptr, artifact, data, shapes);
     }
-    
+
+    /// Get the backend type
+    pub fn getBackendType(self: WorkerBackend) backend_selection.Backend {
+        return self.vtable.getBackendType(self.ptr);
+    }
+
     /// Clean up backend resources
     pub fn deinit(self: WorkerBackend) void {
         self.vtable.deinit(self.ptr);

@@ -103,12 +103,12 @@
 
         packages.iree-sdk = llvmPkg.stdenv.mkDerivation rec {
           pname = "iree-sdk";
-          version = "3.8.0";
+          version = "3.9.0";
           src = pkgs.fetchFromGitHub {
             owner = "iree-org";
             repo = "iree";
             rev = "v${version}";
-            hash = "sha256-G7fPelraUhiXc/rJSr7J2OAaVSLggvghsSAoaGuGrxc=";
+            hash = "sha256-O+yp6ysHQJKlgLnoK1esGdRmce6M4nPgFTsxEck0xw0=";
             fetchSubmodules = true;
           };
           nativeBuildInputs =

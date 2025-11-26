@@ -302,8 +302,6 @@ fn addIreeDependencies(target: *std.Build.Step.Compile, b: *std.Build, iree_conf
     target.addLibraryPath(.{ .cwd_relative = b.fmt("{s}/runtime/src/iree/hal/drivers/local_sync", .{build_dir}) });
     target.addLibraryPath(.{ .cwd_relative = b.fmt("{s}/runtime/src/iree/hal/drivers/local_sync/registration", .{build_dir}) });
     target.addLibraryPath(.{ .cwd_relative = b.fmt("{s}/runtime/src/iree/hal/drivers", .{build_dir}) });
-    target.addLibraryPath(.{ .cwd_relative = b.fmt("{s}/runtime/src/iree/hal/drivers/metal", .{build_dir}) });
-    target.addLibraryPath(.{ .cwd_relative = b.fmt("{s}/runtime/src/iree/hal/drivers/metal/registration", .{build_dir}) });
 
     // --- Build and Link C++ Dialect Anchors ---
     const dialect_anchors_lib = b.addStaticLibrary(.{

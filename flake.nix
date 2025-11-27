@@ -90,6 +90,7 @@
             packages.iree-sdk.src
             packages.iree-sdk.build
           ];
+          propagatedBuildInputs = [ pkgs.cudaPackages.cuda_cudart pkgs.glibc ];
           dontConfigure = true;
           doCheck = true;
           zigBuildFlags = [ "--verbose" "--color" "off" ];
@@ -98,6 +99,18 @@
           CAPNP_DIR = "${pkgs.capnproto}";
           IREE_SOURCE_DIR = "${packages.iree-sdk.src}";
           IREE_BUILD_DIR = "${packages.iree-sdk.build}";
+
+          postFixup = ''
+            # TODO Come up with something better here. -- IREE needs to load libcuda.so.  On
+            # non-NixOS systems this is most probably installed as a system package and not via
+            # the nix-store.  Thus, we somehow have to inject the library search path into.  IREE
+            # internally simply uses `dlopen("libcuda.so")`.  The only workable way I could find is
+            # manipulating the rpath.
+
+            # glibc is a dependency of libcuda.so
+            patchelf --add-rpath ${pkgs.glibc}/lib $out/bin/main_distributed
+            patchelf --add-rpath /lib/x86_64-linux-gnu $out/bin/main_distributed
+          '';
         };
         checks.pcp = packages.pcp;
 

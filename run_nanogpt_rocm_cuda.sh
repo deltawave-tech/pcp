@@ -36,8 +36,8 @@ fi
 
 # Path to the executable
 EXE="./zig-out/bin/pcp"
-# Use the nano GPT model
-MODEL_PATH="models/nano_stablehlo.mlir"
+# Use the GPU-aligned nano GPT model
+MODEL_PATH="models/nanogpt_forward_32.mlir"
 
 if [ ! -f "$MODEL_PATH" ]; then
     echo "💣 Error: Model file $MODEL_PATH not found."

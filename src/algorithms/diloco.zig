@@ -827,7 +827,16 @@ pub const DiLoCo = struct {
         }
         std.log.info("✓ Final module verification successful!", .{});
 
-        return try @import("../mlir/context.zig").serializeMLIRModule(self.allocator, builder.module);
+        // === DUMP MLIR TO FILE FOR DEBUGGING ===
+        const serialized_mlir = try @import("../mlir/context.zig").serializeMLIRModule(self.allocator, builder.module);
+
+        // Write the MLIR to project root as worker_graph_after_autodiff.mlir
+        const mlir_dump_path = "worker_graph_after_autodiff.mlir";
+        std.log.info("Dumping MLIR to {s} for analysis...", .{mlir_dump_path});
+        try std.fs.cwd().writeFile(.{ .sub_path = mlir_dump_path, .data = serialized_mlir });
+        std.log.info("✓ MLIR dumped to {s}", .{mlir_dump_path});
+
+        return serialized_mlir;
     }
 
 

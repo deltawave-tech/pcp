@@ -251,13 +251,8 @@ fn runWorker(allocator: Allocator, args: Args) !void {
     var worker_instance = try Worker.init(allocator, worker_backend_instance);
     defer worker_instance.deinit();
 
-    // Connect to shepherd with AMD target info
-    try worker_instance.connect(args.host, args.port, args.amd_target);
-
-    print("🌙 Connected to Shepherd with ID: {}\n", .{worker_instance.getNodeId().?});
-
-    // Start worker main loop
-    try worker_instance.run();
+    // Start worker main loop with automatic reconnection
+    try worker_instance.runRobust(args.host, args.port, args.amd_target);
 
     print("💀 Worker shutting down\n", .{});
 }

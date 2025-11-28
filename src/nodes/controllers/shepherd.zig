@@ -459,36 +459,53 @@ pub const Shepherd = struct {
         }
         return error.WorkerNotFound;
     }
+
+    /// Snapshot of currently connected workers for the current training round
+    pub fn snapshotWorkers(self: *Self) !ArrayList(WorkerConnection) {
+        self.worker_pool_mutex.lock();
+        defer self.worker_pool_mutex.unlock();
+
+        var snapshot = ArrayList(WorkerConnection).init(self.allocator);
+        for (self.worker_pool.items) |worker| {
+            try snapshot.append(worker);
+        }
+        return snapshot;
+    }
+
+    /// Update worker status
+    pub fn setWorkerStatus(self: *Self, node_id: NodeId, status: WorkerStatus) void {
+        self.worker_pool_mutex.lock();
+        defer self.worker_pool_mutex.unlock();
+        for (self.worker_pool.items) |*w| {
+            if (w.node_id == node_id) {
+                w.status = status;
+                return;
+            }
+        }
+    }
     
-    /// Collect responses from all workers
-    pub fn collectFromWorkers(self: *Self, expected_msg_type: []const u8) !ArrayList(MessageEnvelope) {
-        std.log.info("Collecting results...", .{});
+    /// Collect responses from a specific number of workers
+    pub fn collectFromWorkers(self: *Self, expected_msg_type: []const u8, expected_count: usize) !ArrayList(MessageEnvelope) {
+        std.log.info("Collecting results (expecting {})...", .{expected_count});
 
         const max_wait_seconds: i64 = 3600;
         const start_time = std.time.timestamp();
 
         while (true) {
-            // Check active worker count dynamically to handle disconnections
-            self.worker_pool_mutex.lock();
-            const active_workers = self.worker_pool.items.len;
-            self.worker_pool_mutex.unlock();
-
             self.result_queue_mutex.lock();
             const current_results = self.result_queue.items.len;
             self.result_queue_mutex.unlock();
 
-            if (current_results >= active_workers and active_workers > 0) {
+            if (current_results >= expected_count) {
                 break;
-            }
-
-            if (active_workers == 0) {
-                return error.AllWorkersLost;
             }
 
             const elapsed = std.time.timestamp() - start_time;
             if (elapsed > max_wait_seconds) {
-                std.log.err("Timeout waiting for worker results: got {}/{} after {} seconds",
-                    .{current_results, active_workers, elapsed});
+                if (current_results > 0) {
+                    std.log.warn("Timeout waiting for all results. Proceeding with {}/{}", .{current_results, expected_count});
+                    break;
+                }
                 return error.CollectionTimeout;
             }
 
@@ -500,16 +517,18 @@ pub const Shepherd = struct {
 
         var responses = ArrayList(MessageEnvelope).init(self.allocator);
 
-        for (self.result_queue.items) |msg| {
-            if (!std.mem.eql(u8, msg.msg_type, expected_msg_type)) {
-                std.log.warn("Unexpected message type: {s}, expected: {s}",
-                    .{msg.msg_type, expected_msg_type});
-                continue;
+        var i: usize = 0;
+        while (i < self.result_queue.items.len) {
+            const msg = self.result_queue.items[i];
+            if (std.mem.eql(u8, msg.msg_type, expected_msg_type)) {
+                try responses.append(msg);
+                _ = self.result_queue.orderedRemove(i);
+            } else {
+                i += 1;
             }
-            try responses.append(msg);
-        }
 
-        self.result_queue.clearRetainingCapacity();
+            if (responses.items.len == expected_count) break;
+        }
 
         std.log.info("Collected {} results from workers", .{responses.items.len});
         return responses;

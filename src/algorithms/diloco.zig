@@ -52,6 +52,26 @@ pub const DiLoCoConfig = struct {
     }
 };
 
+/// Worker configuration identifier for compiled artifacts
+const WorkerConfig = struct {
+    backend: backend_selection.Backend,
+    amd_target: ?[]const u8,
+
+    pub fn hash(ctx: @This(), hasher: anytype) void {
+        std.hash.autoHash(hasher, ctx.backend);
+        if (ctx.amd_target) |target| {
+            hasher.update(target);
+        }
+    }
+
+    pub fn eql(ctx: @This(), other: @This()) bool {
+        if (ctx.backend != other.backend) return false;
+        if (ctx.amd_target == null and other.amd_target == null) return true;
+        if (ctx.amd_target == null or other.amd_target == null) return false;
+        return std.mem.eql(u8, ctx.amd_target.?, other.amd_target.?);
+    }
+};
+
 /// DiLoCo algorithm implementation with real MLIR optimizers
 /// Now backend-agnostic using the generic Executor interface
 pub const DiLoCo = struct {
@@ -318,26 +338,6 @@ pub const DiLoCo = struct {
         //    which calls this run() function. So by the time we are here, workers are present.)
 
         // 2. Identify unique (backend, amd_target) combinations in the connected worker pool
-        // We need a struct to use as a hashmap key
-        const WorkerConfig = struct {
-            backend: backend_selection.Backend,
-            amd_target: ?[]const u8,
-
-            pub fn hash(ctx: @This(), hasher: anytype) void {
-                std.hash.autoHash(hasher, ctx.backend);
-                if (ctx.amd_target) |target| {
-                    hasher.update(target);
-                }
-            }
-
-            pub fn eql(ctx: @This(), other: @This()) bool {
-                if (ctx.backend != other.backend) return false;
-                if (ctx.amd_target == null and other.amd_target == null) return true;
-                if (ctx.amd_target == null or other.amd_target == null) return false;
-                return std.mem.eql(u8, ctx.amd_target.?, other.amd_target.?);
-            }
-        };
-
         var config_set = std.HashMap(WorkerConfig, void, std.hash_map.AutoContext(WorkerConfig), std.hash_map.default_max_load_percentage).init(self.allocator);
         defer config_set.deinit();
 
@@ -442,9 +442,22 @@ pub const DiLoCo = struct {
         self.status = .running;
         monitoring.setStatus(.running);
 
-        // Main outer loop
+        // Main outer loop with snapshot-based dynamic topology
         for (0..self.config.base_config.outer_loop_steps) |step| {
             const start_time = std.time.milliTimestamp();
+
+            // Take snapshot of currently connected workers
+            const participants = try self.coordinator.snapshotWorkers();
+            defer participants.deinit();
+
+            if (participants.items.len == 0) {
+                std.log.warn("No workers connected. Waiting...", .{});
+                std.time.sleep(1 * std.time.ns_per_s);
+                continue;
+            }
+
+            // Initialize any new workers that haven't received the graph yet
+            try self.initializeNewWorkers(participants.items);
 
             const batch_size = 64;
             const block_size = 8;
@@ -452,14 +465,19 @@ pub const DiLoCo = struct {
             defer self.allocator.free(batch.x);
             defer self.allocator.free(batch.y);
 
-            // Phase 1: Broadcast master parameters and data batch to all workers
-            try self.broadcastMasterParametersAndBatch(batch);
+            // Broadcast to snapshot participants only
+            try self.broadcastToSnapshot(participants.items, batch);
 
-            // Phase 2: Collect results from workers after inner loop
-            const worker_results = try self.collectWorkerResults();
+            // Collect from snapshot participants only
+            const worker_results = try self.collectFromSnapshot(participants.items);
             defer self.cleanupWorkerResults(worker_results);
 
-            // Phase 3: Update master parameters using host-side Nesterov optimizer
+            if (worker_results.items.len == 0) {
+                std.log.warn("Round {} failed: No results received. Skipping update.", .{step});
+                continue;
+            }
+
+            // Update master parameters using host-side Nesterov optimizer
             try self.updateMasterParameters(worker_results);
 
             // Save checkpoint every 10 steps or at the end
@@ -967,9 +985,158 @@ pub const DiLoCo = struct {
         try self.coordinator.broadcastToWorkers(MessageType.START_INNER_LOOP, json_payload);
     }
 
+    /// Initialize any new workers in the snapshot that need the graph
+    fn initializeNewWorkers(self: *Self, workers: []const shepherd.WorkerConnection) !void {
+        for (workers) |worker| {
+            if (worker.status == .Connected) {
+                std.log.info("Initializing new worker {} (Backend: {s})...", .{worker.node_id, worker.backend.toString()});
+
+                // Get compiled artifact for this worker's backend
+                const worker_config = WorkerConfig{
+                    .backend = worker.backend,
+                    .amd_target = worker.amd_target,
+                };
+                const vmfb_bytes = self.coordinator.compiled_artifacts.get(worker_config) orelse return error.VMFBNotFound;
+
+                const b64_len = std.base64.standard.Encoder.calcSize(vmfb_bytes.len);
+                const b64_encoded_vmfb = try self.allocator.alloc(u8, b64_len);
+                defer self.allocator.free(b64_encoded_vmfb);
+
+                const encoded_len = std.base64.standard.Encoder.encode(b64_encoded_vmfb, vmfb_bytes).len;
+
+                // Create JSON payload with VMFB and shapes
+                var param_shape_array = std.json.Array.init(self.allocator);
+                defer param_shape_array.deinit();
+                for (self.parameter_shapes) |shape_slice| {
+                    var dim_array = std.json.Array.init(self.allocator);
+                    for (shape_slice) |dim| {
+                        try dim_array.append(std.json.Value{ .integer = dim });
+                    }
+                    try param_shape_array.append(std.json.Value{ .array = dim_array });
+                }
+
+                var data_shape_array = std.json.Array.init(self.allocator);
+                defer data_shape_array.deinit();
+                for (self.data_input_shapes) |shape_slice| {
+                    var dim_array = std.json.Array.init(self.allocator);
+                    for (shape_slice) |dim| {
+                        try dim_array.append(std.json.Value{ .integer = dim });
+                    }
+                    try data_shape_array.append(std.json.Value{ .array = dim_array });
+                }
+
+                var payload = std.json.ObjectMap.init(self.allocator);
+                defer payload.deinit();
+                try payload.put("vmfb", std.json.Value{ .string = b64_encoded_vmfb[0..encoded_len] });
+                try payload.put("parameter_shapes", std.json.Value{ .array = param_shape_array });
+                try payload.put("data_input_shapes", std.json.Value{ .array = data_shape_array });
+
+                try self.coordinator.sendToWorker(worker.node_id, MessageType.INITIALIZE_GRAPH, .{ .object = payload });
+                self.coordinator.setWorkerStatus(worker.node_id, .GraphInitialized);
+            }
+        }
+    }
+
+    /// Broadcast to snapshot participants only
+    fn broadcastToSnapshot(self: *Self, workers: []const shepherd.WorkerConnection, batch: data_loader.Batch) !void {
+        if (self.master_parameters == null) {
+            return error.ParametersNotInitialized;
+        }
+
+        const param_tensors = self.master_parameters.?;
+
+        // Extract and concatenate all parameter tensor data
+        var total_param_bytes = ArrayList(u8).init(self.allocator);
+        defer total_param_bytes.deinit();
+
+        for (param_tensors) |param_tensor| {
+            const tensor_data = try self.extractTensorData(param_tensor);
+            defer self.allocator.free(tensor_data);
+            try total_param_bytes.appendSlice(tensor_data);
+        }
+
+        // Convert u32 batch data to i64 for IREE
+        const input_ids_i64 = try self.allocator.alloc(i64, batch.x.len);
+        defer self.allocator.free(input_ids_i64);
+        for (batch.x, 0..) |val, i| input_ids_i64[i] = @intCast(val);
+
+        const targets_i64 = try self.allocator.alloc(i64, batch.y.len);
+        defer self.allocator.free(targets_i64);
+        for (batch.y, 0..) |val, i| targets_i64[i] = @intCast(val);
+
+        const input_ids_bytes = std.mem.sliceAsBytes(input_ids_i64);
+        const targets_bytes = std.mem.sliceAsBytes(targets_i64);
+
+        const worker_payload = binary_protocol.WorkerPayload{
+            .params = total_param_bytes.items,
+            .input_ids = input_ids_bytes,
+            .targets = targets_bytes,
+        };
+
+        const capnp_bytes = try worker_payload.serialize(self.allocator);
+        defer self.allocator.free(capnp_bytes);
+
+        const b64_len = std.base64.standard.Encoder.calcSize(capnp_bytes.len);
+        const b64_encoded_payload = try self.allocator.alloc(u8, b64_len);
+        defer self.allocator.free(b64_encoded_payload);
+
+        const encoded_len = std.base64.standard.Encoder.encode(b64_encoded_payload, capnp_bytes).len;
+        const json_payload = std.json.Value{ .string = b64_encoded_payload[0..encoded_len] };
+
+        // Send to each worker in the snapshot
+        for (workers) |worker| {
+            self.coordinator.sendToWorker(worker.node_id, MessageType.START_INNER_LOOP, json_payload) catch |err| {
+                std.log.err("Failed to send task to worker {}: {}", .{worker.node_id, err});
+            };
+        }
+    }
+
+    /// Collect results from snapshot participants only
+    fn collectFromSnapshot(self: *Self, participants: []const shepherd.WorkerConnection) !ArrayList(WorkerResult) {
+        const responses = try self.coordinator.collectFromWorkers(MessageType.INNER_LOOP_COMPLETE, participants.len);
+        defer {
+            for (responses.items) |*msg| {
+                msg.deinitClone(self.allocator);
+            }
+            responses.deinit();
+        }
+
+        var results = ArrayList(WorkerResult).init(self.allocator);
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+
+        for (responses.items) |response| {
+            const b64_encoded_payload = switch (response.data) {
+                .string => |s| s,
+                else => return error.InvalidMessageFormat,
+            };
+
+            const capnp_len = try std.base64.standard.Decoder.calcSizeForSlice(b64_encoded_payload);
+            const capnp_bytes = try arena.allocator().alloc(u8, capnp_len);
+            try std.base64.standard.Decoder.decode(capnp_bytes, b64_encoded_payload);
+
+            const reader = try binary_protocol.ShepherdPayload.Reader.init(capnp_bytes);
+            defer reader.deinit();
+
+            const params_bytes = try reader.getUpdatedParams();
+            const loss_value = try reader.getLoss();
+
+            const result = WorkerResult{
+                .node_id = response.sender_node,
+                .parameter_bytes = try self.allocator.dupe(u8, params_bytes),
+                .loss = loss_value,
+                .steps_completed = self.config.tau,
+            };
+            try results.append(result);
+        }
+
+        return results;
+    }
+
     /// Collect results from workers after inner loop using Cap'n Proto
     fn collectWorkerResults(self: *Self) !ArrayList(WorkerResult) {
-        const responses = try self.coordinator.collectFromWorkers(MessageType.INNER_LOOP_COMPLETE);
+        const worker_count = self.coordinator.getWorkerCount();
+        const responses = try self.coordinator.collectFromWorkers(MessageType.INNER_LOOP_COMPLETE, worker_count);
         defer {
             // Clean up cloned messages
             for (responses.items) |*msg| {

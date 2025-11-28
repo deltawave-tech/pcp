@@ -159,9 +159,9 @@ pub const Worker = struct {
         if (self.state != .connected) {
             return error.NotConnected;
         }
-        
+
         std.log.info("Worker {} entering main loop", .{self.node_id.?});
-        
+
         while (self.is_running) {
             // Receive command from Shepherd
             const receive_result = self.client.receive() catch |err| {
@@ -172,7 +172,7 @@ pub const Worker = struct {
             defer receive_result.parsed.deinit();
             defer self.allocator.free(receive_result.buffer); // Free the buffer
             const msg = receive_result.parsed.value;
-            
+
             // Handle different message types
             if (std.mem.eql(u8, msg.msg_type, MessageType.INITIALIZE_GRAPH)) {
                 try self.handleInitializeGraph(msg);
@@ -185,8 +185,41 @@ pub const Worker = struct {
                 std.log.warn("Unknown message type: {s}", .{msg.msg_type});
             }
         }
-        
+
         std.log.info("Worker {} exiting main loop", .{self.node_id.?});
+    }
+
+    /// Robust entry point with automatic reconnection on failure
+    pub fn runRobust(self: *Self, host: []const u8, port: u16, amd_target: ?[]const u8) !void {
+        var backoff_ms: u64 = 100;
+        const max_backoff_ms: u64 = 10000;
+
+        while (true) {
+            self.connect(host, port, amd_target) catch |err| {
+                std.log.warn("Failed to connect to Shepherd: {}. Retrying in {}ms...", .{ err, backoff_ms });
+                std.time.sleep(backoff_ms * std.time.ns_per_ms);
+                backoff_ms = @min(backoff_ms * 2, max_backoff_ms);
+                continue;
+            };
+
+            backoff_ms = 100;
+            std.log.info("Worker connected and running...", .{});
+
+            self.run() catch |err| {
+                std.log.err("Worker loop error: {}", .{err});
+            };
+
+            if (self.state == .shutting_down) {
+                std.log.info("Worker received shutdown signal. Exiting.", .{});
+                break;
+            }
+
+            std.log.warn("Connection lost. Cleaning up and reconnecting...", .{});
+
+            self.client.deinit();
+            self.client = TcpClient.init(self.allocator);
+            self.state = .disconnected;
+        }
     }
     
     /// Handles the one-time setup message, caching the VMFB binary and shapes

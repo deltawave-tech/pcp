@@ -45,6 +45,7 @@ SPIRV-Cross/
 
 # Data files (not tracked)
 data/
+checkpoint_*.bin
 
 # Nix artifacts
 result

@@ -72,6 +72,7 @@
           version = "main";
           src = ./.;
           nativeBuildInputs = [
+            pkgs.makeWrapper
             llvmPkg.libllvm.dev
             mlirPkg.dev
             pkgs.zig_0_13
@@ -103,15 +104,17 @@
           IREE_BUILD_DIR = "${packages.iree-sdk.build}";
 
           postFixup = ''
-            # TODO Come up with something better here. -- IREE needs to load libcuda.so.  On
-            # non-NixOS systems this is most probably installed as a system package and not via
-            # the nix-store.  Thus, we somehow have to inject the library search path into.  IREE
-            # internally simply uses `dlopen("libcuda.so")`.  The only workable way I could find is
-            # manipulating the rpath.
+            # IREE needs to load libcuda.so.  On non-NixOS systems this is most probably installed
+            # as a system package and not via the nix-store.  Thus, we somehow have to inject the
+            # library search path into.  IREE internally simply uses `dlopen("libcuda.so")`.  The
+            # only workable way we have is to manipulate the rpath.
+            patchelf --force-rpath \
+              --add-rpath /usr/lib/x86_64-linux-gnu:/usr/lib64:/usr/lib:/run/opengl-driver/lib \
+              $out/bin/pcp
 
-            # glibc is a dependency of libcuda.so
-            patchelf --add-rpath ${pkgs.glibc}/lib $out/bin/main_distributed
-            patchelf --add-rpath /lib/x86_64-linux-gnu $out/bin/main_distributed
+            # Ensure that 'iree-compile' is present on 'PATH'
+            wrapProgram $out/bin/pcp \
+              --suffix PATH : "${packages.iree-sdk}/bin"
           '';
         };
         checks.pcp = packages.pcp;

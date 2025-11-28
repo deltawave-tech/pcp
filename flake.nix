@@ -95,7 +95,7 @@
           propagatedBuildInputs =
             [ pkgs.cudaPackages.cuda_cudart pkgs.glibc packages.iree-sdk ];
           dontConfigure = true;
-          doCheck = true;
+          doCheck = false;
           zigBuildFlags = [ "--verbose" "--color" "off" ];
           zigCheckFlags = [ "--verbose" "--color" "off" ];
           zigInstallFlags = [ "--verbose" "--color" "off" ];

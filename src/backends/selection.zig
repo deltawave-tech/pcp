@@ -6,21 +6,21 @@ const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 
 // Core interfaces
-const execution = @import("execution.zig");
-const worker_backend = @import("backends/worker_backend.zig");
+const execution = @import("../execution.zig");
+const worker_backend = @import("worker_backend.zig");
 
 // Algorithm implementations
-const diloco = @import("algorithms/diloco.zig");
-const shepherd = @import("controllers/shepherd.zig");
-const worker = @import("worker.zig");
+const diloco = @import("../algorithms/diloco.zig");
+const shepherd = @import("../nodes/controllers/shepherd.zig");
+const worker = @import("../nodes/workers/worker.zig");
 
 // Backend implementations
-const iree_backend = @import("backends/iree.zig");
+const iree_backend = @import("iree.zig");
 
 // NEW: Necessary imports for HostExecutor
-const mlir_ctx = @import("mlir_ctx.zig");
-const mlir = @import("mlir.zig");
-const tensor = @import("tensor.zig");
+const mlir_ctx = @import("../mlir/context.zig");
+const mlir = @import("../mlir/wrapper.zig");
+const tensor = @import("../core/tensor.zig");
 
 const Executor = execution.Executor;
 const WorkerBackend = worker_backend.WorkerBackend;
@@ -62,7 +62,7 @@ pub const Backend = enum {
             .metal => "metal", // IREE's Metal runtime driver name
             .cuda => "cuda",
             .vulkan => "vulkan",
-            .rocm => "rocm",
+            .rocm => "hip", // IREE uses 'hip' as the runtime driver name for ROCm
             .cpu => "local-sync", // IREE's CPU runtime driver name
         };
     }
@@ -132,7 +132,7 @@ const HostExecutor = struct {
 
         // 3. Compile to VMFB for CPU (llvm-cpu)
         // The Shepherd runs locally on the CPU, so we target llvm-cpu
-        const vmfb = try self.context.compileToVMFB(self.allocator, mlir_source, "llvm-cpu");
+        const vmfb = try self.context.compileToVMFB(self.allocator, mlir_source, "llvm-cpu", null);
         defer self.allocator.free(vmfb);
 
         // 4. Execute using the internal IREE backend

@@ -3,6 +3,29 @@
 
 const std = @import("std");
 
+/// Worker information for dashboard display
+pub const WorkerInfo = struct {
+    node_id: u32,
+    backend: [16]u8,  // Fixed size for backend name
+    backend_len: usize,
+    ip_address: [64]u8,  // Fixed size for IP address
+    ip_len: usize,
+    status: [16]u8,  // Fixed size for status
+    status_len: usize,
+
+    pub fn getBackend(self: *const WorkerInfo) []const u8 {
+        return self.backend[0..self.backend_len];
+    }
+
+    pub fn getIpAddress(self: *const WorkerInfo) []const u8 {
+        return self.ip_address[0..self.ip_len];
+    }
+
+    pub fn getStatus(self: *const WorkerInfo) []const u8 {
+        return self.status[0..self.status_len];
+    }
+};
+
 /// Training metrics structure
 pub const TrainingMetrics = struct {
     outer_loop_step: usize = 0,
@@ -13,11 +36,23 @@ pub const TrainingMetrics = struct {
     total_parameters: usize = 0,
     learning_rate: f32 = 0.01,
     epoch_time_ms: u64 = 0,
-    
+
     /// Loss history for graphing (circular buffer)
     loss_history: [100]f32 = [_]f32{0.0} ** 100,
     loss_history_index: usize = 0,
     loss_history_count: usize = 0,
+
+    /// Worker information
+    worker_info: [16]WorkerInfo = [_]WorkerInfo{.{
+        .node_id = 0,
+        .backend = [_]u8{0} ** 16,
+        .backend_len = 0,
+        .ip_address = [_]u8{0} ** 64,
+        .ip_len = 0,
+        .status = [_]u8{0} ** 16,
+        .status_len = 0,
+    }} ** 16,
+    worker_info_count: usize = 0,
 };
 
 /// Training status enumeration
@@ -96,7 +131,19 @@ pub const TrainingMonitor = struct {
         self.metrics.epoch_time_ms = time_ms;
         self.metrics.last_update_time = std.time.timestamp();
     }
-    
+
+    /// Set worker information for dashboard display
+    pub fn setWorkerInfo(self: *Self, workers: []const WorkerInfo) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const count = @min(workers.len, self.metrics.worker_info.len);
+        for (0..count) |i| {
+            self.metrics.worker_info[i] = workers[i];
+        }
+        self.metrics.worker_info_count = count;
+        self.metrics.last_update_time = std.time.timestamp();
+    }
+
     /// Get a snapshot of current metrics (thread-safe copy)
     pub fn getMetrics(self: *Self) TrainingMetrics {
         self.mutex.lock();
@@ -182,6 +229,10 @@ pub fn setModelInfo(total_params: usize, lr: f32) void {
 
 pub fn setEpochTime(time_ms: u64) void {
     global_monitor.setEpochTime(time_ms);
+}
+
+pub fn setWorkerInfo(workers: []const WorkerInfo) void {
+    global_monitor.setWorkerInfo(workers);
 }
 
 pub fn getMetrics() TrainingMetrics {

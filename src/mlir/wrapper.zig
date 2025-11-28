@@ -1,5 +1,5 @@
 const std = @import("std");
-const c = @import("mlir/c.zig");
+const c = @import("c.zig");
 
 /// Test function for MLIR operations
 pub fn testMLIROperations(allocator: std.mem.Allocator) !void {
@@ -712,5 +712,5 @@ pub const Context = struct {
 
 /// MLIR Dialects
 pub const dialects = struct {
-    pub const stablehlo = @import("mlir/dialects/stablehlo.zig");
+    pub const stablehlo = @import("dialects/stablehlo.zig");
 };

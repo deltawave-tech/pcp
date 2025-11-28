@@ -1,9 +1,9 @@
 const std = @import("std");
-const mlir = @import("mlir.zig");
-const mlir_ctx = @import("mlir_ctx.zig"); // Import complete MLIR context
+const mlir = @import("../mlir/wrapper.zig");
+const mlir_ctx = @import("../mlir/context.zig"); // Import complete MLIR context
 const tensor = @import("tensor.zig");
-const hlo = @import("mlir/dialects/stablehlo.zig");
-const c = @import("mlir/c.zig").c;
+const hlo = @import("../mlir/dialects/stablehlo.zig");
+const c = @import("../mlir/c.zig").c;
 
 const Tensor = tensor.Tensor(void); // DataType is encoded in mlir.Type
 const Shape = tensor.Shape;
@@ -99,9 +99,9 @@ pub const MLIRBuilder = struct {
 
     /// Add a block argument (function input)
     pub fn addBlockArgument(self: *Self, mlir_type: mlir.Type) !mlir.Value {
-        const body_block = @import("mlir/c.zig").c.moduleGetBody(self.module.handle);
+        const body_block = @import("../mlir/c.zig").c.moduleGetBody(self.module.handle);
         const arg_count = 0; // Add at end for now
-        const value_handle = @import("mlir/c.zig").c.blockAddArgument(body_block, arg_count, mlir_type.handle, self.loc.handle);
+        const value_handle = @import("../mlir/c.zig").c.blockAddArgument(body_block, arg_count, mlir_type.handle, self.loc.handle);
         return mlir.Value{ .handle = value_handle };
     }
 
@@ -174,7 +174,7 @@ pub const MLIRBuilder = struct {
     
     /// Create a new block (static helper function)
     pub fn createBlock() !mlir.Block {
-        const c_api = @import("mlir/c.zig").c;
+        const c_api = @import("../mlir/c.zig").c;
         // An empty block takes no arguments.
         const block_handle = c_api.blockCreate(0, @constCast(@ptrCast(&[_]*c_api.MlirType{})), @constCast(@ptrCast(&[_]*c_api.MlirLocation{})));
         return mlir.Block{ .handle = block_handle };
@@ -842,6 +842,190 @@ pub fn gather(
     return try builder.createAndAppendOp(operation);
 }
 
+// ============================================================================
+// Shape Utilities for Autodifferentiation
+// ============================================================================
+
+/// Broadcast a value to a target shape using stablehlo.broadcast_in_dim
+pub fn broadcastToShape(builder: *MLIRBuilder, value: mlir.Value, target_shape: []const i64) !mlir.Value {
+    const value_type = value.getType().as(mlir.RankedTensorType) orelse return error.NotRankedTensor;
+    const value_shape = try value_type.getShape(builder.allocator);
+    defer builder.allocator.free(value_shape);
+
+    // Check if broadcasting is needed
+    var needs_broadcast = false;
+    if (value_shape.len != target_shape.len) {
+        needs_broadcast = true;
+    } else {
+        for (value_shape, target_shape) |v, t| {
+            if (v != t) {
+                needs_broadcast = true;
+                break;
+            }
+        }
+    }
+
+    if (!needs_broadcast) {
+        return value;
+    }
+
+    // Create target type
+    const element_type = value_type.getElementType();
+    const ctx = mlir.Context{ .handle = c.mlirTypeGetContext(value.getType().handle) };
+    const target_type = mlir.Type.rankedTensorType(ctx, target_shape, element_type);
+
+    // Compute broadcast_dimensions attribute
+    // Maps dimensions of the value to dimensions of the target
+    var broadcast_dims = std.ArrayList(i64).init(builder.allocator);
+    defer broadcast_dims.deinit();
+
+    // Align from the right (NumPy broadcasting semantics)
+    const rank_diff = target_shape.len - value_shape.len;
+    for (0..value_shape.len) |i| {
+        try broadcast_dims.append(@intCast(rank_diff + i));
+    }
+
+    const broadcast_dims_attr = mlir.Attribute.denseI64ArrayAttr(builder.ctx, broadcast_dims.items);
+    const broadcast_op = try builder.createAndAttach("stablehlo.broadcast_in_dim",
+        &.{value},
+        &.{target_type},
+        .{ .attributes = &.{.{ "broadcast_dimensions", broadcast_dims_attr }} }
+    );
+
+    return broadcast_op.getResult(0);
+}
+
+/// Compute broadcasted shape and broadcast operands to that shape for StableHLO operations
+/// StableHLO requires explicit broadcasting - operands must have identical shapes AND types
+pub fn broadcastOperands(builder: *MLIRBuilder, lhs: mlir.Value, rhs: mlir.Value) !struct { lhs: mlir.Value, rhs: mlir.Value, shape: []const i64 } {
+    const lhs_type = lhs.getType().as(mlir.RankedTensorType) orelse return error.NotRankedTensor;
+    const rhs_type = rhs.getType().as(mlir.RankedTensorType) orelse return error.NotRankedTensor;
+
+    const lhs_shape = try lhs_type.getShape(builder.allocator);
+    defer builder.allocator.free(lhs_shape);
+    const rhs_shape = try rhs_type.getShape(builder.allocator);
+    defer builder.allocator.free(rhs_shape);
+
+    const lhs_elem_type = lhs_type.getElementType();
+    const rhs_elem_type = rhs_type.getElementType();
+
+    const lhs_rank = lhs_shape.len;
+    const rhs_rank = rhs_shape.len;
+    const result_rank = @max(lhs_rank, rhs_rank);
+
+    // Compute broadcasted shape
+    const result_shape = try builder.allocator.alloc(i64, result_rank);
+
+    var i: usize = 0;
+    while (i < result_rank) : (i += 1) {
+        const lhs_idx = if (i < lhs_rank) lhs_rank - 1 - i else null;
+        const rhs_idx = if (i < rhs_rank) rhs_rank - 1 - i else null;
+
+        const lhs_dim = if (lhs_idx) |idx| lhs_shape[idx] else 1;
+        const rhs_dim = if (rhs_idx) |idx| rhs_shape[idx] else 1;
+
+        const result_dim = if (lhs_dim == rhs_dim) lhs_dim
+                          else if (lhs_dim == 1) rhs_dim
+                          else if (rhs_dim == 1) lhs_dim
+                          else {
+            std.debug.print("ERROR: Incompatible shapes for broadcast!\n", .{});
+            std.debug.print("  lhs_shape: {any}, rhs_shape: {any}\n", .{lhs_shape, rhs_shape});
+            std.debug.print("  Conflict at dimension {}: lhs_dim={}, rhs_dim={}\n", .{i, lhs_dim, rhs_dim});
+            builder.allocator.free(result_shape);
+            return error.IncompatibleShapesForBroadcast;
+        };
+
+        result_shape[result_rank - 1 - i] = result_dim;
+    }
+
+    // Handle element type conversion if needed (promote to common type)
+    // For simplicity, if types differ, use rhs's type (usually the gradient type)
+    var lhs_converted = lhs;
+    const rhs_converted = rhs;
+
+    // Check if element types match using proper MLIR type equality
+    const types_match = lhs_elem_type.isEqual(rhs_elem_type);
+
+    if (!types_match) {
+        std.debug.print("DEBUG broadcastOperands: Element types differ, converting lhs\n", .{});
+        std.debug.print("  lhs_shape: {any}, rhs_shape: {any}, result_shape: {any}\n", .{lhs_shape, rhs_shape, result_shape});
+        // Convert lhs to rhs's element type (keeping lhs's original shape)
+        const ctx = mlir.Context{ .handle = c.mlirTypeGetContext(lhs.getType().handle) };
+        const lhs_converted_type = mlir.Type.rankedTensorType(ctx, lhs_shape, rhs_elem_type);
+        std.debug.print("  Creating convert [broadcastOperands]: input_shape={any} output_shape={any}\n", .{lhs_shape, lhs_shape});
+        const convert_op = try builder.createAndAttach("stablehlo.convert", &.{lhs}, &.{lhs_converted_type}, .{});
+        lhs_converted = convert_op.getResult(0);
+        std.debug.print("  Convert created successfully, now broadcasting\n", .{});
+    }
+
+    // Broadcast operands to the common shape
+    std.debug.print("DEBUG broadcastOperands: Broadcasting lhs to {any}\n", .{result_shape});
+    const broadcasted_lhs = try broadcastToShape(builder, lhs_converted, result_shape);
+    std.debug.print("DEBUG broadcastOperands: Broadcasting rhs to {any}\n", .{result_shape});
+    const broadcasted_rhs = try broadcastToShape(builder, rhs_converted, result_shape);
+    std.debug.print("DEBUG broadcastOperands: Done\n", .{});
+
+    return .{ .lhs = broadcasted_lhs, .rhs = broadcasted_rhs, .shape = result_shape };
+}
+
+/// Reduce gradient to match target shape (for handling broadcasted operations in VJPs)
+pub fn reduceGradient(builder: *MLIRBuilder, grad: mlir.Value, target_shape: mlir.Value) !mlir.Value {
+    const grad_type = grad.getType().as(mlir.RankedTensorType) orelse return grad;
+    const target_type = target_shape.getType().as(mlir.RankedTensorType) orelse return grad;
+
+    const grad_shape = try grad_type.getShape(builder.allocator);
+    defer builder.allocator.free(grad_shape);
+    const target_shape_arr = try target_type.getShape(builder.allocator);
+    defer builder.allocator.free(target_shape_arr);
+
+    // If shapes match, no reduction needed
+    if (grad_shape.len == target_shape_arr.len) {
+        var match = true;
+        for (grad_shape, target_shape_arr) |g, t| {
+            if (g != t) {
+                match = false;
+                break;
+            }
+        }
+        if (match) return grad;
+    }
+
+    // Find dimensions to reduce
+    var reduce_dims = std.ArrayList(i64).init(builder.allocator);
+    defer reduce_dims.deinit();
+
+    // Handle rank mismatch - reduce leading dimensions
+    const rank_diff = @as(i64, @intCast(grad_shape.len)) - @as(i64, @intCast(target_shape_arr.len));
+    if (rank_diff > 0) {
+        for (0..@intCast(rank_diff)) |i| {
+            try reduce_dims.append(@intCast(i));
+        }
+    }
+
+    // Handle size-1 dimensions in target (broadcasted dimensions)
+    if (rank_diff >= 0) {
+        for (target_shape_arr, 0..) |t_dim, i| {
+            const grad_idx = @as(usize, @intCast(@as(i64, @intCast(i)) + rank_diff));
+            if (grad_idx < grad_shape.len and t_dim == 1 and grad_shape[grad_idx] != 1) {
+                try reduce_dims.append(@as(i64, @intCast(grad_idx)));
+            }
+        }
+    }
+
+    if (reduce_dims.items.len == 0) return grad;
+
+    // Use ops.reduceSum which properly creates the reduction region
+    const grad_tensor = try builder.newTensor(grad);
+    const reduced_tensor = try reduceSum(builder, grad_tensor, reduce_dims.items, false);
+
+    // After reduction, reshape to match target shape exactly
+    const target_element_type = target_type.getElementType();
+    const result_type = mlir.Type.rankedTensorType(builder.ctx, target_shape_arr, target_element_type);
+    const reshape_op = try builder.createAndAttach("stablehlo.reshape", &.{reduced_tensor.value}, &.{result_type}, .{});
+
+    return reshape_op.getResult(0);
+}
+
 /// Test function for MLIR operations using dialect wrappers
 pub fn testMLIROpGeneration(allocator: std.mem.Allocator) !void {
     std.debug.print("\n=== Testing MLIR Operation Generation with Dialect Wrappers ===\n", .{});
@@ -849,7 +1033,7 @@ pub fn testMLIROpGeneration(allocator: std.mem.Allocator) !void {
     // Create MLIR context for this test
     var ctx = try mlir.Context.init();
     defer ctx.deinit();
-    const c_api = @import("mlir/c.zig").c;
+    const c_api = @import("../mlir/c.zig").c;
     c_api.mlirContextSetAllowUnregisteredDialects(ctx.handle, true);
     
     // Create MLIR builder

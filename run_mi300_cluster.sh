@@ -20,8 +20,8 @@ fi
 
 # Path to the executable
 EXE="./zig-out/bin/pcp"
-# Use the NanoGPT model file
-MODEL_PATH="models/nanogpt_forward.mlir"
+# Use the model file you generated earlier
+MODEL_PATH="models/nano_stablehlo.mlir"
 
 if [ ! -f "$MODEL_PATH" ]; then
     echo "💣 Error: Model file $MODEL_PATH not found."
@@ -29,7 +29,7 @@ if [ ! -f "$MODEL_PATH" ]; then
     exit 1
 fi
 
-echo "🌙 Starting PCP A100 Cluster Test"
+echo "🌙 Starting PCP MI300 Cluster Test"
 echo "Model: $MODEL_PATH"
 
 # 2. Start Shepherd (Coordinator)
@@ -51,11 +51,12 @@ $EXE --worker \
      --backend cpu &
 WORKER1_PID=$!
 
-# 4. Start Worker 2 (CUDA)
-echo "Starting Worker 2 (CUDA)..."
+# 4. Start Worker 2 (ROCm/AMD MI300X with gfx942 target)
+echo "Starting Worker 2 (ROCm/AMD MI300X)..."
 $EXE --worker \
      --connect 127.0.0.1:8090 \
-     --backend cuda &
+     --backend rocm \
+     --amd-target gfx942 &
 WORKER2_PID=$!
 
 # Wait for Shepherd to finish (it exits after training loop completes)

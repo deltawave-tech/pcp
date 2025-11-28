@@ -4,11 +4,11 @@
 const std = @import("std");
 const net = std.net;
 const Allocator = std.mem.Allocator;
-const tcp_stream = @import("network/tcp_stream.zig");
-const message = @import("network/message.zig");
-const binary_protocol = @import("network/capnp_zig_wrapper.zig");
-const worker_backend = @import("backends/worker_backend.zig");
-const backend_selection = @import("backend_selection.zig");
+const tcp_stream = @import("../../network/tcp_stream.zig");
+const message = @import("../../network/message.zig");
+const binary_protocol = @import("../../network/capnp_zig_wrapper.zig");
+const worker_backend = @import("../../backends/worker_backend.zig");
+const backend_selection = @import("../../backends/selection.zig");
 
 const TcpClient = tcp_stream.TcpClient;
 const TcpStreamManager = tcp_stream.TcpStreamManager;
@@ -98,19 +98,26 @@ pub const Worker = struct {
     }
     
     /// Connect to the Shepherd coordinator
-    pub fn connect(self: *Self, master_host: []const u8, master_port: u16) !void {
+    pub fn connect(self: *Self, master_host: []const u8, master_port: u16, amd_target: ?[]const u8) !void {
         self.state = .connecting;
-        
+
         // Connect to the master
         try self.client.connect(master_host, master_port);
         std.log.info("Connected to Shepherd at {s}:{}", .{ master_host, master_port });
-        
+
         // Get our backend type from the backend instance
         const my_backend = self.backend.getBackendType();
 
         // Create a JSON object for the payload
         var payload_map = std.json.ObjectMap.init(self.allocator);
         try payload_map.put("backend", std.json.Value{ .string = my_backend.toString() });
+
+        // Add AMD target if specified
+        if (amd_target) |target| {
+            try payload_map.put("amd_target", std.json.Value{ .string = target });
+            std.log.info("Reporting AMD target: {s}", .{target});
+        }
+
         const payload = std.json.Value{ .object = payload_map };
 
         // Send JoinRequest with the backend information in the payload
@@ -123,7 +130,7 @@ pub const Worker = struct {
             1, // message id
             payload, // Use the new payload
         );
-        
+
         try self.client.send(join_request);
         
         // Wait for JoinAccept

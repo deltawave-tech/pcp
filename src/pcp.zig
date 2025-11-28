@@ -7,15 +7,15 @@ const ArrayList = std.ArrayList;
 const Allocator = std.mem.Allocator;
 
 // Import our distributed training components
-const shepherd = @import("controllers/shepherd.zig");
-const worker = @import("worker.zig");
+const shepherd = @import("nodes/controllers/shepherd.zig");
+const worker = @import("nodes/workers/worker.zig");
 const diloco = @import("algorithms/diloco.zig");
 const training_algorithm = @import("algorithms/training_algorithm.zig");
-const backend_selection = @import("backend_selection.zig");
-const ops = @import("ops.zig");
-const mlir = @import("mlir.zig");
-const autodiff = @import("autodiff.zig");
-const dashboard = @import("dashboard.zig");
+const backend_selection = @import("backends/selection.zig");
+const ops = @import("core/ops.zig");
+const mlir = @import("mlir/wrapper.zig");
+const autodiff = @import("autodiff/engine.zig");
+const dashboard = @import("ui/dashboard.zig");
 
 const Shepherd = shepherd.Shepherd;
 const Worker = worker.Worker;
@@ -31,6 +31,7 @@ const Args = struct {
     workers: usize,
     model_path: ?[]const u8,
     backend: ?backend_selection.Backend,
+    amd_target: ?[]const u8,
 
     const Mode = enum {
         shepherd,
@@ -46,6 +47,7 @@ const Args = struct {
                 .workers = 2,
                 .model_path = null,
                 .backend = null,
+                .amd_target = null,
             };
         }
 
@@ -55,6 +57,7 @@ const Args = struct {
         var workers: usize = 2;
         var model_path: ?[]const u8 = null;
         var backend: ?backend_selection.Backend = null;
+        var amd_target: ?[]const u8 = null;
 
         var i: usize = 1;
         while (i < args.len) {
@@ -114,6 +117,11 @@ const Args = struct {
                         return error.InvalidBackend;
                     }
                 }
+            } else if (std.mem.eql(u8, args[i], "--amd-target")) {
+                i += 1;
+                if (i < args.len) {
+                    amd_target = args[i];
+                }
             }
             i += 1;
         }
@@ -125,6 +133,7 @@ const Args = struct {
             .workers = workers,
             .model_path = model_path,
             .backend = backend,
+            .amd_target = amd_target,
         };
     }
 
@@ -139,6 +148,7 @@ const Args = struct {
         print("  --workers <count>    Number of workers to wait for (default: 2)\n", .{});
         print("  --model <path>       Path to MLIR model file (Shepherd only)\n", .{});
         print("  --backend <type>     Backend to use: cpu, cuda, metal, vulkan, rocm (default: auto)\n", .{});
+        print("  --amd-target <arch>  AMD GPU target architecture (e.g., gfx942 for MI300X)\n", .{});
         print("  --help               Show this help message\n", .{});
     }
 };
@@ -175,12 +185,16 @@ fn runShepherd(allocator: Allocator, args: Args) !void {
     // Initialize the DataLoader for real training data
     print("Loading Tiny Shakespeare dataset...\n", .{});
     // Dataset expected at data/tiny_shakespeare.txt
-    var data_loader = try @import("data_loader.zig").DataLoader.init(allocator, "data/tiny_shakespeare.txt");
+    var data_loader = try @import("data/loader.zig").DataLoader.init(allocator, "data/tiny_shakespeare.txt");
     defer data_loader.deinit();
     print("🌙 Dataset loaded with {} tokens\n", .{data_loader.tokens.len});
 
     var diloco_config = DiLoCoConfig.default();
-    // Apply model path if provided
+    diloco_config.base_config.batch_size = 64;
+    diloco_config.base_config.learning_rate = 0.0006;
+    diloco_config.tau = 50;
+    diloco_config.base_config.outer_loop_steps = 100;
+
     if (args.model_path) |path| {
         diloco_config.model_mlir_path = path;
         print("   Model: {s}\n", .{path});
@@ -228,13 +242,17 @@ fn runWorker(allocator: Allocator, args: Args) !void {
     const backend = args.backend orelse backend_selection.Backend.selectDefault();
     print("   Backend: {s}\n", .{backend.toString()});
 
+    if (args.amd_target) |amd_target| {
+        print("   AMD Target: {s}\n", .{amd_target});
+    }
+
     const worker_backend_instance = try backend_selection.createWorkerBackend(allocator, backend);
 
     var worker_instance = try Worker.init(allocator, worker_backend_instance);
     defer worker_instance.deinit();
 
-    // Connect to shepherd
-    try worker_instance.connect(args.host, args.port);
+    // Connect to shepherd with AMD target info
+    try worker_instance.connect(args.host, args.port, args.amd_target);
 
     print("🌙 Connected to Shepherd with ID: {}\n", .{worker_instance.getNodeId().?});
 

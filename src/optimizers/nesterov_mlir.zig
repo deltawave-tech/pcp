@@ -1,9 +1,9 @@
 /// MLIR-based implementation of the Nesterov Accelerated Gradient optimizer
 /// Implements the Nesterov momentum optimizer using MLIR/StableHLO operations for compilation and optimization
 const std = @import("std");
-const mlir = @import("../mlir.zig");
-const ops = @import("../ops.zig");
-const tensor = @import("../tensor.zig");
+const mlir = @import("../mlir/wrapper.zig");
+const ops = @import("../core/ops.zig");
+const tensor = @import("../core/tensor.zig");
 const hlo = @import("../mlir/dialects/stablehlo.zig");
 
 const MLIRBuilder = ops.MLIRBuilder;

@@ -4,7 +4,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const ArrayList = std.ArrayList;
 const training_algorithm = @import("training_algorithm.zig");
-const shepherd = @import("../controllers/shepherd.zig");
+const shepherd = @import("../nodes/controllers/shepherd.zig");
 const message = @import("../network/message.zig");
 const binary_protocol = @import("../network/capnp_zig_wrapper.zig");
 const nesterov_mlir = @import("../optimizers/nesterov_mlir.zig");
@@ -12,14 +12,14 @@ const adam_mlir = @import("../optimizers/adam_mlir.zig");
 const nesterov_host = @import("../optimizers/nesterov.zig");
 const NesterovHost = nesterov_host.Nesterov;
 const AdamMLIR = adam_mlir.AdamMLIR(f32);
-const autodiff = @import("../autodiff.zig");
-const ops = @import("../ops.zig");
-const mlir = @import("../mlir.zig");
-const tensor = @import("../tensor.zig");
+const autodiff = @import("../autodiff/engine.zig");
+const ops = @import("../core/ops.zig");
+const mlir = @import("../mlir/wrapper.zig");
+const tensor = @import("../core/tensor.zig");
 const execution = @import("../execution.zig");
-const monitoring = @import("../monitoring.zig");
-const data_loader = @import("../data_loader.zig");
-const backend_selection = @import("../backend_selection.zig");
+const monitoring = @import("../ui/monitoring.zig");
+const data_loader = @import("../data/loader.zig");
+const backend_selection = @import("../backends/selection.zig");
 
 const TrainingAlgorithm = training_algorithm.TrainingAlgorithm;
 const TrainingStatus = training_algorithm.TrainingStatus;
@@ -317,38 +317,67 @@ pub const DiLoCo = struct {
         // 1. Wait for workers to connect (this logic is in Shepherd.startTraining,
         //    which calls this run() function. So by the time we are here, workers are present.)
 
-        // 2. Identify unique backends in the connected worker pool (protected by mutex)
-        var backend_set = std.AutoHashMap(backend_selection.Backend, void).init(self.allocator);
-        defer backend_set.deinit();
+        // 2. Identify unique (backend, amd_target) combinations in the connected worker pool
+        // We need a struct to use as a hashmap key
+        const WorkerConfig = struct {
+            backend: backend_selection.Backend,
+            amd_target: ?[]const u8,
+
+            pub fn hash(ctx: @This(), hasher: anytype) void {
+                std.hash.autoHash(hasher, ctx.backend);
+                if (ctx.amd_target) |target| {
+                    hasher.update(target);
+                }
+            }
+
+            pub fn eql(ctx: @This(), other: @This()) bool {
+                if (ctx.backend != other.backend) return false;
+                if (ctx.amd_target == null and other.amd_target == null) return true;
+                if (ctx.amd_target == null or other.amd_target == null) return false;
+                return std.mem.eql(u8, ctx.amd_target.?, other.amd_target.?);
+            }
+        };
+
+        var config_set = std.HashMap(WorkerConfig, void, std.hash_map.AutoContext(WorkerConfig), std.hash_map.default_max_load_percentage).init(self.allocator);
+        defer config_set.deinit();
 
         self.coordinator.worker_pool_mutex.lock();
         for (self.coordinator.worker_pool.items) |worker| {
-            try backend_set.put(worker.backend, {});
+            const config = WorkerConfig{
+                .backend = worker.backend,
+                .amd_target = worker.amd_target,
+            };
+            try config_set.put(config, {});
         }
         self.coordinator.worker_pool_mutex.unlock();
 
-        // 3. Compile the MLIR source once for EACH unique backend
-        var compiled_artifacts = std.AutoHashMap(backend_selection.Backend, []const u8).init(self.allocator);
+        // 3. Compile the MLIR source once for EACH unique (backend, amd_target) combination
+        var compiled_artifacts = std.HashMap(WorkerConfig, []const u8, std.hash_map.AutoContext(WorkerConfig), std.hash_map.default_max_load_percentage).init(self.allocator);
         defer {
             var it = compiled_artifacts.iterator();
             while (it.next()) |entry| self.allocator.free(entry.value_ptr.*);
             compiled_artifacts.deinit();
         }
-        
-        var temp_mlir_ctx = try @import("../mlir_ctx.zig").MLIRContext.init(self.allocator);
+
+        var temp_mlir_ctx = try @import("../mlir/context.zig").MLIRContext.init(self.allocator);
         defer temp_mlir_ctx.deinit();
 
-        var backend_it = backend_set.keyIterator();
-        while (backend_it.next()) |backend_ptr| {
-            const backend = backend_ptr.*;
-            std.log.info("Compiling worker graph for backend: {s}", .{backend.toString()});
+        var config_it = config_set.keyIterator();
+        while (config_it.next()) |config_ptr| {
+            const config = config_ptr.*;
+            if (config.amd_target) |target| {
+                std.log.info("Compiling worker graph for backend: {s} with AMD target: {s}", .{config.backend.toString(), target});
+            } else {
+                std.log.info("Compiling worker graph for backend: {s}", .{config.backend.toString()});
+            }
 
             const vmfb_bytes = try temp_mlir_ctx.compileToVMFB(
                 self.allocator,
                 self.worker_graph_mlir_source,
-                backend.toIreeCompilationTarget(),
+                config.backend.toIreeCompilationTarget(),
+                config.amd_target,
             );
-            try compiled_artifacts.put(backend, vmfb_bytes);
+            try compiled_artifacts.put(config, vmfb_bytes);
         }
         
         // 4. Create the JSON payload for BOTH parameter shapes and data input shapes
@@ -384,7 +413,11 @@ pub const DiLoCo = struct {
         defer self.allocator.free(worker_list);
 
         for (worker_list) |worker| {
-            const vmfb_bytes = compiled_artifacts.get(worker.backend).?;
+            const worker_config = WorkerConfig{
+                .backend = worker.backend,
+                .amd_target = worker.amd_target,
+            };
+            const vmfb_bytes = compiled_artifacts.get(worker_config).?;
 
             const b64_len = std.base64.standard.Encoder.calcSize(vmfb_bytes.len);
             const b64_encoded_vmfb = try self.allocator.alloc(u8, b64_len);
@@ -410,11 +443,10 @@ pub const DiLoCo = struct {
         monitoring.setStatus(.running);
 
         // Main outer loop
-        for (0..self.config.base_config.outer_loop_steps) |_| {
+        for (0..self.config.base_config.outer_loop_steps) |step| {
             const start_time = std.time.milliTimestamp();
 
-            // Phase 0: Get a fresh batch of training data
-            const batch_size = 1; // Match model input shape tensor<1x8xi64>
+            const batch_size = 64;
             const block_size = 8;
             const batch = try self.data_loader.getBatch(batch_size, block_size);
             defer self.allocator.free(batch.x);
@@ -429,6 +461,11 @@ pub const DiLoCo = struct {
 
             // Phase 3: Update master parameters using host-side Nesterov optimizer
             try self.updateMasterParameters(worker_results);
+
+            // Save checkpoint every 10 steps or at the end
+            if ((step + 1) % 10 == 0 or (step + 1) == self.config.base_config.outer_loop_steps) {
+                try self.saveCheckpoint(step + 1);
+            }
 
             // Update metrics
             self.metrics.outer_loop_count += 1;
@@ -544,6 +581,47 @@ pub const DiLoCo = struct {
 
         // 5. Return a duplicate of the data for the caller to own
         return result;
+    }
+
+    /// Save current master parameters to a binary file
+    fn saveCheckpoint(self: *Self, step: usize) !void {
+        var path_buf: [64]u8 = undefined;
+        const path = try std.fmt.bufPrint(&path_buf, "checkpoint_{d}.bin", .{step});
+
+        std.log.info("Saving checkpoint to {s}...", .{path});
+        const file = try std.fs.cwd().createFile(path, .{});
+        defer file.close();
+        var writer = file.writer();
+
+        // 1. Header
+        try writer.writeAll("PCPCHECK");
+        try writer.writeInt(u32, 1, .little); // Version
+
+        if (self.master_parameters) |params| {
+            // 2. Number of tensors
+            try writer.writeInt(u32, @intCast(params.len), .little);
+
+            for (params) |t| {
+                // 3a. Write Shape info
+                const rank = t.shape.rank();
+                try writer.writeInt(u8, @intCast(rank), .little);
+
+                const dims = try t.shape.getDims(self.allocator);
+                defer self.allocator.free(dims);
+                for (dims) |d| {
+                    try writer.writeInt(i64, d, .little);
+                }
+
+                // 3b. Write Data
+                const raw_bytes = try self.extractTensorData(t);
+                defer self.allocator.free(raw_bytes);
+
+                // Write size of data block followed by data
+                try writer.writeInt(u64, @intCast(raw_bytes.len), .little);
+                try writer.writeAll(raw_bytes);
+            }
+        }
+        std.log.info("✓ Checkpoint saved.", .{});
     }
 
     /// Build the complete worker training graph as MLIR module using loaded .mlir file
@@ -749,7 +827,16 @@ pub const DiLoCo = struct {
         }
         std.log.info("✓ Final module verification successful!", .{});
 
-        return try @import("../mlir_ctx.zig").serializeMLIRModule(self.allocator, builder.module);
+        // === DUMP MLIR TO FILE FOR DEBUGGING ===
+        const serialized_mlir = try @import("../mlir/context.zig").serializeMLIRModule(self.allocator, builder.module);
+
+        // Write the MLIR to project root as worker_graph_after_autodiff.mlir
+        const mlir_dump_path = "worker_graph_after_autodiff.mlir";
+        std.log.info("Dumping MLIR to {s} for analysis...", .{mlir_dump_path});
+        try std.fs.cwd().writeFile(.{ .sub_path = mlir_dump_path, .data = serialized_mlir });
+        std.log.info("✓ MLIR dumped to {s}", .{mlir_dump_path});
+
+        return serialized_mlir;
     }
 
 

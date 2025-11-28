@@ -56,7 +56,7 @@ pub const ExecutionHelper = struct {
 
         const backend = backend_selection.Backend.cpu;  // Change from .metal
         
-        const vmfb_binary = try mlir_context.compileToVMFB(self.allocator, module, backend.toIreeCompilationTarget());
+        const vmfb_binary = try mlir_context.compileToVMFB(self.allocator, module, backend.toIreeCompilationTarget(), null);
         defer self.allocator.free(vmfb_binary);
 
         var iree_backend = try IreeBackend.init(self.allocator, backend);

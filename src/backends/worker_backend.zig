@@ -1,5 +1,5 @@
 const std = @import("std");
-const backend_selection = @import("../backend_selection.zig");
+const backend_selection = @import("selection.zig");
 
 /// Generic worker backend interface for executing compiled training artifacts.
 /// This interface is completely MLIR-agnostic.

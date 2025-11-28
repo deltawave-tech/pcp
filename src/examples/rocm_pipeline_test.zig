@@ -10,7 +10,7 @@ pub fn main() !void {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    std.debug.print("💻 CPU IREE-based MLIR -> CPU Pipeline Test\n", .{});
+    std.debug.print("🔥 ROCm IREE-based MLIR -> GPU Pipeline Test\n", .{});
     std.debug.print("==============================================\n", .{});
 
     const input_a_data = [_]f32{ 1.0, 2.0, 3.0, 4.0 };
@@ -30,11 +30,12 @@ pub fn main() !void {
     ;
     std.debug.print("✓ Created StableHLO module\n", .{});
 
-    // NEW: Select the CPU backend for compilation and execution
-    const target_backend = backend_selection.Backend.cpu;
+    // Select the ROCm backend for compilation and execution
+    const target_backend = backend_selection.Backend.rocm;
     std.debug.print("Compiling MLIR to VMFB for backend: {s}...\n", .{target_backend.toIreeCompilationTarget()});
 
-    const vmfb_binary = try mlir_context.compileToVMFB(allocator, stablehlo_module_str, target_backend.toIreeCompilationTarget(), null);
+    // Use gfx942 for MI300X by default in this test
+    const vmfb_binary = try mlir_context.compileToVMFB(allocator, stablehlo_module_str, target_backend.toIreeCompilationTarget(), "gfx942");
     defer allocator.free(vmfb_binary);
     std.debug.print("✓ Compiled to VMFB artifact ({} bytes)\n", .{vmfb_binary.len});
 
@@ -59,19 +60,19 @@ pub fn main() !void {
     }
     std.debug.print("🌙 IREE execution finished.\n", .{});
 
-    const cpu_result_slice: []const f32 = @alignCast(std.mem.bytesAsSlice(f32, outputs[0]));
+    const rocm_result_slice: []const f32 = @alignCast(std.mem.bytesAsSlice(f32, outputs[0]));
 
     std.debug.print("Verifying IREE output against expected result...\n", .{});
-    std.debug.print("   IREE Result: {any}\n", .{cpu_result_slice});
+    std.debug.print("   IREE Result: {any}\n", .{rocm_result_slice});
     std.debug.print("   Expected:    {any}\n", .{expected_output_data});
 
     const tolerance = 1e-6;
-    for (cpu_result_slice, expected_output_data) |cpu_val, expected_val| {
-        if (@abs(cpu_val - expected_val) > tolerance) {
-            std.debug.print("💣 IREE verification failed! Computed: {}, Expected: {}\n", .{ cpu_val, expected_val });
-            return error.CPUVerificationFailed;
+    for (rocm_result_slice, expected_output_data) |rocm_val, expected_val| {
+        if (@abs(rocm_val - expected_val) > tolerance) {
+            std.debug.print("💣 IREE verification failed! Computed: {}, Expected: {}\n", .{ rocm_val, expected_val });
+            return error.RocmVerificationFailed;
         }
     }
     std.debug.print("🌙 Verification successful! The result from the IREE runtime is correct.\n", .{});
-    std.debug.print("\n🌚 CPU IREE pipeline test completed successfully!\n", .{});
+    std.debug.print("\n🔥 ROCm IREE pipeline test completed successfully!\n", .{});
 }

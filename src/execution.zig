@@ -1,6 +1,6 @@
 const std = @import("std");
-const tensor = @import("tensor.zig");
-const mlir = @import("mlir.zig");
+const tensor = @import("core/tensor.zig");
+const mlir = @import("mlir/wrapper.zig");
 const Tensor = tensor.Tensor(void);
 
 /// Generic execution interface that the Shepherd owns and passes to algorithms.

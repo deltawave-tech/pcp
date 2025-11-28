@@ -1,8 +1,8 @@
 /// FILE: src/optimizers/adam_mlir.zig (AdamW with Weight Decay)
 const std = @import("std");
-const mlir = @import("../mlir.zig");
-const ops = @import("../ops.zig");
-const tensor = @import("../tensor.zig");
+const mlir = @import("../mlir/wrapper.zig");
+const ops = @import("../core/ops.zig");
+const tensor = @import("../core/tensor.zig");
 
 const MLIRBuilder = ops.MLIRBuilder;
 const Tensor = tensor.Tensor(void);

@@ -50,7 +50,7 @@ pub fn main() !void {
 
     // The 'compileToVMFB' function (which you may have from a previous step) handles this.
     // If not, you would implement it in mlir_ctx.zig to call 'iree-compile'.
-    const vmfb_binary = try mlir_context.compileToVMFB(allocator, stablehlo_module_str, target_backend.toIreeCompilationTarget());
+    const vmfb_binary = try mlir_context.compileToVMFB(allocator, stablehlo_module_str, target_backend.toIreeCompilationTarget(), null);
     defer allocator.free(vmfb_binary);
     std.debug.print("✓ Compiled to VMFB artifact ({} bytes)\n", .{vmfb_binary.len});
 

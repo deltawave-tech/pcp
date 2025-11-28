@@ -376,6 +376,13 @@ fn addIreeDependencies(target: *std.Build.Step.Compile, b: *std.Build, iree_conf
         target.linkSystemLibrary("iree_hal_drivers_cuda_cuda");
         target.linkSystemLibrary("iree_hal_drivers_cuda_dynamic_symbols");
         target.linkSystemLibrary("iree_hal_drivers_cuda_registration_registration");
+
+        // HIP driver for Linux (AMD ROCm GPUs)
+        target.addLibraryPath(.{ .cwd_relative = b.fmt("{s}/runtime/src/iree/hal/drivers/hip", .{build_dir}) });
+        target.addLibraryPath(.{ .cwd_relative = b.fmt("{s}/runtime/src/iree/hal/drivers/hip/registration", .{build_dir}) });
+        target.linkSystemLibrary("iree_hal_drivers_hip_hip");
+        target.linkSystemLibrary("iree_hal_drivers_hip_dynamic_symbols");
+        target.linkSystemLibrary("iree_hal_drivers_hip_registration_registration");
     }
 }
 
@@ -523,18 +530,34 @@ pub fn build(b: *std.Build) void {
     const run_cuda_pipeline_test_step = b.step("run-cuda-pipeline-test", "Test IREE CUDA pipeline on NVIDIA GPU");
     run_cuda_pipeline_test_step.dependOn(&run_cuda_pipeline_test_cmd.step);
 
-    // Distributed training system executable (main_distributed.zig)
-    std.debug.print("==> Creating distributed training executable\n", .{});
-    const main_distributed = b.addExecutable(.{
-        .name = "main_distributed",
-        .root_source_file = b.path("src/main_distributed.zig"),
+    // --- NEW: ROCm Pipeline Test ---
+    const rocm_pipeline_test = b.addExecutable(.{
+        .name = "rocm_pipeline_test",
+        .root_source_file = b.path("src/examples/rocm_pipeline_test.zig"),
         .target = target,
         .optimize = optimize,
     });
-    main_distributed.root_module.addImport("pcp", pcp_module);
+    rocm_pipeline_test.root_module.addImport("pcp", pcp_module);
+    addIreeDependencies(rocm_pipeline_test, b, iree_config);
+
+    const run_rocm_pipeline_test_cmd = b.addRunArtifact(rocm_pipeline_test);
+    run_rocm_pipeline_test_cmd.step.dependOn(&rocm_pipeline_test.step);
+
+    const run_rocm_pipeline_test_step = b.step("run-rocm-pipeline-test", "Test IREE ROCm pipeline on AMD GPU");
+    run_rocm_pipeline_test_step.dependOn(&run_rocm_pipeline_test_cmd.step);
+
+    // PCP distributed training executable
+    std.debug.print("==> Creating PCP executable\n", .{});
+    const pcp = b.addExecutable(.{
+        .name = "pcp",
+        .root_source_file = b.path("src/pcp.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    pcp.root_module.addImport("pcp", pcp_module);
 
     // IREE dependencies
-    addIreeDependencies(main_distributed, b, iree_config); // REFACTORED
+    addIreeDependencies(pcp, b, iree_config); // REFACTORED
 
     // Cap'n Proto bridge linking (specific to this target)
     if (!capnp_config.enabled) {
@@ -567,44 +590,44 @@ pub fn build(b: *std.Build) void {
             capnp_bridge_lib.addLibraryPath(.{ .cwd_relative = lib_dir });
         }
         // Note: Don't link capnp/kj here - static libraries should only contain object files.
-        // The final executable (main_distributed) will link these libraries.
+        // The final executable (pcp) will link these libraries.
 
         // Add include paths for the main executable
-        main_distributed.addIncludePath(b.path("src/network"));
+        pcp.addIncludePath(b.path("src/network"));
         if (capnp_config.include_dir) |include_dir| {
-            main_distributed.addIncludePath(.{ .cwd_relative = include_dir });
+            pcp.addIncludePath(.{ .cwd_relative = include_dir });
         }
 
         // 2. Link the Zig executable against our bridge and the Cap'n Proto libs
-        main_distributed.linkLibrary(capnp_bridge_lib);
+        pcp.linkLibrary(capnp_bridge_lib);
         // Ensure the bridge library is built before the main executable
-        main_distributed.step.dependOn(&capnp_bridge_lib.step);
+        pcp.step.dependOn(&capnp_bridge_lib.step);
         // Use detected Cap'n Proto libraries
         if (capnp_config.lib_dir) |lib_dir| {
-            main_distributed.addLibraryPath(.{ .cwd_relative = lib_dir });
+            pcp.addLibraryPath(.{ .cwd_relative = lib_dir });
         }
-        main_distributed.linkSystemLibrary("capnp");
-        main_distributed.linkSystemLibrary("kj");
+        pcp.linkSystemLibrary("capnp");
+        pcp.linkSystemLibrary("kj");
 
         // Ensure libstdc++ is linked after Cap'n Proto libraries for proper symbol resolution
-        main_distributed.linkSystemLibrary("stdc++");
+        pcp.linkSystemLibrary("stdc++");
 
         std.debug.print("==> Cap'n Proto bridge library configured successfully\n", .{});
     }
 
     // Install the distributed training executable
-    b.installArtifact(main_distributed);
+    b.installArtifact(pcp);
 
     // Run step for distributed training
-    const run_main_distributed_cmd = b.addRunArtifact(main_distributed);
+    const run_pcp_cmd = b.addRunArtifact(pcp);
     if (b.args) |args| {
-        run_main_distributed_cmd.addArgs(args);
+        run_pcp_cmd.addArgs(args);
     }
-    run_main_distributed_cmd.step.dependOn(&main_distributed.step);
+    run_pcp_cmd.step.dependOn(&pcp.step);
 
     std.debug.print("==> Registering run-distributed step\n", .{});
-    const run_main_distributed_step = b.step("run-distributed", "Run the distributed training system");
-    run_main_distributed_step.dependOn(&run_main_distributed_cmd.step);
+    const run_pcp_step = b.step("run-distributed", "Run the distributed training system");
+    run_pcp_step.dependOn(&run_pcp_cmd.step);
     std.debug.print("==> run-distributed step registered successfully\n", .{});
 
     // Data pipeline test executable

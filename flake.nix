@@ -51,7 +51,8 @@
         devShells.default = pkgs.mkShell {
           nativeBuildInputs = packages.pcp.nativeBuildInputs
             ++ [ pkgs.cachix pkgs.claude-code pkgs.lldb pkgs.act zls ];
-          buildInputs = packages.pcp.buildInputs;
+          buildInputs = packages.pcp.buildInputs
+            ++ packages.pcp.propagatedBuildInputs;
           shellHook = ''
             echo "Zig development environment loaded"
             echo "Zig version: $(zig version)"
@@ -90,7 +91,8 @@
             packages.iree-sdk.src
             packages.iree-sdk.build
           ];
-          propagatedBuildInputs = [ pkgs.cudaPackages.cuda_cudart pkgs.glibc ];
+          propagatedBuildInputs =
+            [ pkgs.cudaPackages.cuda_cudart pkgs.glibc packages.iree-sdk ];
           dontConfigure = true;
           doCheck = true;
           zigBuildFlags = [ "--verbose" "--color" "off" ];

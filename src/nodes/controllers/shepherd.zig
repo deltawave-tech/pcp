@@ -462,45 +462,44 @@ pub const Shepherd = struct {
     
     /// Collect responses from all workers
     pub fn collectFromWorkers(self: *Self, expected_msg_type: []const u8) !ArrayList(MessageEnvelope) {
-        // Get worker count under mutex
-        self.worker_pool_mutex.lock();
-        const worker_count = self.worker_pool.items.len;
-        self.worker_pool_mutex.unlock();
+        std.log.info("Collecting results...", .{});
 
-        std.log.info("Collecting results from {} workers...", .{worker_count});
-
-        // Poll the result queue until we have messages from all workers
-        const max_wait_seconds: i64 = 30; // 30 second timeout
+        const max_wait_seconds: i64 = 3600;
         const start_time = std.time.timestamp();
 
         while (true) {
+            // Check active worker count dynamically to handle disconnections
+            self.worker_pool_mutex.lock();
+            const active_workers = self.worker_pool.items.len;
+            self.worker_pool_mutex.unlock();
+
             self.result_queue_mutex.lock();
-            const current_count = self.result_queue.items.len;
+            const current_results = self.result_queue.items.len;
             self.result_queue_mutex.unlock();
 
-            if (current_count >= worker_count) {
+            if (current_results >= active_workers and active_workers > 0) {
                 break;
             }
 
-            // Check for timeout
+            if (active_workers == 0) {
+                return error.AllWorkersLost;
+            }
+
             const elapsed = std.time.timestamp() - start_time;
             if (elapsed > max_wait_seconds) {
                 std.log.err("Timeout waiting for worker results: got {}/{} after {} seconds",
-                    .{current_count, worker_count, elapsed});
+                    .{current_results, active_workers, elapsed});
                 return error.CollectionTimeout;
             }
 
-            // Sleep briefly before checking again
-            std.time.sleep(50 * std.time.ns_per_ms); // 50ms polling interval
+            std.time.sleep(50 * std.time.ns_per_ms);
         }
 
-        // Drain the queue and return results
         self.result_queue_mutex.lock();
         defer self.result_queue_mutex.unlock();
 
         var responses = ArrayList(MessageEnvelope).init(self.allocator);
 
-        // Verify all messages are of the expected type
         for (self.result_queue.items) |msg| {
             if (!std.mem.eql(u8, msg.msg_type, expected_msg_type)) {
                 std.log.warn("Unexpected message type: {s}, expected: {s}",
@@ -510,7 +509,6 @@ pub const Shepherd = struct {
             try responses.append(msg);
         }
 
-        // Clear the queue for the next collection
         self.result_queue.clearRetainingCapacity();
 
         std.log.info("Collected {} results from workers", .{responses.items.len});

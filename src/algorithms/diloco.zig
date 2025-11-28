@@ -26,6 +26,7 @@ const TrainingStatus = training_algorithm.TrainingStatus;
 const TrainingConfig = training_algorithm.TrainingConfig;
 const TrainingMetrics = training_algorithm.TrainingMetrics;
 const Shepherd = shepherd.Shepherd;
+const WorkerConfig = shepherd.WorkerConfig;
 const MessageType = message.MessageType;
 const NesterovMLIR = nesterov_mlir.NesterovMLIR(f32);
 const MLIRBuilder = ops.MLIRBuilder;
@@ -49,26 +50,6 @@ pub const DiLoCoConfig = struct {
             .parameter_averaging = true,
             .model_mlir_path = "src/models/nanogpt_forward.mlir", // Default path
         };
-    }
-};
-
-/// Worker configuration identifier for compiled artifacts
-const WorkerConfig = struct {
-    backend: backend_selection.Backend,
-    amd_target: ?[]const u8,
-
-    pub fn hash(ctx: @This(), hasher: anytype) void {
-        std.hash.autoHash(hasher, ctx.backend);
-        if (ctx.amd_target) |target| {
-            hasher.update(target);
-        }
-    }
-
-    pub fn eql(ctx: @This(), other: @This()) bool {
-        if (ctx.backend != other.backend) return false;
-        if (ctx.amd_target == null and other.amd_target == null) return true;
-        if (ctx.amd_target == null or other.amd_target == null) return false;
-        return std.mem.eql(u8, ctx.amd_target.?, other.amd_target.?);
     }
 };
 
@@ -379,7 +360,15 @@ pub const DiLoCo = struct {
             );
             try compiled_artifacts.put(config, vmfb_bytes);
         }
-        
+
+        // Copy compiled artifacts to shepherd for later worker reconnections
+        // We need to duplicate the VMFB bytes since the local compiled_artifacts will be freed
+        var artifact_it = compiled_artifacts.iterator();
+        while (artifact_it.next()) |entry| {
+            const vmfb_copy = try self.allocator.dupe(u8, entry.value_ptr.*);
+            try self.coordinator.compiled_artifacts.put(entry.key_ptr.*, vmfb_copy);
+        }
+
         // 4. Create the JSON payload for BOTH parameter shapes and data input shapes
         var param_shape_array = std.json.Array.init(self.allocator);
         defer param_shape_array.deinit();

@@ -27,6 +27,26 @@ pub const WorkerStatus = enum {
     Training,         // Worker is actively training
 };
 
+/// Worker configuration identifier for compiled artifacts
+pub const WorkerConfig = struct {
+    backend: Backend,
+    amd_target: ?[]const u8,
+
+    pub fn hash(self: @This(), hasher: anytype) void {
+        std.hash.autoHash(hasher, self.backend);
+        if (self.amd_target) |target| {
+            hasher.update(target);
+        }
+    }
+
+    pub fn eql(self: @This(), other: @This()) bool {
+        if (self.backend != other.backend) return false;
+        if (self.amd_target == null and other.amd_target == null) return true;
+        if (self.amd_target == null or other.amd_target == null) return false;
+        return std.mem.eql(u8, self.amd_target.?, other.amd_target.?);
+    }
+};
+
 /// Represents a connected worker
 pub const WorkerConnection = struct {
     node_id: NodeId,
@@ -72,7 +92,7 @@ pub const Shepherd = struct {
     is_running: bool,
     algorithm: ?*training_algorithm.TrainingAlgorithm, // Training algorithm interface
     executor: ?Executor, // Generic execution backend for algorithms
-    compiled_artifacts: std.AutoHashMap(Backend, []const u8), // Cache: Backend -> VMFB bytes
+    compiled_artifacts: std.HashMap(WorkerConfig, []const u8, std.hash_map.AutoContext(WorkerConfig), std.hash_map.default_max_load_percentage), // Cache: WorkerConfig -> VMFB bytes
     // Message queue for collecting worker results
     result_queue: ArrayList(MessageEnvelope),
     result_queue_mutex: std.Thread.Mutex,
@@ -89,7 +109,7 @@ pub const Shepherd = struct {
             .is_running = false,
             .algorithm = null,
             .executor = null,
-            .compiled_artifacts = std.AutoHashMap(Backend, []const u8).init(allocator),
+            .compiled_artifacts = std.HashMap(WorkerConfig, []const u8, std.hash_map.AutoContext(WorkerConfig), std.hash_map.default_max_load_percentage).init(allocator),
             .result_queue = ArrayList(MessageEnvelope).init(allocator),
             .result_queue_mutex = std.Thread.Mutex{},
         };
@@ -306,7 +326,7 @@ pub const Shepherd = struct {
                 std.log.info("Worker {} disconnected", .{worker_id});
                 // Update monitoring after worker removal
                 monitoring.setWorkerCount(self.worker_pool.items.len);
-                self.updateWorkerInfo();
+                self.updateWorkerInfoUnlocked();
                 return;
             }
         }
@@ -319,11 +339,8 @@ pub const Shepherd = struct {
         return self.worker_pool.items.len;
     }
 
-    /// Update worker information in monitoring system
-    pub fn updateWorkerInfo(self: *Self) void {
-        self.worker_pool_mutex.lock();
-        defer self.worker_pool_mutex.unlock();
-
+    /// Update worker information in monitoring system (internal, assumes mutex is held)
+    fn updateWorkerInfoUnlocked(self: *Self) void {
         // Create worker info array (static allocation is fine since we copy immediately)
         var worker_info_buf: [16]monitoring.WorkerInfo = undefined;
         var count: usize = 0;
@@ -365,6 +382,13 @@ pub const Shepherd = struct {
 
         // Update monitoring with worker info (monitoring will copy the data)
         monitoring.setWorkerInfo(worker_info_buf[0..count]);
+    }
+
+    /// Update worker information in monitoring system (public, acquires mutex)
+    pub fn updateWorkerInfo(self: *Self) void {
+        self.worker_pool_mutex.lock();
+        defer self.worker_pool_mutex.unlock();
+        self.updateWorkerInfoUnlocked();
     }
 
     /// Set the training algorithm
@@ -488,7 +512,7 @@ pub const Shepherd = struct {
     pub fn collectFromWorkers(self: *Self, expected_msg_type: []const u8, expected_count: usize) !ArrayList(MessageEnvelope) {
         std.log.info("Collecting results (expecting {})...", .{expected_count});
 
-        const max_wait_seconds: i64 = 3600;
+        const max_wait_seconds: i64 = 60; // Reduced from 3600 to handle mid-round disconnections
         const start_time = std.time.timestamp();
 
         while (true) {

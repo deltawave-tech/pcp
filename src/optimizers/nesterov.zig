@@ -64,9 +64,13 @@ pub const Nesterov = struct {
     /// Perform the update on a specific parameter tensor by index.
     ///
     /// In DiLoCo: gradient = (master_param - averaged_worker_param)
-    /// update:
-    ///    v = momentum * v + gradient
-    ///    p_new = p_old - lr * v
+    ///
+    /// Nesterov Momentum (Sutskever formulation):
+    ///    v_{t+1} = mu * v_t + grad
+    ///    p_{t+1} = p_t - lr * (grad + mu * v_{t+1})
+    ///
+    /// This is the "lookahead" behavior: the update includes both the current
+    /// gradient and the momentum-projected future velocity.
     ///
     /// Arguments:
     ///   - index: The index of the parameter tensor (matches initParameters order)
@@ -89,20 +93,16 @@ pub const Nesterov = struct {
             const p_worker = averaged_worker_param[i];
 
             // 1. Compute pseudo-gradient (direction towards workers)
-            // If workers moved right, p_worker > p_master.
-            // We want grad to be negative so -lr*grad moves right.
-            // Standard SGD: p -= lr * grad.
-            // Here: grad = p_master - p_worker
             const grad = p_master - p_worker;
 
-            // 2. Update Velocity
-            // v_{t+1} = mu * v_t + grad
-            const v_new = mu * velocity[i] + grad;
+            // 2. Update Velocity (same as Polyak)
+            const v_prev = velocity[i];
+            const v_new = mu * v_prev + grad;
             velocity[i] = v_new;
 
-            // 3. Apply Update
-            // p_{t+1} = p_t - lr * v_{t+1}
-            master_param[i] = p_master - (lr * v_new);
+            // 3. Apply Nesterov Update (Sutskever formulation)
+            // theta_new = theta_old - lr * (grad + mu * v_new)
+            master_param[i] = p_master - lr * (grad + mu * v_new);
         }
     }
 };

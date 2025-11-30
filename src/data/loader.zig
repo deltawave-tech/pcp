@@ -1,5 +1,8 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const dataset_mod = @import("dataset.zig");
+const Dataset = dataset_mod.Dataset;
+const DatasetBatch = dataset_mod.Batch;
 
 pub const Batch = struct {
     x: []u32,
@@ -108,5 +111,88 @@ pub const DataLoader = struct {
         }
 
         return Batch{ .x = x, .y = y };
+    }
+};
+
+/// TextDataset implements the Dataset interface for chunk-based data loading
+pub const TextDataset = struct {
+    allocator: Allocator,
+    tokenizer: CharTokenizer,
+    tokens: []u32, // The specific chunk of tokens for this worker
+    prng: std.Random.DefaultPrng,
+
+    const Self = @This();
+
+    /// Initialize with explicit offset and length (Strict Partitioning)
+    pub fn initChunk(allocator: Allocator, path: []const u8, offset: usize, length: usize, seed: u64) !*Self {
+        var tokenizer = try CharTokenizer.initFromFile(allocator, path);
+
+        // Read ONLY the assigned chunk
+        const file = try std.fs.cwd().openFile(path, .{});
+        defer file.close();
+
+        // Safety check
+        const stat = try file.stat();
+        if (offset >= stat.size) return error.OffsetOutOfBounds;
+        const actual_len = @min(length, stat.size - offset);
+
+        const buffer = try allocator.alloc(u8, actual_len);
+        defer allocator.free(buffer);
+
+        try file.seekTo(offset);
+        _ = try file.readAll(buffer);
+
+        // Convert chunk to tokens
+        const chunk_tokens = try tokenizer.encode(buffer);
+
+        const self = try allocator.create(Self);
+        self.* = Self{
+            .allocator = allocator,
+            .tokenizer = tokenizer,
+            .tokens = chunk_tokens,
+            .prng = std.Random.DefaultPrng.init(seed),
+        };
+        return self;
+    }
+
+    pub fn asDataset(self: *Self) Dataset {
+        return Dataset{
+            .ptr = self,
+            .vtable = &.{ .getBatch = getBatchImpl, .deinit = deinitImpl },
+        };
+    }
+
+    fn deinitImpl(ptr: *anyopaque) void {
+        const self: *Self = @ptrCast(@alignCast(ptr));
+        self.tokenizer.deinit();
+        self.allocator.free(self.tokens);
+        self.allocator.destroy(self);
+    }
+
+    fn getBatchImpl(ptr: *anyopaque, batch_size: usize, block_size: usize) anyerror!DatasetBatch {
+        const self: *Self = @ptrCast(@alignCast(ptr));
+
+        // Allocate IREE-compatible byte buffers (u32 -> 4 bytes)
+        const size_bytes = batch_size * block_size * 4;
+        const x_bytes = try self.allocator.alloc(u8, size_bytes);
+        errdefer self.allocator.free(x_bytes);
+        const y_bytes = try self.allocator.alloc(u8, size_bytes);
+        errdefer self.allocator.free(y_bytes);
+
+        const x_flat = std.mem.bytesAsSlice(u32, x_bytes);
+        const y_flat = std.mem.bytesAsSlice(u32, y_bytes);
+
+        const random = self.prng.random();
+
+        // Randomly sample FROM THE ASSIGNED CHUNK ONLY
+        for (0..batch_size) |i| {
+            if (self.tokens.len <= block_size + 1) return error.ChunkTooSmall;
+            const start = random.uintAtMost(usize, self.tokens.len - block_size - 1);
+
+            @memcpy(x_flat[i * block_size..(i + 1) * block_size], self.tokens[start..start + block_size]);
+            @memcpy(y_flat[i * block_size..(i + 1) * block_size], self.tokens[start + 1..start + block_size + 1]);
+        }
+
+        return DatasetBatch{ .inputs = x_bytes, .targets = y_bytes, .allocator = self.allocator };
     }
 };

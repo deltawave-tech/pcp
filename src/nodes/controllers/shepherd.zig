@@ -11,6 +11,7 @@ const training_algorithm = @import("../../algorithms/training_algorithm.zig");
 const execution = @import("../../execution.zig");
 const monitoring = @import("../../ui/monitoring.zig");
 const backend_selection = @import("../../backends/selection.zig");
+const data_manager = @import("data_manager.zig");
 
 const TcpServer = tcp_stream.TcpServer;
 const TcpStreamManager = tcp_stream.TcpStreamManager;
@@ -96,6 +97,8 @@ pub const Shepherd = struct {
     // Message queue for collecting worker results
     result_queue: ArrayList(MessageEnvelope),
     result_queue_mutex: std.Thread.Mutex,
+    // Data manager for chunk-based strict partitioning
+    data_manager: ?data_manager.DataManager,
 
     const Self = @This();
 
@@ -112,6 +115,7 @@ pub const Shepherd = struct {
             .compiled_artifacts = std.HashMap(WorkerConfig, []const u8, std.hash_map.AutoContext(WorkerConfig), std.hash_map.default_max_load_percentage).init(allocator),
             .result_queue = ArrayList(MessageEnvelope).init(allocator),
             .result_queue_mutex = std.Thread.Mutex{},
+            .data_manager = null, // Initialized when training starts
         };
     }
     
@@ -142,6 +146,11 @@ pub const Shepherd = struct {
         // Clean up executor if owned
         if (self.executor) |executor| {
             executor.deinit();
+        }
+
+        // Clean up data manager
+        if (self.data_manager) |*dm| {
+            dm.deinit();
         }
     }
     
@@ -404,6 +413,13 @@ pub const Shepherd = struct {
     /// Get the executor for algorithms to use
     pub fn getExecutor(self: *Self) ?Executor {
         return self.executor;
+    }
+
+    /// Initialize the data manager for chunk-based data partitioning
+    pub fn initDataManager(self: *Self, total_size: usize, chunk_size: usize) !void {
+        if (self.data_manager != null) return; // Already initialized
+        self.data_manager = try data_manager.DataManager.init(self.allocator, total_size, chunk_size);
+        std.log.info("DataManager initialized: {} total size, {} chunk size", .{ total_size, chunk_size });
     }
 
     /// Start training once we have enough workers

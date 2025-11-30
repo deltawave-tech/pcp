@@ -255,11 +255,15 @@ fn runShepherd(allocator: Allocator, args: Args) !void {
     // Now use system.shepherd instead of a local variable
     const shepherd_controller = &system.shepherd;
 
-    // 2. Initialize DataLoader with configured path
-    print("Loading dataset: {s}...\n", .{exp_config.data_path});
-    var data_loader = try @import("data/loader.zig").DataLoader.init(allocator, exp_config.data_path);
-    defer data_loader.deinit();
-    print("🌙 Dataset loaded with {} tokens\n", .{data_loader.tokens.len});
+    // 2. Initialize DataManager for chunk-based data partitioning
+    print("Initializing DataManager for dataset: {s}...\n", .{exp_config.data_path});
+    const file = try std.fs.cwd().openFile(exp_config.data_path, .{});
+    defer file.close();
+    const stat = try file.stat();
+    const total_size = stat.size;
+    const chunk_size = 100 * 1024; // 100KB chunks
+    try shepherd_controller.initDataManager(total_size, chunk_size);
+    print("🌙 DataManager initialized: {} total size, {} byte chunks\n", .{ total_size, chunk_size });
 
     // 3. Populate DiLoCo Config with experiment configuration
     var diloco_config = DiLoCoConfig.default();
@@ -286,7 +290,7 @@ fn runShepherd(allocator: Allocator, args: Args) !void {
 
     print("Initializing DiLoCo algorithm...\n", .{});
     // This will trigger Autodiff -> Compilation
-    var diloco_algo = try DiLoCo.init(allocator, shepherd_controller, diloco_config, system.executor, &mlir_builder, &data_loader);
+    var diloco_algo = try DiLoCo.init(allocator, shepherd_controller, diloco_config, system.executor, &mlir_builder);
     defer diloco_algo.deinit();
     print("🌙 DiLoCo algorithm initialized successfully\n", .{});
 

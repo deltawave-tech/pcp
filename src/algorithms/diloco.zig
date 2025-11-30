@@ -134,8 +134,8 @@ pub const DiLoCo = struct {
         return error.FunctionNotFound;
     }
 
-    // Change the init signature to accept the generic executor and DataLoader
-    pub fn init(allocator: Allocator, coordinator: *Shepherd, config: DiLoCoConfig, executor: Executor, mlir_builder: *MLIRBuilder, dataset: *DataLoader) !Self {
+    // Change the init signature to accept the generic executor (dataset now loaded by workers)
+    pub fn init(allocator: Allocator, coordinator: *Shepherd, config: DiLoCoConfig, executor: Executor, mlir_builder: *MLIRBuilder) !Self {
         // The MLIRBuilder is now passed in, ensuring a single context.
         const element_type = mlir.Type.f32Type(mlir_builder.ctx);
 
@@ -258,7 +258,7 @@ pub const DiLoCo = struct {
             .data_input_shapes = data_input_shapes,
             .executor = executor,
             .worker_graph_mlir_source = undefined, // Will be set below
-            .data_loader = dataset,
+            .data_loader = undefined, // No longer used - workers load data locally
             .wandb_logger = logger,
         };
 
@@ -281,7 +281,7 @@ pub const DiLoCo = struct {
             .data_input_shapes = data_input_shapes,
             .executor = executor, // Store the generic executor
             .worker_graph_mlir_source = graph, // Store the MLIR source
-            .data_loader = dataset,
+            .data_loader = undefined, // No longer used - workers load data locally
             .wandb_logger = logger,
         };
     }
@@ -491,13 +491,8 @@ pub const DiLoCo = struct {
             // Initialize any new workers that haven't received the graph yet
             try self.initializeNewWorkers(participants.items);
 
-            // USE CONFIG VALUES HERE
-            const batch = try self.data_loader.getBatch(self.config.batch_size, self.config.block_size);
-            defer self.allocator.free(batch.x);
-            defer self.allocator.free(batch.y);
-
-            // Broadcast to snapshot participants only
-            try self.broadcastToSnapshot(participants.items, batch);
+            // Broadcast to snapshot participants only (workers will load data locally)
+            try self.broadcastToSnapshot(participants.items);
 
             // Collect from snapshot participants only
             const worker_results = try self.collectFromSnapshot(participants.items);
@@ -1089,7 +1084,7 @@ pub const DiLoCo = struct {
     }
 
     /// Broadcast to snapshot participants only
-    fn broadcastToSnapshot(self: *Self, workers: []const shepherd.WorkerConnection, batch: data_loader.Batch) !void {
+    fn broadcastToSnapshot(self: *Self, workers: []const shepherd.WorkerConnection) !void {
         if (self.master_parameters == null) {
             return error.ParametersNotInitialized;
         }
@@ -1106,39 +1101,47 @@ pub const DiLoCo = struct {
             try total_param_bytes.appendSlice(tensor_data);
         }
 
-        // Convert u32 batch data to i64 for IREE
-        const input_ids_i64 = try self.allocator.alloc(i64, batch.x.len);
-        defer self.allocator.free(input_ids_i64);
-        for (batch.x, 0..) |val, i| input_ids_i64[i] = @intCast(val);
+        // Base64 encode parameters for JSON transport
+        const b64_len = std.base64.standard.Encoder.calcSize(total_param_bytes.items.len);
+        const b64_encoded_params = try self.allocator.alloc(u8, b64_len);
+        defer self.allocator.free(b64_encoded_params);
+        const encoded_len = std.base64.standard.Encoder.encode(b64_encoded_params, total_param_bytes.items).len;
 
-        const targets_i64 = try self.allocator.alloc(i64, batch.y.len);
-        defer self.allocator.free(targets_i64);
-        for (batch.y, 0..) |val, i| targets_i64[i] = @intCast(val);
-
-        const input_ids_bytes = std.mem.sliceAsBytes(input_ids_i64);
-        const targets_bytes = std.mem.sliceAsBytes(targets_i64);
-
-        const worker_payload = binary_protocol.WorkerPayload{
-            .params = total_param_bytes.items,
-            .input_ids = input_ids_bytes,
-            .targets = targets_bytes,
-        };
-
-        const capnp_bytes = try worker_payload.serialize(self.allocator);
-        defer self.allocator.free(capnp_bytes);
-
-        const b64_len = std.base64.standard.Encoder.calcSize(capnp_bytes.len);
-        const b64_encoded_payload = try self.allocator.alloc(u8, b64_len);
-        defer self.allocator.free(b64_encoded_payload);
-
-        const encoded_len = std.base64.standard.Encoder.encode(b64_encoded_payload, capnp_bytes).len;
-        const json_payload = std.json.Value{ .string = b64_encoded_payload[0..encoded_len] };
-
-        // Send to each worker in the snapshot
+        // Send to each worker with their assigned data chunk
         for (workers) |worker| {
+            // Assign data chunk for this worker
+            const chunk = if (self.coordinator.data_manager) |*dm|
+                dm.assignNextChunk(worker.node_id)
+            else
+                null;
+
+            if (chunk == null) {
+                std.log.warn("No data chunk available for worker {}", .{worker.node_id});
+                continue;
+            }
+
+            // Build JSON payload with params and chunk info
+            var payload_map = std.json.ObjectMap.init(self.allocator);
+            defer payload_map.deinit();
+
+            try payload_map.put("params", std.json.Value{ .string = b64_encoded_params[0..encoded_len] });
+            try payload_map.put("offset", std.json.Value{ .integer = @intCast(chunk.?.offset) });
+            try payload_map.put("length", std.json.Value{ .integer = @intCast(chunk.?.length) });
+            try payload_map.put("chunk_id", std.json.Value{ .integer = @intCast(chunk.?.id) });
+            try payload_map.put("data_path", std.json.Value{ .string = self.config.data_path });
+
+            const json_payload = std.json.Value{ .object = payload_map };
+
             self.coordinator.sendToWorker(worker.node_id, MessageType.START_INNER_LOOP, json_payload) catch |err| {
                 std.log.err("Failed to send task to worker {}: {}", .{worker.node_id, err});
             };
+
+            std.log.info("Assigned chunk {} (offset: {}, len: {}) to worker {}", .{
+                chunk.?.id,
+                chunk.?.offset,
+                chunk.?.length,
+                worker.node_id,
+            });
         }
     }
 
@@ -1157,8 +1160,31 @@ pub const DiLoCo = struct {
         defer arena.deinit();
 
         for (responses.items) |response| {
+            // Extract chunk_id if present and mark complete
+            if (response.data == .object) {
+                if (response.data.object.get("chunk_id")) |chunk_val| {
+                    if (chunk_val == .integer) {
+                        const chunk_id: usize = @intCast(chunk_val.integer);
+                        if (self.coordinator.data_manager) |*dm| {
+                            dm.markComplete(chunk_id);
+                            std.log.info("Worker {} completed chunk {}", .{ response.sender_node, chunk_id });
+                        }
+                    }
+                }
+            }
+
             const b64_encoded_payload = switch (response.data) {
                 .string => |s| s,
+                .object => |obj| blk: {
+                    // New format: JSON object with params field
+                    if (obj.get("params")) |params_val| {
+                        break :blk switch (params_val) {
+                            .string => |s| s,
+                            else => return error.InvalidMessageFormat,
+                        };
+                    }
+                    return error.InvalidMessageFormat;
+                },
                 else => return error.InvalidMessageFormat,
             };
 

@@ -9,6 +9,8 @@ const message = @import("../../network/message.zig");
 const binary_protocol = @import("../../network/capnp_zig_wrapper.zig");
 const worker_backend = @import("../../backends/worker_backend.zig");
 const backend_selection = @import("../../backends/selection.zig");
+const dataset_mod = @import("../../data/dataset.zig");
+const loader = @import("../../data/loader.zig");
 
 const TcpClient = tcp_stream.TcpClient;
 const TcpStreamManager = tcp_stream.TcpStreamManager;
@@ -16,6 +18,8 @@ const MessageEnvelope = message.MessageEnvelope;
 const MessageType = message.MessageType;
 const NodeId = message.NodeId;
 const WorkerBackend = worker_backend.WorkerBackend;
+const Dataset = dataset_mod.Dataset;
+const TextDataset = loader.TextDataset;
 
 
 /// Worker state
@@ -35,7 +39,7 @@ pub const Worker = struct {
     node_id: ?NodeId,
     state: WorkerState,
     is_running: bool,
-    
+
     // Backend abstraction - handles all MLIR compilation and execution
     backend: WorkerBackend,
 
@@ -48,6 +52,10 @@ pub const Worker = struct {
     m_states: ?[][]u8, // One buffer per parameter
     v_states: ?[][]u8, // One buffer per parameter
     timestep: f32,
+
+    // NEW: Dataset for chunk-based data loading
+    dataset: ?Dataset,
+    current_chunk_id: ?usize,
 
     const Self = @This();
     
@@ -65,11 +73,18 @@ pub const Worker = struct {
             .m_states = null,
             .v_states = null,
             .timestep = 1.0,
+            .dataset = null,
+            .current_chunk_id = null,
         };
     }
     
     
     pub fn deinit(self: *Self) void {
+        // Cleanup dataset if it exists
+        if (self.dataset) |ds| {
+            ds.deinit();
+        }
+
         // Cleanup cached VMFB if it exists
         if (self.cached_vmfb) |vmfb| {
             self.allocator.free(vmfb);
@@ -361,7 +376,7 @@ pub const Worker = struct {
     }
     
     /// Handle StartInnerLoop command from Shepherd using Cap'n Proto
-    /// Implements the tau-step inner loop with AdamW state management
+    /// Implements the tau-step inner loop with AdamW state management and chunk-based data loading
     fn handleStartInnerLoop(self: *Self, msg: MessageEnvelope) !void {
         self.state = .training;
 
@@ -372,61 +387,106 @@ pub const Worker = struct {
         const m_states = self.m_states orelse return error.OptimizerStateNotInitialized;
         const v_states = self.v_states orelse return error.OptimizerStateNotInitialized;
 
-        // 2. Decode the Base64-encoded Cap'n Proto payload
-        const b64_encoded_payload = switch (msg.data) {
-            .string => |s| s,
+        // 2. Extract payload as JSON object
+        const payload = switch (msg.data) {
+            .object => |obj| obj,
             else => return error.InvalidMessageFormat,
+        };
+
+        // 3. Extract chunk metadata
+        const offset = switch (payload.get("offset") orelse return error.MissingOffset) {
+            .integer => |i| i,
+            else => return error.InvalidOffsetFormat,
+        };
+        const length = switch (payload.get("length") orelse return error.MissingLength) {
+            .integer => |i| i,
+            else => return error.InvalidLengthFormat,
+        };
+        const chunk_id = switch (payload.get("chunk_id") orelse return error.MissingChunkId) {
+            .integer => |i| i,
+            else => return error.InvalidChunkIdFormat,
+        };
+        const data_path = switch (payload.get("data_path") orelse return error.MissingDataPath) {
+            .string => |s| s,
+            else => return error.InvalidDataPathFormat,
+        };
+
+        self.current_chunk_id = @intCast(chunk_id);
+
+        std.log.info("Worker {}: Assigned chunk {} (offset={}, length={})", .{ self.node_id.?, chunk_id, offset, length });
+
+        // 4. Initialize dataset for this chunk
+        if (self.dataset) |ds| {
+            ds.deinit();
+        }
+        const text_ds = try TextDataset.initChunk(
+            self.allocator,
+            data_path,
+            @intCast(offset),
+            @intCast(length),
+            @intCast(self.node_id.?),
+        );
+        self.dataset = text_ds.asDataset();
+
+        // 5. Decode the Base64-encoded Cap'n Proto params
+        const b64_params = switch (payload.get("params") orelse return error.MissingParams) {
+            .string => |s| s,
+            else => return error.InvalidParamsFormat,
         };
 
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
 
-        const capnp_len = try std.base64.standard.Decoder.calcSizeForSlice(b64_encoded_payload);
+        const capnp_len = try std.base64.standard.Decoder.calcSizeForSlice(b64_params);
         const capnp_bytes = try arena.allocator().alloc(u8, capnp_len);
-        try std.base64.standard.Decoder.decode(capnp_bytes, b64_encoded_payload);
+        try std.base64.standard.Decoder.decode(capnp_bytes, b64_params);
 
-        // 3. Deserialize the payload to get initial params and batch data
+        // 6. Deserialize params only (no batch data)
         const reader = try binary_protocol.WorkerPayload.Reader.init(capnp_bytes);
         defer reader.deinit();
         const initial_params_bytes = try reader.getParams();
-        const input_ids_bytes = try reader.getInputIds();
-        const targets_bytes = try reader.getTargets();
 
-        std.log.info("Starting inner loop: params={} bytes, inputs={} bytes, targets={} bytes", .{
-            initial_params_bytes.len, input_ids_bytes.len, targets_bytes.len
-        });
+        std.log.info("Starting inner loop: params={} bytes, chunk={}", .{ initial_params_bytes.len, chunk_id });
 
-        // 4. Reset optimizer states (M and V to zero, timestep to 1.0)
+        // 7. Reset optimizer states (M and V to zero, timestep to 1.0)
         // Per DiLoCo paper: "inner optimizer states are reset at the beginning of each inner loop"
         for (m_states) |m_buf| @memset(m_buf, 0);
         for (v_states) |v_buf| @memset(v_buf, 0);
         self.timestep = 1.0;
 
-        // 5. Copy initial params into working buffers (we'll update these in the loop)
+        // 8. Copy initial params into working buffers (we'll update these in the loop)
         var current_params = try self.allocator.alloc([]u8, param_shapes.len);
         defer {
             for (current_params) |buf| self.allocator.free(buf);
             self.allocator.free(current_params);
         }
 
-        var offset: usize = 0;
+        var param_offset: usize = 0;
         for (param_shapes, 0..) |shape, i| {
             var size: usize = @sizeOf(f32);
             for (shape) |dim| size *= @intCast(dim);
 
-            if (offset + size > initial_params_bytes.len) return error.ParameterBufferTooSmall;
+            if (param_offset + size > initial_params_bytes.len) return error.ParameterBufferTooSmall;
 
             current_params[i] = try self.allocator.alloc(u8, size);
-            @memcpy(current_params[i], initial_params_bytes[offset .. offset + size]);
-            offset += size;
+            @memcpy(current_params[i], initial_params_bytes[param_offset .. param_offset + size]);
+            param_offset += size;
         }
 
-        // 6. Run the inner loop for tau steps
+        // 9. Extract batch_size and block_size from data_shapes
+        const batch_size: usize = @intCast(data_shapes[0][0]);
+        const block_size: usize = @intCast(data_shapes[0][1]);
+
+        // 10. Run the inner loop for tau steps
         const tau: usize = 10; // DiLoCo default
         var final_loss: f32 = 0.0;
 
         for (0..tau) |step| {
             std.log.info("Worker {} inner loop step {}/{}", .{ self.node_id.?, step + 1, tau });
+
+            // A. Generate batch locally from dataset
+            const batch = try self.dataset.?.getBatch(batch_size, block_size);
+            defer batch.deinit();
 
             // Build input list: [Params (N), Ms (N), Vs (N), Timestep (1), Data (D)]
             var inputs_list = std.ArrayList([]const u8).init(self.allocator);
@@ -445,9 +505,9 @@ pub const Worker = struct {
             const timestep_bytes = std.mem.asBytes(&self.timestep);
             try inputs_list.append(timestep_bytes);
 
-            // Add data inputs
-            try inputs_list.append(input_ids_bytes);
-            try inputs_list.append(targets_bytes);
+            // Add data inputs (from locally generated batch)
+            try inputs_list.append(batch.inputs);
+            try inputs_list.append(batch.targets);
 
             const inputs = try inputs_list.toOwnedSlice();
             defer self.allocator.free(inputs);
@@ -515,7 +575,7 @@ pub const Worker = struct {
 
         std.log.info("Worker {} completed {} inner loop steps, final loss: {d:.4}", .{ self.node_id.?, tau, final_loss });
 
-        // 7. After tau steps, send back the final parameters and loss
+        // 11. After tau steps, send back the final parameters, loss, and chunk_id
         // Concatenate final parameters
         var final_params_bytes = std.ArrayList(u8).init(self.allocator);
         defer final_params_bytes.deinit();
@@ -528,12 +588,18 @@ pub const Worker = struct {
         const response_capnp_bytes = try shepherd_payload.serialize(self.allocator);
         defer self.allocator.free(response_capnp_bytes);
 
-        // Base64 encode the response
+        // Base64 encode the params+loss
         const b64_len = std.base64.standard.Encoder.calcSize(response_capnp_bytes.len);
-        const response_b64_payload = try self.allocator.alloc(u8, b64_len);
-        defer self.allocator.free(response_b64_payload);
+        const response_b64_params = try self.allocator.alloc(u8, b64_len);
+        defer self.allocator.free(response_b64_params);
 
-        const encoded_len = std.base64.standard.Encoder.encode(response_b64_payload, response_capnp_bytes).len;
+        const encoded_len = std.base64.standard.Encoder.encode(response_b64_params, response_capnp_bytes).len;
+
+        // Create JSON response with params and chunk_id
+        var response_payload = std.json.ObjectMap.init(self.allocator);
+        defer response_payload.deinit();
+        try response_payload.put("params", std.json.Value{ .string = response_b64_params[0..encoded_len] });
+        try response_payload.put("chunk_id", std.json.Value{ .integer = @intCast(self.current_chunk_id.?) });
 
         // Send the response
         const response = tcp_stream.createMessage(
@@ -543,7 +609,7 @@ pub const Worker = struct {
             "shepherd",
             MessageType.INNER_LOOP_COMPLETE,
             msg.msg_id + 1,
-            std.json.Value{ .string = response_b64_payload[0..encoded_len] },
+            std.json.Value{ .object = response_payload },
         );
 
         try self.client.send(response);

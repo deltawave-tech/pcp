@@ -30,20 +30,20 @@ pub const WorkerStatus = enum {
 /// Worker configuration identifier for compiled artifacts
 pub const WorkerConfig = struct {
     backend: Backend,
-    amd_target: ?[]const u8,
+    target_arch: ?[]const u8,
 
     pub fn hash(self: @This(), hasher: anytype) void {
         std.hash.autoHash(hasher, self.backend);
-        if (self.amd_target) |target| {
+        if (self.target_arch) |target| {
             hasher.update(target);
         }
     }
 
     pub fn eql(self: @This(), other: @This()) bool {
         if (self.backend != other.backend) return false;
-        if (self.amd_target == null and other.amd_target == null) return true;
-        if (self.amd_target == null or other.amd_target == null) return false;
-        return std.mem.eql(u8, self.amd_target.?, other.amd_target.?);
+        if (self.target_arch == null and other.target_arch == null) return true;
+        if (self.target_arch == null or other.target_arch == null) return false;
+        return std.mem.eql(u8, self.target_arch.?, other.target_arch.?);
     }
 };
 
@@ -55,11 +55,11 @@ pub const WorkerConnection = struct {
     backend: Backend,
     status: WorkerStatus,
     address: net.Address,  // Worker's network address
-    amd_target: ?[]const u8,  // AMD GPU target architecture (e.g., gfx942 for MI300X)
+    target_arch: ?[]const u8,  // GPU target architecture (e.g., gfx942 for MI300X, sm_80 for A100)
 
     const Self = @This();
 
-    pub fn init(node_id: NodeId, stream: net.Stream, backend: Backend, address: net.Address, amd_target: ?[]const u8) Self {
+    pub fn init(node_id: NodeId, stream: net.Stream, backend: Backend, address: net.Address, target_arch: ?[]const u8) Self {
         return Self{
             .node_id = node_id,
             .stream = stream,
@@ -67,7 +67,7 @@ pub const WorkerConnection = struct {
             .backend = backend,
             .status = .Connected,
             .address = address,
-            .amd_target = amd_target,
+            .target_arch = target_arch,
         };
     }
     
@@ -201,8 +201,8 @@ pub const Shepherd = struct {
             else if (std.mem.eql(u8, backend_str, "metal")) backend_selection.Backend.metal
             else .cpu; // Default to cpu
 
-        // Parse AMD target if present
-        const amd_target: ?[]const u8 = if (data_obj.get("amd_target")) |target_val|
+        // Parse target architecture if present
+        const target_arch: ?[]const u8 = if (data_obj.get("target_arch")) |target_val|
             switch (target_val) {
                 .string => |s| s,
                 else => null,
@@ -211,8 +211,8 @@ pub const Shepherd = struct {
             null;
 
         std.log.info("Worker connecting with backend: {s}", .{worker_backend.toString()});
-        if (amd_target) |target| {
-            std.log.info("  AMD target: {s}", .{target});
+        if (target_arch) |target| {
+            std.log.info("  Target architecture: {s}", .{target});
         }
 
         // Assign new NodeId and add worker to pool (both protected by mutex)
@@ -220,7 +220,7 @@ pub const Shepherd = struct {
         const assigned_node_id = self.next_node_id;
         self.next_node_id += 1;
 
-        const worker = WorkerConnection.init(assigned_node_id, stream, worker_backend, worker_address, amd_target);
+        const worker = WorkerConnection.init(assigned_node_id, stream, worker_backend, worker_address, target_arch);
         self.worker_pool.append(worker) catch |err| {
             self.worker_pool_mutex.unlock();
             std.log.err("Failed to append worker {}: {}", .{ assigned_node_id, err });

@@ -41,6 +41,10 @@ pub const DiLoCoConfig = struct {
     nesterov_momentum: f32,
     parameter_averaging: bool,
     model_mlir_path: []const u8, // Path to the model MLIR file
+    // NEW FIELDS for experiment configuration
+    data_path: []const u8,
+    batch_size: usize,
+    block_size: usize,
 
     pub fn default() DiLoCoConfig {
         return DiLoCoConfig{
@@ -49,6 +53,9 @@ pub const DiLoCoConfig = struct {
             .nesterov_momentum = 0.9,
             .parameter_averaging = true,
             .model_mlir_path = "src/models/nanogpt_forward.mlir", // Default path
+            .data_path = "data/tiny_shakespeare.txt",
+            .batch_size = 64,
+            .block_size = 64, // Typically matches model context window
         };
     }
 };
@@ -318,7 +325,7 @@ pub const DiLoCo = struct {
         // 1. Wait for workers to connect (this logic is in Shepherd.startTraining,
         //    which calls this run() function. So by the time we are here, workers are present.)
 
-        // 2. Identify unique (backend, amd_target) combinations in the connected worker pool
+        // 2. Identify unique (backend, target_arch) combinations in the connected worker pool
         var config_set = std.HashMap(WorkerConfig, void, std.hash_map.AutoContext(WorkerConfig), std.hash_map.default_max_load_percentage).init(self.allocator);
         defer config_set.deinit();
 
@@ -326,13 +333,13 @@ pub const DiLoCo = struct {
         for (self.coordinator.worker_pool.items) |worker| {
             const config = WorkerConfig{
                 .backend = worker.backend,
-                .amd_target = worker.amd_target,
+                .target_arch = worker.target_arch,
             };
             try config_set.put(config, {});
         }
         self.coordinator.worker_pool_mutex.unlock();
 
-        // 3. Compile the MLIR source once for EACH unique (backend, amd_target) combination
+        // 3. Compile the MLIR source once for EACH unique (backend, target_arch) combination
         var compiled_artifacts = std.HashMap(WorkerConfig, []const u8, std.hash_map.AutoContext(WorkerConfig), std.hash_map.default_max_load_percentage).init(self.allocator);
         defer {
             var it = compiled_artifacts.iterator();
@@ -346,8 +353,8 @@ pub const DiLoCo = struct {
         var config_it = config_set.keyIterator();
         while (config_it.next()) |config_ptr| {
             const config = config_ptr.*;
-            if (config.amd_target) |target| {
-                std.log.info("Compiling worker graph for backend: {s} with AMD target: {s}", .{config.backend.toString(), target});
+            if (config.target_arch) |target| {
+                std.log.info("Compiling worker graph for backend: {s} with target: {s}", .{config.backend.toString(), target});
             } else {
                 std.log.info("Compiling worker graph for backend: {s}", .{config.backend.toString()});
             }
@@ -356,7 +363,7 @@ pub const DiLoCo = struct {
                 self.allocator,
                 self.worker_graph_mlir_source,
                 config.backend.toIreeCompilationTarget(),
-                config.amd_target,
+                config.target_arch,
             );
             try compiled_artifacts.put(config, vmfb_bytes);
         }
@@ -404,7 +411,7 @@ pub const DiLoCo = struct {
         for (worker_list) |worker| {
             const worker_config = WorkerConfig{
                 .backend = worker.backend,
-                .amd_target = worker.amd_target,
+                .target_arch = worker.target_arch,
             };
             const vmfb_bytes = compiled_artifacts.get(worker_config).?;
 
@@ -448,9 +455,8 @@ pub const DiLoCo = struct {
             // Initialize any new workers that haven't received the graph yet
             try self.initializeNewWorkers(participants.items);
 
-            const batch_size = 64;
-            const block_size = 8;
-            const batch = try self.data_loader.getBatch(batch_size, block_size);
+            // USE CONFIG VALUES HERE
+            const batch = try self.data_loader.getBatch(self.config.batch_size, self.config.block_size);
             defer self.allocator.free(batch.x);
             defer self.allocator.free(batch.y);
 
@@ -983,7 +989,7 @@ pub const DiLoCo = struct {
                 // Get compiled artifact for this worker's backend
                 const worker_config = WorkerConfig{
                     .backend = worker.backend,
-                    .amd_target = worker.amd_target,
+                    .target_arch = worker.target_arch,
                 };
                 const vmfb_bytes = self.coordinator.compiled_artifacts.get(worker_config) orelse return error.VMFBNotFound;
 

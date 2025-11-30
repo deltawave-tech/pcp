@@ -98,7 +98,7 @@ pub const Worker = struct {
     }
     
     /// Connect to the Shepherd coordinator
-    pub fn connect(self: *Self, master_host: []const u8, master_port: u16, amd_target: ?[]const u8) !void {
+    pub fn connect(self: *Self, master_host: []const u8, master_port: u16, target_arch: ?[]const u8) !void {
         self.state = .connecting;
 
         // Connect to the master
@@ -112,10 +112,10 @@ pub const Worker = struct {
         var payload_map = std.json.ObjectMap.init(self.allocator);
         try payload_map.put("backend", std.json.Value{ .string = my_backend.toString() });
 
-        // Add AMD target if specified
-        if (amd_target) |target| {
-            try payload_map.put("amd_target", std.json.Value{ .string = target });
-            std.log.info("Reporting AMD target: {s}", .{target});
+        // Add target architecture if specified
+        if (target_arch) |target| {
+            try payload_map.put("target_arch", std.json.Value{ .string = target });
+            std.log.info("Reporting target architecture: {s}", .{target});
         }
 
         const payload = std.json.Value{ .object = payload_map };
@@ -190,12 +190,12 @@ pub const Worker = struct {
     }
 
     /// Robust entry point with automatic reconnection on failure
-    pub fn runRobust(self: *Self, host: []const u8, port: u16, amd_target: ?[]const u8) !void {
+    pub fn runRobust(self: *Self, host: []const u8, port: u16, target_arch: ?[]const u8) !void {
         var backoff_ms: u64 = 100;
         const max_backoff_ms: u64 = 10000;
 
         while (true) {
-            self.connect(host, port, amd_target) catch |err| {
+            self.connect(host, port, target_arch) catch |err| {
                 std.log.warn("Failed to connect to Shepherd: {}. Retrying in {}ms...", .{ err, backoff_ms });
                 std.time.sleep(backoff_ms * std.time.ns_per_ms);
                 backoff_ms = @min(backoff_ms * 2, max_backoff_ms);

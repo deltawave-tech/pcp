@@ -119,8 +119,8 @@ pub const MLIRContext = struct {
     }
 
     /// Compiles an MLIR module to a VMFB artifact using the IREE compiler.
-    /// amd_target: Optional AMD GPU target architecture (e.g., "gfx942" for MI300X)
-    pub fn compileToVMFB(self: *Self, allocator: Allocator, mlir_source: []const u8, iree_target: []const u8, amd_target: ?[]const u8) ![]u8 {
+    /// target_arch: Optional GPU target architecture (e.g., "gfx942" for MI300X, "sm_80" for A100)
+    pub fn compileToVMFB(self: *Self, allocator: Allocator, mlir_source: []const u8, iree_target: []const u8, target_arch: ?[]const u8) ![]u8 {
         _ = self;
 
         // 2. Create unique temporary file paths
@@ -168,12 +168,17 @@ pub const MLIRContext = struct {
         try argv.append(target_arg);
 
         // Handle architecture targets
-        if (is_rocm and amd_target != null) {
-            hip_target_arg = try std.fmt.allocPrint(allocator, "--iree-hip-target={s}", .{amd_target.?});
+        if (is_rocm) {
+            // Default to gfx942 (MI300X) if not specified for ROCm
+            const arch = target_arch orelse "gfx942";
+            std.log.info("Compiling for HIP target: {s}", .{arch});
+            hip_target_arg = try std.fmt.allocPrint(allocator, "--iree-hip-target={s}", .{arch});
             try argv.append(hip_target_arg.?);
-            std.log.info("Compiling for AMD target: {s}", .{amd_target.?});
         } else if (is_cuda) {
-            cuda_arch_arg = try std.fmt.allocPrint(allocator, "--iree-cuda-target=sm_80", .{});
+            // Default to sm_80 (A100) if not specified for CUDA
+            const arch = target_arch orelse "sm_80";
+            std.log.info("Compiling for CUDA target: {s}", .{arch});
+            cuda_arch_arg = try std.fmt.allocPrint(allocator, "--iree-cuda-target={s}", .{arch});
             try argv.append(cuda_arch_arg.?);
 
             // Disable all advanced CUDA codegen features to avoid LLVM lowering issues

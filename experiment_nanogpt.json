@@ -1,0 +1,10 @@
+{
+    "model_path": "models/nanogpt_forward_32.mlir",
+    "data_path": "data/tiny_shakespeare.txt",
+    "learning_rate": 0.0006,
+    "batch_size": 32,
+    "block_size": 32,
+    "tau": 50,
+    "outer_loop_steps": 100,
+    "nesterov_momentum": 0.9
+}

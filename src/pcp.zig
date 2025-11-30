@@ -23,15 +23,45 @@ const DiLoCo = diloco.DiLoCo;
 const DiLoCoConfig = diloco.DiLoCoConfig;
 const MLIRBuilder = ops.MLIRBuilder;
 
+/// JSON Config File Structure
+const ExperimentConfig = struct {
+    model_path: []const u8 = "src/models/nanogpt_forward.mlir",
+    data_path: []const u8 = "data/tiny_shakespeare.txt",
+    learning_rate: f32 = 0.001,
+    batch_size: usize = 64,
+    block_size: usize = 64,
+    tau: usize = 10,
+    outer_loop_steps: usize = 100,
+    nesterov_momentum: f32 = 0.9,
+};
+
+/// Config result that owns the parsed JSON data
+const ConfigResult = struct {
+    config: ExperimentConfig,
+    parsed: ?std.json.Parsed(ExperimentConfig),
+    json_data: ?[]u8,  // Keep the raw JSON buffer alive
+    allocator: Allocator,
+
+    pub fn deinit(self: *@This()) void {
+        if (self.parsed) |*p| {
+            p.deinit();
+        }
+        if (self.json_data) |data| {
+            self.allocator.free(data);
+        }
+    }
+};
+
 /// Command line arguments
 const Args = struct {
     mode: Mode,
     host: []const u8,
     port: u16,
     workers: usize,
+    config_path: ?[]const u8,
     model_path: ?[]const u8,
     backend: ?backend_selection.Backend,
-    amd_target: ?[]const u8,
+    target_arch: ?[]const u8,
 
     const Mode = enum {
         shepherd,
@@ -45,9 +75,10 @@ const Args = struct {
                 .host = "127.0.0.1",
                 .port = 8080,
                 .workers = 2,
+                .config_path = null,
                 .model_path = null,
                 .backend = null,
-                .amd_target = null,
+                .target_arch = null,
             };
         }
 
@@ -55,9 +86,10 @@ const Args = struct {
         var host: []const u8 = "127.0.0.1";
         var port: u16 = 8080;
         var workers: usize = 2;
+        var config_path: ?[]const u8 = null;
         var model_path: ?[]const u8 = null;
         var backend: ?backend_selection.Backend = null;
-        var amd_target: ?[]const u8 = null;
+        var target_arch: ?[]const u8 = null;
 
         var i: usize = 1;
         while (i < args.len) {
@@ -65,6 +97,11 @@ const Args = struct {
                 mode = .worker;
             } else if (std.mem.eql(u8, args[i], "--shepherd")) {
                 mode = .shepherd;
+            } else if (std.mem.eql(u8, args[i], "--config")) {
+                i += 1;
+                if (i < args.len) {
+                    config_path = args[i];
+                }
             } else if (std.mem.eql(u8, args[i], "--host")) {
                 i += 1;
                 if (i < args.len) {
@@ -117,10 +154,10 @@ const Args = struct {
                         return error.InvalidBackend;
                     }
                 }
-            } else if (std.mem.eql(u8, args[i], "--amd-target")) {
+            } else if (std.mem.eql(u8, args[i], "--target")) {
                 i += 1;
                 if (i < args.len) {
-                    amd_target = args[i];
+                    target_arch = args[i];
                 }
             }
             i += 1;
@@ -131,9 +168,10 @@ const Args = struct {
             .host = host,
             .port = port,
             .workers = workers,
+            .config_path = config_path,
             .model_path = model_path,
             .backend = backend,
-            .amd_target = amd_target,
+            .target_arch = target_arch,
         };
     }
 
@@ -142,20 +180,49 @@ const Args = struct {
         print("Options:\n", .{});
         print("  --shepherd           Run as Shepherd coordinator (default)\n", .{});
         print("  --worker             Run as Worker\n", .{});
+        print("  --config <path>      Path to experiment JSON config file (Shepherd only)\n", .{});
         print("  --connect <host:port> Connect to Shepherd at host:port\n", .{});
         print("  --host <host>        Host to bind/connect to (default: 127.0.0.1)\n", .{});
         print("  --port <port>        Port to bind/connect to (default: 8080)\n", .{});
         print("  --workers <count>    Number of workers to wait for (default: 2)\n", .{});
-        print("  --model <path>       Path to MLIR model file (Shepherd only)\n", .{});
+        print("  --model <path>       Path to MLIR model file (Shepherd only, overrides config)\n", .{});
         print("  --backend <type>     Backend to use: cpu, cuda, metal, vulkan, rocm (default: auto)\n", .{});
-        print("  --amd-target <arch>  AMD GPU target architecture (e.g., gfx942 for MI300X)\n", .{});
+        print("  --target <arch>      GPU target architecture (e.g., gfx942 for MI300X, sm_80 for A100)\n", .{});
         print("  --help               Show this help message\n", .{});
     }
 };
 
+/// Load experiment configuration from JSON file
+fn loadConfig(allocator: Allocator, path: ?[]const u8) !ConfigResult {
+    if (path) |p| {
+        std.log.info("Loading config from: {s}", .{p});
+        const data = try std.fs.cwd().readFileAlloc(allocator, p, 1024 * 1024);
+        // Don't free data - the parsed strings point into it!
+        const parsed = try std.json.parseFromSlice(ExperimentConfig, allocator, data, .{ .ignore_unknown_fields = true });
+        // Keep both the parsed struct and raw JSON data alive so strings remain valid
+        return ConfigResult{
+            .config = parsed.value,
+            .parsed = parsed,
+            .json_data = data,
+            .allocator = allocator,
+        };
+    }
+    std.log.info("No config file specified, using defaults", .{});
+    return ConfigResult{
+        .config = ExperimentConfig{},
+        .parsed = null,
+        .json_data = null,
+        .allocator = allocator,
+    };
+}
 
 /// Run as Shepherd coordinator
 fn runShepherd(allocator: Allocator, args: Args) !void {
+    // 1. Load Experiment Config from JSON file (or use defaults)
+    var config_result = try loadConfig(allocator, args.config_path);
+    defer config_result.deinit();
+    const exp_config = config_result.config;
+
     print("👹 Starting Shepherd coordinator...\n", .{});
     print("   Host: {s}\n", .{args.host});
     print("   Port: {}\n", .{args.port});
@@ -182,24 +249,29 @@ fn runShepherd(allocator: Allocator, args: Args) !void {
     // Now use system.shepherd instead of a local variable
     const shepherd_controller = &system.shepherd;
 
-    // Initialize the DataLoader for real training data
-    print("Loading Tiny Shakespeare dataset...\n", .{});
-    // Dataset expected at data/tiny_shakespeare.txt
-    var data_loader = try @import("data/loader.zig").DataLoader.init(allocator, "data/tiny_shakespeare.txt");
+    // 2. Initialize DataLoader with configured path
+    print("Loading dataset: {s}...\n", .{exp_config.data_path});
+    var data_loader = try @import("data/loader.zig").DataLoader.init(allocator, exp_config.data_path);
     defer data_loader.deinit();
     print("🌙 Dataset loaded with {} tokens\n", .{data_loader.tokens.len});
 
+    // 3. Populate DiLoCo Config with experiment configuration
     var diloco_config = DiLoCoConfig.default();
-    diloco_config.base_config.batch_size = 64;
-    diloco_config.base_config.learning_rate = 0.0006;
-    diloco_config.tau = 50;
-    diloco_config.base_config.outer_loop_steps = 100;
+    diloco_config.model_mlir_path = exp_config.model_path;
+    diloco_config.data_path = exp_config.data_path;
+    diloco_config.batch_size = exp_config.batch_size;
+    diloco_config.block_size = exp_config.block_size;
+    diloco_config.tau = exp_config.tau;
+    diloco_config.base_config.learning_rate = exp_config.learning_rate;
+    diloco_config.base_config.outer_loop_steps = exp_config.outer_loop_steps;
+    diloco_config.nesterov_momentum = exp_config.nesterov_momentum;
 
+    // CLI flag overrides config file
     if (args.model_path) |path| {
         diloco_config.model_mlir_path = path;
-        print("   Model: {s}\n", .{path});
+        print("   Model: {s} (overridden by CLI)\n", .{path});
     } else {
-        print("   Model: Default (src/models/nanogpt_forward.mlir)\n", .{});
+        print("   Model: {s}\n", .{diloco_config.model_mlir_path});
     }
 
     print("Initializing DiLoCo algorithm...\n", .{});
@@ -242,8 +314,8 @@ fn runWorker(allocator: Allocator, args: Args) !void {
     const backend = args.backend orelse backend_selection.Backend.selectDefault();
     print("   Backend: {s}\n", .{backend.toString()});
 
-    if (args.amd_target) |amd_target| {
-        print("   AMD Target: {s}\n", .{amd_target});
+    if (args.target_arch) |target| {
+        print("   Target Architecture: {s}\n", .{target});
     }
 
     const worker_backend_instance = try backend_selection.createWorkerBackend(allocator, backend);
@@ -252,7 +324,7 @@ fn runWorker(allocator: Allocator, args: Args) !void {
     defer worker_instance.deinit();
 
     // Start worker main loop with automatic reconnection
-    try worker_instance.runRobust(args.host, args.port, args.amd_target);
+    try worker_instance.runRobust(args.host, args.port, args.target_arch);
 
     print("💀 Worker shutting down\n", .{});
 }

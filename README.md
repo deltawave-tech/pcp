@@ -262,3 +262,86 @@ You can run workers with different hardware backends in the same training sessio
 # Terminal 4: AMD MI300X Worker
 ./zig-out/bin/pcp --worker --connect 127.0.0.1:8080 --backend rocm --target gfx942
 ```
+
+## Adding Custom Models
+
+PCP ships with example models (NanoGPT) for demonstration and testing. When generating a new model for training, you have to go through these steps:
+
+- Verifying the correctness of your PyTorch model implementation
+- Ensuring the model outputs a scalar loss value (not logits)
+- Adapting the data loader to match your dataset format and vocabulary
+- Testing your model independently before integrating with PCP
+
+PCP allows you to train arbitrary PyTorch architectures as long as they can be compiled to StableHLO.
+
+### 1. Define Your PyTorch Model
+
+Create a Python file (e.g., `my_gpt.py`). Your model class must adhere to the following signature for its forward pass:
+
+```python
+class MyModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        # Define layers...
+
+    # Input:
+    #   idx: LongTensor of shape (Batch, BlockSize)
+    #   targets: LongTensor of shape (Batch, BlockSize)
+    # Output:
+    #   loss: Scalar FloatTensor (must be the loss value, not logits)
+    def forward(self, idx, targets):
+        # ... logic ...
+        # ... logits = self.head(x) ...
+        loss = F.cross_entropy(logits.view(-1, VOCAB_SIZE), targets.view(-1))
+        return loss
+```
+
+Note: The model must return the loss as a scalar. The optimizer logic in PCP expects the final output of the graph to be the value to minimize.
+
+### 2. Export to MLIR
+
+We provide a utility tool to trace your PyTorch model and convert it into a "stateless" StableHLO MLIR module that PCP can execute.
+
+Run the exporter tool:
+
+```sh
+python tools/export_model.py \
+  --model-file my_gpt.py \
+  --class-name MyModel \
+  --out models/my_custom_model.mlir \
+  --batch-size 64 \
+  --block-size 64
+```
+
+What this does:
+
+- Loads your Python class
+- Wraps it in a StatelessWrapper (separating parameters from computation)
+- Uses torch-mlir to compile the computation graph to StableHLO
+- Saves the .mlir file to the models/ directory
+
+### 3. Update Configuration
+
+The MLIR file has fixed input shapes burned into it during compilation. You must ensure your runtime configuration matches these shapes.
+
+The export script will print a JSON snippet at the end. Create or update your experiment.json file:
+
+```json
+{
+    "model_path": "models/my_custom_model.mlir",
+    "data_path": "data/tiny_shakespeare.txt",
+    "batch_size": 64,
+    "block_size": 64,
+    "learning_rate": 0.0006,
+    "tau": 10,
+    "outer_loop_steps": 100
+}
+```
+
+### 4. Run Training
+
+Start the Shepherd with your new configuration:
+
+```sh
+./zig-out/bin/pcp --shepherd --config experiment.json --workers 2
+```

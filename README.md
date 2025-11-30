@@ -85,9 +85,9 @@ IREE handles the entire lowering pipeline from a high-level dialect to a hardwar
 
 ### Prerequisites
 
-- **Zig**: Version 0.12.0 or newer.
+- **Zig**: Version 0.13.0 .
 - **System Build Tools**: `git`, `cmake`, `ninja`.
-- **Cap'n Proto**: (Required for distributed functionality). The build script will try to find it automatically. If it fails, you may need to install it or set the `CAPNP_DIR` environment variable.
+- **Cap'n Proto**: The build script will try to find it automatically. If it fails, you may need to install it or set the `CAPNP_DIR` environment variable.
   - **macOS**: `brew install capnp`
   - **Ubuntu/Debian**: `sudo apt install capnproto libcapnp-dev`
 
@@ -98,7 +98,7 @@ Clone this project repository.
 ```sh
 git clone https://github.com/deltawave-tech/pcp.git
 cd pcp
-git checkout iree-install-test
+git checkout master
 ```
 
 ### Step 2: Build IREE from Source
@@ -155,12 +155,6 @@ Run the IREE pipeline verification tests:
 
 These tests confirm that your environment is correctly configured to compile and execute MLIR graphs via IREE on your available hardware.
 
-For macOS (testing Metal backend):
-
-```sh
-zig build run-m3-pipeline-test
-```
-
 For any platform (testing CPU backend):
 
 ```sh
@@ -181,116 +175,90 @@ zig build run-rocm-pipeline-test
 
 ## Usage
 
-The distributed training system consists of one Shepherd (coordinator) and multiple Workers (compute nodes).
+The distributed training system consists of one Shepherd (coordinator) and multiple Workers (compute nodes). PCP separates infrastructure configuration (CLI flags) from experiment configuration (JSON file), following best practices from PyTorch and DeepSpeed.
+
+### Configuration
+
+**Infrastructure (CLI Flags):**
+- Networking: `--host`, `--port`, `--connect`
+- Hardware: `--backend`, `--target`
+- Topology: `--workers`
+
+**Experiment (JSON File):**
+- Model: `model_path`
+- Data: `data_path`
+- Hyperparameters: `learning_rate`, `batch_size`, `block_size`
+- Algorithm: `tau`, `outer_loop_steps`, `nesterov_momentum`
+
+Create an experiment configuration file (e.g., `experiment.json`):
+
+```json
+{
+    "model_path": "models/nanogpt_forward_32.mlir",
+    "data_path": "data/tiny_shakespeare.txt",
+    "learning_rate": 0.0006,
+    "batch_size": 32,
+    "block_size": 64,
+    "tau": 50,
+    "outer_loop_steps": 100,
+    "nesterov_momentum": 0.9
+}
+```
 
 ### Starting the Shepherd
 
 The Shepherd coordinates training, aggregates gradients, and manages the global model state.
 
 ```sh
-./zig-out/bin/main_distributed \
+./zig-out/bin/pcp \
   --shepherd \
+  --config experiment.json \
   --host 0.0.0.0 \
   --port 8080 \
-  --workers 2 \
-  --model ./src/models/nanogpt_forward.mlir
+  --workers 2
 ```
-
-**Flags:**
-- `--host`: Interface to bind to (default: 127.0.0.1)
-- `--port`: TCP port to listen on (default: 8080)
-- `--workers`: Number of workers to wait for before starting training
-- `--model`: Path to the StableHLO MLIR model file
 
 ### Starting Workers
 
-Workers connect to the Shepherd, compile the MLIR graph for their specific hardware, and perform the inner training loops.
+Workers connect to the Shepherd and execute training on their local hardware. The `--target` flag specifies GPU architecture (optional, defaults: sm_80 for CUDA, gfx942 for ROCm).
 
-#### CPU Worker
+**GPU Target Architectures:**
+
+NVIDIA: A100 (sm_80), V100 (sm_70), RTX 4090 (sm_89)
+AMD: MI300X (gfx942), MI250X/MI210 (gfx90a), MI100 (gfx908)
+
+**CPU Worker:**
 
 ```sh
-./zig-out/bin/main_distributed \
-  --worker \
-  --connect <SHEPHERD_IP>:8080 \
-  --backend cpu
+./zig-out/bin/pcp --worker --connect <SHEPHERD_IP>:8080 --backend cpu
 ```
 
-#### NVIDIA GPU (CUDA)
+**NVIDIA GPU:**
 
 ```sh
-./zig-out/bin/main_distributed \
-  --worker \
-  --connect <SHEPHERD_IP>:8080 \
-  --backend cuda
+./zig-out/bin/pcp --worker --connect <SHEPHERD_IP>:8080 --backend cuda --target sm_80
 ```
 
-#### Apple Silicon (Metal)
+**AMD GPU:**
 
 ```sh
-./zig-out/bin/main_distributed \
-  --worker \
-  --connect <SHEPHERD_IP>:8080 \
-  --backend metal
-```
-
-#### AMD GPU (ROCm)
-
-For AMD GPUs, you must specify the target architecture using the `--amd-target` flag:
-
-- MI300X: `gfx942`
-- MI250X: `gfx90a`
-- MI210: `gfx90a`
-- MI100: `gfx908`
-
-```sh
-./zig-out/bin/main_distributed \
-  --worker \
-  --connect <SHEPHERD_IP>:8080 \
-  --backend rocm \
-  --amd-target gfx942
+./zig-out/bin/pcp --worker --connect <SHEPHERD_IP>:8080 --backend rocm --target gfx942
 ```
 
 ### Example: Mixed Hardware Cluster
 
-You can run workers with different hardware backends in the same training session. The Shepherd will compile separate VMFB artifacts for each unique (backend, amd_target) combination.
+You can run workers with different hardware backends in the same training session. The Shepherd will compile separate VMFB artifacts for each unique (backend, target) combination.
 
 ```sh
 # Terminal 1: Start Shepherd
-./zig-out/bin/main_distributed --shepherd --workers 3
+./zig-out/bin/pcp --shepherd --config experiment.json --workers 3
 
 # Terminal 2: CPU Worker
-./zig-out/bin/main_distributed --worker --backend cpu
+./zig-out/bin/pcp --worker --connect 127.0.0.1:8080 --backend cpu
 
-# Terminal 3: CUDA Worker
-./zig-out/bin/main_distributed --worker --backend cuda
+# Terminal 3: NVIDIA A100 Worker
+./zig-out/bin/pcp --worker --connect 127.0.0.1:8080 --backend cuda --target sm_80
 
 # Terminal 4: AMD MI300X Worker
-./zig-out/bin/main_distributed --worker --backend rocm --amd-target gfx942
-```
-
-Alternatively, use the provided test script for AMD clusters:
-
-```sh
-./run_mi300_cluster.sh
-```
-
-## Running Tests
-
-Pipeline tests verify the MLIR-to-Hardware toolchain without running a full distributed session.
-
-```sh
-# Verify CPU Pipeline
-zig build run-cpu-pipeline-test
-
-# Verify CUDA Pipeline (requires NVIDIA GPU)
-zig build run-cuda-pipeline-test
-
-# Verify ROCm Pipeline (requires AMD GPU)
-zig build run-rocm-pipeline-test
-
-# Verify Optimizer Numerics
-zig test src/examples/mlir_optimizer_test.zig
-
-# Verify Autodiff Gradients
-zig test src/examples/isolated_vjp_tests.zig
+./zig-out/bin/pcp --worker --connect 127.0.0.1:8080 --backend rocm --target gfx942
 ```

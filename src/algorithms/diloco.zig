@@ -1102,8 +1102,11 @@ pub const DiLoCo = struct {
         }
 
         // Create WorkerPayload with parameters (no batch data - workers load locally)
+        const empty_slice: []const u8 = &[_]u8{};
         const worker_payload = binary_protocol.WorkerPayload{
             .params = total_param_bytes.items,
+            .input_ids = empty_slice,
+            .targets = empty_slice,
         };
         const capnp_bytes = try worker_payload.serialize(self.allocator);
         defer self.allocator.free(capnp_bytes);

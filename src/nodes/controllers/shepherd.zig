@@ -416,10 +416,10 @@ pub const Shepherd = struct {
     }
 
     /// Initialize the data manager for chunk-based data partitioning
-    pub fn initDataManager(self: *Self, total_size: usize, chunk_size: usize) !void {
+    pub fn initDataManager(self: *Self, total_size: usize, chunk_size: usize, max_epochs: usize) !void {
         if (self.data_manager != null) return; // Already initialized
-        self.data_manager = try data_manager.DataManager.init(self.allocator, total_size, chunk_size);
-        std.log.info("DataManager initialized: {} total size, {} chunk size", .{ total_size, chunk_size });
+        self.data_manager = try data_manager.DataManager.init(self.allocator, total_size, chunk_size, max_epochs);
+        std.log.info("DataManager initialized: {} total size, {} chunk size, {} max epochs", .{ total_size, chunk_size, max_epochs });
     }
 
     /// Start training once we have enough workers

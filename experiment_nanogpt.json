@@ -9,6 +9,6 @@
     "nesterov_momentum": 0.9,
     "wandb_project": "pcp-distributed",
     "wandb_entity": null,
-    "wandb_run_name": "nanogpt-diloco-experiment",
+    "wandb_run_name": "nanogpt-diloco-experiment2",
     "wandb_api_key": null
 }

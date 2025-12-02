@@ -513,7 +513,14 @@ pub const DiLoCo = struct {
 
             // Update metrics
             self.metrics.outer_loop_count += 1;
-            self.current_epoch += 1;
+
+            // Get true epoch from DataManager
+            if (self.coordinator.data_manager) |*dm| {
+                self.current_epoch = dm.current_epoch;
+            } else {
+                // Fallback if no DM
+                self.current_epoch = 1;
+            }
 
             // Calculate epoch time and update monitoring
             const end_time = std.time.milliTimestamp();
@@ -1401,11 +1408,24 @@ pub const DiLoCo = struct {
 
     /// Check if training should stop
     fn shouldStop(self: *Self) bool {
-        if (self.current_epoch >= self.config.base_config.max_epochs) {
+        // Stop if we've reached the configured outer loop steps limit
+        // (Note: We keep this to allow "train for X steps", but if user wants
+        // pure epoch-based training, they set outer_loop_steps very high)
+        if (self.metrics.outer_loop_count >= self.config.base_config.outer_loop_steps) {
+            std.log.info("Stopping: Reached maximum outer loop steps ({})", .{self.config.base_config.outer_loop_steps});
             return true;
         }
 
+        // Stop if DataManager says we are done (Max epochs reached)
+        if (self.coordinator.data_manager) |*dm| {
+            if (dm.current_epoch > dm.max_epochs) {
+                std.log.info("Stopping: Reached maximum epochs ({})", .{dm.max_epochs});
+                return true;
+            }
+        }
+
         if (self.metrics.loss < 0.01) {
+            std.log.info("Stopping: Converged (loss < 0.01)", .{});
             return true;
         }
 

@@ -33,6 +33,7 @@ const ExperimentConfig = struct {
     tau: usize = 10,
     outer_loop_steps: usize = 100,
     nesterov_momentum: f32 = 0.9,
+    max_epochs: usize = 10,
 
     // WandB configuration
     wandb_project: []const u8 = "pcp-distributed",
@@ -262,8 +263,8 @@ fn runShepherd(allocator: Allocator, args: Args) !void {
     const stat = try file.stat();
     const total_size = stat.size;
     const chunk_size = 100 * 1024; // 100KB chunks
-    try shepherd_controller.initDataManager(total_size, chunk_size);
-    print("🌙 DataManager initialized: {} total size, {} byte chunks\n", .{ total_size, chunk_size });
+    try shepherd_controller.initDataManager(total_size, chunk_size, exp_config.max_epochs);
+    print("🌙 DataManager initialized: {} total size, {} byte chunks, {} max epochs\n", .{ total_size, chunk_size, exp_config.max_epochs });
 
     // 3. Populate DiLoCo Config with experiment configuration
     var diloco_config = DiLoCoConfig.default();

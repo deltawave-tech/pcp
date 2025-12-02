@@ -33,6 +33,12 @@ const ExperimentConfig = struct {
     tau: usize = 10,
     outer_loop_steps: usize = 100,
     nesterov_momentum: f32 = 0.9,
+
+    // WandB configuration
+    wandb_project: []const u8 = "pcp-distributed",
+    wandb_entity: ?[]const u8 = null,
+    wandb_run_name: ?[]const u8 = null,
+    wandb_api_key: ?[]const u8 = null,
 };
 
 /// Config result that owns the parsed JSON data
@@ -265,6 +271,10 @@ fn runShepherd(allocator: Allocator, args: Args) !void {
     diloco_config.base_config.learning_rate = exp_config.learning_rate;
     diloco_config.base_config.outer_loop_steps = exp_config.outer_loop_steps;
     diloco_config.nesterov_momentum = exp_config.nesterov_momentum;
+    diloco_config.wandb_project = exp_config.wandb_project;
+    diloco_config.wandb_entity = exp_config.wandb_entity;
+    diloco_config.wandb_run_name = exp_config.wandb_run_name;
+    diloco_config.wandb_api_key = exp_config.wandb_api_key;
 
     // CLI flag overrides config file
     if (args.model_path) |path| {

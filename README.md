@@ -189,6 +189,7 @@ The distributed training system consists of one Shepherd (coordinator) and multi
 - Data: `data_path`
 - Hyperparameters: `learning_rate`, `batch_size`, `block_size`
 - Algorithm: `tau`, `outer_loop_steps`, `nesterov_momentum`
+- Logging: `wandb_project`, `wandb_entity`, `wandb_run_name`, `wandb_api_key`
 
 Create an experiment configuration file (e.g., `experiment.json`):
 
@@ -201,9 +202,37 @@ Create an experiment configuration file (e.g., `experiment.json`):
     "block_size": 64,
     "tau": 50,
     "outer_loop_steps": 100,
-    "nesterov_momentum": 0.9
+    "nesterov_momentum": 0.9,
+    "wandb_project": "pcp-distributed",
+    "wandb_entity": null,
+    "wandb_run_name": "my-experiment",
+    "wandb_api_key": null
 }
 ```
+
+**Weights & Biases Integration:**
+
+PCP automatically logs training metrics to [Weights & Biases](https://wandb.ai) for experiment tracking and visualization. To enable WandB logging:
+
+1. **Set your API key** (required):
+   ```sh
+   export WANDB_API_KEY=your_api_key_here
+   ```
+
+2. **Configure logging parameters** in your experiment JSON:
+   - `wandb_project`: Project name in WandB (default: "pcp-distributed")
+   - `wandb_entity`: WandB team/username (optional, uses your default)
+   - `wandb_run_name`: Custom name for this training run (optional, auto-generated if null)
+   - `wandb_api_key`: API key (optional, reads from environment variable if null)
+
+3. **Logged metrics include:**
+   - Loss (average, min, max across workers)
+   - Learning rate
+   - Active worker count
+   - Epoch time
+   - Outer loop step progress
+
+If no API key is provided, WandB logging will be disabled and training will continue normally.
 
 ### Starting the Shepherd
 

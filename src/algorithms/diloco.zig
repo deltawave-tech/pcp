@@ -20,6 +20,7 @@ const execution = @import("../execution.zig");
 const monitoring = @import("../ui/monitoring.zig");
 const data_loader = @import("../data/loader.zig");
 const backend_selection = @import("../backends/selection.zig");
+const wandb = @import("../ui/wandb.zig");
 
 const TrainingAlgorithm = training_algorithm.TrainingAlgorithm;
 const TrainingStatus = training_algorithm.TrainingStatus;
@@ -46,6 +47,12 @@ pub const DiLoCoConfig = struct {
     batch_size: usize,
     block_size: usize,
 
+    // WandB configuration
+    wandb_project: []const u8,
+    wandb_entity: ?[]const u8,
+    wandb_run_name: ?[]const u8,
+    wandb_api_key: ?[]const u8,
+
     pub fn default() DiLoCoConfig {
         return DiLoCoConfig{
             .base_config = TrainingConfig.default(),
@@ -56,6 +63,10 @@ pub const DiLoCoConfig = struct {
             .data_path = "data/tiny_shakespeare.txt",
             .batch_size = 64,
             .block_size = 64, // Typically matches model context window
+            .wandb_project = "pcp-distributed",
+            .wandb_entity = null,
+            .wandb_run_name = null,
+            .wandb_api_key = null,
         };
     }
 };
@@ -91,6 +102,9 @@ pub const DiLoCo = struct {
 
     // Data loading for real training batches
     data_loader: *DataLoader,
+
+    // WandB logging
+    wandb_logger: wandb.WandBLogger,
 
     const Self = @This();
 
@@ -210,6 +224,23 @@ pub const DiLoCo = struct {
         // Pre-allocate velocity buffers based on introspection
         try host_opt.initParameters(parameter_shapes);
 
+        // Initialize WandB logger
+        const wb_config = wandb.WandBConfig{
+            .project = config.wandb_project,
+            .entity = config.wandb_entity,
+            .run_name = config.wandb_run_name,
+            .api_key = config.wandb_api_key orelse std.posix.getenv("WANDB_API_KEY"),
+        };
+
+        const logger = try wandb.WandBLogger.init(allocator, wb_config, .{
+            .learning_rate = config.base_config.learning_rate,
+            .batch_size = config.batch_size,
+            .block_size = config.block_size,
+            .tau = config.tau,
+            .nesterov_momentum = config.nesterov_momentum,
+            .optimizer = "Nesterov-AdamW",
+        });
+
         // Create a partial instance to build the worker graph
         var partial_self = Self{
             .allocator = allocator,
@@ -228,6 +259,7 @@ pub const DiLoCo = struct {
             .executor = executor,
             .worker_graph_mlir_source = undefined, // Will be set below
             .data_loader = dataset,
+            .wandb_logger = logger,
         };
 
         // Build the worker graph ONCE during initialization using the safe function builder
@@ -250,10 +282,14 @@ pub const DiLoCo = struct {
             .executor = executor, // Store the generic executor
             .worker_graph_mlir_source = graph, // Store the MLIR source
             .data_loader = dataset,
+            .wandb_logger = logger,
         };
     }
 
     pub fn deinit(self: *Self) void {
+        // Deinit WandB logger first
+        self.wandb_logger.deinit();
+
         if (self.master_parameters) |params| {
             for (params) |param| {
                 param.deinit();
@@ -489,6 +525,26 @@ pub const DiLoCo = struct {
             const epoch_time_ms: u64 = @intCast(end_time - start_time);
             monitoring.setEpochTime(epoch_time_ms);
             monitoring.setMetrics(self.current_epoch, self.metrics.loss, self.coordinator.getWorkerCount());
+
+            // Calculate detailed worker stats
+            var min_loss: f32 = 1e9;
+            var max_loss: f32 = -1e9;
+            for (worker_results.items) |res| {
+                if (res.loss < min_loss) min_loss = res.loss;
+                if (res.loss > max_loss) max_loss = res.loss;
+            }
+
+            // Log to WandB
+            self.wandb_logger.log(.{
+                .outer_step = step,
+                .epoch = self.current_epoch,
+                .loss = self.metrics.loss,
+                .min_worker_loss = min_loss,
+                .max_worker_loss = max_loss,
+                .active_workers = worker_results.items.len,
+                .learning_rate = self.host_optimizer.config.learning_rate,
+                .epoch_time_ms = epoch_time_ms,
+            });
 
             // Check convergence or stopping conditions
             if (self.shouldStop()) {

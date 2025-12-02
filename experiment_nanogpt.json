@@ -6,5 +6,9 @@
     "block_size": 32,
     "tau": 50,
     "outer_loop_steps": 100,
-    "nesterov_momentum": 0.9
+    "nesterov_momentum": 0.9,
+    "wandb_project": "pcp-distributed",
+    "wandb_entity": null,
+    "wandb_run_name": "nanogpt-diloco-experiment",
+    "wandb_api_key": null
 }

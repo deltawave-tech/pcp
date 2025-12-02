@@ -1101,11 +1101,18 @@ pub const DiLoCo = struct {
             try total_param_bytes.appendSlice(tensor_data);
         }
 
-        // Base64 encode parameters for JSON transport
-        const b64_len = std.base64.standard.Encoder.calcSize(total_param_bytes.items.len);
+        // Create WorkerPayload with parameters (no batch data - workers load locally)
+        const worker_payload = binary_protocol.WorkerPayload{
+            .params = total_param_bytes.items,
+        };
+        const capnp_bytes = try worker_payload.serialize(self.allocator);
+        defer self.allocator.free(capnp_bytes);
+
+        // Base64 encode the Cap'n Proto message for JSON transport
+        const b64_len = std.base64.standard.Encoder.calcSize(capnp_bytes.len);
         const b64_encoded_params = try self.allocator.alloc(u8, b64_len);
         defer self.allocator.free(b64_encoded_params);
-        const encoded_len = std.base64.standard.Encoder.encode(b64_encoded_params, total_param_bytes.items).len;
+        const encoded_len = std.base64.standard.Encoder.encode(b64_encoded_params, capnp_bytes).len;
 
         // Send to each worker with their assigned data chunk
         for (workers) |worker| {

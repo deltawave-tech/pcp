@@ -492,10 +492,10 @@ pub const DiLoCo = struct {
             try self.initializeNewWorkers(participants.items);
 
             // Broadcast to snapshot participants only (workers will load data locally)
-            try self.broadcastToSnapshot(participants.items);
+            const workers_assigned = try self.broadcastToSnapshot(participants.items);
 
-            // Collect from snapshot participants only
-            const worker_results = try self.collectFromSnapshot(participants.items);
+            // Collect from snapshot participants only (only from workers that got chunks)
+            const worker_results = try self.collectFromSnapshot(workers_assigned);
             defer self.cleanupWorkerResults(worker_results);
 
             if (worker_results.items.len == 0) {
@@ -1084,7 +1084,8 @@ pub const DiLoCo = struct {
     }
 
     /// Broadcast to snapshot participants only
-    fn broadcastToSnapshot(self: *Self, workers: []const shepherd.WorkerConnection) !void {
+    /// Returns the number of workers that were actually assigned chunks
+    fn broadcastToSnapshot(self: *Self, workers: []const shepherd.WorkerConnection) !usize {
         if (self.master_parameters == null) {
             return error.ParametersNotInitialized;
         }
@@ -1118,6 +1119,7 @@ pub const DiLoCo = struct {
         const encoded_len = std.base64.standard.Encoder.encode(b64_encoded_params, capnp_bytes).len;
 
         // Send to each worker with their assigned data chunk
+        var workers_assigned: usize = 0;
         for (workers) |worker| {
             // Assign data chunk for this worker
             const chunk = if (self.coordinator.data_manager) |*dm|
@@ -1152,12 +1154,16 @@ pub const DiLoCo = struct {
                 chunk.?.length,
                 worker.node_id,
             });
+
+            workers_assigned += 1;
         }
+
+        return workers_assigned;
     }
 
     /// Collect results from snapshot participants only
-    fn collectFromSnapshot(self: *Self, participants: []const shepherd.WorkerConnection) !ArrayList(WorkerResult) {
-        const responses = try self.coordinator.collectFromWorkers(MessageType.INNER_LOOP_COMPLETE, participants.len);
+    fn collectFromSnapshot(self: *Self, expected_count: usize) !ArrayList(WorkerResult) {
+        const responses = try self.coordinator.collectFromWorkers(MessageType.INNER_LOOP_COMPLETE, expected_count);
         defer {
             for (responses.items) |*msg| {
                 msg.deinitClone(self.allocator);

@@ -452,11 +452,13 @@ pub const Worker = struct {
 
         std.log.info("Starting inner loop: params={} bytes, chunk={}", .{ initial_params_bytes.len, chunk_id });
 
-        // 7. Reset optimizer states (M and V to zero, timestep to 1.0)
-        // Per DiLoCo paper: "inner optimizer states are reset at the beginning of each inner loop"
-        for (m_states) |m_buf| @memset(m_buf, 0);
-        for (v_states) |v_buf| @memset(v_buf, 0);
-        self.timestep = 1.0;
+        // 7. Persistent optimizer states
+        // We do NOT reset m_states, v_states, or timestep.
+        // They must persist to maintain local momentum and curvature information
+        // across communication rounds (as per DiLoCo Sec 6.1).
+
+        // Ensure timestep is initialized if it's the very first run
+        if (self.timestep == 0.0) self.timestep = 1.0;
 
         // 8. Copy initial params into working buffers (we'll update these in the loop)
         var current_params = try self.allocator.alloc([]u8, param_shapes.len);

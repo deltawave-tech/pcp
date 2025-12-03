@@ -119,6 +119,11 @@
         };
         checks.pcp = packages.pcp;
 
+        packages.pcp-docker = pkgs.dockerTools.buildImage {
+          name = "pcp";
+          config = { Cmd = [ "${packages.pcp}/bin/pcp" ]; };
+        };
+
         packages.iree-sdk = llvmPkg.stdenv.mkDerivation rec {
           pname = "iree-sdk";
           version = "3.9.0";

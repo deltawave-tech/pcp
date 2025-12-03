@@ -494,17 +494,13 @@ pub const DiLoCo = struct {
             // Broadcast to snapshot participants only (workers will load data locally)
             const workers_assigned = try self.broadcastToSnapshot(participants.items);
 
-            // Collect from snapshot participants only (only from workers that got chunks)
-            const worker_results = try self.collectFromSnapshot(workers_assigned);
-            defer self.cleanupWorkerResults(worker_results);
-
-            if (worker_results.items.len == 0) {
-                std.log.warn("Round {} failed: No results received. Skipping update.", .{step});
+            if (workers_assigned == 0) {
+                std.log.warn("Round {} failed: No workers assigned. Skipping update.", .{step});
                 continue;
             }
 
-            // Update master parameters using host-side Nesterov optimizer
-            try self.updateMasterParameters(worker_results);
+            // Streaming Accumulation: Collect and apply gradients on the fly
+            try self.accumulateAndApplyGradients(workers_assigned);
 
             // Save checkpoint every 10 steps or at the end
             if ((step + 1) % 10 == 0 or (step + 1) == self.config.base_config.outer_loop_steps) {
@@ -528,22 +524,14 @@ pub const DiLoCo = struct {
             monitoring.setEpochTime(epoch_time_ms);
             monitoring.setMetrics(self.current_epoch, self.metrics.loss, self.coordinator.getWorkerCount());
 
-            // Calculate detailed worker stats
-            var min_loss: f32 = 1e9;
-            var max_loss: f32 = -1e9;
-            for (worker_results.items) |res| {
-                if (res.loss < min_loss) min_loss = res.loss;
-                if (res.loss > max_loss) max_loss = res.loss;
-            }
-
             // Log to WandB
             self.wandb_logger.log(.{
                 .outer_step = step,
                 .epoch = self.current_epoch,
                 .loss = self.metrics.loss,
-                .min_worker_loss = min_loss,
-                .max_worker_loss = max_loss,
-                .active_workers = worker_results.items.len,
+                .min_worker_loss = self.metrics.loss, // Note: Individual worker losses not tracked in streaming mode
+                .max_worker_loss = self.metrics.loss, // Note: Individual worker losses not tracked in streaming mode
+                .active_workers = workers_assigned,
                 .learning_rate = self.host_optimizer.config.learning_rate,
                 .epoch_time_ms = epoch_time_ms,
             });
@@ -910,134 +898,6 @@ pub const DiLoCo = struct {
         return serialized_mlir;
     }
 
-
-    /// Broadcast master parameters to all workers using Cap'n Proto
-    fn broadcastMasterParameters(self: *Self) !void {
-        if (self.master_parameters == null) {
-            return error.ParametersNotInitialized;
-        }
-
-        const param_tensors = self.master_parameters.?;
-
-        // Extract and concatenate all parameter tensor data
-        var total_param_bytes = ArrayList(u8).init(self.allocator);
-        defer total_param_bytes.deinit();
-
-        for (param_tensors) |param_tensor| {
-            const tensor_data = try self.extractTensorData(param_tensor);
-            defer self.allocator.free(tensor_data);
-            try total_param_bytes.appendSlice(tensor_data);
-        }
-
-        // Create WorkerPayload and serialize with Cap'n Proto
-        const worker_payload = binary_protocol.WorkerPayload{
-            .params = total_param_bytes.items,
-        };
-        const capnp_bytes = try worker_payload.serialize(self.allocator);
-        defer self.allocator.free(capnp_bytes);
-
-        // Base64 encode the binary data
-        const b64_len = std.base64.standard.Encoder.calcSize(capnp_bytes.len);
-        const b64_encoded_payload = try self.allocator.alloc(u8, b64_len);
-        defer self.allocator.free(b64_encoded_payload);
-
-        const encoded_len = std.base64.standard.Encoder.encode(b64_encoded_payload, capnp_bytes).len;
-
-        // Create JSON payload with Base64-encoded binary data
-        const json_payload = std.json.Value{ .string = b64_encoded_payload[0..encoded_len] };
-
-        // Broadcast StartInnerLoop message with Cap'n Proto
-        try self.coordinator.broadcastToWorkers(MessageType.START_INNER_LOOP, json_payload);
-    }
-
-    /// Broadcast master parameters and data batch to all workers using Cap'n Proto
-    fn broadcastMasterParametersAndBatch(self: *Self, batch: data_loader.Batch) !void {
-        if (self.master_parameters == null) {
-            return error.ParametersNotInitialized;
-        }
-
-        const param_tensors = self.master_parameters.?;
-
-        // Extract and concatenate all parameter tensor data
-        var total_param_bytes = ArrayList(u8).init(self.allocator);
-        defer total_param_bytes.deinit();
-
-        for (param_tensors) |param_tensor| {
-            const tensor_data = try self.extractTensorData(param_tensor);
-            defer self.allocator.free(tensor_data);
-            try total_param_bytes.appendSlice(tensor_data);
-        }
-
-        // --- FIX START ---
-        // Convert u32 batch data to i64 for IREE
-        // The model expects tensor<...xi64>, but batch.x is []u32.
-        const input_ids_i64 = try self.allocator.alloc(i64, batch.x.len);
-        defer self.allocator.free(input_ids_i64);
-        for (batch.x, 0..) |val, i| input_ids_i64[i] = @intCast(val);
-
-        const targets_i64 = try self.allocator.alloc(i64, batch.y.len);
-        defer self.allocator.free(targets_i64);
-        for (batch.y, 0..) |val, i| targets_i64[i] = @intCast(val);
-
-        const input_ids_bytes = std.mem.sliceAsBytes(input_ids_i64);
-        const targets_bytes = std.mem.sliceAsBytes(targets_i64);
-        // --- FIX END ---
-
-        // VALIDATION: Check that we have valid data before serialization
-        if (total_param_bytes.items.len == 0) {
-            std.log.err("Empty parameters detected in broadcastMasterParametersAndBatch", .{});
-            return error.EmptyParameters;
-        }
-        if (input_ids_bytes.len == 0) {
-            std.log.err("Empty input_ids detected in broadcastMasterParametersAndBatch", .{});
-            return error.EmptyInputIds;
-        }
-        if (targets_bytes.len == 0) {
-            std.log.err("Empty targets detected in broadcastMasterParametersAndBatch", .{});
-            return error.EmptyTargets;
-        }
-
-        std.log.info("Broadcasting params: {} bytes, input_ids: {} bytes, targets: {} bytes", .{ total_param_bytes.items.len, input_ids_bytes.len, targets_bytes.len });
-
-        // Create WorkerPayload with parameters and batch data
-        const worker_payload = binary_protocol.WorkerPayload{
-            .params = total_param_bytes.items,
-            .input_ids = input_ids_bytes,
-            .targets = targets_bytes,
-        };
-
-        const capnp_bytes = try worker_payload.serialize(self.allocator);
-        defer self.allocator.free(capnp_bytes);
-
-        // Debug: Check Cap'n Proto serialization output
-        std.log.info("Cap'n Proto serialized to {} bytes", .{capnp_bytes.len});
-        if (capnp_bytes.len > 0) {
-            const sample_size = @min(32, capnp_bytes.len);
-            std.log.info("Cap'n Proto first {} bytes: {any}", .{ sample_size, capnp_bytes[0..sample_size] });
-
-            // Check if data is mostly zeros (which would become 'A's in Base64)
-            var zero_count: usize = 0;
-            const check_size = @min(1024, capnp_bytes.len);
-            for (capnp_bytes[0..check_size]) |byte| {
-                if (byte == 0) zero_count += 1;
-            }
-            std.log.info("Cap'n Proto zero density: {}/{} ({d:.1}%)", .{ zero_count, check_size, (@as(f32, @floatFromInt(zero_count)) / @as(f32, @floatFromInt(check_size))) * 100.0 });
-        }
-
-        // Base64 encode the binary data
-        const b64_len = std.base64.standard.Encoder.calcSize(capnp_bytes.len);
-        const b64_encoded_payload = try self.allocator.alloc(u8, b64_len);
-        defer self.allocator.free(b64_encoded_payload);
-
-        const encoded_len = std.base64.standard.Encoder.encode(b64_encoded_payload, capnp_bytes).len;
-
-        // Create JSON payload with Base64-encoded binary data
-        const json_payload = std.json.Value{ .string = b64_encoded_payload[0..encoded_len] };
-
-        // Broadcast StartInnerLoop message with Cap'n Proto
-        try self.coordinator.broadcastToWorkers(MessageType.START_INNER_LOOP, json_payload);
-    }
-
     /// Initialize any new workers in the snapshot that need the graph
     fn initializeNewWorkers(self: *Self, workers: []const shepherd.WorkerConnection) !void {
         for (workers) |worker| {
@@ -1168,22 +1028,44 @@ pub const DiLoCo = struct {
         return workers_assigned;
     }
 
-    /// Collect results from snapshot participants only
-    fn collectFromSnapshot(self: *Self, expected_count: usize) !ArrayList(WorkerResult) {
-        const responses = try self.coordinator.collectFromWorkers(MessageType.INNER_LOOP_COMPLETE, expected_count);
-        defer {
-            for (responses.items) |*msg| {
-                msg.deinitClone(self.allocator);
-            }
-            responses.deinit();
+    /// Collect results from workers, accumulate gradients on the fly, and apply update.
+    /// This keeps memory usage constant O(ModelSize) regardless of worker count.
+    fn accumulateAndApplyGradients(self: *Self, expected_count: usize) !void {
+        if (expected_count == 0) return;
+        if (self.master_parameters == null) return error.ParametersNotInitialized;
+
+        // 1. Initialize Accumulator (Zeroed buffer matching total parameter size)
+        // We calculate total size first
+        var total_param_bytes: usize = 0;
+        for (self.parameter_shapes) |shape| {
+            var elem_count: usize = 1;
+            for (shape) |dim| elem_count *= @intCast(dim);
+            total_param_bytes += elem_count * @sizeOf(f32);
         }
 
-        var results = ArrayList(WorkerResult).init(self.allocator);
-        var arena = std.heap.ArenaAllocator.init(self.allocator);
-        defer arena.deinit();
+        const accumulator = try self.allocator.alloc(u8, total_param_bytes);
+        defer self.allocator.free(accumulator);
+        @memset(accumulator, 0); // Important: Init to zero
 
-        for (responses.items) |response| {
-            // Extract chunk_id if present and mark complete
+        var collected_count: usize = 0;
+        var total_loss: f32 = 0.0;
+
+        std.log.info("Streaming results from {} workers...", .{expected_count});
+
+        // 2. Collection Loop
+        while (collected_count < expected_count) {
+            // Fetch one message at a time
+            const responses = try self.coordinator.collectFromWorkers(MessageType.INNER_LOOP_COMPLETE, 1);
+            defer {
+                for (responses.items) |*msg| msg.deinitClone(self.allocator);
+                responses.deinit();
+            }
+
+            if (responses.items.len == 0) continue; // Safety check
+
+            const response = responses.items[0];
+
+            // Handle chunk completion tracking
             if (response.data == .object) {
                 if (response.data.object.get("chunk_id")) |chunk_val| {
                     if (chunk_val == .integer) {
@@ -1196,12 +1078,16 @@ pub const DiLoCo = struct {
                 }
             }
 
-            const b64_encoded_payload = switch (response.data) {
+            // Decode Payload
+            var arena = std.heap.ArenaAllocator.init(self.allocator);
+            defer arena.deinit();
+
+            // Extract base64 payload
+            const b64_payload = switch (response.data) {
                 .string => |s| s,
                 .object => |obj| blk: {
-                    // New format: JSON object with params field
-                    if (obj.get("params")) |params_val| {
-                        break :blk switch (params_val) {
+                    if (obj.get("params")) |p| {
+                        break :blk switch (p) {
                             .string => |s| s,
                             else => return error.InvalidMessageFormat,
                         };
@@ -1211,181 +1097,80 @@ pub const DiLoCo = struct {
                 else => return error.InvalidMessageFormat,
             };
 
-            const capnp_len = try std.base64.standard.Decoder.calcSizeForSlice(b64_encoded_payload);
+            const capnp_len = try std.base64.standard.Decoder.calcSizeForSlice(b64_payload);
             const capnp_bytes = try arena.allocator().alloc(u8, capnp_len);
-            try std.base64.standard.Decoder.decode(capnp_bytes, b64_encoded_payload);
+            try std.base64.standard.Decoder.decode(capnp_bytes, b64_payload);
 
             const reader = try binary_protocol.ShepherdPayload.Reader.init(capnp_bytes);
             defer reader.deinit();
 
-            const params_bytes = try reader.getUpdatedParams();
-            const loss_value = try reader.getLoss();
+            const delta_bytes = try reader.getUpdatedParams(); // This is now the Delta
+            const loss_val = try reader.getLoss();
 
-            const result = WorkerResult{
-                .node_id = response.sender_node,
-                .parameter_bytes = try self.allocator.dupe(u8, params_bytes),
-                .loss = loss_value,
-                .steps_completed = self.config.tau,
-            };
-            try results.append(result);
-        }
-
-        return results;
-    }
-
-    /// Collect results from workers after inner loop using Cap'n Proto
-    fn collectWorkerResults(self: *Self) !ArrayList(WorkerResult) {
-        const worker_count = self.coordinator.getWorkerCount();
-        const responses = try self.coordinator.collectFromWorkers(MessageType.INNER_LOOP_COMPLETE, worker_count);
-        defer {
-            // Clean up cloned messages
-            for (responses.items) |*msg| {
-                msg.deinitClone(self.allocator);
+            // 3. Accumulate: Accumulator += Delta
+            if (delta_bytes.len != total_param_bytes) {
+                std.log.err("Worker delta size mismatch! Expected {}, got {}", .{ total_param_bytes, delta_bytes.len });
+                return error.DimensionMismatch;
             }
-            responses.deinit();
+
+            const acc_f32: [*]f32 = @ptrCast(@alignCast(accumulator.ptr));
+            const delta_f32: [*]const f32 = @ptrCast(@alignCast(delta_bytes.ptr));
+            const num_floats = total_param_bytes / @sizeOf(f32);
+
+            // Vectorize addition
+            for (0..num_floats) |i| {
+                acc_f32[i] += delta_f32[i];
+            }
+
+            total_loss += loss_val;
+            collected_count += 1;
+
+            // Message is freed here by the defer/arena logic, keeping memory low
         }
 
-        var results = ArrayList(WorkerResult).init(self.allocator);
-        var arena = std.heap.ArenaAllocator.init(self.allocator);
-        defer arena.deinit();
+        // 4. Average the Accumulator
+        const acc_f32: [*]f32 = @ptrCast(@alignCast(accumulator.ptr));
+        const num_floats = total_param_bytes / @sizeOf(f32);
+        const divisor = @as(f32, @floatFromInt(collected_count));
 
-        for (responses.items) |response| {
-            // 1. Extract the Base64 string payload
-            const b64_encoded_payload = switch (response.data) {
-                .string => |s| s,
-                else => return error.InvalidMessageFormat,
-            };
-
-            // 2. Base64-decode the payload to get the binary Cap'n Proto data
-            const capnp_len = try std.base64.standard.Decoder.calcSizeForSlice(b64_encoded_payload);
-            const capnp_bytes = try arena.allocator().alloc(u8, capnp_len);
-            try std.base64.standard.Decoder.decode(capnp_bytes, b64_encoded_payload);
-
-            // 3. Deserialize the binary data using Cap'n Proto
-            const reader = try binary_protocol.ShepherdPayload.Reader.init(capnp_bytes);
-            defer reader.deinit();
-
-            // 4. Extract the data and build the WorkerResult
-            const params_bytes = try reader.getUpdatedParams();
-            const loss_value = try reader.getLoss();
-
-            // The WorkerResult struct expects owned slices, so we must dupe the data.
-            const result = WorkerResult{
-                .node_id = response.sender_node,
-                .parameter_bytes = try self.allocator.dupe(u8, params_bytes),
-                .loss = loss_value,
-                .steps_completed = self.config.tau,
-            };
-            try results.append(result);
+        for (0..num_floats) |i| {
+            acc_f32[i] /= divisor;
         }
 
-        return results;
-    }
-
-    /// Update master parameters using host-side pure-Zig Nesterov optimizer
-    fn updateMasterParameters(self: *Self, worker_results: ArrayList(WorkerResult)) !void {
-        if (worker_results.items.len == 0) return error.NoWorkerResults;
-        if (self.master_parameters == null) return error.ParametersNotInitialized;
-
-        // 1. Average workers
-        const averaged_bytes = try self.averageWorkerParameterBytes(worker_results);
-        defer self.allocator.free(averaged_bytes);
-
-        const param_tensors = self.master_parameters.?;
+        // 5. Apply to Master Parameters (Per Tensor)
         var byte_offset: usize = 0;
+        const param_tensors = self.master_parameters.?;
 
-        // 2. Update each parameter tensor
         for (param_tensors, 0..) |*param_tensor_ptr, i| {
             const shape = self.parameter_shapes[i];
+            var elem_count: usize = 1;
+            for (shape) |dim| elem_count *= @intCast(dim);
+            const tensor_size = elem_count * @sizeOf(f32);
 
-            // Calculate size info
-            var element_count: usize = 1;
-            for (shape) |dim| element_count *= @intCast(dim);
-            const tensor_size_bytes = element_count * @sizeOf(f32);
-
-            // Extract current Master Data (f32 slice)
-            // Note: extractTensorData allocates new memory
+            // Get current master data
             const master_bytes = try self.extractTensorData(param_tensor_ptr.*);
             defer self.allocator.free(master_bytes);
-
-            // Extract Averaged Data (f32 slice)
-            const avg_slice_bytes = averaged_bytes[byte_offset .. byte_offset + tensor_size_bytes];
-
-            // Cast to f32 slices (with alignment)
             const master_f32: []f32 = @alignCast(std.mem.bytesAsSlice(f32, master_bytes));
-            const avg_f32: []const f32 = @alignCast(std.mem.bytesAsSlice(f32, avg_slice_bytes));
 
-            // 3. Delegate math to the clean NesterovHost struct
-            // This updates master_f32 IN-PLACE
-            try self.host_optimizer.update(i, master_f32, avg_f32);
+            // Get corresponding averaged delta
+            const grad_slice = acc_f32[byte_offset / 4 .. (byte_offset + tensor_size) / 4];
 
-            // 4. Wrap the updated float data back into a new MLIR Constant Tensor
-            // This ensures the 'master_parameters' are always valid constants for the next broadcast
-            param_tensor_ptr.deinit(); // Free old symbolic handle
+            // Update using Nesterov (Host Optimizer)
+            // Note: master_f32 is modified in-place
+            try self.host_optimizer.update(i, master_f32, grad_slice);
+
+            // Wrap back to MLIR Tensor
+            param_tensor_ptr.deinit();
             param_tensor_ptr.* = try self.createTensorFromArrayWithShape(master_f32, shape);
 
-            byte_offset += tensor_size_bytes;
+            byte_offset += tensor_size;
         }
 
         // Update metrics
-        self.metrics.loss = self.calculateAverageLoss(worker_results);
-        std.log.info("Parameters updated, loss: {d:.4}", .{self.metrics.loss});
+        self.metrics.loss = total_loss / divisor;
+        std.log.info("Round complete. Avg Loss: {d:.4}", .{self.metrics.loss});
     }
 
-    /// Average parameters from all workers (new byte-based version)
-    fn averageWorkerParameterBytes(self: *Self, worker_results: ArrayList(WorkerResult)) ![]u8 {
-        // Calculate total parameter count from introspected shapes
-        var total_param_count: usize = 0;
-        for (self.parameter_shapes) |shape| {
-            var element_count: usize = 1;
-            for (shape) |dim| {
-                element_count *= @intCast(dim);
-            }
-            total_param_count += element_count;
-        }
-        const averaged = try self.allocator.alloc(f32, total_param_count);
-        defer self.allocator.free(averaged);
-
-        // Initialize to zero
-        for (averaged) |*param| {
-            param.* = 0.0;
-        }
-
-        // Sum all worker parameters
-        for (worker_results.items) |result| {
-            const worker_params: []const f32 = @alignCast(std.mem.bytesAsSlice(f32, result.parameter_bytes));
-            for (averaged, 0..) |*avg_param, i| {
-                if (i < worker_params.len) {
-                    avg_param.* += worker_params[i];
-                }
-            }
-        }
-
-        // Divide by number of workers to get average
-        const num_workers: f32 = @floatFromInt(worker_results.items.len);
-        for (averaged) |*avg_param| {
-            avg_param.* /= num_workers;
-        }
-
-        // Convert back to bytes
-        const result_bytes = try self.allocator.alloc(u8, averaged.len * @sizeOf(f32));
-        const result_f32: []f32 = @alignCast(std.mem.bytesAsSlice(f32, result_bytes));
-        @memcpy(result_f32, averaged);
-
-        return result_bytes;
-    }
-
-    /// Calculate average loss across workers
-    fn calculateAverageLoss(self: *Self, worker_results: ArrayList(WorkerResult)) f32 {
-        _ = self;
-        var total_loss: f32 = 0.0;
-
-        for (worker_results.items) |result| {
-            total_loss += result.loss;
-        }
-
-        return total_loss / @as(f32, @floatFromInt(worker_results.items.len));
-    }
 
     /// Create MLIR tensor from parameter array with specific shape
     fn createTensorFromArrayWithShape(self: *Self, array: []const f32, shape: []const i64) !Tensor {
@@ -1396,14 +1181,6 @@ pub const DiLoCo = struct {
         defer tensor_shape.deinit();
         const value = try self.mlir_builder.createConstant(byte_data, tensor_type, tensor_shape);
         return try self.mlir_builder.newTensor(value);
-    }
-
-    /// Clean up worker results
-    fn cleanupWorkerResults(self: *Self, worker_results: ArrayList(WorkerResult)) void {
-        for (worker_results.items) |result| {
-            self.allocator.free(result.parameter_bytes);
-        }
-        worker_results.deinit();
     }
 
     /// Check if training should stop
@@ -1447,12 +1224,4 @@ pub const DiLoCo = struct {
         const self: *Self = @ptrCast(@alignCast(ptr));
         return self.status;
     }
-};
-
-/// Result from a worker after inner loop completion
-const WorkerResult = struct {
-    node_id: message.NodeId,
-    parameter_bytes: []u8,
-    loss: f32,
-    steps_completed: usize,
 };

@@ -61,25 +61,16 @@ pub const Nesterov = struct {
         }
     }
 
-    /// Perform the update on a specific parameter tensor by index.
-    ///
-    /// In DiLoCo: gradient = (master_param - averaged_worker_param)
-    ///
-    /// Nesterov Momentum (Sutskever formulation):
-    ///    v_{t+1} = mu * v_t + grad
-    ///    p_{t+1} = p_t - lr * (grad + mu * v_{t+1})
-    ///
-    /// This is the "lookahead" behavior: the update includes both the current
-    /// gradient and the momentum-projected future velocity.
+    /// Perform the Nesterov update using a pre-calculated outer gradient (Delta).
     ///
     /// Arguments:
-    ///   - index: The index of the parameter tensor (matches initParameters order)
-    ///   - master_param: Slice containing current master values (in/out)
-    ///   - averaged_worker_param: Slice containing averaged worker values
-    pub fn update(self: *Self, index: usize, master_param: []f32, averaged_worker_param: []const f32) !void {
+    ///   - index: The index of the parameter tensor.
+    ///   - master_param: Slice containing current master values (in/out).
+    ///   - outer_gradient: The averaged delta from all workers (1/k * sum(theta_old - theta_new)).
+    pub fn update(self: *Self, index: usize, master_param: []f32, outer_gradient: []const f32) !void {
         if (!self.initialized) return error.NotInitialized;
         if (index >= self.velocities.len) return error.OutOfBounds;
-        if (master_param.len != averaged_worker_param.len) return error.DimensionMismatch;
+        if (master_param.len != outer_gradient.len) return error.DimensionMismatch;
 
         const velocity = self.velocities[index];
         if (master_param.len != velocity.len) return error.DimensionMismatch;
@@ -87,21 +78,21 @@ pub const Nesterov = struct {
         const lr = self.config.learning_rate;
         const mu = self.config.momentum;
 
-        // Vectorized loop optimization (auto-vectorized by Zig ReleaseFast)
+        // Vectorized loop optimization
         for (0..master_param.len) |i| {
+            const grad = outer_gradient[i];
             const p_master = master_param[i];
-            const p_worker = averaged_worker_param[i];
 
-            // 1. Compute pseudo-gradient (direction towards workers)
-            const grad = p_master - p_worker;
-
-            // 2. Update Velocity (same as Polyak)
+            // 1. Update Velocity (Polyak)
+            // v_{t+1} = mu * v_t + grad
             const v_prev = velocity[i];
             const v_new = mu * v_prev + grad;
             velocity[i] = v_new;
 
-            // 3. Apply Nesterov Update (Sutskever formulation)
-            // theta_new = theta_old - lr * (grad + mu * v_new)
+            // 2. Apply Nesterov Update (Sutskever formulation)
+            // theta_{t+1} = theta_t - lr * (grad + mu * v_{t+1})
+            // Note: The gradient here acts as the direction *up* the hill of the loss function
+            // defined by the difference, so we subtract it.
             master_param[i] = p_master - lr * (grad + mu * v_new);
         }
     }

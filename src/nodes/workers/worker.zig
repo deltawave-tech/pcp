@@ -444,7 +444,11 @@ pub const Worker = struct {
         // 6. Deserialize params only (no batch data)
         const reader = try binary_protocol.WorkerPayload.Reader.init(capnp_bytes);
         defer reader.deinit();
-        const initial_params_bytes = try reader.getParams();
+        const initial_params_bytes_temp = try reader.getParams();
+
+        // Save a persistent copy of initial params for delta calculation later
+        const initial_params_bytes = try self.allocator.dupe(u8, initial_params_bytes_temp);
+        defer self.allocator.free(initial_params_bytes);
 
         std.log.info("Starting inner loop: params={} bytes, chunk={}", .{ initial_params_bytes.len, chunk_id });
 
@@ -575,14 +579,34 @@ pub const Worker = struct {
 
         std.log.info("Worker {} completed {} inner loop steps, final loss: {d:.4}", .{ self.node_id.?, tau, final_loss });
 
-        // 11. After tau steps, send back the final parameters, loss, and chunk_id
-        // Concatenate final parameters
-        var final_params_bytes = std.ArrayList(u8).init(self.allocator);
-        defer final_params_bytes.deinit();
-        for (current_params) |p| try final_params_bytes.appendSlice(p);
+        // 11. Calculate Delta = Initial_Params - Final_Params and send it
+        var delta_bytes = std.ArrayList(u8).init(self.allocator);
+        defer delta_bytes.deinit();
 
+        // Iterate over parameter blocks to compute delta
+        var delta_offset: usize = 0;
+        for (current_params) |final_block_bytes| {
+            const param_block_size = final_block_bytes.len;
+            const initial_block_bytes = initial_params_bytes[delta_offset .. delta_offset + param_block_size];
+
+            // Cast to f32 for arithmetic
+            const initial_f32 = std.mem.bytesAsSlice(f32, initial_block_bytes);
+            const final_f32 = std.mem.bytesAsSlice(f32, final_block_bytes);
+
+            // Calculate delta for each element and append to delta_bytes
+            const num_elements = param_block_size / @sizeOf(f32);
+            for (0..num_elements) |j| {
+                const delta_val = initial_f32[j] - final_f32[j];
+                const delta_val_bytes = std.mem.asBytes(&delta_val);
+                try delta_bytes.appendSlice(delta_val_bytes);
+            }
+
+            delta_offset += param_block_size;
+        }
+
+        // Send Delta instead of raw params
         const shepherd_payload = binary_protocol.ShepherdPayload{
-            .updated_params = final_params_bytes.items,
+            .updated_params = delta_bytes.items,
             .loss = final_loss,
         };
         const response_capnp_bytes = try shepherd_payload.serialize(self.allocator);

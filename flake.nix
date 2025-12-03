@@ -7,190 +7,224 @@
     flake-utils.url = "github:numtide/flake-utils";
   };
   outputs = { self, nixpkgs, zig-overlay, zls, flake-utils }@inputs:
-    let
-      # Your original, correct overlay structure with gdbm, zls, meson, and libxml2 overrides added
-      overlays = [
-        (final: prev: {
-          zigpkgs = inputs.zig-overlay.packages.${prev.system};
-          zlspkgs = let orig = zls.packages.${prev.system}; in orig // {
-            zls = orig.zls.overrideAttrs (old: {
-              doCheck = false;  # Disable tests to bypass failures (likely due to emulation timeouts or env issues)
-            });
-          };
-          claude-code = prev.claude-code.overrideAttrs (old: rec {
-            version = "1.0.85";
-            src = prev.fetchzip {
-              url =
-                "https://registry.npmjs.org/@anthropic-ai/claude-code/-/claude-code-${version}.tgz";
-              hash = "sha256-CLqvcolG94JBC5VFlsfybZ9OXe81gJBzKU6Xgr7CGWo=";
-            };
-          });
-          gdbm = prev.gdbm.overrideAttrs (old: {
-            doCheck = false;  # Disable tests to bypass failures under emulation
-          });
-          meson = prev.meson.overrideAttrs (old: {
-            doCheck = false;  # Disable tests to bypass the failing "215 source set realistic example" test under emulation
-          });
-          libxml2 = prev.libxml2.overrideAttrs (old: {
-            doCheck = false;  # Disable tests to bypass "Illegal instruction" error in runxmlconf under QEMU emulation
-          });
-        })
-      ];
-    in
-    flake-utils.lib.eachSystem [ "x86_64-linux" "aarch64-darwin" "x86_64-darwin" ] (system:
+    flake-utils.lib.eachSystem [
+      "x86_64-linux"
+      "aarch64-linux"
+      "aarch64-darwin"
+      "x86_64-darwin"
+    ] (system:
       let
         pkgs = import nixpkgs {
           inherit system overlays;
           config.allowUnfree = true;
         };
         lib = pkgs.lib;
-        zls = pkgs.zlspkgs.zls;
+        # zig is LLVM based. In order to ensure ABI compatibility, we have base our builds on
+        # LLVM/clang.  The following is the `pkgs` set based on LLVM.
         pkgsLLVM = if pkgs.stdenv.isLinux then pkgs.pkgsLLVM else pkgs;
-        llvmPkg = pkgsLLVM.llvmPackages_git;
+        # The actual LLVM package we are using for building.
+        llvmPkg = pkgsLLVM.llvmPackages_21;
+        zls = pkgs.zls;
+        # Patch mlir to also contain mlir-pdll
         mlirPkg = llvmPkg.mlir.overrideAttrs (old: {
           postInstall = (old.postInstall or "") + ''
             cp -v bin/mlir-pdll $out/bin
           '';
         });
-        # --- IREE SDK (Build from Source v3.8.0) ---
-        iree-sdk = pkgs.stdenv.mkDerivation (finalAttrs: {
-          pname = "iree-sdk";
-          version = "3.8.0";
-          src = pkgs.fetchFromGitHub {
-            owner = "iree-org";
-            repo = "iree";
-            rev = "v${finalAttrs.version}";
-            hash = "sha256-cPy2xudIH1OVVzDlq5YAg1uFu59h6zDOvXpKaJ+fuP8=";
-            fetchSubmodules = true;
-          };
-          nativeBuildInputs = [ pkgs.cmake pkgs.ninja pkgs.python3 ];
-          buildInputs = [ llvmPkg.libllvm mlirPkg ];
-          cmakeFlags = [
-            "-DCMAKE_BUILD_TYPE=Release"
-            "-DIREE_BUILD_COMPILER=ON"
-            "-DIREE_BUILD_SAMPLES=OFF"
-            "-DIREE_BUILD_TESTS=OFF"
-          ] ++ (lib.optionals pkgs.stdenv.isDarwin [
-            "-DCMAKE_OSX_ARCHITECTURES=arm64"
-          ]);
-          installPhase = ''
-            cmake --install . --prefix $out
-          '';
-          meta = with lib; {
-            description = "IREE SDK built from source";
-            homepage = "https://iree.dev/";
-            platforms = [ "aarch64-darwin" "x86_64-darwin" "x86_64-linux" ];
-          };
-        });
+
+        overlays = [
+          (final: prev: {
+            # Provide a newer version of claude
+            claude-code = prev.claude-code.overrideAttrs (old: rec {
+              version = "2.0.36";
+              src = prev.fetchzip {
+                url =
+                  "https://registry.npmjs.org/@anthropic-ai/claude-code/-/claude-code-${version}.tgz";
+                hash = "sha256-6tbbCaF1HIgdk1vpbgQnBKWghaKKphGIGZoXtmnhY2I=";
+              };
+            });
+          })
+        ];
       in rec {
         packages.default = packages.pcp;
-        packages.stablehlo = let
-          libllvm = llvmPkg.libllvm;
-          tblgen = llvmPkg.tblgen;
-        in llvmPkg.stdenv.mkDerivation rec {
-          name = "stablehlo";
-          version = "1.13.0";
-          src = pkgs.fetchFromGitHub {
-            owner = "openxla";
-            repo = "stablehlo";
-            rev = "v${version}";
-            hash = "sha256-OH6Nz4b5sR8sPII59p6AaHXY7VlUS3pJM5ejdrri4iw=";
-          };
-          outputs = [ "out" "dev" ];
-          nativeBuildInputs = [ mlirPkg.dev tblgen ]
-            ++ (with pkgs; [ cmake gtest ninja pkg-config ]);
-          buildInputs = [ mlirPkg libllvm ] ++ (with pkgs; [ libffi libxml2 ]);
-          cmakeFlags = [
-            (lib.cmakeBool "LLVM_ENABLE_LDD" true)
-            (lib.cmakeFeature "CMAKE_BUILD_TYPE" "Release")
-            (lib.cmakeFeature "STABLEHLO_ENABLE_BINDINGS_PYTHON" "OFF")
-            (lib.cmakeFeature "MLIR_DIR" "${mlirPkg.dev}/lib/cmake/mlir")
-            (lib.cmakeFeature "LLVM_DIR" "${libllvm.dev}/lib/cmake/llvm")
-          ];
-          buildPhase = ''
-            cd $TMPDIR
-            cmake \
-              $src \
-              -GNinja \
-              $cmakeFlags
-            # ninja: error: 'stablehlo/reference/mlir-tblgen', needed by 'stablehlo/reference/InterpreterOps.h.inc', missing and no known rule to make it
-            ln -s ${tblgen}/bin/mlir-tblgen stablehlo/dialect/
-            ln -s ${tblgen}/bin/mlir-tblgen stablehlo/reference/
-            ln -s ${tblgen}/bin/mlir-tblgen stablehlo/tests/
-            ln -s ${tblgen}/bin/mlir-tblgen stablehlo/conversions/linalg/transforms/
-            ln -s ${tblgen}/bin/mlir-tblgen stablehlo/conversions/tosa/transforms/
-            ln -s ${mlirPkg}/bin/mlir-pdll stablehlo/conversions/tosa/transforms/
-            ln -s ${tblgen}/bin/mlir-tblgen stablehlo/transforms/
-            ln -s ${tblgen}/bin/mlir-tblgen stablehlo/transforms/optimization/
-            cmake --build . --verbose
-          '';
-          # See https://github.com/openxla/stablehlo/issues/2811 -- StableHLO does not install
-          # header files. The header files need a couple of '*.h.inc' files.
-          postInstall = ''
-            env | sort
-            mkdir -p $dev/include/
-            find stablehlo/ -name '*.h.inc' -exec cp -v --parents {} $dev/include/ \;
-            cd $src
-            find stablehlo/ -name '*.h' -exec cp -v --parents {} $dev/include/ \;
-          '';
-        };
-        packages.pcp = llvmPkg.stdenv.mkDerivation {
-          name = "pcp";
-          version = "main";
-          src = ./.;
-          nativeBuildInputs = [
-            llvmPkg.libllvm.dev
-            mlirPkg.dev
-            packages.stablehlo.dev
-            iree-sdk
-            pkgs.zig
-            pkgs.pkg-config
-            llvmPkg.lld
-            llvmPkg.clang-tools
-            llvmPkg.bintools
-            llvmPkg.libcxx.dev
-            pkgs.zig.hook
-          ] ++ lib.optionals pkgs.stdenv.isDarwin [
-            pkgs.apple-sdk_15
-          ];
-          buildInputs = [
-            llvmPkg.libcxx
-            llvmPkg.clang-tools
-            packages.stablehlo
-            llvmPkg.libllvm
-            mlirPkg
-            pkgs.capnproto
-            iree-sdk
-          ];
-          dontConfigure = true;
-          doCheck = true;
-          zigBuildFlags = [ "--verbose" "--color" "off" ];
-          zigCheckFlags = [ "--verbose" "--color" "off" ];
-          zigInstallFlags = [ "--verbose" "--color" "off" ];
-          CAPNP_DIR = "${pkgs.capnproto}";
-          IREE_SDK_DIR = "${iree-sdk}";
-        };
+
         devShells.default = pkgs.mkShell {
-          nativeBuildInputs = packages.pcp.nativeBuildInputs ++ [
-            pkgs.cachix
-            pkgs.claude-code
-            pkgs.lldb
-            pkgs.act
-            zls
-          ];
-          buildInputs = packages.pcp.buildInputs;
+          nativeBuildInputs = packages.pcp.nativeBuildInputs
+            ++ [ pkgs.cachix pkgs.claude-code pkgs.lldb pkgs.act zls ];
+          buildInputs = packages.pcp.buildInputs
+            ++ packages.pcp.propagatedBuildInputs;
           shellHook = ''
             echo "Zig development environment loaded"
             echo "Zig version: $(zig version)"
             echo "ZLS version: $(zls --version)"
             export ZIG_GLOBAL_CACHE_DIR="$(pwd)/.zig-cache"
             export CAPNP_DIR="${pkgs.capnproto}"
-            export IREE_SDK_DIR="${iree-sdk}"
+            export IREE_SOURCE_DIR="${packages.iree-sdk.src}"
+            export IREE_BUILD_DIR="${packages.iree-sdk.build}"
             ${lib.optionalString pkgs.stdenv.isDarwin ''
               export MACOSX_DEPLOYMENT_TARGET="11.0"
             ''}
           '';
         };
+
+        packages.pcp = llvmPkg.stdenv.mkDerivation {
+          name = "pcp";
+          version = "main";
+          src = ./.;
+          nativeBuildInputs = [
+            pkgs.makeWrapper
+            llvmPkg.libllvm.dev
+            mlirPkg.dev
+            pkgs.zig_0_13
+            pkgs.pkg-config
+            llvmPkg.lld
+            llvmPkg.clang-tools
+            llvmPkg.bintools
+            llvmPkg.libcxx.dev
+            pkgs.zig_0_13.hook
+          ] ++ lib.optionals pkgs.stdenv.isDarwin [ pkgs.apple-sdk_15 ];
+          buildInputs = [
+            llvmPkg.libcxx
+            llvmPkg.clang-tools
+            llvmPkg.libllvm
+            mlirPkg
+            pkgs.capnproto
+            packages.iree-sdk.src
+            packages.iree-sdk.build
+          ];
+          propagatedBuildInputs =
+            [ pkgs.cudaPackages.cuda_cudart pkgs.glibc packages.iree-sdk ];
+          dontConfigure = true;
+          doCheck = false;
+          zigBuildFlags = [ "--verbose" "--color" "off" ];
+          zigCheckFlags = [ "--verbose" "--color" "off" ];
+          zigInstallFlags = [ "--verbose" "--color" "off" ];
+          CAPNP_DIR = "${pkgs.capnproto}";
+          IREE_SOURCE_DIR = "${packages.iree-sdk.src}";
+          IREE_BUILD_DIR = "${packages.iree-sdk.build}";
+
+          postFixup = ''
+            # IREE needs to load libcuda.so.  On non-NixOS systems this is most probably installed
+            # as a system package and not via the nix-store.  Thus, we somehow have to inject the
+            # library search path into.  IREE internally simply uses `dlopen("libcuda.so")`.  The
+            # only workable way we have is to manipulate the rpath.
+            patchelf --force-rpath \
+              --add-rpath /usr/lib/x86_64-linux-gnu:/usr/lib64:/usr/lib:/run/opengl-driver/lib \
+              $out/bin/pcp
+
+            # Ensure that 'iree-compile' is present on 'PATH'
+            wrapProgram $out/bin/pcp \
+              --suffix PATH : "${packages.iree-sdk}/bin"
+          '';
+        };
         checks.pcp = packages.pcp;
+
+        packages.pcp-docker = pkgs.dockerTools.buildImage {
+          name = "pcp";
+          config = { Cmd = [ "${packages.pcp}/bin/pcp" ]; };
+        };
+
+        packages.iree-sdk = llvmPkg.stdenv.mkDerivation rec {
+          pname = "iree-sdk";
+          version = "3.9.0";
+          src = pkgs.fetchFromGitHub {
+            owner = "iree-org";
+            repo = "iree";
+            rev = "v${version}";
+            hash = "sha256-O+yp6ysHQJKlgLnoK1esGdRmce6M4nPgFTsxEck0xw0=";
+            fetchSubmodules = true;
+          };
+          nativeBuildInputs =
+            [ pkgs.cmake pkgs.ninja pkgs.python3 pkgs.bintools pkgs.patchelf ];
+          # Mix together a couple of dependencies needed to build the CUDA layer.  See
+          # 'build_tools/scripts/fetch_cuda_deps.sh'.
+          postUnpack = ''
+            set -e
+
+            echo "Copying needed cuda artifacts"
+            icd=/build/iree_cuda_deps
+            mkdir -p $icd
+            cp -r ${pkgs.cudaPackages_12_2.cuda_cccl.dev}/include $icd
+            chmod --recursive u+w $icd
+            cp -r ${pkgs.cudaPackages_12_2.cuda_cudart.dev}/include $icd
+            chmod --recursive u+w $icd
+            cp -r ${pkgs.cudaPackages_12_2.cuda_nvcc}/include $icd
+            chmod --recursive u+w $icd
+
+            mkdir -p $icd/nvvm/
+            cp -r ${pkgs.cudaPackages_12_2.cuda_nvcc}/nvvm/libdevice/ $icd/nvvm/
+            chmod u+w $icd
+          '';
+          propagatedBuildInputs = [ llvmPkg.lld llvmPkg.libllvm ];
+          buildInputs = [ pkgs.gtest ];
+          cmakeFlags = [
+            # Flags suggested in
+            # https://iree.dev/building-from-source/getting-started/#configuration-settings
+            (lib.cmakeFeature "CMAKE_BUILD_TYPE" "RelWithDebInfo")
+            (lib.cmakeFeature "CMAKE_AR" "ar")
+            (lib.cmakeBool "CMAKE_SKIP_INSTALL_RPATH" true)
+
+            (lib.cmakeBool "IREE_ENABLE_ASSERTIONS" true)
+            (lib.cmakeBool "IREE_ENABLE_SPLIT_DWARF" true)
+            (lib.cmakeBool "IREE_ENABLE_THIN_ARCHIVES" true)
+            (lib.cmakeBool "IREE_ENABLE_LLD" true)
+
+            (lib.cmakeFeature "CUDAToolkit_ROOT" "/build/iree_cuda_deps")
+            (lib.cmakeFeature "IREE_TARGET_BACKEND_ROCM_DEVICE_BC_PATH"
+              "${packages.iree-amdgpu-device-libs}")
+            (lib.cmakeBool "IREE_HAL_DRIVER_CUDA" true)
+            (lib.cmakeBool "IREE_HAL_DRIVER_HIP" true)
+            (lib.cmakeBool "IREE_HAL_DRIVER_VULKAN" true)
+            (lib.cmakeBool "IREE_TARGET_BACKEND_CUDA" true)
+            (lib.cmakeBool "IREE_TARGET_BACKEND_ROCM" true)
+            "-B"
+            "/build/build"
+          ];
+          ninjaFlags = [ "-C" "/build/build" ];
+
+          IREE_CUDA_DEPS_DIR = "/build/iree_cuda_deps";
+          preConfigure = ''
+            mkdir /build/build
+          '';
+
+          outputs = [ "out" "build" ];
+          postInstall = ''
+            mkdir -p $build
+            to_patch=(
+              iree-compile
+              iree-link
+              iree-lld
+              iree-mlir-lsp-server
+              iree-opt
+              iree-reduce
+              iree-run-mlir
+              test-iree-compiler-api-test-binary
+            )
+
+            for f in ''${to_patch[@]}; do
+              patchelf --remove-rpath /build/build/tools/$f
+            done
+            cp -r /build/build/* $build/
+          '';
+
+          # Prevent the `_multioutDevs` routine to perform any action. -- It tries to move
+          # `$build/lib/cmake` to `$out/lib/cmake` which produces a collision due to the already
+          # present `IREE` directory.
+          moveToDev = false;
+          meta = {
+            description = "IREE SDK built from source";
+            homepage = "https://iree.dev/";
+            platforms = [ "aarch64-darwin" "x86_64-darwin" "x86_64-linux" ];
+          };
+        };
+
+        # See ${packages.iree-sdk.src}/compiler/plugins/target/ROCM/CMakeLists.txt
+        packages.iree-amdgpu-device-libs = pkgs.fetchzip {
+          name = "iree-amdgpu-device-libs";
+          url =
+            "https://github.com/shark-infra/amdgpu-device-libs/releases/download/v20231101/amdgpu-device-libs-llvm-6086c272a3a59eb0b6b79dcbe00486bf4461856a.tgz";
+          hash = "sha256-jCv8pg3oXFVSfvgcSenwxsC/jkyN+dWTwosSAAFEvCo=";
+          stripRoot = false;
+        };
       });
 }

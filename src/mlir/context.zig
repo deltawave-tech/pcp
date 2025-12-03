@@ -143,7 +143,7 @@ pub const MLIRContext = struct {
         try std.fs.cwd().writeFile(.{ .sub_path = temp_mlir_path, .data = mlir_source });
 
         // 4. Call the IREE compiler as a subprocess
-        const iree_compile_path = "../iree-build/tools/iree-compile";
+        const iree_compile_path = "iree-compile";
 
         const target_arg = try std.fmt.allocPrint(allocator, "--iree-hal-target-backends={s}", .{iree_target});
         defer allocator.free(target_arg);

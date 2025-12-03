@@ -232,13 +232,17 @@ pub fn reduce_sum(
 
     // 2. Create the zero constant for init_value using type-aware attribute creation
     const scalar_type = mlir.Type.tensor(&.{}, element_type);
+
     var zero_attr: mlir.Attribute = undefined;
     if (element_type.isInteger() or element_type.isIndex()) {
         const zero_val = mlir.Attribute.integerAttr(ctx, 0, element_type);
         zero_attr = mlir.Attribute.denseElementsAttrSplat(scalar_type, zero_val);
     } else {
-        zero_attr = mlir.Attribute.denseElementsAttrFloatSplat(scalar_type, 0.0);
+        // Create a properly typed float attribute instead of using FloatSplat
+        const zero_val = mlir.Attribute.floatAttr(ctx, 0.0, element_type);
+        zero_attr = mlir.Attribute.denseElementsAttrSplat(scalar_type, zero_val);
     }
+
     const init_constant_op = try constant(allocator, ctx, .{ .value = zero_attr, .result_type = scalar_type });
 
     // FIX: Attach the constant op to the graph before using its result.

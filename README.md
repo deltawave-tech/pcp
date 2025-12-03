@@ -81,7 +81,77 @@ IREE handles the entire lowering pipeline from a high-level dialect to a hardwar
     └── worker.zig              # Worker node state machine
 ```
 
-## Building the Project
+## Building the Project via Nix
+
+The project uses [Nix](https://nixos.org/download/) as a build system.  It is possible to compile
+dependencies locally on your own, but that requires a considerable amount of manual work and
+compilation time.  We cache build and runtime dependencies and the builds themselves via
+[cachix](https://app.cachix.org/cache/pcp).
+
+No matter what, you will have to [install Nix and enable flakes](#install-nix-and-enable-flakes).
+
+If you then just want to perform training runs follow [Install final builds](#install-nix-and-enable-flakes).
+If you want to actively develop on pcp follow [Install a build environment](#install-a-build-environment).
+
+
+### Install Nix and enable flakes
+
+
+Follow one of the methodes presented in <https://nixos.org/download/>. For example:
+
+```shell
+# The following performs a single-user installation
+$ sh <(curl --proto '=https' --tlsv1.2 -L https://nixos.org/nix/install) --daemon
+```
+
+You probably have to logout and login again, or source the init-scripts of your shell. On Ubuntu
+using bash:
+
+```shell
+source /etc/bash.bashrc
+```
+
+You have to enable flakes. On a new installation do the following:
+
+```shell
+mkdir -p ~/.config/nix/
+echo 'experimental-features = nix-command flakes' >> ~/.config/nix/nix.conf
+```
+
+### Install final Builds
+
+If you just want to grab the final build, you can add cachix manually:
+
+```shell
+cat << EOF >> ~/.config/nix/nix.conf
+substituters = https://cache.nixos.org https://pcp.cachix.org
+trusted-public-keys = cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY= pcp.cachix.org-1:D/JYXqFAnVLlvVUJEBOWoGLmJKwKW58SxPD0+m/HXZk=
+EOF
+```
+
+Now, install pcp using
+
+```shell
+nix profile add github:deltawave-tech/pcp
+```
+
+### Install a build environment
+
+Install cachix and enable the relevant cache:
+```shell
+nix-env -iA nixpkgs.cachix
+cachix use pcp
+```
+
+Fetch the repository from GitHub. At the repository root perform
+```shell
+nix develop
+```
+
+Nix will drop you into a shell with all required dependencies. You should now be able to compile the
+project using `zig build`.
+
+## Building the Project manually (without Nix)
 
 ### Prerequisites
 

@@ -1,6 +1,7 @@
 const std = @import("std");
 const mlir = @import("../mlir/wrapper.zig");
-const mlir_ctx = @import("../mlir/context.zig"); 
+const mlir_ctx = @import("../mlir/context.zig");
+const c = @import("../mlir/c.zig").c;
 
 const Allocator = std.mem.Allocator;
 
@@ -262,6 +263,49 @@ pub fn Tensor(comptime T: type) type {
         pub fn relu(self: Self) !Self {
             const ops_mod = @import("ops.zig");
             return try ops_mod.relu(self.builder, self);
+        }
+
+        /// Create a generic Tensor from a raw byte slice and shape.
+        /// Effectively wraps a stablehlo.constant.
+        pub fn fromBytes(builder: *MLIRBuilder, bytes: []const u8, shape_dims: []const i64, dtype: DType) !Self {
+            const tensor_type = mlir.Type.rankedTensorType(builder.ctx, shape_dims, dtype.toMLIRType(builder.ctx));
+
+            // Create shape object
+            const ts_shape = try Shape.initWithDims(builder.ctx, shape_dims, dtype);
+
+            const value = try builder.createConstant(bytes, tensor_type, ts_shape);
+            return try builder.newTensor(value);
+        }
+
+        /// Extract raw bytes from a stablehlo.constant tensor.
+        /// This allocates new memory for the result which caller must free.
+        pub fn toBytes(self: Self, allocator: std.mem.Allocator) ![]u8 {
+            // 1. Get Defining Op
+            if (!c.mlirValueIsAOpResult(self.value.handle)) return error.NotAnOperationResult;
+            const op_handle = c.mlirOpResultGetOwner(self.value.handle);
+
+            // 2. Check Op Name
+            const name_id = c.mlirOperationGetName(op_handle);
+            const name_ref = c.mlirIdentifierStr(name_id);
+            const name = c.fromStringRef(name_ref);
+            if (!std.mem.eql(u8, name, "stablehlo.constant")) return error.NotAConstantOp;
+
+            // 3. Get 'value' Attribute
+            const val_ref = c.stringRefFromString("value");
+            const attr = c.operationGetAttributeByName(op_handle, val_ref);
+            if (@intFromPtr(attr.ptr) == 0 or !c.mlirAttributeIsADenseElements(attr)) {
+                return error.InvalidConstantAttribute;
+            }
+
+            // 4. Extract Data
+            const raw_ptr = c.mlirDenseElementsAttrGetRawData(attr);
+            if (@intFromPtr(raw_ptr) == 0) return error.InvalidRawDataPointer;
+
+            const num_bytes = self.shape.elemCount() * self.shape.dtype.sizeInBytes();
+
+            // 5. Dupe
+            const data_slice: [*]const u8 = @ptrCast(raw_ptr);
+            return try allocator.dupe(u8, data_slice[0..num_bytes]);
         }
 
         // Note: No more getScalar/setScalar - tensors are symbolic!

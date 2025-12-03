@@ -137,6 +137,37 @@ pub const Context = struct {
         pub fn op(self: Self) Operation {
             return Operation{ .handle = c.c.moduleGetOperation(self.handle) };
         }
+
+        /// Find a function operation by its symbol name (e.g. "main")
+        pub fn findFunction(self: Self, name: []const u8) !Operation {
+            // Get the block of the module body
+            const module_op = c.c.moduleGetOperation(self.handle);
+            const body_region = c.c.operationGetRegion(module_op, 0);
+            const body_block = c.c.regionGetFirstBlock(body_region);
+
+            // Iterate operations
+            var maybe_op = c.c.blockGetFirstOperation(body_block);
+            while (@intFromPtr(maybe_op.ptr) != 0) {
+                const current_op = Operation{ .handle = maybe_op };
+
+                // Check if it is a func.func
+                const op_name = current_op.getName();
+                if (std.mem.eql(u8, op_name, "func.func")) {
+                    const sym_name_ref = c.c.stringRefFromString("sym_name");
+                    const sym_name_attr = c.c.operationGetAttributeByName(current_op.handle, sym_name_ref);
+
+                    if (@intFromPtr(sym_name_attr.ptr) != 0 and c.c.attributeIsAString(sym_name_attr)) {
+                        const val_ref = c.c.stringAttributeGetValue(sym_name_attr);
+                        const func_name = c.c.fromStringRef(val_ref);
+                        if (std.mem.eql(u8, func_name, name)) {
+                            return current_op;
+                        }
+                    }
+                }
+                maybe_op = c.c.operationGetNextInBlock(maybe_op);
+            }
+            return error.FunctionNotFound;
+        }
     };
     
     /// MLIR Operation - represents a single operation in the IR

@@ -12,6 +12,7 @@ const execution = @import("../../execution.zig");
 const monitoring = @import("../../ui/monitoring.zig");
 const backend_selection = @import("../../backends/selection.zig");
 const data_manager = @import("data_manager.zig");
+const mlir_ctx = @import("../../mlir/context.zig");
 
 const TcpServer = tcp_stream.TcpServer;
 const TcpStreamManager = tcp_stream.TcpStreamManager;
@@ -573,7 +574,104 @@ pub const Shepherd = struct {
         std.log.info("Collected {} results from workers", .{responses.items.len});
         return responses;
     }
-    
+
+    /// Compiles the MLIR source for all connected workers and ensures they are initialized.
+    /// Handles caching, VMFB compilation, Base64 encoding, and JSON payload construction.
+    pub fn ensureWorkersCompiled(
+        self: *Self,
+        mlir_source: []const u8,
+        parameter_shapes: [][]i64,
+        data_input_shapes: [][]i64,
+    ) !void {
+        // 1. Identify unique configs that need compilation
+        var config_set = std.HashMap(WorkerConfig, void, std.hash_map.AutoContext(WorkerConfig), std.hash_map.default_max_load_percentage).init(self.allocator);
+        defer config_set.deinit();
+
+        self.worker_pool_mutex.lock();
+        // Create a snapshot of workers to avoid holding the lock during compilation/network I/O
+        const workers = try self.allocator.dupe(WorkerConnection, self.worker_pool.items);
+        self.worker_pool_mutex.unlock();
+        defer self.allocator.free(workers);
+
+        for (workers) |worker| {
+            const config = WorkerConfig{ .backend = worker.backend, .target_arch = worker.target_arch };
+            if (!self.compiled_artifacts.contains(config)) {
+                try config_set.put(config, {});
+            }
+        }
+
+        // 2. Compile missing artifacts
+        if (config_set.count() > 0) {
+            var temp_ctx = try mlir_ctx.MLIRContext.init(self.allocator);
+            defer temp_ctx.deinit();
+
+            var it = config_set.keyIterator();
+            while (it.next()) |config_ptr| {
+                const config = config_ptr.*;
+                const label = if (config.target_arch) |t| t else config.backend.toString();
+                std.log.info("Compiling graph for target: {s}...", .{label});
+
+                const vmfb = try temp_ctx.compileToVMFB(
+                    self.allocator,
+                    mlir_source,
+                    config.backend.toIreeCompilationTarget(),
+                    config.target_arch,
+                );
+
+                // Cache the artifact (Shepherd owns this memory now)
+                try self.compiled_artifacts.put(config, vmfb);
+            }
+        }
+
+        // 3. Initialize uninitialized workers
+        for (workers) |worker| {
+            if (worker.status == .Connected) {
+                const config = WorkerConfig{ .backend = worker.backend, .target_arch = worker.target_arch };
+                const vmfb_bytes = self.compiled_artifacts.get(config).?; // Must exist now
+
+                std.log.info("Initializing worker {} (Backend: {s})...", .{ worker.node_id, worker.backend.toString() });
+
+                try self.sendInitializeMessage(worker.node_id, vmfb_bytes, parameter_shapes, data_input_shapes);
+                self.setWorkerStatus(worker.node_id, .GraphInitialized);
+            }
+        }
+    }
+
+    /// Helper to construct and send the initialization JSON payload
+    fn sendInitializeMessage(self: *Self, node_id: NodeId, vmfb: []const u8, p_shapes: [][]i64, d_shapes: [][]i64) !void {
+        // Base64 encode VMFB
+        const b64_len = std.base64.standard.Encoder.calcSize(vmfb.len);
+        const b64_encoded_vmfb = try self.allocator.alloc(u8, b64_len);
+        defer self.allocator.free(b64_encoded_vmfb);
+        const encoded_len = std.base64.standard.Encoder.encode(b64_encoded_vmfb, vmfb).len;
+
+        // Build JSON shapes
+        var param_shape_array = std.json.Array.init(self.allocator);
+        defer param_shape_array.deinit();
+        for (p_shapes) |shape| {
+            var dim_array = std.json.Array.init(self.allocator);
+            for (shape) |dim| try dim_array.append(std.json.Value{ .integer = dim });
+            try param_shape_array.append(std.json.Value{ .array = dim_array });
+        }
+
+        var data_shape_array = std.json.Array.init(self.allocator);
+        defer data_shape_array.deinit();
+        for (d_shapes) |shape| {
+            var dim_array = std.json.Array.init(self.allocator);
+            for (shape) |dim| try dim_array.append(std.json.Value{ .integer = dim });
+            try data_shape_array.append(std.json.Value{ .array = dim_array });
+        }
+
+        // Build Payload
+        var payload = std.json.ObjectMap.init(self.allocator);
+        defer payload.deinit();
+        try payload.put("vmfb", std.json.Value{ .string = b64_encoded_vmfb[0..encoded_len] });
+        try payload.put("parameter_shapes", std.json.Value{ .array = param_shape_array });
+        try payload.put("data_input_shapes", std.json.Value{ .array = data_shape_array });
+
+        try self.sendToWorker(node_id, MessageType.INITIALIZE_GRAPH, .{ .object = payload });
+    }
+
     /// Stop the coordinator
     pub fn stop(self: *Self) void {
         self.is_running = false;

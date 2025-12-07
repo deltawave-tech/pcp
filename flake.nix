@@ -93,7 +93,7 @@
             packages.iree-sdk.build
           ];
           propagatedBuildInputs =
-            [ pkgs.cudaPackages.cuda_cudart pkgs.glibc packages.iree-sdk ];
+            [ pkgs.cudaPackages.cuda_cudart pkgs.glibc packages.iree-sdk pkgs.numactl pkgs.elfutils pkgs.zlib pkgs.zstd pkgs.libdrm ];
           dontConfigure = true;
           doCheck = false;
           zigBuildFlags = [ "--verbose" "--color" "off" ];
@@ -104,22 +104,19 @@
           IREE_BUILD_DIR = "${packages.iree-sdk.build}";
 
           postFixup = ''
-            # IREE needs to load libcuda.so (NVIDIA) AND libamdhip64.so (AMD).
-            # On non-NixOS systems these are most probably installed as system packages
-            # and not via the nix-store. Thus, we have to inject the library search paths.
-            # IREE internally uses `dlopen("libcuda.so")` and `dlopen("libamdhip64.so")`.
-            # We must explicitly add /opt/rocm/lib and /lib/x86_64-linux-gnu to the RPATH
-            # so the Nix binary can see the system drivers on the worker node.
-            patchelf --force-rpath \
-              --add-rpath /usr/lib/x86_64-linux-gnu:/usr/lib64:/usr/lib:/lib/x86_64-linux-gnu:/run/opengl-driver/lib:/opt/rocm/lib \
+            patchelf --add-needed libnuma.so.1 $out/bin/pcp
+            patchelf --add-needed libelf.so.1 $out/bin/pcp
+            patchelf --add-needed libz.so.1 $out/bin/pcp
+            patchelf --add-needed libzstd.so.1 $out/bin/pcp
+            patchelf --add-needed libdrm.so.2 $out/bin/pcp
+            patchelf --add-needed libdrm_amdgpu.so.1 $out/bin/pcp
+
+            patchelf --add-rpath \
+              "${pkgs.numactl}/lib:${pkgs.elfutils}/lib:${pkgs.zlib}/lib:${pkgs.zstd}/lib:${pkgs.libdrm}/lib:/usr/lib/x86_64-linux-gnu:/usr/lib64:/usr/lib:/opt/amdgpu/lib/x86_64-linux-gnu:/opt/amdgpu/lib:/run/opengl-driver/lib:/opt/rocm/lib" \
               $out/bin/pcp
 
-            # Ensure that 'iree-compile' is present on 'PATH'
-            # Also set LD_LIBRARY_PATH so dynamically loaded libraries (via dlopen)
-            # can find their dependencies (e.g., libamdhip64.so -> libnuma.so.1)
             wrapProgram $out/bin/pcp \
-              --suffix PATH : "${packages.iree-sdk}/bin" \
-              --prefix LD_LIBRARY_PATH : "/usr/lib/x86_64-linux-gnu:/usr/lib64:/usr/lib:/lib/x86_64-linux-gnu:/opt/rocm/lib"
+              --suffix PATH : "${packages.iree-sdk}/bin"
           '';
         };
         checks.pcp = packages.pcp;

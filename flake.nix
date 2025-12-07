@@ -108,15 +108,18 @@
             # On non-NixOS systems these are most probably installed as system packages
             # and not via the nix-store. Thus, we have to inject the library search paths.
             # IREE internally uses `dlopen("libcuda.so")` and `dlopen("libamdhip64.so")`.
-            # We must explicitly add /opt/rocm/lib to the RPATH so the Nix binary
-            # can see the system drivers on the worker node.
+            # We must explicitly add /opt/rocm/lib and /lib/x86_64-linux-gnu to the RPATH
+            # so the Nix binary can see the system drivers on the worker node.
             patchelf --force-rpath \
-              --add-rpath /usr/lib/x86_64-linux-gnu:/usr/lib64:/usr/lib:/run/opengl-driver/lib:/opt/rocm/lib \
+              --add-rpath /usr/lib/x86_64-linux-gnu:/usr/lib64:/usr/lib:/lib/x86_64-linux-gnu:/run/opengl-driver/lib:/opt/rocm/lib \
               $out/bin/pcp
 
             # Ensure that 'iree-compile' is present on 'PATH'
+            # Also set LD_LIBRARY_PATH so dynamically loaded libraries (via dlopen)
+            # can find their dependencies (e.g., libamdhip64.so -> libnuma.so.1)
             wrapProgram $out/bin/pcp \
-              --suffix PATH : "${packages.iree-sdk}/bin"
+              --suffix PATH : "${packages.iree-sdk}/bin" \
+              --prefix LD_LIBRARY_PATH : "/usr/lib/x86_64-linux-gnu:/usr/lib64:/usr/lib:/lib/x86_64-linux-gnu:/opt/rocm/lib"
           '';
         };
         checks.pcp = packages.pcp;

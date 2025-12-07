@@ -104,12 +104,14 @@
           IREE_BUILD_DIR = "${packages.iree-sdk.build}";
 
           postFixup = ''
-            # IREE needs to load libcuda.so.  On non-NixOS systems this is most probably installed
-            # as a system package and not via the nix-store.  Thus, we somehow have to inject the
-            # library search path into.  IREE internally simply uses `dlopen("libcuda.so")`.  The
-            # only workable way we have is to manipulate the rpath.
+            # IREE needs to load libcuda.so (NVIDIA) AND libamdhip64.so (AMD).
+            # On non-NixOS systems these are most probably installed as system packages
+            # and not via the nix-store. Thus, we have to inject the library search paths.
+            # IREE internally uses `dlopen("libcuda.so")` and `dlopen("libamdhip64.so")`.
+            # We must explicitly add /opt/rocm/lib to the RPATH so the Nix binary
+            # can see the system drivers on the worker node.
             patchelf --force-rpath \
-              --add-rpath /usr/lib/x86_64-linux-gnu:/usr/lib64:/usr/lib:/run/opengl-driver/lib \
+              --add-rpath /usr/lib/x86_64-linux-gnu:/usr/lib64:/usr/lib:/run/opengl-driver/lib:/opt/rocm/lib \
               $out/bin/pcp
 
             # Ensure that 'iree-compile' is present on 'PATH'

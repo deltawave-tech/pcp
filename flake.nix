@@ -93,7 +93,7 @@
             packages.iree-sdk.build
           ];
           propagatedBuildInputs =
-            [ pkgs.cudaPackages.cuda_cudart pkgs.glibc packages.iree-sdk ];
+            [ pkgs.cudaPackages.cuda_cudart pkgs.glibc packages.iree-sdk pkgs.numactl pkgs.elfutils pkgs.zlib pkgs.zstd pkgs.libdrm ];
           dontConfigure = true;
           doCheck = false;
           zigBuildFlags = [ "--verbose" "--color" "off" ];
@@ -104,15 +104,17 @@
           IREE_BUILD_DIR = "${packages.iree-sdk.build}";
 
           postFixup = ''
-            # IREE needs to load libcuda.so.  On non-NixOS systems this is most probably installed
-            # as a system package and not via the nix-store.  Thus, we somehow have to inject the
-            # library search path into.  IREE internally simply uses `dlopen("libcuda.so")`.  The
-            # only workable way we have is to manipulate the rpath.
-            patchelf --force-rpath \
-              --add-rpath /usr/lib/x86_64-linux-gnu:/usr/lib64:/usr/lib:/run/opengl-driver/lib \
+            patchelf --add-needed libnuma.so.1 $out/bin/pcp
+            patchelf --add-needed libelf.so.1 $out/bin/pcp
+            patchelf --add-needed libz.so.1 $out/bin/pcp
+            patchelf --add-needed libzstd.so.1 $out/bin/pcp
+            patchelf --add-needed libdrm.so.2 $out/bin/pcp
+            patchelf --add-needed libdrm_amdgpu.so.1 $out/bin/pcp
+
+            patchelf --add-rpath \
+              "${pkgs.numactl}/lib:${pkgs.elfutils}/lib:${pkgs.zlib}/lib:${pkgs.zstd}/lib:${pkgs.libdrm}/lib:/usr/lib/x86_64-linux-gnu:/usr/lib64:/usr/lib:/opt/amdgpu/lib/x86_64-linux-gnu:/opt/amdgpu/lib:/run/opengl-driver/lib:/opt/rocm/lib" \
               $out/bin/pcp
 
-            # Ensure that 'iree-compile' is present on 'PATH'
             wrapProgram $out/bin/pcp \
               --suffix PATH : "${packages.iree-sdk}/bin"
           '';

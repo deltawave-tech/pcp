@@ -58,11 +58,11 @@ pub const Worker = struct {
     current_chunk_id: ?usize,
 
     // Supervisor Pattern: ID of the supervisor managing this worker
-    supervisor_id: ?u64,
+    supervisor_id: ?i64,
 
     const Self = @This();
 
-    pub fn init(allocator: Allocator, backend: WorkerBackend, supervisor_id: ?u64) !Self {
+    pub fn init(allocator: Allocator, backend: WorkerBackend, supervisor_id: ?i64) !Self {
         return Self{
             .allocator = allocator,
             .client = TcpClient.init(allocator),
@@ -217,33 +217,39 @@ pub const Worker = struct {
     /// Robust entry point with automatic reconnection on failure
     pub fn runRobust(self: *Self, host: []const u8, port: u16, target_arch: ?[]const u8) !void {
         var backoff_ms: u64 = 100;
-        const max_backoff_ms: u64 = 10000;
+        const max_backoff_ms: u64 = 5000; // Cap at 5 seconds
 
         while (true) {
+            // Reset state on reconnect attempts
+            self.state = .connecting;
+
             self.connect(host, port, target_arch) catch |err| {
-                std.log.warn("Failed to connect to Shepherd: {}. Retrying in {}ms...", .{ err, backoff_ms });
+                // Only log warning if backoff is significant to reduce noise during quick restarts
+                if (backoff_ms > 500) {
+                    std.log.warn("Worker failed to connect to Shepherd: {}. Retrying in {}ms...", .{ err, backoff_ms });
+                }
                 std.time.sleep(backoff_ms * std.time.ns_per_ms);
                 backoff_ms = @min(backoff_ms * 2, max_backoff_ms);
                 continue;
             };
 
+            // Connected! Reset backoff
             backoff_ms = 100;
-            std.log.info("Worker connected and running...", .{});
 
             self.run() catch |err| {
-                std.log.err("Worker loop error: {}", .{err});
+                std.log.err("Worker connection dropped: {}", .{err});
             };
 
             if (self.state == .shutting_down) {
-                std.log.info("Worker received shutdown signal. Exiting.", .{});
                 break;
             }
 
-            std.log.warn("Connection lost. Cleaning up and reconnecting...", .{});
-
-            self.client.deinit();
-            self.client = TcpClient.init(self.allocator);
+            // Important: Explicitly disconnect client to close socket fd
+            self.client.disconnect();
             self.state = .disconnected;
+
+            // Wait a moment before immediate reconnect to allow Shepherd to recover
+            std.time.sleep(500 * std.time.ns_per_ms);
         }
     }
     

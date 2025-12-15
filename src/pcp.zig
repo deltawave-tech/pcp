@@ -69,7 +69,9 @@ const Args = struct {
     model_path: ?[]const u8,
     backend: ?backend_selection.Backend,
     target_arch: ?[]const u8,
-    supervisor_id: ?u64,
+    supervisor_id: ?i64,
+    supervise: bool,
+    child_args: std.ArrayList([]const u8),
 
     const Mode = enum {
         shepherd,
@@ -77,7 +79,9 @@ const Args = struct {
         supervisor,
     };
 
-    pub fn parse(_: Allocator, args: [][:0]u8) !Args {
+    pub fn parse(allocator: Allocator, args: [][:0]u8) !Args {
+        var child_args_list = std.ArrayList([]const u8).init(allocator);
+
         if (args.len < 2) {
             return Args{
                 .mode = .shepherd,
@@ -89,6 +93,8 @@ const Args = struct {
                 .backend = null,
                 .target_arch = null,
                 .supervisor_id = null,
+                .supervise = false,
+                .child_args = child_args_list,
             };
         }
 
@@ -100,7 +106,8 @@ const Args = struct {
         var model_path: ?[]const u8 = null;
         var backend: ?backend_selection.Backend = null;
         var target_arch: ?[]const u8 = null;
-        var supervisor_id: ?u64 = null;
+        var supervisor_id: ?i64 = null;
+        var supervise: bool = false;
 
         var i: usize = 1;
         while (i < args.len) {
@@ -175,8 +182,17 @@ const Args = struct {
             } else if (std.mem.eql(u8, args[i], "--supervisor-id")) {
                 i += 1;
                 if (i < args.len) {
-                    supervisor_id = std.fmt.parseInt(u64, args[i], 10) catch null;
+                    supervisor_id = std.fmt.parseInt(i64, args[i], 10) catch null;
                 }
+            } else if (std.mem.eql(u8, args[i], "--supervise")) {
+                // All subsequent arguments belong to the child process
+                supervise = true;
+                // Collect all remaining args for the child
+                i += 1;
+                while (i < args.len) : (i += 1) {
+                    try child_args_list.append(args[i]);
+                }
+                break; // Stop parsing parent args
             }
             i += 1;
         }
@@ -191,6 +207,8 @@ const Args = struct {
             .backend = backend,
             .target_arch = target_arch,
             .supervisor_id = supervisor_id,
+            .supervise = supervise,
+            .child_args = child_args_list,
         };
     }
 
@@ -200,6 +218,7 @@ const Args = struct {
         print("  --shepherd           Run as Shepherd coordinator (default)\n", .{});
         print("  --worker             Run as Worker\n", .{});
         print("  --supervisor         Run as Supervisor (manages a Worker child process)\n", .{});
+        print("  --supervise -- <child_args>  Run with supervision (spawns child with args after --)\n", .{});
         print("  --config <path>      Path to experiment JSON config file (Shepherd only)\n", .{});
         print("  --connect <host:port> Connect to Shepherd at host:port\n", .{});
         print("  --host <host>        Host to bind/connect to (default: 127.0.0.1)\n", .{});
@@ -210,6 +229,11 @@ const Args = struct {
         print("  --target <arch>      GPU target architecture (e.g., gfx942 for MI300X, sm_80 for A100)\n", .{});
         print("  --supervisor-id <id> Internal: Supervisor ID (used by spawned workers)\n", .{});
         print("  --help               Show this help message\n", .{});
+        print("\nExamples:\n", .{});
+        print("  # Run resilient shepherd:\n", .{});
+        print("  ./pcp --supervise -- --shepherd --config experiment.json\n", .{});
+        print("\n  # Run resilient worker:\n", .{});
+        print("  ./pcp --supervise -- --worker --host 127.0.0.1 --port 8080\n", .{});
     }
 };
 
@@ -388,11 +412,39 @@ pub fn main() !void {
     print("Workers: {}\n", .{args.workers});
     print("=====================================\n", .{});
 
+    // Check if supervision is enabled
+    if (args.supervise) {
+        print("🛡️  Running in supervision mode (resilient)\n", .{});
+        print("   Child args: ", .{});
+        for (args.child_args.items) |arg| {
+            print("{s} ", .{arg});
+        }
+        print("\n", .{});
+
+        // This process becomes the Supervisor
+        // It will spawn a child process with args.child_args
+        var s = try @import("nodes/supervisor.zig").Supervisor.init(
+            allocator,
+            args.host,
+            args.port,
+            args.child_args.items,
+        );
+        defer s.deinit();
+        try s.run();
+        return;
+    }
+
     switch (args.mode) {
         .shepherd => try runShepherd(allocator, args),
         .worker => try runWorker(allocator, args),
         .supervisor => {
-            var s = try @import("nodes/supervisor.zig").Supervisor.init(allocator, args.host, args.port, process_args);
+            // Legacy supervisor mode for workers only
+            var s = try @import("nodes/supervisor.zig").Supervisor.init(
+                allocator,
+                args.host,
+                args.port,
+                &[_][]const u8{ "--worker" },
+            );
             defer s.deinit();
             try s.run();
         },

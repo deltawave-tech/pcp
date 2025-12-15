@@ -135,4 +135,59 @@ pub const DataManager = struct {
         if (self.chunks.items.len == 0) return 1.0;
         return @as(f32, @floatFromInt(self.completed_chunks_count)) / @as(f32, @floatFromInt(self.chunks.items.len));
     }
+
+    /// Serialize DataManager state to JSON for checkpoint recovery
+    pub fn serialize(self: *DataManager) ![]u8 {
+        // Create state structure for serialization
+        const State = struct {
+            current_epoch: usize,
+            completed_count: usize,
+            chunks_state: []const ChunkState,
+        };
+
+        // Map current chunk states
+        var states = try self.allocator.alloc(ChunkState, self.chunks.items.len);
+        defer self.allocator.free(states);
+
+        for (self.chunks.items, 0..) |chunk, i| {
+            states[i] = chunk.state;
+        }
+
+        const state = State{
+            .current_epoch = self.current_epoch,
+            .completed_count = self.completed_chunks_count,
+            .chunks_state = states,
+        };
+
+        return std.json.stringifyAlloc(self.allocator, state, .{});
+    }
+
+    /// Load DataManager state from JSON for checkpoint recovery
+    pub fn loadState(self: *DataManager, json_data: []u8) !void {
+        const parsed = try std.json.parseFromSlice(
+            struct {
+                current_epoch: usize,
+                completed_count: usize,
+                chunks_state: []ChunkState,
+            },
+            self.allocator,
+            json_data,
+            .{},
+        );
+        defer parsed.deinit();
+
+        self.current_epoch = parsed.value.current_epoch;
+        self.completed_chunks_count = parsed.value.completed_count;
+
+        // Restore chunk states
+        for (self.chunks.items, 0..) |*chunk, i| {
+            if (i < parsed.value.chunks_state.len) {
+                chunk.state = parsed.value.chunks_state[i];
+                // If it was Assigned but we crashed, reset to Unassigned so it gets picked up again
+                if (chunk.state == .Assigned) {
+                    chunk.state = .Unassigned;
+                }
+            }
+        }
+    }
 };

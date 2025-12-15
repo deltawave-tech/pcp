@@ -102,9 +102,9 @@ pub const Shepherd = struct {
     data_manager: ?data_manager.DataManager,
 
     // Supervisor Pattern: Map SupervisorID -> TCP Stream
-    supervisors: std.AutoHashMap(u64, net.Stream),
+    supervisors: std.AutoHashMap(i64, net.Stream),
     // Supervisor Pattern: Map Worker NodeID -> SupervisorID
-    worker_map: std.AutoHashMap(NodeId, u64),
+    worker_map: std.AutoHashMap(NodeId, i64),
 
     const Self = @This();
 
@@ -122,8 +122,8 @@ pub const Shepherd = struct {
             .result_queue = ArrayList(MessageEnvelope).init(allocator),
             .result_queue_mutex = std.Thread.Mutex{},
             .data_manager = null, // Initialized when training starts
-            .supervisors = std.AutoHashMap(u64, net.Stream).init(allocator),
-            .worker_map = std.AutoHashMap(NodeId, u64).init(allocator),
+            .supervisors = std.AutoHashMap(i64, net.Stream).init(allocator),
+            .worker_map = std.AutoHashMap(NodeId, i64).init(allocator),
         };
     }
     
@@ -211,15 +211,29 @@ pub const Shepherd = struct {
 
         // Handle Supervisor Handshake
         if (std.mem.eql(u8, join_msg.msg_type, MessageType.SUPERVISOR_HANDSHAKE)) {
-            const sid = @as(u64, @intCast(join_msg.data.object.get("supervisor_id").?.integer));
+            const sid = join_msg.data.object.get("supervisor_id").?.integer;
 
             self.worker_pool_mutex.lock();
+            // If this supervisor was already connected (zombie connection), the put will overwrite it.
+            // This is correct behavior for a reconnecting supervisor.
             try self.supervisors.put(sid, stream);
             self.worker_pool_mutex.unlock();
 
-            std.log.info("Registered Supervisor ID: {}", .{sid});
-            // Keep connection open for future control messages
-            // Stream is owned by supervisors map now and will be closed on deinit
+            std.log.info("Supervisor {} re-registered control plane.", .{sid});
+
+            // IMPORTANT: Keep this connection alive to detect supervisor disconnects.
+            // We loop reading to detect when the connection drops.
+            while (true) {
+                // Read 1 byte to detect disconnect
+                var dummy: [1]u8 = undefined;
+                const bytes = stream.read(&dummy) catch 0;
+                if (bytes == 0) break; // Disconnected
+            }
+
+            // Cleanup on disconnect
+            self.worker_pool_mutex.lock();
+            _ = self.supervisors.remove(sid);
+            self.worker_pool_mutex.unlock();
             return;
         }
 
@@ -269,7 +283,7 @@ pub const Shepherd = struct {
 
         // Link worker to supervisor if supervisor_id is present
         if (data_obj.get("supervisor_id")) |sid_val| {
-            const sid = @as(u64, @intCast(sid_val.integer));
+            const sid = sid_val.integer;
             self.worker_map.put(assigned_node_id, sid) catch |err| {
                 std.log.err("Failed to map worker {} to supervisor {}: {}", .{ assigned_node_id, sid, err });
             };

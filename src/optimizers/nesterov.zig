@@ -96,4 +96,34 @@ pub const Nesterov = struct {
             master_param[i] = p_master - lr * (grad + mu * v_new);
         }
     }
+
+    /// Serialize optimizer state (velocities) to binary format for checkpoint recovery
+    pub fn serialize(self: *Nesterov) ![]u8 {
+        if (!self.initialized) return error.NotInitialized;
+
+        var buffer = std.ArrayList(u8).init(self.allocator);
+
+        // Write raw bytes of all velocity tensors sequentially
+        for (self.velocities) |v| {
+            const bytes = std.mem.sliceAsBytes(v);
+            try buffer.appendSlice(bytes);
+        }
+
+        return buffer.toOwnedSlice();
+    }
+
+    /// Deserialize optimizer state (velocities) from binary format for checkpoint recovery
+    pub fn deserialize(self: *Nesterov, data: []const u8) !void {
+        if (!self.initialized) return error.NotInitialized;
+
+        var offset: usize = 0;
+        for (self.velocities) |v| {
+            const size = v.len * @sizeOf(f32);
+            if (offset + size > data.len) return error.CorruptSaveFile;
+
+            const src = data[offset .. offset + size];
+            @memcpy(std.mem.sliceAsBytes(v), src);
+            offset += size;
+        }
+    }
 };

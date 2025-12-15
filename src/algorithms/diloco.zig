@@ -37,6 +37,8 @@ const Tensor = tensor.Tensor(void);
 const Executor = execution.Executor; // NEW: Generic executor interface
 const DataLoader = data_loader.DataLoader;
 
+const RECOVERY_FILE = "shepherd_state.bin";
+
 /// DiLoCo algorithm configuration
 pub const DiLoCoConfig = struct {
     base_config: TrainingConfig,
@@ -294,8 +296,12 @@ pub const DiLoCo = struct {
         }
         monitoring.setModelInfo(total_param_count, self.config.base_config.learning_rate);
 
-        // Initialize master parameters
-        try self.initializeMasterParameters();
+        // Try to recover state before starting
+        const recovered = try self.tryLoadRecoveryState();
+        if (!recovered) {
+            // Cold start - initialize master parameters
+            try self.initializeMasterParameters();
+        }
 
         // --- NEW LOGIC: Delegate compilation/distribution to Shepherd ---
         // Ensure initial workers are ready before starting
@@ -340,6 +346,9 @@ pub const DiLoCo = struct {
 
             // Streaming Accumulation: Collect and apply gradients on the fly
             try self.accumulateAndApplyGradients(workers_assigned);
+
+            // Save recovery state immediately after update
+            try self.saveRecoveryState();
 
             // Save checkpoint every 10 steps or at the end
             if ((step + 1) % 10 == 0 or (step + 1) == self.config.base_config.outer_loop_steps) {
@@ -706,6 +715,112 @@ pub const DiLoCo = struct {
     }
 
 
+
+    /// Save recovery state to disk for shepherd resilience
+    fn saveRecoveryState(self: *Self) !void {
+        const file = try std.fs.cwd().createFile(RECOVERY_FILE, .{});
+        defer file.close();
+        var writer = file.writer();
+
+        // 1. Magic Header
+        try writer.writeAll("PCP_RES");
+
+        // 2. Save Model Parameters
+        if (self.master_parameters) |params| {
+            try writer.writeInt(u32, @intCast(params.len), .little);
+            for (params) |t| {
+                const bytes = try t.toBytes(self.allocator);
+                defer self.allocator.free(bytes);
+                try writer.writeInt(u64, @intCast(bytes.len), .little);
+                try writer.writeAll(bytes);
+            }
+        } else {
+            try writer.writeInt(u32, 0, .little);
+        }
+
+        // 3. Save Optimizer State
+        const opt_bytes = try self.host_optimizer.serialize();
+        defer self.allocator.free(opt_bytes);
+        try writer.writeInt(u64, @intCast(opt_bytes.len), .little);
+        try writer.writeAll(opt_bytes);
+
+        // 4. Save DataManager State
+        if (self.coordinator.data_manager) |*dm| {
+            const dm_bytes = try dm.serialize();
+            defer self.allocator.free(dm_bytes);
+            try writer.writeInt(u64, @intCast(dm_bytes.len), .little);
+            try writer.writeAll(dm_bytes);
+        } else {
+            try writer.writeInt(u64, 0, .little);
+        }
+
+        std.log.info("State checkpoint saved for recovery.", .{});
+    }
+
+    /// Try to load recovery state from disk
+    fn tryLoadRecoveryState(self: *Self) !bool {
+        std.log.info("Attempting to load recovery state from: {s}", .{RECOVERY_FILE});
+        const file = std.fs.cwd().openFile(RECOVERY_FILE, .{}) catch |err| {
+            std.log.warn("Could not open recovery file: {}", .{err});
+            return false;
+        };
+        defer file.close();
+        var reader = file.reader();
+
+        // 1. Check Header
+        var header: [7]u8 = undefined;
+        _ = try reader.readAll(&header);
+        if (!std.mem.eql(u8, &header, "PCP_RES")) {
+            std.log.warn("Invalid recovery file header", .{});
+            return false;
+        }
+        std.log.info("Recovery file header valid, loading state...", .{});
+
+        // 2. Load Parameters
+        const num_tensors = try reader.readInt(u32, .little);
+        if (num_tensors > 0) {
+            // Ensure master_parameters is allocated
+            if (self.master_parameters == null) {
+                self.master_parameters = try self.allocator.alloc(Tensor, num_tensors);
+            }
+
+            for (self.master_parameters.?, 0..) |*t, i| {
+                const len = try reader.readInt(u64, .little);
+                const bytes = try self.allocator.alloc(u8, len);
+                defer self.allocator.free(bytes);
+                _ = try reader.readAll(bytes);
+
+                // If tensor already exists, deinit it first
+                if (i < self.parameter_shapes.len) {
+                    // Recreate tensor from bytes
+                    t.* = try Tensor.fromBytes(self.mlir_builder, bytes, self.parameter_shapes[i], .f32);
+                }
+            }
+        }
+
+        // 3. Load Optimizer
+        const opt_len = try reader.readInt(u64, .little);
+        if (opt_len > 0) {
+            const opt_bytes = try self.allocator.alloc(u8, opt_len);
+            defer self.allocator.free(opt_bytes);
+            _ = try reader.readAll(opt_bytes);
+            try self.host_optimizer.deserialize(opt_bytes);
+        }
+
+        // 4. Load DataManager
+        const dm_len = try reader.readInt(u64, .little);
+        if (dm_len > 0) {
+            const dm_bytes = try self.allocator.alloc(u8, dm_len);
+            defer self.allocator.free(dm_bytes);
+            _ = try reader.readAll(dm_bytes);
+            if (self.coordinator.data_manager) |*dm| {
+                try dm.loadState(dm_bytes);
+            }
+        }
+
+        std.log.info("Successfully resumed training from checkpoint!", .{});
+        return true;
+    }
 
     /// Check if training should stop
     fn shouldStop(self: *Self) bool {

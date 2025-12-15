@@ -172,12 +172,27 @@ pub const TcpClient = struct {
             stream.close();
         }
     }
-    
+
+    /// Check if currently connected
+    pub fn isConnected(self: Self) bool {
+        return self.stream != null;
+    }
+
+    /// Disconnect and reset stream state, but keep allocator
+    pub fn disconnect(self: *Self) void {
+        if (self.stream) |s| {
+            s.close();
+            self.stream = null;
+        }
+    }
+
     /// Connect to a TCP server
     pub fn connect(self: *Self, host: []const u8, port: u16) !void {
+        if (self.stream != null) self.disconnect();
+
         const address = try net.Address.parseIp(host, port);
         self.stream = try net.tcpConnectToAddress(address);
-        
+
         std.log.info("Connected to TCP server at {s}:{}", .{ host, port });
     }
     

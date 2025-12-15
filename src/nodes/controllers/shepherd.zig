@@ -101,6 +101,11 @@ pub const Shepherd = struct {
     // Data manager for chunk-based strict partitioning
     data_manager: ?data_manager.DataManager,
 
+    // Supervisor Pattern: Map SupervisorID -> TCP Stream
+    supervisors: std.AutoHashMap(u64, net.Stream),
+    // Supervisor Pattern: Map Worker NodeID -> SupervisorID
+    worker_map: std.AutoHashMap(NodeId, u64),
+
     const Self = @This();
 
     pub fn init(allocator: Allocator) Self {
@@ -117,6 +122,8 @@ pub const Shepherd = struct {
             .result_queue = ArrayList(MessageEnvelope).init(allocator),
             .result_queue_mutex = std.Thread.Mutex{},
             .data_manager = null, // Initialized when training starts
+            .supervisors = std.AutoHashMap(u64, net.Stream).init(allocator),
+            .worker_map = std.AutoHashMap(NodeId, u64).init(allocator),
         };
     }
     
@@ -130,6 +137,14 @@ pub const Shepherd = struct {
             worker.stream.close();
         }
         self.worker_pool.deinit();
+
+        // Close all supervisor connections
+        var supervisor_iter = self.supervisors.valueIterator();
+        while (supervisor_iter.next()) |stream| {
+            stream.close();
+        }
+        self.supervisors.deinit();
+        self.worker_map.deinit();
 
         // Clean up compiled artifacts
         var artifact_iter = self.compiled_artifacts.valueIterator();
@@ -183,24 +198,39 @@ pub const Shepherd = struct {
 
     /// Handle a new worker connection
     fn handleWorkerConnection(self: *Self, stream: net.Stream, worker_address: net.Address) !void {
-        defer stream.close();
-        
-        // Wait for JoinRequest from worker
+        // Wait for JoinRequest from worker or Supervisor handshake
         const join_msg_result = TcpStreamManager.receive(stream, self.allocator) catch |err| {
             std.log.err("Failed to receive join message: {}", .{err});
+            stream.close();
             return;
         };
         defer join_msg_result.parsed.deinit();
         defer self.allocator.free(join_msg_result.buffer);
-        
+
         const join_msg = join_msg_result.parsed.value;
-        
-        
-        // Validate it's a JoinRequest
-        if (!std.mem.eql(u8, join_msg.msg_type, MessageType.JOIN_REQUEST)) {
-            std.log.err("Expected JoinRequest, got: {s}", .{join_msg.msg_type});
+
+        // Handle Supervisor Handshake
+        if (std.mem.eql(u8, join_msg.msg_type, MessageType.SUPERVISOR_HANDSHAKE)) {
+            const sid = @as(u64, @intCast(join_msg.data.object.get("supervisor_id").?.integer));
+
+            self.worker_pool_mutex.lock();
+            try self.supervisors.put(sid, stream);
+            self.worker_pool_mutex.unlock();
+
+            std.log.info("Registered Supervisor ID: {}", .{sid});
+            // Keep connection open for future control messages
+            // Stream is owned by supervisors map now and will be closed on deinit
             return;
         }
+
+        // Validate it's a JoinRequest
+        if (!std.mem.eql(u8, join_msg.msg_type, MessageType.JOIN_REQUEST)) {
+            std.log.err("Expected JoinRequest or SupervisorHandshake, got: {s}", .{join_msg.msg_type});
+            stream.close();
+            return;
+        }
+        // For workers, we'll handle the stream lifecycle normally
+        defer stream.close();
 
         // NEW: Parse the backend from the join request's data payload
         const data_obj = join_msg.data.object;
@@ -236,6 +266,15 @@ pub const Shepherd = struct {
             std.log.err("Failed to append worker {}: {}", .{ assigned_node_id, err });
             return;
         };
+
+        // Link worker to supervisor if supervisor_id is present
+        if (data_obj.get("supervisor_id")) |sid_val| {
+            const sid = @as(u64, @intCast(sid_val.integer));
+            self.worker_map.put(assigned_node_id, sid) catch |err| {
+                std.log.err("Failed to map worker {} to supervisor {}: {}", .{ assigned_node_id, sid, err });
+            };
+            std.log.info("Worker {} linked to Supervisor {}", .{ assigned_node_id, sid });
+        }
 
         // Update monitoring while still holding mutex
         const worker_count = self.worker_pool.items.len;

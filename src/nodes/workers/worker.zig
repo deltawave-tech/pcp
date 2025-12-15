@@ -57,9 +57,12 @@ pub const Worker = struct {
     dataset: ?Dataset,
     current_chunk_id: ?usize,
 
+    // Supervisor Pattern: ID of the supervisor managing this worker
+    supervisor_id: ?u64,
+
     const Self = @This();
-    
-    pub fn init(allocator: Allocator, backend: WorkerBackend) !Self {
+
+    pub fn init(allocator: Allocator, backend: WorkerBackend, supervisor_id: ?u64) !Self {
         return Self{
             .allocator = allocator,
             .client = TcpClient.init(allocator),
@@ -75,6 +78,7 @@ pub const Worker = struct {
             .timestep = 1.0,
             .dataset = null,
             .current_chunk_id = null,
+            .supervisor_id = supervisor_id,
         };
     }
     
@@ -131,6 +135,12 @@ pub const Worker = struct {
         if (target_arch) |target| {
             try payload_map.put("target_arch", std.json.Value{ .string = target });
             std.log.info("Reporting target architecture: {s}", .{target});
+        }
+
+        // Add supervisor ID if this worker is managed by a supervisor
+        if (self.supervisor_id) |sid| {
+            try payload_map.put("supervisor_id", std.json.Value{ .integer = @intCast(sid) });
+            std.log.info("Reporting supervisor ID: {}", .{sid});
         }
 
         const payload = std.json.Value{ .object = payload_map };
@@ -706,7 +716,7 @@ pub fn testWorker(allocator: Allocator) !void {
         },
     };
     
-    var worker = try Worker.init(allocator, mock_backend);
+    var worker = try Worker.init(allocator, mock_backend, null);
     defer worker.deinit();
     
     // Test basic initialization

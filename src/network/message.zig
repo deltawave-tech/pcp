@@ -177,6 +177,10 @@ pub const MessageType = struct {
     pub const INNER_LOOP_COMPLETE = "InnerLoopComplete";
     pub const SHUTDOWN = "Shutdown";
     pub const HEARTBEAT = "Heartbeat";
+
+    // Supervisor Control Protocol
+    pub const SUPERVISOR_HANDSHAKE = "SupervisorHandshake"; // Supervisor -> Shepherd (ID: u64)
+    pub const RESTART_WORKER = "RestartWorker";           // Shepherd -> Supervisor (Force restart)
 };
 
 pub const MessageHandler = *const fn (MessageEnvelope) anyerror!void;

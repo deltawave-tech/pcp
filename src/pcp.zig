@@ -69,10 +69,12 @@ const Args = struct {
     model_path: ?[]const u8,
     backend: ?backend_selection.Backend,
     target_arch: ?[]const u8,
+    supervisor_id: ?u64,
 
     const Mode = enum {
         shepherd,
         worker,
+        supervisor,
     };
 
     pub fn parse(_: Allocator, args: [][:0]u8) !Args {
@@ -86,6 +88,7 @@ const Args = struct {
                 .model_path = null,
                 .backend = null,
                 .target_arch = null,
+                .supervisor_id = null,
             };
         }
 
@@ -97,6 +100,7 @@ const Args = struct {
         var model_path: ?[]const u8 = null;
         var backend: ?backend_selection.Backend = null;
         var target_arch: ?[]const u8 = null;
+        var supervisor_id: ?u64 = null;
 
         var i: usize = 1;
         while (i < args.len) {
@@ -104,6 +108,8 @@ const Args = struct {
                 mode = .worker;
             } else if (std.mem.eql(u8, args[i], "--shepherd")) {
                 mode = .shepherd;
+            } else if (std.mem.eql(u8, args[i], "--supervisor")) {
+                mode = .supervisor;
             } else if (std.mem.eql(u8, args[i], "--config")) {
                 i += 1;
                 if (i < args.len) {
@@ -166,6 +172,11 @@ const Args = struct {
                 if (i < args.len) {
                     target_arch = args[i];
                 }
+            } else if (std.mem.eql(u8, args[i], "--supervisor-id")) {
+                i += 1;
+                if (i < args.len) {
+                    supervisor_id = std.fmt.parseInt(u64, args[i], 10) catch null;
+                }
             }
             i += 1;
         }
@@ -179,6 +190,7 @@ const Args = struct {
             .model_path = model_path,
             .backend = backend,
             .target_arch = target_arch,
+            .supervisor_id = supervisor_id,
         };
     }
 
@@ -187,6 +199,7 @@ const Args = struct {
         print("Options:\n", .{});
         print("  --shepherd           Run as Shepherd coordinator (default)\n", .{});
         print("  --worker             Run as Worker\n", .{});
+        print("  --supervisor         Run as Supervisor (manages a Worker child process)\n", .{});
         print("  --config <path>      Path to experiment JSON config file (Shepherd only)\n", .{});
         print("  --connect <host:port> Connect to Shepherd at host:port\n", .{});
         print("  --host <host>        Host to bind/connect to (default: 127.0.0.1)\n", .{});
@@ -195,6 +208,7 @@ const Args = struct {
         print("  --model <path>       Path to MLIR model file (Shepherd only, overrides config)\n", .{});
         print("  --backend <type>     Backend to use: cpu, cuda, metal, vulkan, rocm (default: auto)\n", .{});
         print("  --target <arch>      GPU target architecture (e.g., gfx942 for MI300X, sm_80 for A100)\n", .{});
+        print("  --supervisor-id <id> Internal: Supervisor ID (used by spawned workers)\n", .{});
         print("  --help               Show this help message\n", .{});
     }
 };
@@ -335,7 +349,7 @@ fn runWorker(allocator: Allocator, args: Args) !void {
 
     const worker_backend_instance = try backend_selection.createWorkerBackend(allocator, backend);
 
-    var worker_instance = try Worker.init(allocator, worker_backend_instance);
+    var worker_instance = try Worker.init(allocator, worker_backend_instance, args.supervisor_id);
     defer worker_instance.deinit();
 
     // Start worker main loop with automatic reconnection
@@ -377,6 +391,11 @@ pub fn main() !void {
     switch (args.mode) {
         .shepherd => try runShepherd(allocator, args),
         .worker => try runWorker(allocator, args),
+        .supervisor => {
+            var s = try @import("nodes/supervisor.zig").Supervisor.init(allocator, args.host, args.port, process_args);
+            defer s.deinit();
+            try s.run();
+        },
     }
 }
 

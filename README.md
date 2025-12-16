@@ -323,7 +323,7 @@ For production environments, it is recommended to run workers under a Supervisor
 
 ```sh
 # Start a Supervisor (which manages the Worker)
-./zig-out/bin/pcp --supervisor --host <SHEPHERD_IP> --port 8080 --backend cuda --target sm_80
+./zig-out/bin/pcp --supervise -- --worker --connect <SHEPHERD_IP>:8080 --backend cuda --target sm_80
 ```
 
 **Standard Worker (No Supervisor):**

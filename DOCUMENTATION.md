@@ -98,13 +98,21 @@ To ensure fault tolerance in long-running training sessions, PCP implements a Su
 - **Handshake**: Performs a `SupervisorHandshake` with the Shepherd, generating a unique `supervisor_id` which is passed to the spawned worker to link the control and data planes.
 
 ```zig
-// Supervisor Logic
+// Supervisor Logic (Asynchronous Model)
 try supervisor.connect(host, port);
 try supervisor.sendHandshake();
+
+// Spawn worker in background thread
+try supervisor.spawnWorker(); // Spawns ./pcp --worker --supervisor-id <ID>
+const monitor_thread = try supervisor.startMonitoringThread();
+
+// Main event loop handles TCP commands from Shepherd
 while (running) {
-    try supervisor.spawnWorker(); // Spawns ./pcp --worker --supervisor-id <ID>
-    supervisor.monitorWorker();   // Blocks until child exit
-    // Auto-restart on crash
+    const message = try supervisor.receiveMessage(); // Non-blocking TCP receive
+    if (message.type == .RESTART_WORKER) {
+        try supervisor.restartWorker(); // Force restart via TCP command
+    }
+    // Worker monitoring and auto-restart happens asynchronously in background
 }
 ```
 
@@ -315,10 +323,10 @@ pub fn setWorkerInfo(workers: []const WorkerInfo) void
 
 ```bash
 # Starts a supervisor which manages the worker process
-./zig-out/bin/main_distributed --supervisor \
-    --host <SHEPHERD_IP> \
-    --port 8080 \
-    --backend cuda
+./zig-out/bin/main_distributed --supervise -- --worker \
+    --connect <SHEPHERD_IP>:8080 \
+    --backend cuda \
+    --target sm_80
 ```
 
 **Worker (Auto-detect backend):**

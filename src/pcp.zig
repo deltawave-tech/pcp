@@ -72,12 +72,14 @@ const Args = struct {
     supervisor_id: ?i64,
     supervise: bool,
     device_id: usize,
+    scale: usize,
     child_args: std.ArrayList([]const u8),
 
     const Mode = enum {
         shepherd,
         worker,
         supervisor,
+        node_manager,
     };
 
     pub fn parse(allocator: Allocator, args: [][:0]u8) !Args {
@@ -96,6 +98,7 @@ const Args = struct {
                 .supervisor_id = null,
                 .supervise = false,
                 .device_id = 0,
+                .scale = 1,
                 .child_args = child_args_list,
             };
         }
@@ -111,6 +114,7 @@ const Args = struct {
         var supervisor_id: ?i64 = null;
         var supervise: bool = false;
         var device_id: usize = 0;
+        var scale: usize = 1;
 
         var i: usize = 1;
         while (i < args.len) {
@@ -120,6 +124,8 @@ const Args = struct {
                 mode = .shepherd;
             } else if (std.mem.eql(u8, args[i], "--supervisor")) {
                 mode = .supervisor;
+            } else if (std.mem.eql(u8, args[i], "--node-manager")) {
+                mode = .node_manager;
             } else if (std.mem.eql(u8, args[i], "--config")) {
                 i += 1;
                 if (i < args.len) {
@@ -192,6 +198,11 @@ const Args = struct {
                 if (i < args.len) {
                     device_id = std.fmt.parseInt(usize, args[i], 10) catch 0;
                 }
+            } else if (std.mem.eql(u8, args[i], "--scale")) {
+                i += 1;
+                if (i < args.len) {
+                    scale = std.fmt.parseInt(usize, args[i], 10) catch 1;
+                }
             } else if (std.mem.eql(u8, args[i], "--supervise")) {
                 // All subsequent arguments belong to the child process
                 supervise = true;
@@ -217,6 +228,7 @@ const Args = struct {
             .supervisor_id = supervisor_id,
             .supervise = supervise,
             .device_id = device_id,
+            .scale = scale,
             .child_args = child_args_list,
         };
     }
@@ -227,6 +239,7 @@ const Args = struct {
         print("  --shepherd           Run as Shepherd coordinator (default)\n", .{});
         print("  --worker             Run as Worker\n", .{});
         print("  --supervisor         Run as Supervisor (manages a Worker child process)\n", .{});
+        print("  --node-manager       Run as Node Manager (spawns multiple supervised workers)\n", .{});
         print("  --supervise -- <child_args>  Run with supervision (spawns child with args after --)\n", .{});
         print("  --config <path>      Path to experiment JSON config file (Shepherd only)\n", .{});
         print("  --connect <host:port> Connect to Shepherd at host:port\n", .{});
@@ -237,6 +250,7 @@ const Args = struct {
         print("  --backend <type>     Backend to use: cpu, cuda, metal, vulkan, rocm (default: auto)\n", .{});
         print("  --target <arch>      GPU target architecture (e.g., gfx942 for MI300X, sm_80 for A100)\n", .{});
         print("  --device-id <id>     GPU device ID to use (default: 0, for multi-GPU nodes)\n", .{});
+        print("  --scale <N>          Number of supervised workers to spawn (NodeManager only, default: 1)\n", .{});
         print("  --supervisor-id <id> Internal: Supervisor ID (used by spawned workers)\n", .{});
         print("  --help               Show this help message\n", .{});
         print("\nExamples:\n", .{});
@@ -246,6 +260,8 @@ const Args = struct {
         print("  ./pcp --supervise -- --worker --host 127.0.0.1 --port 8080 --device-id 0\n", .{});
         print("\n  # Run 8 workers on an 8xH100 node (one per GPU):\n", .{});
         print("  for i in {{0..7}}; do ./pcp --worker --device-id $i & done\n", .{});
+        print("\n  # Run node manager with 8 supervised workers:\n", .{});
+        print("  ./pcp --node-manager --scale 8 --backend cuda\n", .{});
     }
 };
 
@@ -395,6 +411,34 @@ fn runWorker(allocator: Allocator, args: Args) !void {
     print("💀 Worker shutting down\n", .{});
 }
 
+/// Run as Node Manager
+fn runNodeManager(allocator: Allocator, args: Args) !void {
+    const backend = args.backend orelse backend_selection.Backend.selectDefault();
+    const backend_str = backend.toString();
+
+    print("Starting Node Manager...\n", .{});
+    print("   Target Backend: {s}\n", .{backend_str});
+    print("   Spawning {} Supervisors\n", .{args.scale});
+
+    const NodeManager = @import("nodes/node_manager.zig").NodeManager;
+    var manager = try NodeManager.init(
+        allocator,
+        args.host,
+        args.port,
+        backend_str,
+        args.target_arch,
+    );
+    defer manager.deinit();
+
+    try manager.spawnSupervisors(args.scale);
+
+    // Keep running and monitor
+    print("Node Manager monitoring {} supervisors...\n", .{args.scale});
+    try manager.wait();
+
+    print("Node Manager shutting down\n", .{});
+}
+
 /// Main function
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -461,6 +505,7 @@ pub fn main() !void {
             defer s.deinit();
             try s.run();
         },
+        .node_manager => try runNodeManager(allocator, args),
     }
 }
 

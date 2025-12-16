@@ -86,6 +86,28 @@ try worker.connect("127.0.0.1", 8080, amd_target);
 try worker.run();
 ```
 
+### Supervisor Pattern (`src/nodes/supervisor.zig`)
+
+To ensure fault tolerance in long-running training sessions, PCP implements a Supervisor pattern. The Supervisor is a lightweight parent process responsible for the lifecycle of the heavy compute Worker process.
+
+**Responsibilities:**
+
+- **Control Plane Connection**: Establishes a dedicated TCP connection to the Shepherd to listen for orchestration commands (e.g., `RESTART_WORKER`).
+- **Process Management**: Spawns the actual Worker process as a child.
+- **Health Monitoring**: Monitors the child process exit codes. If a worker crashes (e.g., CUDA OOM, segfault), the Supervisor automatically respawns it after a backoff period.
+- **Handshake**: Performs a `SupervisorHandshake` with the Shepherd, generating a unique `supervisor_id` which is passed to the spawned worker to link the control and data planes.
+
+```zig
+// Supervisor Logic
+try supervisor.connect(host, port);
+try supervisor.sendHandshake();
+while (running) {
+    try supervisor.spawnWorker(); // Spawns ./pcp --worker --supervisor-id <ID>
+    supervisor.monitorWorker();   // Blocks until child exit
+    // Auto-restart on crash
+}
+```
+
 ### DiLoCo Algorithm (`src/algorithms/diloco.zig`)
 
 PCP implements the DiLoCo algorithm to reduce communication overhead:
@@ -202,13 +224,18 @@ The Shepherd compiles separate VMFB artifacts for each unique `(backend, amd_tar
 
 ## Networking Protocol
 
-PCP uses a hybrid networking approach for maximum efficiency:
+PCP uses a hybrid networking approach:
 
-### 1. Control Plane (JSON)
+### Control Plane (Supervisor <-> Shepherd)
 
-Lightweight messages (Join requests, Heartbeats, Status updates) are sent as JSON objects wrapped in a framing protocol.
+- **Format**: JSON-only messages.
+- **Purpose**: Handshakes, Heartbeats, and Restart commands (`MessageType.RESTART_WORKER`).
+- **Persistence**: Connection remains open even if the Worker process crashes.
 
-### 2. Data Plane (Cap'n Proto)
+### Data Plane (Worker <-> Shepherd)
+
+- **Format**: JSON envelope with embedded Base64-encoded Cap'n Proto blobs.
+- **Purpose**: Transmission of VMFB artifacts, tensor parameters, and gradients.
 
 Heavy tensor data (Model parameters, Gradients) is serialized using Cap'n Proto (`src/network/protocol.capnp`).
 
@@ -282,6 +309,16 @@ pub fn setWorkerInfo(workers: []const WorkerInfo) void
     --workers 2 \
     --host 0.0.0.0 \
     --port 8080
+```
+
+**Supervisor (Fault-Tolerant Worker):**
+
+```bash
+# Starts a supervisor which manages the worker process
+./zig-out/bin/main_distributed --supervisor \
+    --host <SHEPHERD_IP> \
+    --port 8080 \
+    --backend cuda
 ```
 
 **Worker (Auto-detect backend):**

@@ -317,7 +317,21 @@ The Shepherd coordinates training, aggregates gradients, and manages the global 
   --workers 2
 ```
 
-### Starting Workers
+### Starting Workers (with Supervisor)
+
+For production environments, it is recommended to run workers under a Supervisor. The Supervisor acts as a watchdog process that connects to the Shepherd via a control plane, spawns the actual Worker process, and automatically restarts it if it crashes.
+
+```sh
+# Start a Supervisor (which manages the Worker)
+./zig-out/bin/pcp --supervisor --host <SHEPHERD_IP> --port 8080 --backend cuda --target sm_80
+```
+
+**Standard Worker (No Supervisor):**
+
+```sh
+# Connect directly (useful for debugging)
+./zig-out/bin/pcp --worker --connect <SHEPHERD_IP>:8080 --backend cuda
+```
 
 Workers connect to the Shepherd and execute training on their local hardware. The `--target` flag specifies GPU architecture (optional, defaults: sm_80 for CUDA, gfx942 for ROCm).
 

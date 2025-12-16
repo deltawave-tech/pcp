@@ -32,11 +32,14 @@ PCP separates the definition of computation (MLIR) from its execution (IREE). Th
                                │ TCP + Cap'n Proto
                                ▼
 ┌──────────────────────────────────────────────────────────────────────┐
-│                         Worker Nodes                                 │
+│                       Compute Node (Node Manager)                    │
 ├──────────────────────────────────────────────────────────────────────┤
-│  VMFB + Tensors → IREE Runtime → Hardware HAL (CUDA/Metal/ROCm)      │
-│                                  ↓                                    │
-│                     Updated Parameters → Network                      │
+│  ┌────────────┐      ┌────────────┐          ┌────────────┐          │
+│  │ Supervisor │      │ Supervisor │          │ Supervisor │          │
+│  │     ↓      │      │     ↓      │   ...    │     ↓      │          │
+│  │   Worker   │      │   Worker   │          │   Worker   │          │
+│  │   (GPU 0)  │      │   (GPU 1)  │          │   (GPU N)  │          │
+│  └────────────┘      └────────────┘          └────────────┘          │
 └──────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -67,54 +70,35 @@ defer shepherd.deinit();
 try shepherd.listen("0.0.0.0", 8080);
 ```
 
-### Worker Nodes (`src/worker.zig`)
+### Node Manager (`src/nodes/node_manager.zig`)
 
-Workers are "dumb" execution units. They do not know the model topology; they simply execute the VMFB provided by the Shepherd.
+The Node Manager is the entry point for all compute nodes. It abstracts the complexity of multi-process management.
+
+**Responsibilities:**
+
+- **Scaling**: Detects configuration and spawns N Supervisor processes (one per GPU).
+- **Orchestration**: Assigns sequential Device IDs to workers.
+- **Staggering**: Staggers worker startup to prevent I/O "thundering herd" issues.
+- **Resilience**: Each worker runs in a dedicated monitor thread with automatic restart on crash.
+
+### Supervisor Pattern (`src/nodes/supervisor.zig`)
+
+To ensure fault tolerance, PCP implements a Supervisor pattern. The Supervisor is a lightweight parent process responsible for the lifecycle of a specific Worker.
+
+**Responsibilities:**
+
+- **Health Monitoring**: Monitors the child Worker process. If a worker crashes (e.g., CUDA OOM, segfault), the Supervisor automatically respawns it.
+- **Control Plane**: Maintains a persistent TCP connection to the Shepherd even if the Worker is restarting.
+
+### Worker Nodes (`src/nodes/workers/worker.zig`)
+
+Workers are execution units pinned to a specific hardware device.
 
 **Characteristics:**
 
 - **State**: Maintains local AdamW optimizer states (M and V moments) which persist across inner loops
 - **Execution**: Runs the inner loop for τ steps (default 10) before syncing back to the Shepherd
-- **Hardware Agnostic**: The same worker code runs on NVIDIA (CUDA), AMD (ROCm), and Apple Silicon (Metal) by selecting the appropriate IREE driver at runtime
-
-```zig
-var worker = Worker.init(allocator, backend);
-defer worker.deinit();
-
-// Connect to shepherd and enter training loop
-try worker.connect("127.0.0.1", 8080, amd_target);
-try worker.run();
-```
-
-### Supervisor Pattern (`src/nodes/supervisor.zig`)
-
-To ensure fault tolerance in long-running training sessions, PCP implements a Supervisor pattern. The Supervisor is a lightweight parent process responsible for the lifecycle of the heavy compute Worker process.
-
-**Responsibilities:**
-
-- **Control Plane Connection**: Establishes a dedicated TCP connection to the Shepherd to listen for orchestration commands (e.g., `RESTART_WORKER`).
-- **Process Management**: Spawns the actual Worker process as a child.
-- **Health Monitoring**: Monitors the child process exit codes. If a worker crashes (e.g., CUDA OOM, segfault), the Supervisor automatically respawns it after a backoff period.
-- **Handshake**: Performs a `SupervisorHandshake` with the Shepherd, generating a unique `supervisor_id` which is passed to the spawned worker to link the control and data planes.
-
-```zig
-// Supervisor Logic (Asynchronous Model)
-try supervisor.connect(host, port);
-try supervisor.sendHandshake();
-
-// Spawn worker in background thread
-try supervisor.spawnWorker(); // Spawns ./pcp --worker --supervisor-id <ID>
-const monitor_thread = try supervisor.startMonitoringThread();
-
-// Main event loop handles TCP commands from Shepherd
-while (running) {
-    const message = try supervisor.receiveMessage(); // Non-blocking TCP receive
-    if (message.type == .RESTART_WORKER) {
-        try supervisor.restartWorker(); // Force restart via TCP command
-    }
-    // Worker monitoring and auto-restart happens asynchronously in background
-}
-```
+- **Hardware Agnostic**: Runs on NVIDIA (CUDA), AMD (ROCm), and Apple Silicon (Metal) via IREE.
 
 ### DiLoCo Algorithm (`src/algorithms/diloco.zig`)
 
@@ -220,11 +204,15 @@ The `IreeBackend` handles:
 
 **Supported Backends:**
 
-- **CUDA**: NVIDIA GPUs
-- **ROCm/HIP**: AMD GPUs (MI300X, MI250X, MI100)
+- **CUDA**: NVIDIA GPUs (A100, H100, etc.)
+- **ROCm/HIP**: AMD GPUs (MI300X, MI250X)
 - **Metal**: Apple Silicon
 - **Vulkan**: Cross-platform
-- **CPU**: Fallback (local-sync driver)
+- **CPU**: Fallback
+
+### Device Selection
+
+The backend uses the IREE HAL Driver API (`iree_hal_driver_create_device_by_ordinal`) to explicitly bind workers to specific GPU indices (0, 1, 2...) based on the assignment from the Node Manager.
 
 ### Per-Worker Compilation
 
@@ -308,52 +296,79 @@ pub fn setWorkerInfo(workers: []const WorkerInfo) void
 
 ### CLI Arguments
 
-**Shepherd:**
+The PCP binary (`pcp`) handles all roles (Shepherd, NodeManager, Worker).
+
+#### 1. Start the Shepherd (Coordinator)
+
+The Shepherd coordinates the training session.
 
 ```bash
-# Start the master node
-./zig-out/bin/main_distributed --shepherd \
-    --model src/models/nanogpt_forward.mlir \
-    --workers 2 \
-    --host 0.0.0.0 \
-    --port 8080
+pcp \
+  --shepherd \
+  --config experiment.json \
+  --host 0.0.0.0 \
+  --port 8080 \
+  --workers 8
 ```
 
-**Supervisor (Fault-Tolerant Worker):**
+#### 2. Start Compute Nodes (Node Manager)
+
+This is the standard way to join the cluster. The Node Manager automatically sets up supervision and crash recovery.
+
+**Single GPU Node (or CPU):**
+
+By default, this spawns 1 worker on Device 0.
 
 ```bash
-# Starts a supervisor which manages the worker process
-./zig-out/bin/main_distributed --supervise -- --worker \
-    --connect <SHEPHERD_IP>:8080 \
-    --backend cuda \
-    --target sm_80
+pcp \
+  --node-manager \
+  --host <SHEPHERD_IP> \
+  --port 8080 \
+  --backend cuda \
+  --target sm_80
 ```
 
-**Worker (Auto-detect backend):**
+**Multi-GPU Node (e.g., 8xH100):**
+
+Use `--scale` to spawn multiple workers (one per GPU).
 
 ```bash
-./zig-out/bin/main_distributed --worker \
-    --connect <SHEPHERD_IP>:8080
+# Spawns 8 workers, mapped to GPUs 0-7
+pcp \
+  --node-manager \
+  --scale 8 \
+  --host <SHEPHERD_IP> \
+  --port 8080 \
+  --backend cuda \
+  --target sm_90a
 ```
 
-**Worker (Specific backend):**
+#### Advanced / Debugging
+
+If you need to debug a specific worker process manually (bypassing the Node Manager and Supervisor):
 
 ```bash
-# CPU Worker
-./zig-out/bin/main_distributed --worker \
-    --connect <SHEPHERD_IP>:8080 \
-    --backend cpu
+pcp \
+  --worker \
+  --connect <SHEPHERD_IP>:8080 \
+  --backend cuda \
+  --device-id 0
+```
 
-# CUDA Worker (NVIDIA)
-./zig-out/bin/main_distributed --worker \
-    --connect <SHEPHERD_IP>:8080 \
-    --backend cuda
+#### Configuration (experiment.json)
 
-# ROCm Worker (AMD MI300X)
-./zig-out/bin/main_distributed --worker \
-    --connect <SHEPHERD_IP>:8080 \
-    --backend rocm \
-    --amd-target gfx942
+```json
+{
+    "model_path": "models/nanogpt_forward_32.mlir",
+    "data_path": "data/tiny_shakespeare.txt",
+    "learning_rate": 0.0006,
+    "batch_size": 32,
+    "block_size": 64,
+    "tau": 10,
+    "outer_loop_steps": 100,
+    "nesterov_momentum": 0.9,
+    "wandb_project": "pcp-distributed"
+}
 ```
 
 ### Running Tests

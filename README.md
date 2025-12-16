@@ -309,7 +309,7 @@ If no API key is provided, WandB logging will be disabled and training will cont
 The Shepherd coordinates training, aggregates gradients, and manages the global model state.
 
 ```sh
-./zig-out/bin/pcp \
+pcp \
   --shepherd \
   --config experiment.json \
   --host 0.0.0.0 \
@@ -317,63 +317,66 @@ The Shepherd coordinates training, aggregates gradients, and manages the global 
   --workers 2
 ```
 
-### Starting Workers (with Supervisor)
+### Starting Workers
 
-For production environments, it is recommended to run workers under a Supervisor. The Supervisor acts as a watchdog process that connects to the Shepherd via a control plane, spawns the actual Worker process, and automatically restarts it if it crashes.
-
-```sh
-# Start a Supervisor (which manages the Worker)
-./zig-out/bin/pcp --supervise -- --worker --connect <SHEPHERD_IP>:8080 --backend cuda --target sm_80
-```
-
-**Standard Worker (No Supervisor):**
-
-```sh
-# Connect directly (useful for debugging)
-./zig-out/bin/pcp --worker --connect <SHEPHERD_IP>:8080 --backend cuda
-```
-
-Workers connect to the Shepherd and execute training on their local hardware. The `--target` flag specifies GPU architecture (optional, defaults: sm_80 for CUDA, gfx942 for ROCm).
+Workers connect to the Shepherd and execute training on their local hardware. We use the Node Manager to launch and monitor workers. The Node Manager automatically handles process supervision, crash recovery, and GPU assignment.
 
 **GPU Target Architectures:**
 
-NVIDIA: A100 (sm_80), V100 (sm_70), RTX 4090 (sm_89)
+NVIDIA: A100 (sm_80), V100 (sm_70), RTX 4090 (sm_89), H100 (sm_90a)
 AMD: MI300X (gfx942), MI250X/MI210 (gfx90a), MI100 (gfx908)
 
-**CPU Worker:**
+#### Basic Usage (Single GPU or CPU)
+
+Run this on any worker node. By default, it spawns 1 worker on Device 0.
 
 ```sh
-./zig-out/bin/pcp --worker --connect <SHEPHERD_IP>:8080 --backend cpu
+pcp \
+  --node-manager \
+  --host <SHEPHERD_IP> \
+  --port 8080 \
+  --backend cuda \
+  --target sm_80
 ```
 
-**NVIDIA GPU:**
+#### Multi-GPU Scaling
+
+To utilize a multi-GPU node (e.g., 8xH100), simply add the `--scale` flag. The Node Manager will spawn 8 independent, supervised workers, pinning each to a specific GPU (0-7).
 
 ```sh
-./zig-out/bin/pcp --worker --connect <SHEPHERD_IP>:8080 --backend cuda --target sm_80
+pcp \
+  --node-manager \
+  --scale 8 \
+  --host <SHEPHERD_IP> \
+  --port 8080 \
+  --backend cuda \
+  --target sm_90a
 ```
 
-**AMD GPU:**
+#### Manual/Debugging Mode (Advanced)
+
+If you need to debug a specific worker process without the supervisor layer, you can run a worker directly:
 
 ```sh
-./zig-out/bin/pcp --worker --connect <SHEPHERD_IP>:8080 --backend rocm --target gfx942
+pcp --worker --device-id 0 --connect <SHEPHERD_IP>:8080 --backend cuda
 ```
 
-### Example: Mixed Hardware Cluster
+### Example: Heterogeneous Multi-Node Cluster
 
-You can run workers with different hardware backends in the same training session. The Shepherd will compile separate VMFB artifacts for each unique (backend, target) combination.
+You can run workers with different hardware backends in the same training session.
 
 ```sh
-# Terminal 1: Start Shepherd
-./zig-out/bin/pcp --shepherd --config experiment.json --workers 3
+# Shepherd Node: Start coordinator expecting 11 total workers
+pcp --shepherd --config experiment.json --workers 11
 
-# Terminal 2: CPU Worker
-./zig-out/bin/pcp --worker --connect 127.0.0.1:8080 --backend cpu
+# Node 1: 8xH100 server (Runs 8 workers)
+pcp --node-manager --scale 8 --host <SHEPHERD_IP> --port 8080 --backend cuda --target sm_90a
 
-# Terminal 3: NVIDIA A100 Worker
-./zig-out/bin/pcp --worker --connect 127.0.0.1:8080 --backend cuda --target sm_80
+# Node 2: Single A100 server (Runs 1 worker)
+pcp --node-manager --host <SHEPHERD_IP> --port 8080 --backend cuda --target sm_80
 
-# Terminal 4: AMD MI300X Worker
-./zig-out/bin/pcp --worker --connect 127.0.0.1:8080 --backend rocm --target gfx942
+# Node 3: 2xMI300X server (Runs 2 workers)
+pcp --node-manager --scale 2 --host <SHEPHERD_IP> --port 8080 --backend rocm --target gfx942
 ```
 
 ## Adding Custom Models
@@ -456,5 +459,5 @@ The export script will print a JSON snippet at the end. Create or update your ex
 Start the Shepherd with your new configuration:
 
 ```sh
-./zig-out/bin/pcp --shepherd --config experiment.json --workers 2
+pcp --shepherd --config experiment.json --workers 2
 ```

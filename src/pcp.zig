@@ -71,6 +71,7 @@ const Args = struct {
     target_arch: ?[]const u8,
     supervisor_id: ?i64,
     supervise: bool,
+    device_id: usize,
     child_args: std.ArrayList([]const u8),
 
     const Mode = enum {
@@ -94,6 +95,7 @@ const Args = struct {
                 .target_arch = null,
                 .supervisor_id = null,
                 .supervise = false,
+                .device_id = 0,
                 .child_args = child_args_list,
             };
         }
@@ -108,6 +110,7 @@ const Args = struct {
         var target_arch: ?[]const u8 = null;
         var supervisor_id: ?i64 = null;
         var supervise: bool = false;
+        var device_id: usize = 0;
 
         var i: usize = 1;
         while (i < args.len) {
@@ -184,6 +187,11 @@ const Args = struct {
                 if (i < args.len) {
                     supervisor_id = std.fmt.parseInt(i64, args[i], 10) catch null;
                 }
+            } else if (std.mem.eql(u8, args[i], "--device-id")) {
+                i += 1;
+                if (i < args.len) {
+                    device_id = std.fmt.parseInt(usize, args[i], 10) catch 0;
+                }
             } else if (std.mem.eql(u8, args[i], "--supervise")) {
                 // All subsequent arguments belong to the child process
                 supervise = true;
@@ -208,6 +216,7 @@ const Args = struct {
             .target_arch = target_arch,
             .supervisor_id = supervisor_id,
             .supervise = supervise,
+            .device_id = device_id,
             .child_args = child_args_list,
         };
     }
@@ -227,13 +236,16 @@ const Args = struct {
         print("  --model <path>       Path to MLIR model file (Shepherd only, overrides config)\n", .{});
         print("  --backend <type>     Backend to use: cpu, cuda, metal, vulkan, rocm (default: auto)\n", .{});
         print("  --target <arch>      GPU target architecture (e.g., gfx942 for MI300X, sm_80 for A100)\n", .{});
+        print("  --device-id <id>     GPU device ID to use (default: 0, for multi-GPU nodes)\n", .{});
         print("  --supervisor-id <id> Internal: Supervisor ID (used by spawned workers)\n", .{});
         print("  --help               Show this help message\n", .{});
         print("\nExamples:\n", .{});
         print("  # Run resilient shepherd:\n", .{});
         print("  ./pcp --supervise -- --shepherd --config experiment.json\n", .{});
-        print("\n  # Run resilient worker:\n", .{});
-        print("  ./pcp --supervise -- --worker --host 127.0.0.1 --port 8080\n", .{});
+        print("\n  # Run resilient worker on GPU 0:\n", .{});
+        print("  ./pcp --supervise -- --worker --host 127.0.0.1 --port 8080 --device-id 0\n", .{});
+        print("\n  # Run 8 workers on an 8xH100 node (one per GPU):\n", .{});
+        print("  for i in {{0..7}}; do ./pcp --worker --device-id $i & done\n", .{});
     }
 };
 
@@ -366,12 +378,13 @@ fn runWorker(allocator: Allocator, args: Args) !void {
 
     const backend = args.backend orelse backend_selection.Backend.selectDefault();
     print("   Backend: {s}\n", .{backend.toString()});
+    print("   Device ID: {}\n", .{args.device_id});
 
     if (args.target_arch) |target| {
         print("   Target Architecture: {s}\n", .{target});
     }
 
-    const worker_backend_instance = try backend_selection.createWorkerBackend(allocator, backend);
+    const worker_backend_instance = try backend_selection.createWorkerBackend(allocator, backend, args.device_id);
 
     var worker_instance = try Worker.init(allocator, worker_backend_instance, args.supervisor_id);
     defer worker_instance.deinit();

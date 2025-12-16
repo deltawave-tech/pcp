@@ -68,33 +68,70 @@ pub const IreeBackend = struct {
         };
     }
 
-    pub fn init(allocator: std.mem.Allocator, backend: backend_selection.Backend) !*IreeBackend {
+    pub fn init(allocator: std.mem.Allocator, backend: backend_selection.Backend, device_id: usize) !*IreeBackend {
         var self = try allocator.create(IreeBackend);
-        
-        // FIX 2: Add errdefer to prevent memory leak on initialization failure.
         errdefer allocator.destroy(self);
 
-        // 1. Create instance
+        self.allocator = allocator;
+        self.backend = backend;
+
+        // 1. Create Instance with driver registry
         var instance_options: c.iree_runtime_instance_options_t = undefined;
         c.iree_runtime_instance_options_initialize(&instance_options);
         c.iree_runtime_instance_options_use_all_available_drivers(&instance_options);
 
-        // Use system allocator like working IREE samples
         try ireeCheck(c.iree_runtime_instance_create(
             &instance_options,
             c.iree_allocator_system(),
             &self.instance,
         ));
 
-        // 2. Create the HAL device directly using the instance
+        // 2. Create device using HAL driver API for proper device selection
         const driver_name = backend.toIreeDriverName();
-        try ireeCheck(c.iree_runtime_instance_try_create_default_device(
-            self.instance.?,
-            c.iree_string_view_t{ .data = driver_name.ptr, .size = driver_name.len },
-            &self.device,
-        ));
 
-        // 4. Create the runtime session
+        if (backend == .cuda or backend == .rocm) {
+            // For GPU backends, use the HAL driver API to select specific device by ordinal
+            std.log.info("Creating {s} device with ordinal {}", .{ backend.toString(), device_id });
+
+            // Get the driver registry from the instance
+            const registry = c.iree_runtime_instance_driver_registry(self.instance.?);
+            if (registry == null) {
+                std.log.err("No driver registry available", .{});
+                return error.NoDriverRegistry;
+            }
+
+            // Create the driver
+            var driver: ?*c.iree_hal_driver_t = null;
+            try ireeCheck(c.iree_hal_driver_registry_try_create(
+                registry.?,
+                c.iree_string_view_t{ .data = driver_name.ptr, .size = driver_name.len },
+                c.iree_allocator_system(),
+                &driver,
+            ));
+            defer if (driver) |d| c.iree_hal_driver_release(d);
+
+            // Create device by ordinal (0, 1, 2, ... for each GPU)
+            try ireeCheck(c.iree_hal_driver_create_device_by_ordinal(
+                driver.?,
+                @intCast(device_id), // device ordinal
+                0, // param_count
+                null, // params
+                c.iree_allocator_system(),
+                &self.device,
+            ));
+
+            std.log.info("Successfully created device {} for {s} backend", .{ device_id, backend.toString() });
+        } else {
+            // For CPU and other backends, use default device
+            std.log.info("Creating default device for {s} backend", .{backend.toString()});
+            try ireeCheck(c.iree_runtime_instance_try_create_default_device(
+                self.instance.?,
+                c.iree_string_view_t{ .data = driver_name.ptr, .size = driver_name.len },
+                &self.device,
+            ));
+        }
+
+        // 3. Create the runtime session
         var session_options: c.iree_runtime_session_options_t = undefined;
         c.iree_runtime_session_options_initialize(&session_options);
         try ireeCheck(c.iree_runtime_session_create_with_device(
@@ -104,9 +141,7 @@ pub const IreeBackend = struct {
             c.iree_runtime_instance_host_allocator(self.instance.?),
             &self.session,
         ));
-        
-        self.allocator = allocator;
-        self.backend = backend;
+
         return self;
     }
 

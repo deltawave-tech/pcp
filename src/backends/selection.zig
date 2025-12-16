@@ -94,7 +94,8 @@ const HostExecutor = struct {
 
         // Initialize IREE with CPU (local-sync) backend for the Shepherd itself
         // This allows the Shepherd to run the Optimizer MLIR graph locally.
-        self.iree_backend = try iree_backend.IreeBackend.init(allocator, .cpu);
+        // CPU backend always uses device 0
+        self.iree_backend = try iree_backend.IreeBackend.init(allocator, .cpu, 0);
 
         return self;
     }
@@ -191,10 +192,10 @@ pub fn createExecutor(allocator: Allocator, backend: Backend) !Executor {
 }
 
 /// Create a WorkerBackend for the specified backend
-pub fn createWorkerBackend(allocator: Allocator, backend: Backend) !WorkerBackend {
+pub fn createWorkerBackend(allocator: Allocator, backend: Backend, device_id: usize) !WorkerBackend {
     // Use IREE backend for all hardware accelerators
-    std.log.info("Using IREE backend for {s} execution", .{backend.toString()});
-    const iree = try iree_backend.IreeBackend.init(allocator, backend);
+    std.log.info("Using IREE backend for {s} execution on device {}", .{backend.toString(), device_id});
+    const iree = try iree_backend.IreeBackend.init(allocator, backend, device_id);
     return iree.asWorkerBackend();
 }
 
@@ -240,9 +241,10 @@ pub const DistributedTrainingSystem = struct {
     }
 
     /// Create a worker with the appropriate backend
+    /// Note: This uses device_id=0. For multi-GPU, use createWorkerBackend directly with specific device_id
     pub fn createWorker(self: *Self) !Worker {
-        const worker_backend_instance = try createWorkerBackend(self.allocator, self.backend);
-        return Worker.init(self.allocator, worker_backend_instance);
+        const worker_backend_instance = try createWorkerBackend(self.allocator, self.backend, 0);
+        return Worker.init(self.allocator, worker_backend_instance, null);
     }
 
     /// Start the system and run training

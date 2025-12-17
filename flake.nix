@@ -111,9 +111,24 @@
             patchelf --add-needed libdrm.so.2 $out/bin/pcp
             patchelf --add-needed libdrm_amdgpu.so.1 $out/bin/pcp
 
-            patchelf --add-rpath \
-              "${pkgs.numactl}/lib:${pkgs.elfutils}/lib:${pkgs.zlib}/lib:${pkgs.zstd}/lib:${pkgs.libdrm}/lib:/usr/lib/x86_64-linux-gnu:/usr/lib64:/usr/lib:/opt/amdgpu/lib/x86_64-linux-gnu:/opt/amdgpu/lib:/run/opengl-driver/lib:/opt/rocm/lib" \
-              $out/bin/pcp
+            # Generate the Nix-side RPATH automatically from inputs
+            NIX_RPATH="${lib.makeLibraryPath [
+              pkgs.numactl
+              pkgs.elfutils
+              pkgs.zlib
+              pkgs.zstd
+              pkgs.libdrm
+              pkgs.capnproto
+              pkgs.cudaPackages.cuda_cudart
+              pkgs.glibc
+              pkgs.stdenv.cc.cc.lib
+              packages.iree-sdk
+            ]}"
+
+            # Append System paths for driver fallbacks (PTX JIT, ROCm, etc.)
+            SYSTEM_RPATH="/usr/lib/x86_64-linux-gnu:/usr/lib64:/usr/lib:/opt/amdgpu/lib/x86_64-linux-gnu:/opt/amdgpu/lib:/run/opengl-driver/lib:/opt/rocm/lib"
+
+            patchelf --force-rpath --set-rpath "$NIX_RPATH:$SYSTEM_RPATH" $out/bin/pcp
 
             wrapProgram $out/bin/pcp \
               --suffix PATH : "${packages.iree-sdk}/bin"

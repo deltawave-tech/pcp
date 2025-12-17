@@ -6,13 +6,13 @@ from torch.func import functional_call
 import math
 
 # --- Configuration (GPU-aligned dimensions) ---
-BATCH_SIZE = 64  # Match Karpathy's training setup
-BLOCK_SIZE = 32  # Changed from 8 to 32 (matches CUDA Warp size)
+BATCH_SIZE = 64
+BLOCK_SIZE = 32
 VOCAB_SIZE = 65
-N_EMBD = 64      # Changed from 32 to 64 (head dim = 64/4 = 16)
+N_EMBD = 64
 N_HEAD = 4
-N_LAYER = 2  # Real blocks!
-DROPOUT = 0.0  # Keep 0 for deterministic testing
+N_LAYER = 2
+DROPOUT = 0.0
 
 
 class CausalSelfAttention(nn.Module):
@@ -46,8 +46,6 @@ class CausalSelfAttention(nn.Module):
         att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
 
         # Create a causal mask (lower triangular)
-        # In a real training loop, this mask should be passed in or created dynamically.
-        # For this static graph export, we construct it here.
         mask = torch.tril(torch.ones(T, T, device=x.device)).view(1, 1, T, T)
         att = att.masked_fill(mask == 0, float("-inf"))
 
@@ -101,7 +99,7 @@ class NanoTransformer(nn.Module):
         tok_emb = self.token_embedding(idx)
         pos_emb = self.position_embedding(torch.arange(T, device=idx.device))
         x = tok_emb + pos_emb
-        x = self.blocks(x)  # Apply Transformer Blocks
+        x = self.blocks(x)
         x = self.ln_f(x)
         logits = self.lm_head(x)
         loss = F.cross_entropy(logits.view(-1, VOCAB_SIZE), targets.view(-1))
@@ -112,7 +110,6 @@ class NanoTransformer(nn.Module):
 model = NanoTransformer()
 model.train()
 
-# Use BATCH_SIZE instead of 1 to match Karpathy's setup
 idx = torch.zeros((BATCH_SIZE, BLOCK_SIZE), dtype=torch.int64)
 targets = torch.zeros((BATCH_SIZE, BLOCK_SIZE), dtype=torch.int64)
 
@@ -142,7 +139,7 @@ full_inputs = param_values + [idx, targets]
 
 print("Compiling to StableHLO with GPU-aligned dimensions...")
 print(f"  BLOCK_SIZE: {BLOCK_SIZE} (matches CUDA warp size)")
-print(f"  N_EMBD: {N_EMBD} (head dim = {N_EMBD//N_HEAD})")
+print(f"  N_EMBD: {N_EMBD} (head dim = {N_EMBD // N_HEAD})")
 module = fx.export_and_import(wrapper, *full_inputs, output_type="stablehlo")
 
 output_path = "models/nanogpt_forward_32.mlir"

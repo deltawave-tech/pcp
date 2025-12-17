@@ -88,11 +88,11 @@ export WANDB_API_KEY=your_api_key_here
 
 ### 4. Start the Shepherd
 
-Use example experiment configuration file `experiment_nanogpt.json`
+Use example experiment configuration file `experiments/nanogpt_small.json`
 
 Start the supervised Shepherd expecting 8 workers:
 ```shell
-pcp --supervise -- --shepherd --config experiment_nanogpt.json --host 0.0.0.0 --port 8080 --workers 8
+pcp --supervise -- --shepherd --config experiments/nanogpt_small.json --host 0.0.0.0 --port 8080 --workers 8
 ```
 
 ### 5. Start Worker Nodes
@@ -285,20 +285,20 @@ zig build run-rocm-pipeline-test
 **Experiment (JSON File):**
 - Model: `model_path`
 - Data: `data_path`
-- Hyperparameters: `learning_rate`, `batch_size`, `block_size`
+- Hyperparameters: `learning_rate`
 - Algorithm: `tau`, `outer_loop_steps`, `max_epochs`, `nesterov_momentum`
 - Logging: `wandb_project`, `wandb_entity`, `wandb_run_name`, `wandb_api_key`
 - Recovery: `checkpoint_dir`, `should_resume`
+
+Note: Batch and block sizes are determined by the compiled MLIR model file, not the configuration.
 
 Create an experiment configuration file (e.g., `experiment.json`):
 
 ```json
 {
-    "model_path": "models/nanogpt_forward_32.mlir",
+    "model_path": "models/nanogpt_small.mlir",
     "data_path": "data/tiny_shakespeare.txt",
     "learning_rate": 0.0006,
-    "batch_size": 32,
-    "block_size": 64,
     "tau": 50,
     "outer_loop_steps": 100,
     "max_epochs": 10,
@@ -408,7 +408,7 @@ You can run workers with different hardware backends in the same training sessio
 
 ```sh
 # Shepherd Node: Start coordinator expecting 11 total workers
-pcp --shepherd --config experiment_nanogpt.json --workers 11
+pcp --shepherd --config experiments/nanogpt_small.json --workers 11
 
 # Node 1: 8xH100 server (Runs 8 workers)
 pcp --node-manager --scale 8 --host <SHEPHERD_IP> --port 8080 --backend cuda --target sm_90a
@@ -479,19 +479,18 @@ What this does:
 
 ### 3. Update Configuration
 
-The MLIR file has fixed input shapes burned into it during compilation. You must ensure your runtime configuration matches these shapes.
+The MLIR file has fixed input shapes (batch size and block size) burned into it during compilation. These shapes are introspected automatically by PCP at runtime.
 
-The export script will print a JSON snippet at the end. Create or update your experiment.json file:
+Create or update your experiment.json file:
 
 ```json
 {
     "model_path": "models/my_custom_model.mlir",
     "data_path": "data/tiny_shakespeare.txt",
-    "batch_size": 64,
-    "block_size": 64,
     "learning_rate": 0.0006,
     "tau": 10,
-    "outer_loop_steps": 100
+    "outer_loop_steps": 100,
+    "max_epochs": 10
 }
 ```
 

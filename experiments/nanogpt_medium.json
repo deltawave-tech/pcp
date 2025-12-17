@@ -1,0 +1,13 @@
+{
+    "model_path": "models/nanogpt_medium.mlir",
+    "data_path": "data/enwik8.txt",
+    "learning_rate": 0.0006,
+    "tau": 10,
+    "outer_loop_steps": 200,
+    "nesterov_momentum": 0.9,
+    "max_epochs": 10,
+    "wandb_project": "pcp-distributed",
+    "wandb_entity": null,
+    "wandb_run_name": "nanogpt-medium-experiment",
+    "wandb_api_key": null
+}

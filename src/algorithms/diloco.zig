@@ -47,8 +47,6 @@ pub const DiLoCoConfig = struct {
     parameter_averaging: bool,
     model_mlir_path: []const u8,
     data_path: []const u8,
-    batch_size: usize,
-    block_size: usize,
 
     wandb_project: []const u8,
     wandb_entity: ?[]const u8,
@@ -66,8 +64,6 @@ pub const DiLoCoConfig = struct {
             .parameter_averaging = true,
             .model_mlir_path = "src/models/nanogpt_forward.mlir",
             .data_path = "data/tiny_shakespeare.txt",
-            .batch_size = 64,
-            .block_size = 64,
             .wandb_project = "pcp-distributed",
             .wandb_entity = null,
             .wandb_run_name = null,
@@ -193,8 +189,6 @@ pub const DiLoCo = struct {
 
         const logger = try wandb.WandBLogger.init(allocator, wb_config, .{
             .learning_rate = config.base_config.learning_rate,
-            .batch_size = config.batch_size,
-            .block_size = config.block_size,
             .tau = config.tau,
             .nesterov_momentum = config.nesterov_momentum,
             .optimizer = "Nesterov-AdamW",
@@ -568,6 +562,7 @@ pub const DiLoCo = struct {
             try payload_map.put("length", std.json.Value{ .integer = @intCast(chunk.?.length) });
             try payload_map.put("chunk_id", std.json.Value{ .integer = @intCast(chunk.?.id) });
             try payload_map.put("data_path", std.json.Value{ .string = self.config.data_path });
+            try payload_map.put("tau", std.json.Value{ .integer = @intCast(self.config.tau) });
 
             const json_payload = std.json.Value{ .object = payload_map };
 

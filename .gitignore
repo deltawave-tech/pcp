@@ -33,19 +33,10 @@ deps/
 *.idb
 *.pdb
 
-# Custom ignore
-notes.md
-
-# Third party dependencies (built locally)
-third_party/
-llvm-project/
-llvm-build/
-stablehlo/
-SPIRV-Cross/
-
 # Data files (not tracked)
 data/
 checkpoint_*.bin
+shepherd_state.bin
 
 # Nix artifacts
 result

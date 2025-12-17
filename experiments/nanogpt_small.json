@@ -1,14 +1,13 @@
 {
-    "model_path": "models/nanogpt_forward_32.mlir",
+    "model_path": "models/nanogpt_small.mlir",
     "data_path": "data/tiny_shakespeare.txt",
     "learning_rate": 0.0006,
-    "batch_size": 32,
-    "block_size": 32,
     "tau": 50,
     "outer_loop_steps": 100,
     "nesterov_momentum": 0.9,
+    "max_epochs": 10,
     "wandb_project": "pcp-distributed",
     "wandb_entity": null,
-    "wandb_run_name": "nanogpt-diloco-experiment2",
+    "wandb_run_name": "nanogpt-small-experiment",
     "wandb_api_key": null
 }

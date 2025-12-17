@@ -426,6 +426,10 @@ pub const Worker = struct {
             .string => |s| s,
             else => return error.InvalidDataPathFormat,
         };
+        const tau = switch (payload.get("tau") orelse return error.MissingTau) {
+            .integer => |i| @as(usize, @intCast(i)),
+            else => return error.InvalidTauFormat,
+        };
 
         self.current_chunk_id = @intCast(chunk_id);
 
@@ -500,7 +504,6 @@ pub const Worker = struct {
         const block_size: usize = @intCast(data_shapes[0][1]);
 
         // 10. Run the inner loop for tau steps
-        const tau: usize = 10; // DiLoCo default
         var final_loss: f32 = 0.0;
 
         for (0..tau) |step| {

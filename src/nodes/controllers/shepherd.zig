@@ -72,11 +72,17 @@ pub const WorkerConnection = struct {
             .target_arch = target_arch,
         };
     }
-    
+
+    pub fn deinit(self: Self, allocator: Allocator) void {
+        if (self.target_arch) |arch| {
+            allocator.free(arch);
+        }
+    }
+
     pub fn updateHeartbeat(self: *Self) void {
         self.last_heartbeat = std.time.timestamp();
     }
-    
+
     pub fn isAlive(self: Self, timeout_seconds: i64) bool {
         const now = std.time.timestamp();
         return (now - self.last_heartbeat) < timeout_seconds;
@@ -135,6 +141,7 @@ pub const Shepherd = struct {
         // Close all worker connections
         for (self.worker_pool.items) |worker| {
             worker.stream.close();
+            worker.deinit(self.allocator);
         }
         self.worker_pool.deinit();
 
@@ -255,17 +262,20 @@ pub const Shepherd = struct {
             else if (std.mem.eql(u8, backend_str, "metal")) backend_selection.Backend.metal
             else .cpu; // Default to cpu
 
-        // Parse target architecture if present
-        const target_arch: ?[]const u8 = if (data_obj.get("target_arch")) |target_val|
+        // Parse and duplicate target architecture string to own it
+        var owned_target_arch: ?[]const u8 = null;
+        if (data_obj.get("target_arch")) |target_val| {
             switch (target_val) {
-                .string => |s| s,
-                else => null,
+                .string => |s| {
+                    owned_target_arch = try self.allocator.dupe(u8, s);
+                },
+                else => {},
             }
-        else
-            null;
+        }
+        errdefer if (owned_target_arch) |s| self.allocator.free(s);
 
         std.log.info("Worker connecting with backend: {s}", .{worker_backend.toString()});
-        if (target_arch) |target| {
+        if (owned_target_arch) |target| {
             std.log.info("  Target architecture: {s}", .{target});
         }
 
@@ -274,9 +284,10 @@ pub const Shepherd = struct {
         const assigned_node_id = self.next_node_id;
         self.next_node_id += 1;
 
-        const worker = WorkerConnection.init(assigned_node_id, stream, worker_backend, worker_address, target_arch);
+        const worker = WorkerConnection.init(assigned_node_id, stream, worker_backend, worker_address, owned_target_arch);
         self.worker_pool.append(worker) catch |err| {
             self.worker_pool_mutex.unlock();
+            if (owned_target_arch) |s| self.allocator.free(s);
             std.log.err("Failed to append worker {}: {}", .{ assigned_node_id, err });
             return;
         };
@@ -385,7 +396,8 @@ pub const Shepherd = struct {
 
         for (self.worker_pool.items, 0..) |worker, i| {
             if (worker.node_id == worker_id) {
-                _ = self.worker_pool.swapRemove(i);
+                const removed_worker = self.worker_pool.swapRemove(i);
+                removed_worker.deinit(self.allocator);
                 std.log.info("Worker {} disconnected", .{worker_id});
                 // Update monitoring after worker removal
                 monitoring.setWorkerCount(self.worker_pool.items.len);

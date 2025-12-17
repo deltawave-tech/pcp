@@ -40,6 +40,9 @@ const ExperimentConfig = struct {
     wandb_entity: ?[]const u8 = null,
     wandb_run_name: ?[]const u8 = null,
     wandb_api_key: ?[]const u8 = null,
+
+    checkpoint_dir: []const u8 = "checkpoints",
+    should_resume: bool = false,
 };
 
 /// Config result that owns the parsed JSON data
@@ -73,12 +76,12 @@ const Args = struct {
     supervise: bool,
     device_id: usize,
     scale: usize,
+    should_resume: bool,
     child_args: std.ArrayList([]const u8),
 
     const Mode = enum {
         shepherd,
         worker,
-        supervisor,
         node_manager,
     };
 
@@ -99,6 +102,7 @@ const Args = struct {
                 .supervise = false,
                 .device_id = 0,
                 .scale = 1,
+                .should_resume = false,
                 .child_args = child_args_list,
             };
         }
@@ -115,6 +119,7 @@ const Args = struct {
         var supervise: bool = false;
         var device_id: usize = 0;
         var scale: usize = 1;
+        var should_resume: bool = false;
 
         var i: usize = 1;
         while (i < args.len) {
@@ -122,8 +127,6 @@ const Args = struct {
                 mode = .worker;
             } else if (std.mem.eql(u8, args[i], "--shepherd")) {
                 mode = .shepherd;
-            } else if (std.mem.eql(u8, args[i], "--supervisor")) {
-                mode = .supervisor;
             } else if (std.mem.eql(u8, args[i], "--node-manager")) {
                 mode = .node_manager;
             } else if (std.mem.eql(u8, args[i], "--config")) {
@@ -203,15 +206,15 @@ const Args = struct {
                 if (i < args.len) {
                     scale = std.fmt.parseInt(usize, args[i], 10) catch 1;
                 }
+            } else if (std.mem.eql(u8, args[i], "--resume")) {
+                should_resume = true;
             } else if (std.mem.eql(u8, args[i], "--supervise")) {
-                // All subsequent arguments belong to the child process
                 supervise = true;
-                // Collect all remaining args for the child
                 i += 1;
                 while (i < args.len) : (i += 1) {
                     try child_args_list.append(args[i]);
                 }
-                break; // Stop parsing parent args
+                break;
             }
             i += 1;
         }
@@ -229,6 +232,7 @@ const Args = struct {
             .supervise = supervise,
             .device_id = device_id,
             .scale = scale,
+            .should_resume = should_resume,
             .child_args = child_args_list,
         };
     }
@@ -238,7 +242,6 @@ const Args = struct {
         print("Options:\n", .{});
         print("  --shepherd           Run as Shepherd coordinator (default)\n", .{});
         print("  --worker             Run as Worker\n", .{});
-        print("  --supervisor         Run as Supervisor (manages a Worker child process)\n", .{});
         print("  --node-manager       Run as Node Manager (spawns multiple supervised workers)\n", .{});
         print("  --supervise -- <child_args>  Run with supervision (spawns child with args after --)\n", .{});
         print("  --config <path>      Path to experiment JSON config file (Shepherd only)\n", .{});
@@ -247,6 +250,7 @@ const Args = struct {
         print("  --port <port>        Port to bind/connect to (default: 8080)\n", .{});
         print("  --workers <count>    Number of workers to wait for (default: 2)\n", .{});
         print("  --model <path>       Path to MLIR model file (Shepherd only, overrides config)\n", .{});
+        print("  --resume             Resume from previous training state\n", .{});
         print("  --backend <type>     Backend to use: cpu, cuda, metal, vulkan, rocm (default: auto)\n", .{});
         print("  --target <arch>      GPU target architecture (e.g., gfx942 for MI300X, sm_80 for A100)\n", .{});
         print("  --device-id <id>     GPU device ID to use (default: 0, for multi-GPU nodes)\n", .{});
@@ -291,12 +295,27 @@ fn loadConfig(allocator: Allocator, path: ?[]const u8) !ConfigResult {
 
 /// Run as Shepherd coordinator
 fn runShepherd(allocator: Allocator, args: Args) !void {
-    // 1. Load Experiment Config from JSON file (or use defaults)
+    const timestamp = std.time.timestamp();
+    var run_id_buf: [64]u8 = undefined;
+    const run_id = try std.fmt.bufPrint(&run_id_buf, "run_{d}", .{timestamp});
+
+    try std.fs.cwd().makePath("checkpoints");
+    const run_dir_path = try std.fs.path.join(allocator, &[_][]const u8{ "checkpoints", run_id });
+    defer allocator.free(run_dir_path);
+    try std.fs.cwd().makePath(run_dir_path);
+
+    const recovery_dir_path = try std.fs.path.join(allocator, &[_][]const u8{ run_dir_path, "recovery" });
+    defer allocator.free(recovery_dir_path);
+    try std.fs.cwd().makePath(recovery_dir_path);
+
     var config_result = try loadConfig(allocator, args.config_path);
     defer config_result.deinit();
     const exp_config = config_result.config;
 
     print("👹 Starting Shepherd coordinator...\n", .{});
+    print("   Run ID: {s}\n", .{run_id});
+    print("   Output Dir: {s}\n", .{run_dir_path});
+    print("   Resume: {}\n", .{args.should_resume});
     print("   Host: {s}\n", .{args.host});
     print("   Port: {}\n", .{args.port});
     print("   Waiting for {} workers\n", .{args.workers});
@@ -346,6 +365,8 @@ fn runShepherd(allocator: Allocator, args: Args) !void {
     diloco_config.wandb_entity = exp_config.wandb_entity;
     diloco_config.wandb_run_name = exp_config.wandb_run_name;
     diloco_config.wandb_api_key = exp_config.wandb_api_key;
+    diloco_config.checkpoint_dir = run_dir_path;
+    diloco_config.resume_training = args.should_resume;
 
     // CLI flag overrides config file
     if (args.model_path) |path| {
@@ -494,17 +515,6 @@ pub fn main() !void {
     switch (args.mode) {
         .shepherd => try runShepherd(allocator, args),
         .worker => try runWorker(allocator, args),
-        .supervisor => {
-            // Legacy supervisor mode for workers only
-            var s = try @import("nodes/supervisor.zig").Supervisor.init(
-                allocator,
-                args.host,
-                args.port,
-                &[_][]const u8{ "--worker" },
-            );
-            defer s.deinit();
-            try s.run();
-        },
         .node_manager => try runNodeManager(allocator, args),
     }
 }

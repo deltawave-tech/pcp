@@ -77,7 +77,6 @@ pub const NodeManager = struct {
 
             const build_success = blk: {
                 args.append(self.self_exe_path) catch break :blk false;
-                args.append("--supervisor") catch break :blk false;
                 args.append("--supervise") catch break :blk false;
                 args.append("--") catch break :blk false;
                 args.append("--worker") catch break :blk false;

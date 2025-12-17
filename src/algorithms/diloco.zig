@@ -37,40 +37,43 @@ const Tensor = tensor.Tensor(void);
 const Executor = execution.Executor; // NEW: Generic executor interface
 const DataLoader = data_loader.DataLoader;
 
-const RECOVERY_FILE = "shepherd_state.bin";
+const RECOVERY_FILENAME = "shepherd_state.bin";
 
 /// DiLoCo algorithm configuration
 pub const DiLoCoConfig = struct {
     base_config: TrainingConfig,
-    tau: usize, // Inner loop steps
+    tau: usize,
     nesterov_momentum: f32,
     parameter_averaging: bool,
-    model_mlir_path: []const u8, // Path to the model MLIR file
-    // NEW FIELDS for experiment configuration
+    model_mlir_path: []const u8,
     data_path: []const u8,
     batch_size: usize,
     block_size: usize,
 
-    // WandB configuration
     wandb_project: []const u8,
     wandb_entity: ?[]const u8,
     wandb_run_name: ?[]const u8,
     wandb_api_key: ?[]const u8,
 
+    checkpoint_dir: []const u8,
+    resume_training: bool,
+
     pub fn default() DiLoCoConfig {
         return DiLoCoConfig{
             .base_config = TrainingConfig.default(),
-            .tau = 10, // Default inner loop steps
+            .tau = 10,
             .nesterov_momentum = 0.9,
             .parameter_averaging = true,
-            .model_mlir_path = "src/models/nanogpt_forward.mlir", // Default path
+            .model_mlir_path = "src/models/nanogpt_forward.mlir",
             .data_path = "data/tiny_shakespeare.txt",
             .batch_size = 64,
-            .block_size = 64, // Typically matches model context window
+            .block_size = 64,
             .wandb_project = "pcp-distributed",
             .wandb_entity = null,
             .wandb_run_name = null,
             .wandb_api_key = null,
+            .checkpoint_dir = "checkpoints",
+            .resume_training = false,
         };
     }
 };
@@ -114,10 +117,22 @@ pub const DiLoCo = struct {
 
     // Change the init signature to accept the generic executor (dataset now loaded by workers)
     pub fn init(allocator: Allocator, coordinator: *Shepherd, config: DiLoCoConfig, executor: Executor, mlir_builder: *MLIRBuilder) !Self {
-        // The MLIRBuilder is now passed in, ensuring a single context.
         const element_type = mlir.Type.f32Type(mlir_builder.ctx);
 
-        // === INTROSPECT MODEL SHAPES FROM .MLIR FILE ===
+        const recovery_path = try std.fs.path.join(allocator, &[_][]const u8{ config.checkpoint_dir, "recovery", RECOVERY_FILENAME });
+        defer allocator.free(recovery_path);
+
+        if (!config.resume_training) {
+            std.fs.cwd().deleteFile(recovery_path) catch |err| {
+                if (err != error.FileNotFound) {
+                    std.log.warn("Could not delete old recovery file: {}", .{err});
+                }
+            };
+            std.log.info("Fresh start: Cleared previous recovery state.", .{});
+        } else {
+            std.log.info("Resume mode: Will attempt to load recovery state from {s}", .{recovery_path});
+        }
+
         std.debug.print("Introspecting model parameters from: {s}\n", .{config.model_mlir_path});
         const mlir_source = try std.fs.cwd().readFileAlloc(allocator, config.model_mlir_path, 10 * 1024 * 1024);
         defer allocator.free(mlir_source);
@@ -432,11 +447,14 @@ pub const DiLoCo = struct {
 
     /// Save current master parameters to a binary file
     fn saveCheckpoint(self: *Self, step: usize) !void {
-        var path_buf: [64]u8 = undefined;
-        const path = try std.fmt.bufPrint(&path_buf, "checkpoint_{d}.bin", .{step});
+        var filename_buf: [64]u8 = undefined;
+        const filename = try std.fmt.bufPrint(&filename_buf, "checkpoint_{d}.bin", .{step});
 
-        std.log.info("Saving checkpoint to {s}...", .{path});
-        const file = try std.fs.cwd().createFile(path, .{});
+        const full_path = try std.fs.path.join(self.allocator, &[_][]const u8{ self.config.checkpoint_dir, filename });
+        defer self.allocator.free(full_path);
+
+        std.log.info("Saving checkpoint to {s}...", .{full_path});
+        const file = try std.fs.cwd().createFile(full_path, .{});
         defer file.close();
         var writer = file.writer();
 
@@ -718,7 +736,15 @@ pub const DiLoCo = struct {
 
     /// Save recovery state to disk for shepherd resilience
     fn saveRecoveryState(self: *Self) !void {
-        const file = try std.fs.cwd().createFile(RECOVERY_FILE, .{});
+        const recovery_dir = try std.fs.path.join(self.allocator, &[_][]const u8{ self.config.checkpoint_dir, "recovery" });
+        defer self.allocator.free(recovery_dir);
+
+        const full_path = try std.fs.path.join(self.allocator, &[_][]const u8{ self.config.checkpoint_dir, "recovery", RECOVERY_FILENAME });
+        defer self.allocator.free(full_path);
+
+        std.fs.cwd().makePath(recovery_dir) catch {};
+
+        const file = try std.fs.cwd().createFile(full_path, .{});
         defer file.close();
         var writer = file.writer();
 
@@ -759,8 +785,13 @@ pub const DiLoCo = struct {
 
     /// Try to load recovery state from disk
     fn tryLoadRecoveryState(self: *Self) !bool {
-        std.log.info("Attempting to load recovery state from: {s}", .{RECOVERY_FILE});
-        const file = std.fs.cwd().openFile(RECOVERY_FILE, .{}) catch |err| {
+        if (!self.config.resume_training) return false;
+
+        const full_path = try std.fs.path.join(self.allocator, &[_][]const u8{ self.config.checkpoint_dir, "recovery", RECOVERY_FILENAME });
+        defer self.allocator.free(full_path);
+
+        std.log.info("Attempting to load recovery state from: {s}", .{full_path});
+        const file = std.fs.cwd().openFile(full_path, .{}) catch |err| {
             std.log.warn("Could not open recovery file: {}", .{err});
             return false;
         };

@@ -21,7 +21,9 @@ pub const Supervisor = struct {
     child_process: ?std.process.Child,
     child_thread: ?std.Thread,
     should_run: bool,
-    child_args: std.ArrayList([]const u8), // Arguments for the child process
+    child_args: std.ArrayList([]const u8),
+    is_first_spawn: bool,
+    is_shepherd_child: bool,
 
     const Self = @This();
 
@@ -29,17 +31,29 @@ pub const Supervisor = struct {
     /// child_cmd_args should contain all arguments to pass to the child (e.g., ["--shepherd", "--config", "exp.json"])
     pub fn init(allocator: std.mem.Allocator, host: []const u8, port: u16, child_cmd_args: []const []const u8) !Self {
         var prng = std.Random.DefaultPrng.init(@intCast(std.time.timestamp()));
+        const my_id = prng.random().int(i64);
 
         var args_list = std.ArrayList([]const u8).init(allocator);
 
-        // First arg is the executable path (will be set in spawnChild)
         const self_exe = try std.fs.selfExePathAlloc(allocator);
         try args_list.append(self_exe);
 
-        // Copy child arguments
         for (child_cmd_args) |arg| {
             const arg_copy = try allocator.dupe(u8, arg);
             try args_list.append(arg_copy);
+        }
+
+        var is_shepherd = false;
+        for (child_cmd_args) |arg| {
+            if (std.mem.eql(u8, arg, "--shepherd")) is_shepherd = true;
+        }
+
+        if (!is_shepherd) {
+            const id_flag = try allocator.dupe(u8, "--supervisor-id");
+            try args_list.append(id_flag);
+
+            const id_str = try std.fmt.allocPrint(allocator, "{d}", .{my_id});
+            try args_list.append(id_str);
         }
 
         return Self{
@@ -47,11 +61,13 @@ pub const Supervisor = struct {
             .client = TcpClient.init(allocator),
             .shepherd_host = host,
             .shepherd_port = port,
-            .supervisor_id = prng.random().int(i64), // Generate Random ID (i64 for JSON compatibility)
+            .supervisor_id = my_id,
             .child_process = null,
             .child_thread = null,
             .should_run = true,
             .child_args = args_list,
+            .is_first_spawn = true,
+            .is_shepherd_child = is_shepherd,
         };
     }
 
@@ -182,6 +198,24 @@ pub const Supervisor = struct {
         if (self.should_run) {
             std.log.warn("Child process died. Restarting in 1s...", .{});
             std.time.sleep(1 * std.time.ns_per_s);
+
+            if (self.is_shepherd_child and !self.is_first_spawn) {
+                var has_resume = false;
+                for (self.child_args.items) |arg| {
+                    if (std.mem.eql(u8, arg, "--resume")) {
+                        has_resume = true;
+                        break;
+                    }
+                }
+
+                if (!has_resume) {
+                    const resume_flag = try self.allocator.dupe(u8, "--resume");
+                    try self.child_args.append(resume_flag);
+                    std.log.info("Supervisor: Adding --resume flag for shepherd restart", .{});
+                }
+            }
+
+            self.is_first_spawn = false;
             self.spawnChild() catch |err| std.log.err("Respawn failed: {}", .{err});
         }
     }

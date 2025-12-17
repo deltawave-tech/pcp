@@ -178,7 +178,7 @@ pub const MLIRContext = struct {
             // Default to sm_80 (A100) if not specified for CUDA
             const arch = target_arch orelse "sm_80";
             std.log.info("Compiling for CUDA target: {s}", .{arch});
-            cuda_arch_arg = try std.fmt.allocPrint(allocator, "--iree-cuda-target={s}", .{arch});
+            cuda_arch_arg = try std.fmt.allocPrint(allocator, "--iree-hal-target-device=cuda://{s}", .{arch});
             try argv.append(cuda_arch_arg.?);
 
             // Disable all advanced CUDA codegen features to avoid LLVM lowering issues

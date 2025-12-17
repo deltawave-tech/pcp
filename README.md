@@ -2,13 +2,27 @@
 
 PCP is a distributed tensor computation framework written in Zig. It employs MLIR and the IREE compiler toolchain as its core to provide automatic differentiation, hardware acceleration, and optimization.
 
+## Table of Contents
+- [Core Architecture](#core-architecture)
+- [Quickstart](#quickstart)
+- [Building the Project via Nix](#building-the-project-via-nix)
+- [Building the Project manually](#building-the-project-manually-without-nix)
+- [Usage](#usage)
+- [Adding Custom Models](#adding-custom-models)
+- [Limitations](#limitations)
+- [Future Work](#future-work)
+
 ## Core Architecture
 
-PCP transforms high-level tensor operations into optimized MLIR computation graphs. The system's design is centered on a forward-pass graph construction, which is then used to derive a corresponding gradient graph for automatic differentiation.
+PCP transforms high-level tensor operations into optimized MLIR computation graphs. The system's design is centered on a forward-pass graph construction, which is then used to derive a corresponding gradient graph for automatic differentiation. The protocol has a modular design to enable composability of components such as distributed training algorithms, optimzers, automatic differentiation methods, compute backends, and network topologies. The current state of the protocol implements a basic configuration:
+- Distributed training algorithm: DiLoCo
+- Optimizers: AdamW, Nesterov
+- Automatic differentiation method: Reverse AD with VJP rules
+- Backends: cuda, rocm, cpu, msl (experimental)
 
 ### Distributed Training Overview
 
-The Shepherd (controller) constructs a complete MLIR training graph using the StableHLO dialect. This graph is then compiled by the IREE compiler (`iree-compile`) into a portable `.vmfb` artifact for a specific hardware target (e.g., Metal for macOS, LLVM-CPU for generic CPUs). This binary artifact is sent to workers, which execute it using the cross-platform IREE runtime.
+The Shepherd (controller) constructs a complete MLIR training graph using the StableHLO dialect. This graph is then compiled by the IREE compiler into a portable `.vmfb` artifact for a specific hardware target (e.g., cuda, rocm, ...). This binary artifact is sent to workers, which execute it using the cross-platform IREE runtime.
 
 ```
 ┌───────────────────────────────────────────────────────────────────┐
@@ -32,54 +46,81 @@ IREE handles the entire lowering pipeline from a high-level dialect to a hardwar
 ```
 ┌─────────┐   ┌───────────────────────────┐   ┌─────────────────┐
 │StableHLO│ → │    IREE Compiler          │ → │Metal/CUDA/CPU   │
-│         │   │   (iree-compile tool)     │   │  (via *.vmfb)   │
+│         │   │                           │   │  (via *.vmfb)   │
 └─────────┘   └───────────────────────────┘   └─────────────────┘
 ```
 
-## Project Structure
+## Quickstart
 
+### 1. Install Nix
+
+```shell
+sh <(curl --proto '=https' --tlsv1.2 -L https://nixos.org/nix/install) --daemon
 ```
-.
-└── src
-    ├── algorithms/              # Distributed training logic
-    │   ├── diloco.zig          # DiLoCo implementation (Inner/Outer loops)
-    │   └── training_algorithm.zig
-    ├── backends/                # Hardware execution backends
-    │   ├── iree.zig            # IREE runtime integration
-    │   └── worker_backend.zig  # Generic backend interface
-    ├── controllers/             # Coordination logic
-    │   └── shepherd.zig        # The Shepherd (Master node) implementation
-    ├── examples/                # Integration tests and pipelines
-    │   ├── cpu_pipeline_test.zig
-    │   ├── cuda_pipeline_test.zig
-    │   ├── rocm_pipeline_test.zig
-    │   └── ...
-    ├── mlir/                    # MLIR Dialects and C-API Wrappers
-    │   ├── dialects/
-    │   │   └── stablehlo.zig   # Safe wrappers for StableHLO ops
-    │   ├── include/            # C++ headers for MLIR integration
-    │   ├── c.zig               # Auto-generated C imports
-    │   └── pass_anchors.cpp    # Dialect registration hooks
-    ├── network/                 # Networking layer
-    │   ├── broker.zig          # Internal message routing
-    │   ├── capnp_bridge.cpp    # C++ bridge for Cap'n Proto
-    │   ├── protocol.capnp      # Protocol definition
-    │   └── tcp_stream.zig      # TCP framing and socket management
-    ├── optimizers/              # Optimizer implementations
-    │   ├── adam_mlir.zig       # AdamW implemented in MLIR (runs on Worker)
-    │   ├── nesterov.zig        # Nesterov (Host/Zig implementation)
-    │   └── nesterov_mlir.zig   # Nesterov (MLIR implementation)
-    ├── autodiff.zig             # Reverse-mode Automatic Differentiation
-    ├── backend_selection.zig   # Compile-time/Runtime backend logic
-    ├── dashboard.zig           # TUI Monitoring Dashboard
-    ├── data_loader.zig         # Tokenizer and Batching
-    ├── execution.zig           # Generic executor interfaces
-    ├── main_distributed.zig    # CLI Entry point
-    ├── mlir_ctx.zig            # MLIR Context management & Compiler invocation
-    ├── ops.zig                 # MLIR Operation Builder
-    ├── tensor.zig              # Symbolic Tensor abstraction
-    └── worker.zig              # Worker node state machine
+
+Enable flakes:
+```shell
+mkdir -p ~/.config/nix/
+echo 'experimental-features = nix-command flakes' >> ~/.config/nix/nix.conf
 ```
+
+### 2. Install PCP
+
+Add cachix keys:
+```shell
+cat << EOF >> ~/.config/nix/nix.conf
+substituters = https://cache.nixos.org https://pcp.cachix.org
+trusted-public-keys = cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY= pcp.cachix.org-1:D/JYXqFAnVLlvVUJEBOWoGLmJKwKW58SxPD0+m/HXZk=
+EOF
+```
+
+Install PCP:
+```shell
+nix profile add github:deltawave-tech/pcp
+```
+
+### 3. Configure WandB (Optional)
+
+```shell
+export WANDB_API_KEY=your_api_key_here
+```
+
+### 4. Start the Shepherd
+
+Create an experiment configuration file `experiment.json`:
+```json
+{
+    "model_path": "models/nanogpt_forward_32.mlir",
+    "data_path": "data/tiny_shakespeare.txt",
+    "learning_rate": 0.0006,
+    "batch_size": 32,
+    "block_size": 64,
+    "tau": 50,
+    "outer_loop_steps": 100,
+    "max_epochs": 10,
+    "nesterov_momentum": 0.9,
+    "wandb_project": "pcp-distributed"
+}
+```
+
+Start the supervised Shepherd expecting 8 workers:
+```shell
+pcp --supervise -- --shepherd --config experiment.json --host 0.0.0.0 --port 8080 --workers 8
+```
+
+### 5. Start Worker Nodes
+
+**Single GPU node:**
+```shell
+pcp --node-manager --host <SHEPHERD_IP> --port 8080 --backend cuda --target sm_80
+```
+
+**Multi-GPU node (8xH100):**
+```shell
+pcp --node-manager --scale 8 --host <SHEPHERD_IP> --port 8080 --backend cuda --target sm_90a
+```
+
+Training will begin automatically once all workers connect.
 
 ## Building the Project via Nix
 
@@ -205,7 +246,7 @@ After this step, your directory structure should look like this:
 └── iree-build/         (IREE build artifacts)
 ```
 
-### Step 3: Configure Environment (Optional but Recommended)
+### Step 3: Configure Environment
 
 For maximum flexibility, you can set the `IREE_DIR` environment variable to point to the directory containing your `iree` and `iree-build` folders.
 
@@ -245,21 +286,22 @@ zig build run-rocm-pipeline-test
 
 ## Usage
 
-The distributed training system consists of one Shepherd (coordinator) and multiple Workers (compute nodes). PCP separates infrastructure configuration (CLI flags) from experiment configuration (JSON file), following best practices from PyTorch and DeepSpeed.
-
 ### Configuration
 
 **Infrastructure (CLI Flags):**
-- Networking: `--host`, `--port`, `--connect`
-- Hardware: `--backend`, `--target`
-- Topology: `--workers`
+- Networking: `--host`, `--port`
+- Hardware: `--backend`, `--target`, `--device-id`
+- Topology: `--workers`, `--scale`
+- Supervision: `--supervise`, `--resume`
+- Modes: `--shepherd`, `--worker`, `--node-manager`
 
 **Experiment (JSON File):**
 - Model: `model_path`
 - Data: `data_path`
 - Hyperparameters: `learning_rate`, `batch_size`, `block_size`
-- Algorithm: `tau`, `outer_loop_steps`, `nesterov_momentum`
+- Algorithm: `tau`, `outer_loop_steps`, `max_epochs`, `nesterov_momentum`
 - Logging: `wandb_project`, `wandb_entity`, `wandb_run_name`, `wandb_api_key`
+- Recovery: `checkpoint_dir`, `should_resume`
 
 Create an experiment configuration file (e.g., `experiment.json`):
 
@@ -272,6 +314,7 @@ Create an experiment configuration file (e.g., `experiment.json`):
     "block_size": 64,
     "tau": 50,
     "outer_loop_steps": 100,
+    "max_epochs": 10,
     "nesterov_momentum": 0.9,
     "wandb_project": "pcp-distributed",
     "wandb_entity": null,
@@ -306,15 +349,26 @@ If no API key is provided, WandB logging will be disabled and training will cont
 
 ### Starting the Shepherd
 
-The Shepherd coordinates training, aggregates gradients, and manages the global model state.
+The Shepherd coordinates training, aggregates gradients, and manages the global model state. Running with `--supervise` enables automatic crash recovery.
 
 ```sh
-pcp \
+pcp --supervise -- \
   --shepherd \
   --config experiment.json \
   --host 0.0.0.0 \
   --port 8080 \
   --workers 2
+```
+
+To resume from a previous training run:
+```sh
+pcp --supervise -- \
+  --shepherd \
+  --config experiment.json \
+  --host 0.0.0.0 \
+  --port 8080 \
+  --workers 2 \
+  --resume
 ```
 
 ### Starting Workers
@@ -341,7 +395,7 @@ pcp \
 
 #### Multi-GPU Scaling
 
-To utilize a multi-GPU node (e.g., 8xH100), simply add the `--scale` flag. The Node Manager will spawn 8 independent, supervised workers, pinning each to a specific GPU (0-7).
+To utilize a multi-GPU node (e.g., 8xH100), add the `--scale` flag. The Node Manager will spawn 8 independent, supervised workers, pinning each to a specific GPU (0-7).
 
 ```sh
 pcp \
@@ -353,7 +407,7 @@ pcp \
   --target sm_90a
 ```
 
-#### Manual/Debugging Mode (Advanced)
+#### Manual/Debugging Mode
 
 If you need to debug a specific worker process without the supervisor layer, you can run a worker directly:
 
@@ -367,7 +421,7 @@ You can run workers with different hardware backends in the same training sessio
 
 ```sh
 # Shepherd Node: Start coordinator expecting 11 total workers
-pcp --shepherd --config experiment.json --workers 11
+pcp --shepherd --config experiment_nanogpt.json --workers 11
 
 # Node 1: 8xH100 server (Runs 8 workers)
 pcp --node-manager --scale 8 --host <SHEPHERD_IP> --port 8080 --backend cuda --target sm_90a
@@ -416,7 +470,7 @@ Note: The model must return the loss as a scalar. The optimizer logic in PCP exp
 
 ### 2. Export to MLIR
 
-We provide a utility tool to trace your PyTorch model and convert it into a "stateless" StableHLO MLIR module that PCP can execute.
+We provide a utility tool to trace your PyTorch model and convert it into a StableHLO MLIR module that PCP can execute.
 
 Run the exporter tool:
 
@@ -459,5 +513,19 @@ The export script will print a JSON snippet at the end. Create or update your ex
 Start the Shepherd with your new configuration:
 
 ```sh
-pcp --shepherd --config experiment.json --workers 2
+pcp --supervise -- --shepherd --config experiment.json --workers 2
 ```
+
+## Limitations
+
+PCP currently implements data parallelism only. Model size is constrained by individual worker node memory capacity, as each worker maintains a complete copy of the model parameters. This limits scalability for very large models without implementing model parallelism techniques.
+
+The system requires manual conversion of PyTorch models to MLIR format. New architectures may require extending the operator library and corresponding VJP (vector-Jacobian product) rules for automatic differentiation. This process demands understanding of both the model architecture and the MLIR/StableHLO representation.
+
+## Future Work
+
+- Expand to support advanced distributed training algorithms beyond DiLoCo, including StreamingDiLoCo, NoLoCo, MuLoCo, etc
+
+- MLIR integration will be extended with a dialect for distributed heterogeneous computing à la ([PLDI 2025](https://pldi25.sigplan.org/details/pldi-2025-src/3/An-MLIR-Dialect-for-Distributed-Heterogeneous-Computing)). This enables first-class representation of distributed computation patterns directly in the compiler infrastructure, allowing hardware-specific optimizations across heterogeneous clusters.
+
+- We will experiment with alternative automatic differentiation methods beyond reverse-mode AD for for exploration of approaches with reduced memory pressure.

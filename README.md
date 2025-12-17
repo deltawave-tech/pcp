@@ -80,13 +80,36 @@ Install PCP:
 nix profile add github:deltawave-tech/pcp
 ```
 
-### 3. Configure WandB (Optional)
+### 3. Set Up Python Environment (for Model Generation & WandB)
+
+PCP requires Python dependencies for generating MLIR models and WandB tracking:
+
+```shell
+# Create virtual environment
+python3 -m venv venv
+
+# Activate it
+source venv/bin/activate
+
+# Install dependencies
+pip install -r requirements.txt
+```
+
+The `requirements.txt` includes:
+- **torch** and **torch-mlir**: For generating StableHLO MLIR models
+- **wandb**: For experiment tracking and metrics visualization
+
+You'll need to activate this environment whenever you:
+- Generate new models using `tools/generate_nanogpt_*.py`
+- Use the WandB adapter for experiment tracking
+
+### 4. Configure WandB (Optional)
 
 ```shell
 export WANDB_API_KEY=your_api_key_here
 ```
 
-### 4. Start the Shepherd
+### 5. Start the Shepherd
 
 Use example experiment configuration file `experiments/nanogpt_small.json`
 
@@ -95,7 +118,7 @@ Start the supervised Shepherd expecting 8 workers:
 pcp --supervise -- --shepherd --config experiments/nanogpt_small.json --host 0.0.0.0 --port 8080 --workers 8
 ```
 
-### 5. Start Worker Nodes
+### 6. Start Worker Nodes
 
 **Single GPU node:**
 ```shell
@@ -430,6 +453,19 @@ PCP ships with example models (NanoGPT) for demonstration and testing. When gene
 - Testing your model independently before integrating with PCP
 
 PCP allows you to train arbitrary PyTorch architectures as long as they can be compiled to StableHLO.
+
+**Prerequisites**: Before generating custom models, ensure you have set up the Python environment with the required dependencies:
+
+```shell
+# If not already created
+python3 -m venv venv
+
+# Activate the virtual environment
+source venv/bin/activate
+
+# Install dependencies (torch, torch-mlir, wandb)
+pip install -r requirements.txt
+```
 
 ### 1. Define Your PyTorch Model
 

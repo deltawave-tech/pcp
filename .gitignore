@@ -19,6 +19,12 @@ zig-out/
 # Dependency directories
 deps/
 
+# Python virtual environment
+venv/
+__pycache__/
+*.pyc
+*.pyo
+
 # Editor and system files
 .DS_Store
 .dir-locals.el
@@ -34,7 +40,8 @@ deps/
 *.pdb
 
 # Data files (not tracked)
-data/
+data/*
+!data/*.sh
 checkpoint_*.bin
 shepherd_state.bin
 

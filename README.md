@@ -9,6 +9,7 @@ PCP is a distributed tensor computation framework written in Zig. It employs MLI
 - [Building the Project manually](#building-the-project-manually-without-nix)
 - [Usage](#usage)
 - [Adding Custom Models](#adding-custom-models)
+- [Documentation](#documentation)
 - [Limitations](#limitations)
 - [Future Work](#future-work)
 
@@ -87,25 +88,11 @@ export WANDB_API_KEY=your_api_key_here
 
 ### 4. Start the Shepherd
 
-Create an experiment configuration file `experiment.json`:
-```json
-{
-    "model_path": "models/nanogpt_forward_32.mlir",
-    "data_path": "data/tiny_shakespeare.txt",
-    "learning_rate": 0.0006,
-    "batch_size": 32,
-    "block_size": 64,
-    "tau": 50,
-    "outer_loop_steps": 100,
-    "max_epochs": 10,
-    "nesterov_momentum": 0.9,
-    "wandb_project": "pcp-distributed"
-}
-```
+Use example experiment configuration file `experiment_nanogpt.json`
 
 Start the supervised Shepherd expecting 8 workers:
 ```shell
-pcp --supervise -- --shepherd --config experiment.json --host 0.0.0.0 --port 8080 --workers 8
+pcp --supervise -- --shepherd --config experiment_nanogpt.json --host 0.0.0.0 --port 8080 --workers 8
 ```
 
 ### 5. Start Worker Nodes
@@ -120,7 +107,7 @@ pcp --node-manager --host <SHEPHERD_IP> --port 8080 --backend cuda --target sm_8
 pcp --node-manager --scale 8 --host <SHEPHERD_IP> --port 8080 --backend cuda --target sm_90a
 ```
 
-Training will begin automatically once all workers connect.
+Training will begin automatically once all (8) workers connect.
 
 ## Building the Project via Nix
 
@@ -516,6 +503,10 @@ Start the Shepherd with your new configuration:
 pcp --supervise -- --shepherd --config experiment.json --workers 2
 ```
 
+## Documentation
+
+For detailed technical documentation, architecture guides, and API references, see [DOCUMENTATION.md](DOCUMENTATION.md).
+
 ## Limitations
 
 PCP currently implements data parallelism only. Model size is constrained by individual worker node memory capacity, as each worker maintains a complete copy of the model parameters. This limits scalability for very large models without implementing model parallelism techniques.
@@ -528,4 +519,4 @@ The system requires manual conversion of PyTorch models to MLIR format. New arch
 
 - MLIR integration will be extended with a dialect for distributed heterogeneous computing à la ([PLDI 2025](https://pldi25.sigplan.org/details/pldi-2025-src/3/An-MLIR-Dialect-for-Distributed-Heterogeneous-Computing)). This enables first-class representation of distributed computation patterns directly in the compiler infrastructure, allowing hardware-specific optimizations across heterogeneous clusters.
 
-- We will experiment with alternative automatic differentiation methods beyond reverse-mode AD for for exploration of approaches with reduced memory pressure.
+- We will experiment with alternative automatic differentiation methods beyond reverse-mode AD for exploration of approaches with reduced memory pressure.

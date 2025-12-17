@@ -70,7 +70,7 @@ zig build run-shepherd -- experiments/nanogpt_small.json
 - **Layers**: 4
 - **Attention Heads**: 8 (head dimension = 32)
 - **Vocabulary Size**: 256 (byte-level, dataset-agnostic)
-- **Parameters**: ~10M
+- **Parameters**: ~3.3M
 
 This configuration is designed for:
 - Realistic distributed training workloads
@@ -151,6 +151,6 @@ All experiment JSON files support the following fields:
 
 - **Start Small**: Test new configurations with `nanogpt_small.json` before scaling up
 - **Dataset Consistency**: Ensure all worker nodes have the same dataset at the specified `data_path`
-- **Memory Planning**: Medium model requires ~4-6GB GPU memory per worker
+- **Memory Planning**: Medium model is lightweight (< 1GB VRAM per worker), making it ideal for testing distributed logic without massive hardware
 - **Monitoring**: Configure W&B credentials to track training progress across distributed workers
-- **Tau Tuning**: Higher `tau` values reduce synchronization overhead but may hurt convergence
+- **Tau Tuning**: Higher `tau` values reduce synchronization overhead but may hurt convergence speed

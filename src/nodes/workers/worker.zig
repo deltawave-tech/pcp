@@ -19,7 +19,8 @@ const MessageType = message.MessageType;
 const NodeId = message.NodeId;
 const WorkerBackend = worker_backend.WorkerBackend;
 const Dataset = dataset_mod.Dataset;
-const TextDataset = loader.TextDataset;
+// Use ByteTextDataset for large datasets/models (Vocab 256, no file size scan limit)
+const TextDataset = loader.ByteTextDataset;
 
 
 /// Worker state

@@ -3,7 +3,7 @@
     "data_path": "data/tiny_shakespeare.txt",
     "tokenizer": "char",
     "learning_rate": 0.0006,
-    "tau": 50,
+    "tau": 10,
     "outer_loop_steps": 100,
     "nesterov_momentum": 0.9,
     "max_epochs": 10,

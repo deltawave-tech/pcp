@@ -53,7 +53,7 @@ IREE handles the entire lowering pipeline from a high-level dialect to a hardwar
 
 ## Quickstart
 
-### 1. Install Nix
+### 1. Install Nix and Cachix
 
 ```shell
 sh <(curl --proto '=https' --tlsv1.2 -L https://nixos.org/nix/install) --daemon
@@ -65,20 +65,28 @@ mkdir -p ~/.config/nix/
 echo 'experimental-features = nix-command flakes' >> ~/.config/nix/nix.conf
 ```
 
+Install cachix
+```shell
+nix profile install nixpkgs#cachix
+cachix use pcp
+```
+
 ### 2. Install PCP
 
-Add cachix keys:
+Configure nix to use cachix as a substituter:
 ```shell
-cat << EOF >> ~/.config/nix/nix.conf
-substituters = https://cache.nixos.org https://pcp.cachix.org
-trusted-public-keys = cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY= pcp.cachix.org-1:D/JYXqFAnVLlvVUJEBOWoGLmJKwKW58SxPD0+m/HXZk=
-EOF
+cachix use pcp
 ```
 
 Install PCP:
 ```shell
 nix profile add github:deltawave-tech/pcp
 ```
+
+**NOTE** There should be **no** compilation happening at this point (except maybe pcp which should
+not take longer than around five minutes).  Especially there is no reason to see LLVM or IREE
+compiling.
+
 
 ### 3. Set Up Python Environment (only needed on Shepherd node)
 

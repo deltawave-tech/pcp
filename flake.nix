@@ -126,7 +126,7 @@
             ]}"
 
             # Append System paths for driver fallbacks (PTX JIT, ROCm, etc.)
-            SYSTEM_RPATH="/usr/lib/x86_64-linux-gnu:/usr/lib64:/usr/lib:/opt/amdgpu/lib/x86_64-linux-gnu:/opt/amdgpu/lib:/run/opengl-driver/lib:/opt/rocm/lib"
+            SYSTEM_RPATH="/usr/lib/x86_64-linux-gnu:/usr/lib64:/usr/lib:/opt/amdgpu/lib/x86_64-linux-gnu:/opt/amdgpu/lib:/run/opengl-driver/lib:/opt/rocm/lib:/opt/rocm/hip/lib"
 
             patchelf --force-rpath --set-rpath "$NIX_RPATH:$SYSTEM_RPATH" $out/bin/pcp
 

@@ -294,13 +294,38 @@ fn loadConfig(allocator: Allocator, path: ?[]const u8) !ConfigResult {
 
 /// Run as Shepherd coordinator
 fn runShepherd(allocator: Allocator, args: Args) !void {
-    const timestamp = std.time.timestamp();
+    const LATEST_RUN_FILE = ".pcp_latest_run";
     var run_id_buf: [64]u8 = undefined;
-    const run_id = try std.fmt.bufPrint(&run_id_buf, "run_{d}", .{timestamp});
+    var run_id: []const u8 = undefined;
 
+    // 1. Determine Run ID (Resume vs Fresh Start)
+    if (args.should_resume) {
+        // Attempt to read the ID of the run we are resuming
+        const f = std.fs.cwd().openFile(LATEST_RUN_FILE, .{}) catch |err| {
+            print("Cannot resume: failed to open {s} to retrieve Run ID: {}\n", .{LATEST_RUN_FILE, err});
+            return err;
+        };
+        defer f.close();
+        const read_len = try f.readAll(&run_id_buf);
+        if (read_len == 0) return error.EmptyRunIdFile;
+        run_id = run_id_buf[0..read_len];
+        print("Resuming previous Run ID: {s}\n", .{run_id});
+    } else {
+        // Fresh start: Generate new ID based on timestamp
+        const timestamp = std.time.timestamp();
+        run_id = try std.fmt.bufPrint(&run_id_buf, "run_{d}", .{timestamp});
+
+        // Persist this ID immediately so we can recover it if we crash
+        const f = try std.fs.cwd().createFile(LATEST_RUN_FILE, .{});
+        defer f.close();
+        try f.writeAll(run_id);
+    }
+
+    // 2. Setup paths using the determined run_id
     try std.fs.cwd().makePath("checkpoints");
     const run_dir_path = try std.fs.path.join(allocator, &[_][]const u8{ "checkpoints", run_id });
     defer allocator.free(run_dir_path);
+    // Ensure directory exists (it might not if we resumed a run that crashed before creating it, though unlikely)
     try std.fs.cwd().makePath(run_dir_path);
 
     const recovery_dir_path = try std.fs.path.join(allocator, &[_][]const u8{ run_dir_path, "recovery" });

@@ -94,9 +94,8 @@ pub const Supervisor = struct {
             }
         }
 
-        // 2. Start the child process immediately (Data Plane)
-        // We do this BEFORE connecting to Shepherd, so the worker exists even if network is down.
         try self.spawnChild();
+        self.is_first_spawn = false;
 
         // 3. Control Loop
         if (is_shepherd_child) {
@@ -199,7 +198,7 @@ pub const Supervisor = struct {
             std.log.warn("Child process died. Restarting in 1s...", .{});
             std.time.sleep(1 * std.time.ns_per_s);
 
-            if (self.is_shepherd_child and !self.is_first_spawn) {
+            if (self.is_shepherd_child) {
                 var has_resume = false;
                 for (self.child_args.items) |arg| {
                     if (std.mem.eql(u8, arg, "--resume")) {

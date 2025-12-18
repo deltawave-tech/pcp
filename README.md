@@ -80,9 +80,9 @@ Install PCP:
 nix profile add github:deltawave-tech/pcp
 ```
 
-### 3. Set Up Python Environment (for Model Generation & WandB)
+### 3. Set Up Python Environment (only needed on Shepherd node)
 
-PCP requires Python dependencies for generating MLIR models and WandB tracking:
+PCP requires Python dependencies for WandB tracking:
 
 ```shell
 # Create virtual environment
@@ -105,7 +105,7 @@ export WANDB_API_KEY=your_api_key_here
 
 Use example experiment configuration file `experiments/nanogpt_small.json`, or use a bigger model configuration with a larger dataset: [nanogpt_medium](experiments/README.md#nanogpt-medium)
 
-Start the supervised Shepherd expecting 8 workers:
+Start a supervised Shepherd expecting (8) workers:
 ```shell
 pcp --supervise -- --shepherd --config experiments/nanogpt_small.json --host 0.0.0.0 --port 8080 --workers 8
 ```
@@ -121,6 +121,8 @@ pcp --node-manager --host <SHEPHERD_IP> --port 8080 --backend cuda --target sm_8
 ```shell
 pcp --node-manager --scale 8 --host <SHEPHERD_IP> --port 8080 --backend cuda --target sm_90a
 ```
+
+See [Starting Workers](#starting-workers) for more details on GPU target architectures.
 
 Training will begin automatically once all (8) workers connect.
 

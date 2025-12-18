@@ -357,7 +357,10 @@ pub const Shepherd = struct {
             if (std.mem.eql(u8, msg.msg_type, MessageType.HEARTBEAT)) {
                 self.handleHeartbeat(worker_id);
             } else if (std.mem.eql(u8, msg.msg_type, MessageType.INNER_LOOP_COMPLETE)) {
-                try self.handleInnerLoopComplete(worker_id, msg);
+                self.handleInnerLoopComplete(worker_id, msg) catch |err| {
+                    std.log.err("CRITICAL: Failed to queue results from worker {}: {s}", .{ worker_id, @errorName(err) });
+                    return err;
+                };
             } else {
                 std.log.warn("Unknown message type from worker {}: {s}", .{ worker_id, msg.msg_type });
             }
@@ -387,6 +390,8 @@ pub const Shepherd = struct {
         defer self.result_queue_mutex.unlock();
 
         try self.result_queue.append(msg_clone);
+
+        std.log.info("Worker {} result successfully queued. Queue len: {}", .{ worker_id, self.result_queue.items.len });
     }
     
     /// Remove a worker from the pool
@@ -597,6 +602,7 @@ pub const Shepherd = struct {
         const max_wait_seconds: i64 = 60; // Reduced from 3600 to handle mid-round disconnections
         const start_time = std.time.timestamp();
 
+        var loops: usize = 0;
         while (true) {
             self.result_queue_mutex.lock();
             const current_results = self.result_queue.items.len;
@@ -604,6 +610,15 @@ pub const Shepherd = struct {
 
             if (current_results >= expected_count) {
                 break;
+            }
+
+            loops += 1;
+            if (loops % 100 == 0) {
+                std.log.info("Still waiting for results. Queue has {}/{}, Elapsed: {}s", .{
+                    current_results,
+                    expected_count,
+                    std.time.timestamp() - start_time,
+                });
             }
 
             const elapsed = std.time.timestamp() - start_time;

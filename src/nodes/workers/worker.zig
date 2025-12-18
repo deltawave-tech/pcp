@@ -19,8 +19,6 @@ const MessageType = message.MessageType;
 const NodeId = message.NodeId;
 const WorkerBackend = worker_backend.WorkerBackend;
 const Dataset = dataset_mod.Dataset;
-// Use ByteTextDataset for large datasets/models (Vocab 256, no file size scan limit)
-const TextDataset = loader.ByteTextDataset;
 
 
 /// Worker state
@@ -431,23 +429,47 @@ pub const Worker = struct {
             .integer => |i| @as(usize, @intCast(i)),
             else => return error.InvalidTauFormat,
         };
+        const tokenizer_type = if (payload.get("tokenizer")) |tok_val|
+            switch (tok_val) {
+                .string => |s| s,
+                else => "char",
+            }
+        else
+            "char";
 
         self.current_chunk_id = @intCast(chunk_id);
 
         std.log.info("Worker {}: Assigned chunk {} (offset={}, length={})", .{ self.node_id.?, chunk_id, offset, length });
 
-        // 4. Initialize dataset for this chunk
+        // 4. Initialize dataset for this chunk using Factory Pattern
         if (self.dataset) |ds| {
             ds.deinit();
         }
-        const text_ds = try TextDataset.initChunk(
-            self.allocator,
-            data_path,
-            @intCast(offset),
-            @intCast(length),
-            @intCast(self.node_id.?),
-        );
-        self.dataset = text_ds.asDataset();
+
+        if (std.mem.eql(u8, tokenizer_type, "byte")) {
+            std.log.info("Worker {}: Using ByteTokenizer (Configured)", .{self.node_id.?});
+            const byte_ds = try loader.ByteTextDataset.initChunk(
+                self.allocator,
+                data_path,
+                @intCast(offset),
+                @intCast(length),
+                @intCast(self.node_id.?),
+            );
+            self.dataset = byte_ds.asDataset();
+        } else if (std.mem.eql(u8, tokenizer_type, "char")) {
+            std.log.info("Worker {}: Using CharTokenizer (Configured)", .{self.node_id.?});
+            const char_ds = try loader.TextDataset.initChunk(
+                self.allocator,
+                data_path,
+                @intCast(offset),
+                @intCast(length),
+                @intCast(self.node_id.?),
+            );
+            self.dataset = char_ds.asDataset();
+        } else {
+            std.log.err("Unknown tokenizer type: {s}", .{tokenizer_type});
+            return error.UnknownTokenizer;
+        }
 
         // 5. Decode the Base64-encoded Cap'n Proto params
         const b64_params = switch (payload.get("params") orelse return error.MissingParams) {

@@ -1,6 +1,7 @@
 {
     "model_path": "models/nanogpt_small.mlir",
     "data_path": "data/tiny_shakespeare.txt",
+    "tokenizer": "char",
     "learning_rate": 0.0006,
     "tau": 50,
     "outer_loop_steps": 100,

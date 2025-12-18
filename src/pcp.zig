@@ -27,6 +27,7 @@ const MLIRBuilder = ops.MLIRBuilder;
 const ExperimentConfig = struct {
     model_path: []const u8 = "src/models/nanogpt_forward.mlir",
     data_path: []const u8 = "data/tiny_shakespeare.txt",
+    tokenizer: []const u8 = "char",
     learning_rate: f32 = 0.001,
     tau: usize = 10,
     outer_loop_steps: usize = 100,
@@ -353,6 +354,7 @@ fn runShepherd(allocator: Allocator, args: Args) !void {
     var diloco_config = DiLoCoConfig.default();
     diloco_config.model_mlir_path = exp_config.model_path;
     diloco_config.data_path = exp_config.data_path;
+    diloco_config.tokenizer_type = exp_config.tokenizer;
     diloco_config.tau = exp_config.tau;
     diloco_config.base_config.learning_rate = exp_config.learning_rate;
     diloco_config.base_config.outer_loop_steps = exp_config.outer_loop_steps;

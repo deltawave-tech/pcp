@@ -95,15 +95,7 @@ source venv/bin/activate
 pip install -r requirements.txt
 ```
 
-The `requirements.txt` includes:
-- **torch** and **torch-mlir**: For generating StableHLO MLIR models
-- **wandb**: For experiment tracking and metrics visualization
-
-You'll need to activate this environment whenever you:
-- Generate new models using `tools/generate_nanogpt_*.py`
-- Use the WandB adapter for experiment tracking
-
-### 4. Configure WandB (Optional)
+### 4. Configure WandB
 
 ```shell
 export WANDB_API_KEY=your_api_key_here
@@ -111,7 +103,7 @@ export WANDB_API_KEY=your_api_key_here
 
 ### 5. Start the Shepherd
 
-Use example experiment configuration file `experiments/nanogpt_small.json`
+Use example experiment configuration file `experiments/nanogpt_small.json`, or use a bigger model configuration with a larger dataset: [nanogpt_medium](experiments/README.md#nanogpt-medium)
 
 Start the supervised Shepherd expecting 8 workers:
 ```shell

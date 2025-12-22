@@ -512,10 +512,7 @@ pub fn minimum(builder: *MLIRBuilder, a: Tensor, b: Tensor) !Tensor {
 
 /// Element-wise negation
 pub fn negate(builder: *MLIRBuilder, a: Tensor) !Tensor {
-    // Use StableHLO dialect wrapper
-    const operation = hlo.negate(builder.ctx, a.value, builder.loc);
-
-    // MUST use the helper that appends the operation
+    const operation = try hlo.negate(builder.allocator, builder.ctx, a.value, builder.loc);
     return try builder.createAndAppendOp(operation);
 }
 
@@ -707,17 +704,13 @@ pub fn log(builder: *MLIRBuilder, a: Tensor) !Tensor {
 
 /// Element-wise sine
 pub fn sin(builder: *MLIRBuilder, a: Tensor) !Tensor {
-    // Use StableHLO dialect wrapper
-    const operation = hlo.sine(builder.ctx, a.value, builder.loc);
-
+    const operation = try hlo.sine(builder.allocator, builder.ctx, a.value, builder.loc);
     return try builder.createAndAppendOp(operation);
 }
 
 /// Element-wise cosine
 pub fn cos(builder: *MLIRBuilder, a: Tensor) !Tensor {
-    // Use StableHLO dialect wrapper
-    const operation = hlo.cosine(builder.ctx, a.value, builder.loc);
-
+    const operation = try hlo.cosine(builder.allocator, builder.ctx, a.value, builder.loc);
     return try builder.createAndAppendOp(operation);
 }
 

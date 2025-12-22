@@ -750,8 +750,8 @@ pub fn tanh(ctx: mlir.Context, operand: mlir.Value, loc: mlir.Location) mlir.Ope
 }
 
 /// Creates a stablehlo.sine operation
-pub fn sine(ctx: mlir.Context, operand: mlir.Value, loc: mlir.Location) mlir.Operation {
-    return mlir.Operation.create(ctx, "stablehlo.sine", .{
+pub fn sine(allocator: std.mem.Allocator, ctx: mlir.Context, operand: mlir.Value, loc: mlir.Location) !mlir.Operation {
+    return mlir.Operation.create(allocator, ctx, "stablehlo.sine", .{
         .operands = &.{operand},
         .results = &.{operand.getType()},
         .location = loc,
@@ -759,8 +759,8 @@ pub fn sine(ctx: mlir.Context, operand: mlir.Value, loc: mlir.Location) mlir.Ope
 }
 
 /// Creates a stablehlo.cosine operation
-pub fn cosine(ctx: mlir.Context, operand: mlir.Value, loc: mlir.Location) mlir.Operation {
-    return mlir.Operation.create(ctx, "stablehlo.cosine", .{
+pub fn cosine(allocator: std.mem.Allocator, ctx: mlir.Context, operand: mlir.Value, loc: mlir.Location) !mlir.Operation {
+    return mlir.Operation.create(allocator, ctx, "stablehlo.cosine", .{
         .operands = &.{operand},
         .results = &.{operand.getType()},
         .location = loc,

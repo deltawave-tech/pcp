@@ -861,6 +861,142 @@ pub fn testSelectVJP(allocator: Allocator) !void {
     std.debug.print("✓ Select verified.\n", .{});
 }
 
+/// Test sinVJP: f(x) = sin(x) with x=1.0 (radians)
+/// Expected: forward=sin(1.0)≈0.84147, dx=cos(1.0)≈0.54030
+pub fn testSinVJP(allocator: Allocator) !void {
+    std.debug.print("\n=== Testing sinVJP Isolated Execution ===\n", .{});
+    try initGlobalMLIRContext(allocator);
+    const context = global_mlir_context.?.getContext();
+    var helper = ExecutionHelper{.allocator = allocator};
+    var builder = try MLIRBuilder.init(allocator, context);
+    defer builder.deinit();
+
+    const f32_type = mlir.Type.f32Type(context);
+    const scalar_type = mlir.Type.rankedTensorType(context, &.{}, f32_type);
+    const func_type = try mlir.Type.functionType(allocator, context, &.{scalar_type}, &.{scalar_type});
+
+    const fwd_result = try builder.createFunction("forward_sin", func_type);
+    builder.setInsertionBlock(fwd_result.entry_block);
+
+    const x_tensor = try builder.newTensor(fwd_result.entry_block.getArgument(0));
+    const result = try ops.sin(&builder, x_tensor);
+    _ = try builder.createAndAttach("func.return", &.{result.value}, &.{}, .{});
+
+    _ = try autodiff.buildGradientGraph(allocator, &builder, fwd_result.func_op);
+
+    const input_x = [_]f32{1.0};
+    const grad_out = [_]f32{1.0};
+    var inputs = [_][]const u8{ std.mem.sliceAsBytes(&input_x), std.mem.sliceAsBytes(&grad_out) };
+    var shapes = [_][]const i64{ &[_]i64{}, &[_]i64{} };
+
+    const outputs = try helper.executeModule(builder.module, "forward_sin_grad", &inputs, &shapes, null);
+    defer { for(outputs) |o| allocator.free(o); allocator.free(outputs); }
+
+    const grad_x: f32 = @bitCast(std.mem.readInt(u32, outputs[0][0..4], .little));
+    try std.testing.expectApproxEqAbs(0.540302, grad_x, 1e-5);
+    std.debug.print("✓ sinVJP verified: f'(1.0) = {d:.5}\n", .{grad_x});
+}
+
+/// Test cosVJP: f(x) = cos(x) with x=1.0
+/// Expected: forward=cos(1.0)≈0.54030, dx=-sin(1.0)≈-0.84147
+pub fn testCosVJP(allocator: Allocator) !void {
+    std.debug.print("\n=== Testing cosVJP Isolated Execution ===\n", .{});
+    try initGlobalMLIRContext(allocator);
+    const context = global_mlir_context.?.getContext();
+    var helper = ExecutionHelper{.allocator = allocator};
+    var builder = try MLIRBuilder.init(allocator, context);
+    defer builder.deinit();
+
+    const f32_type = mlir.Type.f32Type(context);
+    const scalar_type = mlir.Type.rankedTensorType(context, &.{}, f32_type);
+    const func_type = try mlir.Type.functionType(allocator, context, &.{scalar_type}, &.{scalar_type});
+
+    const fwd_result = try builder.createFunction("forward_cos", func_type);
+    builder.setInsertionBlock(fwd_result.entry_block);
+
+    const x_tensor = try builder.newTensor(fwd_result.entry_block.getArgument(0));
+    const result = try ops.cos(&builder, x_tensor);
+    _ = try builder.createAndAttach("func.return", &.{result.value}, &.{}, .{});
+
+    _ = try autodiff.buildGradientGraph(allocator, &builder, fwd_result.func_op);
+
+    const input_x = [_]f32{1.0};
+    const grad_out = [_]f32{1.0};
+    var inputs = [_][]const u8{ std.mem.sliceAsBytes(&input_x), std.mem.sliceAsBytes(&grad_out) };
+    var shapes = [_][]const i64{ &[_]i64{}, &[_]i64{} };
+
+    const outputs = try helper.executeModule(builder.module, "forward_cos_grad", &inputs, &shapes, null);
+    defer { for(outputs) |o| allocator.free(o); allocator.free(outputs); }
+
+    const grad_x: f32 = @bitCast(std.mem.readInt(u32, outputs[0][0..4], .little));
+    try std.testing.expectApproxEqAbs(-0.841470, grad_x, 1e-5);
+    std.debug.print("✓ cosVJP verified: f'(1.0) = {d:.5}\n", .{grad_x});
+}
+
+/// Test RoPE rotation component VJP
+pub fn testRoPEComponentVJP(allocator: Allocator) !void {
+    std.debug.print("\n=== Testing RoPE Rotation Logic VJP ===\n", .{});
+    try initGlobalMLIRContext(allocator);
+    const context = global_mlir_context.?.getContext();
+    var helper = ExecutionHelper{.allocator = allocator};
+    var builder = try MLIRBuilder.init(allocator, context);
+    defer builder.deinit();
+
+    const f32_type = mlir.Type.f32Type(context);
+    const vec_type = mlir.Type.rankedTensorType(context, &.{2}, f32_type);
+    const theta_type = mlir.Type.rankedTensorType(context, &.{}, f32_type);
+    const func_type = try mlir.Type.functionType(allocator, context, &.{vec_type, theta_type}, &.{vec_type});
+
+    const fwd_result = try builder.createFunction("rope_rotate", func_type);
+    builder.setInsertionBlock(fwd_result.entry_block);
+
+    const x = try builder.newTensor(fwd_result.entry_block.getArgument(0));
+    const theta = try builder.newTensor(fwd_result.entry_block.getArgument(1));
+
+    const x1 = try ops.slice(&builder, x, &.{0}, &.{1}, &.{1});
+    const x2 = try ops.slice(&builder, x, &.{1}, &.{2}, &.{1});
+
+    const cos_t = try ops.cos(&builder, theta);
+    const sin_t = try ops.sin(&builder, theta);
+
+    const term1 = try ops.multiply(&builder, x1, cos_t);
+    const term2 = try ops.multiply(&builder, x2, sin_t);
+    const y1 = try ops.subtract(&builder, term1, term2);
+
+    const term3 = try ops.multiply(&builder, x1, sin_t);
+    const term4 = try ops.multiply(&builder, x2, cos_t);
+    const y2 = try ops.add(&builder, term3, term4);
+
+    const hlo = @import("../mlir/dialects/stablehlo.zig");
+    const concat_op = hlo.concatenate(context, &.{y1.value, y2.value}, 0, builder.loc);
+    builder.insertion_block.appendOwnedOperation(concat_op);
+
+    _ = try builder.createAndAttach("func.return", &.{concat_op.getResult(0)}, &.{}, .{});
+
+    _ = try autodiff.buildGradientGraph(allocator, &builder, fwd_result.func_op);
+
+    const x_data = [_]f32{1.0, 2.0};
+    const th_data = [_]f32{0.5};
+    const dy_data = [_]f32{1.0, 1.0};
+
+    var inputs = [_][]const u8{
+        std.mem.sliceAsBytes(&x_data),
+        std.mem.sliceAsBytes(&th_data),
+        std.mem.sliceAsBytes(&dy_data)
+    };
+    var shapes = [_][]const i64{ &[_]i64{2}, &[_]i64{}, &[_]i64{2} };
+
+    const grad_out = try helper.executeModule(builder.module, "rope_rotate_grad", &inputs, &shapes, null);
+    defer { for(grad_out) |o| allocator.free(o); allocator.free(grad_out); }
+
+    const dx: []const f32 = @alignCast(std.mem.bytesAsSlice(f32, grad_out[0]));
+    std.debug.print("RoPE dx: {any}\n", .{dx});
+
+    try std.testing.expectApproxEqAbs(1.3567, dx[0], 1e-4);
+    try std.testing.expectApproxEqAbs(0.3981, dx[1], 1e-4);
+    std.debug.print("✓ RoPE Component VJP verified!\n", .{});
+}
+
 /// Test chain rule: f(x, w, b) = (x * w) + b
 /// This tests gradient propagation through a sequence of operations
 /// Expected gradients: df/dx = w, df/dw = x, df/db = 1
@@ -1049,7 +1185,11 @@ pub fn main() !void {
     try testLogVJP(allocator);
     try testRsqrtVJP(allocator);
     try testSelectVJP(allocator);
-    // Convert test implies simple pass through, implicitly tested via others
+
+    // TRIG AND ROPE TESTS
+    try testSinVJP(allocator);
+    try testCosVJP(allocator);
+    try testRoPEComponentVJP(allocator);
 
     std.debug.print("\n🌚 Individual VJP Tests Completed Successfully! 🌚\n", .{});
     

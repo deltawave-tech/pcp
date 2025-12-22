@@ -750,15 +750,15 @@ pub fn sinVJP(
     var result = std.ArrayList(mlir.Value).init(builder.allocator);
     defer result.deinit();
 
-    // cos(x)
     const x_tensor = try builder.newTensor(x);
     const cos_x = try ops.cos(builder, x_tensor);
-    
-    // grad_out * cos(x)
-    const grad_tensor = try builder.newTensor(grad_out);
-    const grad_x = try ops.multiply(builder, grad_tensor, cos_x);
 
-    try result.append(grad_x.value);
+    const grad_tensor = try builder.newTensor(grad_out);
+    const grad_x_raw = try ops.multiply(builder, grad_tensor, cos_x);
+
+    const grad_x = try ops.reduceGradient(builder, grad_x_raw.value, x);
+    try result.append(grad_x);
+
     return result.toOwnedSlice();
 }
 
@@ -790,18 +790,17 @@ pub fn cosVJP(
     var result = std.ArrayList(mlir.Value).init(builder.allocator);
     defer result.deinit();
 
-    // sin(x)
     const x_tensor = try builder.newTensor(x);
     const sin_x = try ops.sin(builder, x_tensor);
-    
-    // -sin(x)
+
     const neg_sin_x = try ops.negate(builder, sin_x);
 
-    // grad_out * -sin(x)
     const grad_tensor = try builder.newTensor(grad_out);
-    const grad_x = try ops.multiply(builder, grad_tensor, neg_sin_x);
+    const grad_x_raw = try ops.multiply(builder, grad_tensor, neg_sin_x);
 
-    try result.append(grad_x.value);
+    const grad_x = try ops.reduceGradient(builder, grad_x_raw.value, x);
+    try result.append(grad_x);
+
     return result.toOwnedSlice();
 }
 

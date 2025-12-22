@@ -722,6 +722,89 @@ pub fn tryVectorIndexLinearization(
     return final_op.getResult(0);
 }
 
+/// VJP rule for sine: d(sin(x)) = cos(x) * dx
+pub fn sinVJP(
+    builder: *MLIRBuilder,
+    original_op: mlir.Operation,
+    primals: []const mlir.Value,
+    adjoints: []const mlir.Value,
+) ![]mlir.Value {
+    const grad_out_raw = adjoints[0];
+    const x = primals[0];
+
+    const result_type = original_op.getResult(0).getType();
+    const result_ranked_type = result_type.as(mlir.RankedTensorType) orelse return error.InvalidTensorType;
+    const result_shape = try result_ranked_type.getShape(builder.allocator);
+    defer builder.allocator.free(result_shape);
+
+    const grad_out_type = grad_out_raw.getType().as(mlir.RankedTensorType) orelse return error.InvalidTensorType;
+    const grad_out_shape = try grad_out_type.getShape(builder.allocator);
+    defer builder.allocator.free(grad_out_shape);
+
+    var grad_out = grad_out_raw;
+    if (!std.mem.eql(i64, result_shape, grad_out_shape)) {
+        const reshape_op = try builder.createAndAttach("stablehlo.reshape", &.{grad_out_raw}, &.{result_type}, .{});
+        grad_out = reshape_op.getResult(0);
+    }
+
+    var result = std.ArrayList(mlir.Value).init(builder.allocator);
+    defer result.deinit();
+
+    // cos(x)
+    const x_tensor = try builder.newTensor(x);
+    const cos_x = try ops.cos(builder, x_tensor);
+    
+    // grad_out * cos(x)
+    const grad_tensor = try builder.newTensor(grad_out);
+    const grad_x = try ops.multiply(builder, grad_tensor, cos_x);
+
+    try result.append(grad_x.value);
+    return result.toOwnedSlice();
+}
+
+/// VJP rule for cosine: d(cos(x)) = -sin(x) * dx
+pub fn cosVJP(
+    builder: *MLIRBuilder,
+    original_op: mlir.Operation,
+    primals: []const mlir.Value,
+    adjoints: []const mlir.Value,
+) ![]mlir.Value {
+    const grad_out_raw = adjoints[0];
+    const x = primals[0];
+
+    const result_type = original_op.getResult(0).getType();
+    const result_ranked_type = result_type.as(mlir.RankedTensorType) orelse return error.InvalidTensorType;
+    const result_shape = try result_ranked_type.getShape(builder.allocator);
+    defer builder.allocator.free(result_shape);
+
+    const grad_out_type = grad_out_raw.getType().as(mlir.RankedTensorType) orelse return error.InvalidTensorType;
+    const grad_out_shape = try grad_out_type.getShape(builder.allocator);
+    defer builder.allocator.free(grad_out_shape);
+
+    var grad_out = grad_out_raw;
+    if (!std.mem.eql(i64, result_shape, grad_out_shape)) {
+        const reshape_op = try builder.createAndAttach("stablehlo.reshape", &.{grad_out_raw}, &.{result_type}, .{});
+        grad_out = reshape_op.getResult(0);
+    }
+
+    var result = std.ArrayList(mlir.Value).init(builder.allocator);
+    defer result.deinit();
+
+    // sin(x)
+    const x_tensor = try builder.newTensor(x);
+    const sin_x = try ops.sin(builder, x_tensor);
+    
+    // -sin(x)
+    const neg_sin_x = try ops.negate(builder, sin_x);
+
+    // grad_out * -sin(x)
+    const grad_tensor = try builder.newTensor(grad_out);
+    const grad_x = try ops.multiply(builder, grad_tensor, neg_sin_x);
+
+    try result.append(grad_x.value);
+    return result.toOwnedSlice();
+}
+
 /// VJP rule for gather: Replaces scatter with One-Hot + MatMul to avoid GPU atomics
 pub fn gatherVJP(
     builder: *MLIRBuilder,

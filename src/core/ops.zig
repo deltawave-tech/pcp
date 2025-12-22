@@ -705,6 +705,22 @@ pub fn log(builder: *MLIRBuilder, a: Tensor) !Tensor {
     return try builder.createAndAppendOp(operation);
 }
 
+/// Element-wise sine
+pub fn sin(builder: *MLIRBuilder, a: Tensor) !Tensor {
+    // Use StableHLO dialect wrapper
+    const operation = hlo.sine(builder.ctx, a.value, builder.loc);
+
+    return try builder.createAndAppendOp(operation);
+}
+
+/// Element-wise cosine
+pub fn cos(builder: *MLIRBuilder, a: Tensor) !Tensor {
+    // Use StableHLO dialect wrapper
+    const operation = hlo.cosine(builder.ctx, a.value, builder.loc);
+
+    return try builder.createAndAppendOp(operation);
+}
+
 /// Element-wise square root
 pub fn sqrt(builder: *MLIRBuilder, a: Tensor) !Tensor {
     // Use StableHLO dialect wrapper

@@ -749,6 +749,24 @@ pub fn tanh(ctx: mlir.Context, operand: mlir.Value, loc: mlir.Location) mlir.Ope
     });
 }
 
+/// Creates a stablehlo.sine operation
+pub fn sine(ctx: mlir.Context, operand: mlir.Value, loc: mlir.Location) mlir.Operation {
+    return mlir.Operation.create(ctx, "stablehlo.sine", .{
+        .operands = &.{operand},
+        .results = &.{operand.getType()},
+        .location = loc,
+    });
+}
+
+/// Creates a stablehlo.cosine operation
+pub fn cosine(ctx: mlir.Context, operand: mlir.Value, loc: mlir.Location) mlir.Operation {
+    return mlir.Operation.create(ctx, "stablehlo.cosine", .{
+        .operands = &.{operand},
+        .results = &.{operand.getType()},
+        .location = loc,
+    });
+}
+
 /// Creates a stablehlo.slice operation
 pub fn slice(allocator: std.mem.Allocator, ctx: mlir.Context, operand: mlir.Value, start_indices: []const i64, limit_indices: []const i64, strides: []const i64, loc: mlir.Location) !mlir.Operation {
     const start_attr = mlir.Attribute.denseI64ArrayAttr(ctx, start_indices);

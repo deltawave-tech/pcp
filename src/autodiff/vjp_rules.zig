@@ -804,6 +804,50 @@ pub fn cosVJP(
     return result.toOwnedSlice();
 }
 
+/// VJP rule for concatenate: gradient flows back via slicing
+pub fn concatenateVJP(
+    builder: *MLIRBuilder,
+    original_op: mlir.Operation,
+    primals: []const mlir.Value,
+    adjoints: []const mlir.Value,
+) ![]mlir.Value {
+    const grad_out = adjoints[0];
+
+    const dimension_attr_name = c.stringRefFromString("dimension");
+    const dimension_attr = c.operationGetAttributeByName(original_op.handle, dimension_attr_name);
+    const dim = c.integerAttrGetValueInt(dimension_attr);
+
+    var result = std.ArrayList(mlir.Value).init(builder.allocator);
+    var offset: i64 = 0;
+
+    for (primals) |primal| {
+        const p_type = primal.getType().as(mlir.RankedTensorType) orelse return error.InvalidTensorType;
+        const p_shape = try p_type.getShape(builder.allocator);
+        defer builder.allocator.free(p_shape);
+        const size = p_shape[@intCast(dim)];
+
+        const start_indices = try builder.allocator.alloc(i64, p_shape.len);
+        defer builder.allocator.free(start_indices);
+        @memset(start_indices, 0);
+        start_indices[@intCast(dim)] = offset;
+
+        const limit_indices = try builder.allocator.dupe(i64, p_shape);
+        defer builder.allocator.free(limit_indices);
+        limit_indices[@intCast(dim)] = offset + size;
+
+        const strides = try builder.allocator.alloc(i64, p_shape.len);
+        defer builder.allocator.free(strides);
+        @memset(strides, 1);
+
+        const grad_slice = try ops.slice(builder, try builder.newTensor(grad_out), start_indices, limit_indices, strides);
+        try result.append(grad_slice.value);
+
+        offset += size;
+    }
+
+    return result.toOwnedSlice();
+}
+
 /// VJP rule for gather: Replaces scatter with One-Hot + MatMul to avoid GPU atomics
 pub fn gatherVJP(
     builder: *MLIRBuilder,

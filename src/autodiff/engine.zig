@@ -61,6 +61,8 @@ fn getVjpFn(op_name: []const u8) ?VJPFn {
         return vjp_rules.sinVJP;
     } else if (std.mem.eql(u8, op_name, "stablehlo.cosine")) {
         return vjp_rules.cosVJP;
+    } else if (std.mem.eql(u8, op_name, "stablehlo.concatenate")) {
+        return vjp_rules.concatenateVJP;
     } else {
         return null;
     }

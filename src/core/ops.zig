@@ -632,8 +632,7 @@ pub fn rsqrt(builder: *MLIRBuilder, a: Tensor) !Tensor {
 
 /// Slice operation to extract sub-tensors
 pub fn slice(builder: *MLIRBuilder, a: Tensor, start_indices: []const i64, limit_indices: []const i64, strides: []const i64) !Tensor {
-    // Use StableHLO dialect wrapper
-    const operation = hlo.slice(builder.ctx, a.value, start_indices, limit_indices, strides, builder.loc);
+    const operation = try hlo.slice(builder.allocator, builder.ctx, a.value, start_indices, limit_indices, strides, builder.loc);
 
     return try builder.createAndAppendOp(operation);
 }

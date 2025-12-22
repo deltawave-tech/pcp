@@ -184,7 +184,7 @@ print(f"  Context: {BLOCK_SIZE}")
 
 module = fx.export_and_import(wrapper, *full_inputs, output_type="stablehlo")
 
-output_path = "models/rope_medium.mlir"
+output_path = "models/tests/rope_test.mlir"
 with open(output_path, "w") as f:
     f.write(str(module.operation))
 

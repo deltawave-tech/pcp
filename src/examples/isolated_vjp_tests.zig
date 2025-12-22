@@ -997,6 +997,65 @@ pub fn testRoPEComponentVJP(allocator: Allocator) !void {
     std.debug.print("✓ RoPE Component VJP verified!\n", .{});
 }
 
+/// Test concatenateVJP: f(a, b) = concat([a, b], dim=0)
+/// Input A: [1, 2], Input B: [3, 4, 5]
+/// Grad Out: [10, 20, 30, 40, 50]
+/// Expected: grad_a = [10, 20], grad_b = [30, 40, 50]
+pub fn testConcatenateVJP(allocator: Allocator) !void {
+    std.debug.print("\n=== Testing concatenateVJP Isolated Execution ===\n", .{});
+    try initGlobalMLIRContext(allocator);
+    const context = global_mlir_context.?.getContext();
+    var helper = ExecutionHelper{.allocator = allocator};
+    var builder = try MLIRBuilder.init(allocator, context);
+    defer builder.deinit();
+
+    const f32_type = mlir.Type.f32Type(context);
+    const type_a = mlir.Type.rankedTensorType(context, &.{2}, f32_type);
+    const type_b = mlir.Type.rankedTensorType(context, &.{3}, f32_type);
+    const type_out = mlir.Type.rankedTensorType(context, &.{5}, f32_type);
+
+    const func_type = try mlir.Type.functionType(allocator, context, &.{type_a, type_b}, &.{type_out});
+
+    const fwd_result = try builder.createFunction("forward_concat", func_type);
+    builder.setInsertionBlock(fwd_result.entry_block);
+
+    const val_a = fwd_result.entry_block.getArgument(0);
+    const val_b = fwd_result.entry_block.getArgument(1);
+
+    const hlo = @import("../mlir/dialects/stablehlo.zig");
+    const concat_op = hlo.concatenate(context, &.{val_a, val_b}, 0, builder.loc);
+    builder.insertion_block.appendOwnedOperation(concat_op);
+
+    _ = try builder.createAndAttach("func.return", &.{concat_op.getResult(0)}, &.{}, .{});
+
+    _ = try autodiff.buildGradientGraph(allocator, &builder, fwd_result.func_op);
+
+    const data_a = [_]f32{1.0, 2.0};
+    const data_b = [_]f32{3.0, 4.0, 5.0};
+    const grad_out = [_]f32{10.0, 20.0, 30.0, 40.0, 50.0};
+
+    var inputs = [_][]const u8{
+        std.mem.sliceAsBytes(&data_a),
+        std.mem.sliceAsBytes(&data_b),
+        std.mem.sliceAsBytes(&grad_out),
+    };
+    var shapes = [_][]const i64{ &[_]i64{2}, &[_]i64{3}, &[_]i64{5} };
+
+    const outputs = try helper.executeModule(builder.module, "forward_concat_grad", &inputs, &shapes, null);
+    defer { for(outputs) |o| allocator.free(o); allocator.free(outputs); }
+
+    const res_grad_a = @as([*]const f32, @ptrCast(@alignCast(outputs[0].ptr)))[0..2];
+    const res_grad_b = @as([*]const f32, @ptrCast(@alignCast(outputs[1].ptr)))[0..3];
+
+    std.debug.print("Grad A: {any}\n", .{res_grad_a});
+    std.debug.print("Grad B: {any}\n", .{res_grad_b});
+
+    try std.testing.expectEqualSlices(f32, &[_]f32{10.0, 20.0}, res_grad_a);
+    try std.testing.expectEqualSlices(f32, &[_]f32{30.0, 40.0, 50.0}, res_grad_b);
+
+    std.debug.print("✓ concatenateVJP verified!\n", .{});
+}
+
 /// Test chain rule: f(x, w, b) = (x * w) + b
 /// This tests gradient propagation through a sequence of operations
 /// Expected gradients: df/dx = w, df/dw = x, df/db = 1
@@ -1190,6 +1249,7 @@ pub fn main() !void {
     try testSinVJP(allocator);
     try testCosVJP(allocator);
     try testRoPEComponentVJP(allocator);
+    try testConcatenateVJP(allocator);
 
     std.debug.print("\n🌚 Individual VJP Tests Completed Successfully! 🌚\n", .{});
     

@@ -115,32 +115,20 @@ pub fn buildGradientGraph(
     var value_map = std.AutoHashMap(mlir.Value, mlir.Value).init(allocator);
     defer value_map.deinit();
 
-    // Get the operations in reverse topological order
-    std.debug.print("Getting operations in reverse order...\n", .{});
-    const ops_reversed = try getOperationsInReverseOrder(allocator, forward_fn);
-    defer allocator.free(ops_reversed);
-
-    // --- NEW INITIALIZATION LOGIC ---
     const forward_block = forward_fn.getRegion(0).getBlock(0);
     const num_forward_args = forward_block.getNumArguments();
 
-    // 1. Map the arguments of the forward function to the arguments of the gradient function
     for (0..num_forward_args) |i| {
         const forward_arg = forward_block.getArgument(i);
-        // CRITICAL FIX: Retrieve existing argument from the block instead of adding a new one
         const grad_arg = grad_fn_block.getArgument(i);
         try value_map.put(forward_arg, grad_arg);
     }
 
-    // 2. The *last* argument of the gradient function is the incoming gradient for the loss
     const loss_value = getReturnValue(forward_fn) orelse return error.NoReturnOperation;
-    // The loss gradient is the argument at index `num_forward_args` (last one)
     const loss_grad_arg = grad_fn_block.getArgument(num_forward_args);
     try adjoint_map.put(loss_value, loss_grad_arg);
-    // --- END INITIALIZATION LOGIC ---
 
-    // CRITICAL FIX: First pass - build value_map by processing operations in FORWARD order
-    // This ensures all primal values are available in gradient scope before we compute gradients
+    // First pass: Clone forward operations into gradient function
     std.debug.print("First pass: Building primal value mappings in forward order...\n", .{});
     const ops_forward = try getOperationsInForwardOrder(allocator, forward_fn);
     defer allocator.free(ops_forward);
@@ -149,15 +137,12 @@ pub fn buildGradientGraph(
         const op_name = op.getName();
 
         if (std.mem.eql(u8, op_name, "stablehlo.constant")) {
-            // Clone constants into gradient scope
             const cloned_op = mlir.Operation{ .handle = c.operationClone(op.handle) };
             builder.insertion_block.appendOwnedOperation(cloned_op);
             try value_map.put(op.getResult(0), cloned_op.getResult(0));
         } else if (!std.mem.eql(u8, op_name, "func.return")) {
-            // Clone regular operations into gradient scope with mapped operands
             const cloned_op = mlir.Operation{ .handle = c.operationClone(op.handle) };
 
-            // Replace operands with their mapped versions
             for (0..cloned_op.getNumOperands()) |i| {
                 const primal_operand = op.getOperand(i);
                 if (value_map.get(primal_operand)) |mapped_operand| {
@@ -167,20 +152,15 @@ pub fn buildGradientGraph(
 
             builder.insertion_block.appendOwnedOperation(cloned_op);
 
-            // Map the results
             for (0..op.getNumResults()) |i| {
                 try value_map.put(op.getResult(i), cloned_op.getResult(i));
             }
         }
     }
 
-    std.debug.print("Second pass: Computing gradients in reverse order...\n", .{});
-
-    // Walk the forward graph backwards, applying VJP rules using the SHARED builder
-    for (ops_reversed) |op| {
-        std.debug.print("Processing operation VJP for: {s}\n", .{op.getName()});
-        try processOperationVJP(allocator, builder, op, &adjoint_map, &value_map);
-    }
+    // Second pass: Compute gradients using use-counting (reverse Kahn's algorithm)
+    std.debug.print("Second pass: Computing gradients using use-counting...\n", .{});
+    try processGradientsWithUseCounting(allocator, builder, forward_fn, &adjoint_map, &value_map);
 
     // Collect gradients and create return statement using the SHARED builder
     try finalizeGradientFunction(allocator, builder, gradient_fn, forward_fn, &adjoint_map);
@@ -269,65 +249,66 @@ fn createGradientFunction(builder: *MLIRBuilder, forward_fn: mlir.Operation, nam
     return result.func_op;
 }
 
-fn getOperationsInReverseOrder(allocator: Allocator, fn_op: mlir.Operation) ![]mlir.Operation {
-    std.debug.print("  Building reverse operation order...\n", .{});
+/// Process gradients using use-counting (reverse Kahn's algorithm)
+/// Ensures operations are processed only after ALL consumers have contributed gradients
+fn processGradientsWithUseCounting(
+    allocator: Allocator,
+    builder: *MLIRBuilder,
+    forward_fn: mlir.Operation,
+    adjoint_map: *std.AutoHashMap(mlir.Value, mlir.Value),
+    value_map: *std.AutoHashMap(mlir.Value, mlir.Value),
+) !void {
+    const forward_block = forward_fn.getRegion(0).getBlock(0);
 
-    var sorted_ops = std.ArrayList(mlir.Operation).init(allocator);
-    errdefer sorted_ops.deinit();
+    // Step 1: Count how many times each operation is used as a producer
+    var use_counts = std.AutoHashMap(mlir.Operation, usize).init(allocator);
+    defer use_counts.deinit();
 
-    var worklist = std.ArrayList(mlir.Operation).init(allocator);
-    defer worklist.deinit();
-
-    var visited = std.AutoHashMap(mlir.Operation, void).init(allocator);
-    defer visited.deinit();
-
-    // CRITICAL FIX: The fn_op is the func.func operation itself. We must start
-    // the reverse traversal from ITS terminator (the func.return op).
-    const func_body_region = fn_op.getRegion(0);
-    const func_body_block = func_body_region.getBlock(0);
-
-    // FIXED: Use getLastOpGeneric instead of getLastOp (which relies on blockGetTerminator)
-    const terminator = func_body_block.getLastOpGeneric();
-
-    if (terminator) |term_op| {
-        // Verify it's actually a func.return
-        const op_name = term_op.getName();
-        if (std.mem.eql(u8, op_name, "func.return")) {
-            try worklist.append(term_op);
-        } else {
-            std.debug.print("  ERROR: Last operation is not func.return, it's: {s}\\n", .{op_name});
-            return error.InvalidTerminator;
-        }
-    } else {
-        std.debug.print("  ERROR: No last operation found in the forward function!\\n", .{});
-        return error.NoTerminatorFound;
-    }
-
-    // Process the worklist using the direct C-API call
-    while (worklist.items.len > 0) {
-        const op = worklist.orderedRemove(worklist.items.len - 1);
-        if (visited.contains(op)) continue;
-        try visited.put(op, {});
-        try sorted_ops.append(op);
-
+    var maybe_op = forward_block.getFirstOp();
+    while (maybe_op) |op| {
         for (0..op.getNumOperands()) |i| {
             const operand = op.getOperand(i);
-
-            // Check if this value is an operation result (not a block argument)
             if (c.mlirValueIsAOpResult(operand.handle)) {
-                // Get the operation that produced this result
-                const def_op_handle = c.mlirOpResultGetOwner(operand.handle);
-                const def_op = mlir.Operation{ .handle = def_op_handle };
-                if (!visited.contains(def_op)) {
-                    try worklist.append(def_op);
-                }
+                const producer_op = mlir.Operation{ .handle = c.mlirOpResultGetOwner(operand.handle) };
+                const entry = try use_counts.getOrPut(producer_op);
+                if (!entry.found_existing) entry.value_ptr.* = 0;
+                entry.value_ptr.* += 1;
             }
-            // If it's a block argument, the traversal correctly stops here
         }
+        maybe_op = op.getNext();
     }
 
-    std.debug.print("  Found {} operations in reverse order\n", .{sorted_ops.items.len});
-    return sorted_ops.toOwnedSlice();
+    // Step 2: Initialize ready queue with the terminator
+    const terminator = forward_block.getLastOpGeneric() orelse return error.NoTerminator;
+    const op_name = terminator.getName();
+    if (!std.mem.eql(u8, op_name, "func.return")) return error.InvalidTerminator;
+
+    var ready_queue = std.ArrayList(mlir.Operation).init(allocator);
+    defer ready_queue.deinit();
+    try ready_queue.append(terminator);
+
+    // Step 3: Process operations in reverse order using use-counting
+    while (ready_queue.items.len > 0) {
+        const current_op = ready_queue.orderedRemove(0);
+
+        std.debug.print("Processing operation VJP for: {s}\n", .{current_op.getName()});
+        try processOperationVJP(allocator, builder, current_op, adjoint_map, value_map);
+
+        // Decrement use counts for producers and add to queue when ready
+        for (0..current_op.getNumOperands()) |i| {
+            const operand = current_op.getOperand(i);
+            if (c.mlirValueIsAOpResult(operand.handle)) {
+                const producer_op = mlir.Operation{ .handle = c.mlirOpResultGetOwner(operand.handle) };
+
+                if (use_counts.getPtr(producer_op)) |count| {
+                    count.* -= 1;
+                    if (count.* == 0) {
+                        try ready_queue.append(producer_op);
+                    }
+                }
+            }
+        }
+    }
 }
 
 fn getOperationsInForwardOrder(allocator: Allocator, fn_op: mlir.Operation) ![]mlir.Operation {

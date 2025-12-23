@@ -381,11 +381,16 @@ pub fn matmul(builder: *MLIRBuilder, a: Tensor, b: Tensor) !Tensor {
     }
     // Case 5: 4D x 4D (multi-batch, e.g., multi-head attention)
     else if (a_rank == 4 and b_rank == 4) {
-        // For multi-head attention: [B, n_head, T, head_dim] x [B, n_head, head_dim, T] -> [B, n_head, T, T]
-        if (a.shape.getDimension(0) != b.shape.getDimension(0) or // Batch size must match
-            a.shape.getDimension(1) != b.shape.getDimension(1) or // Number of heads must match  
-            a.shape.getDimension(3) != b.shape.getDimension(2)) { // Contracting dimension must match
+        const q_heads = a.shape.getDimension(1);
+        const kv_heads = b.shape.getDimension(1);
+
+        if (a.shape.getDimension(0) != b.shape.getDimension(0) or
+            a.shape.getDimension(3) != b.shape.getDimension(2)) {
             return error.IncompatibleShapes;
+        }
+
+        if (q_heads != kv_heads) {
+            if (@rem(q_heads, kv_heads) != 0) return error.InvalidGQAHeadRatio;
         }
     }
     else {
@@ -491,22 +496,14 @@ pub fn reshape(builder: *MLIRBuilder, a: Tensor, new_shape: []const i64) !Tensor
 /// Element-wise maximum operation
 pub fn maximum(builder: *MLIRBuilder, a: Tensor, b: Tensor) !Tensor {
     const b_tensors = try broadcastTensors(builder, a, b);
-    
-    // Use StableHLO dialect wrapper
-    const operation = hlo.maximum(builder.ctx, b_tensors[0].value, b_tensors[1].value, builder.loc);
-
-    // MUST use the helper that appends the operation
+    const operation = try hlo.maximum(builder.allocator, builder.ctx, b_tensors[0].value, b_tensors[1].value, builder.loc);
     return try builder.createAndAppendOp(operation);
 }
 
 /// Element-wise minimum operation
 pub fn minimum(builder: *MLIRBuilder, a: Tensor, b: Tensor) !Tensor {
     const b_tensors = try broadcastTensors(builder, a, b);
-    
-    // Use StableHLO dialect wrapper
-    const operation = hlo.minimum(builder.ctx, b_tensors[0].value, b_tensors[1].value, builder.loc);
-
-    // MUST use the helper that appends the operation
+    const operation = try hlo.minimum(builder.allocator, builder.ctx, b_tensors[0].value, b_tensors[1].value, builder.loc);
     return try builder.createAndAppendOp(operation);
 }
 
@@ -543,9 +540,7 @@ pub fn softmax(builder: *MLIRBuilder, a: Tensor) !Tensor {
 
 /// Element-wise exponential
 pub fn exp(builder: *MLIRBuilder, a: Tensor) !Tensor {
-    // Use StableHLO dialect wrapper
-    const operation = hlo.exponential(builder.ctx, a.value, builder.loc);
-
+    const operation = try hlo.exponential(builder.allocator, builder.ctx, a.value, builder.loc);
     return try builder.createAndAppendOp(operation);
 }
 
@@ -624,9 +619,7 @@ pub fn reduceSum(builder: *MLIRBuilder, a: Tensor, dimensions: []const i64, keep
 
 /// Element-wise reciprocal square root (1/sqrt(x))
 pub fn rsqrt(builder: *MLIRBuilder, a: Tensor) !Tensor {
-    // Use StableHLO dialect wrapper
-    const operation = hlo.rsqrt(builder.ctx, a.value, builder.loc);
-
+    const operation = try hlo.rsqrt(builder.allocator, builder.ctx, a.value, builder.loc);
     return try builder.createAndAppendOp(operation);
 }
 
@@ -687,9 +680,7 @@ pub fn select(builder: *MLIRBuilder, pred: Tensor, on_true: Tensor, on_false: Te
 
 /// Element-wise tanh operation
 pub fn tanh(builder: *MLIRBuilder, a: Tensor) !Tensor {
-    // Use StableHLO dialect wrapper
-    const operation = hlo.tanh(builder.ctx, a.value, builder.loc);
-
+    const operation = try hlo.tanh(builder.allocator, builder.ctx, a.value, builder.loc);
     return try builder.createAndAppendOp(operation);
 }
 
@@ -707,9 +698,7 @@ pub fn silu(builder: *MLIRBuilder, a: Tensor) !Tensor {
 
 /// Element-wise natural logarithm
 pub fn log(builder: *MLIRBuilder, a: Tensor) !Tensor {
-    // Use StableHLO dialect wrapper
-    const operation = hlo.log(builder.ctx, a.value, builder.loc);
-
+    const operation = try hlo.log(builder.allocator, builder.ctx, a.value, builder.loc);
     return try builder.createAndAppendOp(operation);
 }
 

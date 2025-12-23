@@ -9,9 +9,15 @@ from pathlib import Path
 
 import torch
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
-if str(REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(REPO_ROOT))
+NANOCHAT_ROOT = None
+for parent in Path(__file__).resolve().parents:
+    if (parent / "nanochat" / "gpt.py").exists():
+        NANOCHAT_ROOT = parent
+        break
+if NANOCHAT_ROOT is None:
+    raise SystemExit("Could not locate nanochat repo root (expected nanochat/gpt.py).")
+if str(NANOCHAT_ROOT) not in sys.path:
+    sys.path.insert(0, str(NANOCHAT_ROOT))
 
 from nanochat.gpt import GPT, GPTConfig
 
@@ -111,7 +117,7 @@ def build_model_and_inputs():
 
 
 def run_generate_nanochat(output_path):
-    script = REPO_ROOT / "pcp" / "tools" / "generate_nanochat.py"
+    script = NANOCHAT_ROOT / "pcp" / "tools" / "generate_nanochat.py"
     cmd = [
         sys.executable,
         str(script),

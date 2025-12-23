@@ -328,6 +328,10 @@ fn addIreeDependencies(target: *std.Build.Step.Compile, b: *std.Build, iree_conf
     dialect_anchors_lib.addIncludePath(.{ .cwd_relative = b.fmt("{s}/third_party/stablehlo", .{source_dir}) });
     dialect_anchors_lib.addIncludePath(.{ .cwd_relative = b.fmt("{s}/llvm-external-projects/stablehlo", .{build_dir}) });
 
+    // Ensure Zig's C++ compilation can find the C++ standard library headers
+    // (e.g. <type_traits>) inside the Nix sandbox.
+    dialect_anchors_lib.linkLibCpp();
+
     target.linkLibrary(dialect_anchors_lib);
     target.step.dependOn(&dialect_anchors_lib.step);
 
@@ -589,6 +593,10 @@ pub fn build(b: *std.Build) void {
         }
         // Note: Don't link capnp/kj here - static libraries should only contain object files.
         // The final executable (pcp) will link these libraries.
+
+        // Ensure Zig's C++ compilation can find the C++ standard library headers
+        // (e.g. <type_traits>) inside the Nix sandbox.
+        capnp_bridge_lib.linkLibCpp();
 
         // Add include paths for the main executable
         pcp.addIncludePath(b.path("src/network"));

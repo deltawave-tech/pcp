@@ -5,14 +5,25 @@ from pathlib import Path
 import torch
 import torch.nn.functional as F
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
-if str(REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(REPO_ROOT))
+NANOCHAT_ROOT = None
+for parent in Path(__file__).resolve().parents:
+    if (parent / "nanochat" / "gpt.py").exists():
+        NANOCHAT_ROOT = parent
+        break
+if NANOCHAT_ROOT is None:
+    raise SystemExit("Could not locate nanochat repo root (expected nanochat/gpt.py).")
+if str(NANOCHAT_ROOT) not in sys.path:
+    sys.path.insert(0, str(NANOCHAT_ROOT))
 
 from nanochat.gpt import norm, scaled_dot_product_attention
 
 
 def assert_close(actual, expected, label, atol=1e-5, rtol=1e-5):
+    if torch.isnan(actual).any() or torch.isnan(expected).any():
+        raise SystemExit(
+            f"{label} produced NaNs (actual_nan={torch.isnan(actual).any().item()} "
+            f"expected_nan={torch.isnan(expected).any().item()})"
+        )
     diff = (actual - expected).abs().max().item()
     ref = expected.abs().max().item()
     print(f"{label}: max_diff={diff} ref_max={ref} tol={atol + rtol * ref}")
@@ -57,7 +68,8 @@ def test_sdpa():
         f"q={tuple(q.shape)} k={tuple(k.shape)} v={tuple(v.shape)} "
         f"dtype={q.dtype} device={q.device}"
     )
-    attn_mask = torch.zeros((3, 5), dtype=torch.bool)
+    # PyTorch SDPA bool masks use True="keep"/False="mask out".
+    attn_mask = torch.ones((3, 5), dtype=torch.bool)
     attn_mask[0, 4] = True
 
     out = scaled_dot_product_attention(

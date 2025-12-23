@@ -233,6 +233,69 @@ pub fn divideVJP(
     return slice;
 }
 
+/// VJP rule for power: d(a^b)/da = grad_out * b * a^(b-1)
+/// NOTE: We currently treat the exponent `b` as non-differentiable and return a zero grad for it.
+pub fn powerVJP(
+    builder: *MLIRBuilder,
+    original_op: mlir.Operation,
+    primals: []const mlir.Value,
+    adjoints: []const mlir.Value,
+) ![]mlir.Value {
+    const grad_out_raw = adjoints[0];
+    const base = primals[0];
+    const exp = primals[1];
+
+    const result_type = original_op.getResult(0).getType();
+    const result_ranked_type = result_type.as(mlir.RankedTensorType) orelse return error.InvalidTensorType;
+    const result_shape = try result_ranked_type.getShape(builder.allocator);
+    defer builder.allocator.free(result_shape);
+    const result_elem_type = result_ranked_type.getElementType();
+
+    const grad_out_type = grad_out_raw.getType().as(mlir.RankedTensorType) orelse return error.InvalidTensorType;
+    const grad_out_shape = try grad_out_type.getShape(builder.allocator);
+    defer builder.allocator.free(grad_out_shape);
+
+    var grad_out = grad_out_raw;
+    if (!std.mem.eql(i64, result_shape, grad_out_shape)) {
+        const reshape_op = try builder.createAndAttach("stablehlo.reshape", &.{grad_out_raw}, &.{result_type}, .{});
+        grad_out = reshape_op.getResult(0);
+    }
+
+    var result = std.ArrayList(mlir.Value).init(builder.allocator);
+    defer result.deinit();
+
+    const one_tensor = try ops.constant(builder, 1.0, result_shape, result_elem_type);
+    const exp_minus_1 = try builder.createAndAttach("stablehlo.subtract", &.{ exp, one_tensor.value }, &.{exp.getType()}, .{});
+    const pow_op = try builder.createAndAttach("stablehlo.power", &.{ base, exp_minus_1.getResult(0) }, &.{result_type}, .{});
+
+    const exp_times_pow_broadcast = try ops.broadcastOperands(builder, exp, pow_op.getResult(0));
+    defer builder.allocator.free(exp_times_pow_broadcast.shape);
+    const exp_times_pow_type = exp_times_pow_broadcast.lhs.getType();
+    const exp_times_pow = try builder.createAndAttach(
+        "stablehlo.multiply",
+        &.{ exp_times_pow_broadcast.lhs, exp_times_pow_broadcast.rhs },
+        &.{exp_times_pow_type},
+        .{},
+    );
+
+    const grad_base_broadcast = try ops.broadcastOperands(builder, grad_out, exp_times_pow.getResult(0));
+    defer builder.allocator.free(grad_base_broadcast.shape);
+    const grad_base_type = grad_base_broadcast.lhs.getType();
+    const grad_base_raw = try builder.createAndAttach(
+        "stablehlo.multiply",
+        &.{ grad_base_broadcast.lhs, grad_base_broadcast.rhs },
+        &.{grad_base_type},
+        .{},
+    );
+    const grad_base = try ops.reduceGradient(builder, grad_base_raw.getResult(0), base);
+    try result.append(grad_base);
+
+    const exp_zero_tensor = try ops.constant(builder, 0.0, result_shape, result_elem_type);
+    try result.append(exp_zero_tensor.value);
+
+    return result.toOwnedSlice();
+}
+
 /// VJP rule for negation: da = -grad_out
 pub fn negateVJP(
     builder: *MLIRBuilder,
@@ -1089,7 +1152,7 @@ pub fn concatenateVJP(
         defer builder.allocator.free(start_indices);
         var limit_indices = try builder.allocator.alloc(i64, rank);
         defer builder.allocator.free(limit_indices);
-        var strides = try builder.allocator.alloc(i64, rank);
+        const strides = try builder.allocator.alloc(i64, rank);
         defer builder.allocator.free(strides);
 
         @memset(strides, 1);

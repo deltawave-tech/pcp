@@ -82,7 +82,8 @@ nix profile add github:deltawave-tech/pcp
 
 ### 3. Set Up Python Environment (only needed on Shepherd node)
 
-PCP requires Python dependencies for WandB tracking:
+PCP requires Python dependencies for WandB tracking. Python 3.10+ is required
+(torch-mlir wheels are not available for 3.9):
 
 ```shell
 # Create virtual environment
@@ -195,6 +196,50 @@ nix develop
 
 Nix will drop you into a shell with all required dependencies. You should now be able to compile the
 project using `zig build`.
+
+### Optional: Installation troubleshooting
+
+If `cachix use pcp` reports permission errors or "untrusted substituter", you are likely using
+multi-user Nix. Either run it via your user-installed binary:
+
+```shell
+sudo $(command -v cachix) use pcp
+```
+
+Or add yourself as a trusted user and restart the daemon:
+
+```shell
+echo "trusted-users = root $USER" | sudo tee -a /etc/nix/nix.conf
+sudo pkill nix-daemon
+cachix use pcp
+```
+
+If `python3 -m venv venv` fails with "ensurepip is not available", install the venv package and
+recreate the environment:
+
+```shell
+sudo apt-get install -y python3-venv
+rm -rf venv
+python3 -m venv venv
+```
+
+If `pip install -r requirements.txt` fails with "No matching distribution found for torch-mlir",
+use Python 3.10+ or build torch-mlir from source.
+
+If you see missing shared library errors under Nix, you may need to export the
+GCC runtime path. Example from our setup (adjust for your system):
+
+```shell
+export LD_LIBRARY_PATH=/nix/store/cf1a53iqg6ncnygl698c4v0l8qam5a2q-gcc-14.3.0-lib/lib:$LD_LIBRARY_PATH
+```
+
+If you need to generate nanochat artifacts, activate the venv and run the tool
+(adjust paths if your repo lives elsewhere):
+
+```shell
+source /home/ahmet/project/nanochat/pcp/venv/bin/activate
+python /home/ahmet/project/nanochat/pcp/tools/generate_nanochat.py --dump-fx
+```
 
 ## Building the Project manually (without Nix)
 

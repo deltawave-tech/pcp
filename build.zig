@@ -666,7 +666,7 @@ pub fn build(b: *std.Build) void {
     addIreeDependencies(isolated_vjp_tests, b, iree_config); // REFACTORED
 
     // Install the test executable
-    //b.installArtifact(isolated_vjp_tests);
+    b.installArtifact(isolated_vjp_tests);
 
     // Run step for isolated VJP tests
     const run_isolated_vjp_tests_cmd = b.addRunArtifact(isolated_vjp_tests);

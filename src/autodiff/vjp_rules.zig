@@ -804,6 +804,58 @@ pub fn cosVJP(
     return result.toOwnedSlice();
 }
 
+/// VJP rule for logistic (sigmoid): d(sigmoid(x)) = sigmoid(x) * (1 - sigmoid(x)) * dx
+pub fn logisticVJP(
+    builder: *MLIRBuilder,
+    _: mlir.Operation,
+    primals: []const mlir.Value,
+    adjoints: []const mlir.Value,
+) ![]mlir.Value {
+    const grad_out_raw = adjoints[0];
+    const x = primals[0];
+
+    // Recompute sigmoid(x) in the gradient function instead of reusing forward result
+    const sigmoid_x_op = try builder.createAndAttach("stablehlo.logistic", &.{x}, &.{x.getType()}, .{});
+    const primal_out = sigmoid_x_op.getResult(0);
+
+    const result_type = primal_out.getType();
+    const result_ranked_type = result_type.as(mlir.RankedTensorType) orelse return error.InvalidTensorType;
+    const result_shape = try result_ranked_type.getShape(builder.allocator);
+    defer builder.allocator.free(result_shape);
+
+    const grad_out_type = grad_out_raw.getType().as(mlir.RankedTensorType) orelse return error.InvalidTensorType;
+    const grad_out_shape = try grad_out_type.getShape(builder.allocator);
+    defer builder.allocator.free(grad_out_shape);
+
+    var grad_out = grad_out_raw;
+    if (!std.mem.eql(i64, result_shape, grad_out_shape)) {
+        const reshape_op = try builder.createAndAttach("stablehlo.reshape", &.{grad_out_raw}, &.{result_type}, .{});
+        grad_out = reshape_op.getResult(0);
+    }
+
+    var result = std.ArrayList(mlir.Value).init(builder.allocator);
+    defer result.deinit();
+
+    const out_tensor = try builder.newTensor(primal_out);
+    const grad_tensor = try builder.newTensor(grad_out);
+
+    // 1 - sigmoid(x)
+    const element_type = result_ranked_type.getElementType();
+    const one = try ops.constant(builder, 1.0, result_shape, element_type);
+    const one_minus_sig = try ops.subtract(builder, one, out_tensor);
+
+    // sigmoid(x) * (1 - sigmoid(x))
+    const sigmoid_grad = try ops.multiply(builder, out_tensor, one_minus_sig);
+
+    // grad_out * sigmoid_grad
+    const grad_x_raw = try ops.multiply(builder, grad_tensor, sigmoid_grad);
+
+    const grad_x = try ops.reduceGradient(builder, grad_x_raw.value, x);
+    try result.append(grad_x);
+
+    return result.toOwnedSlice();
+}
+
 /// VJP rule for concatenate: gradient flows back via slicing
 pub fn concatenateVJP(
     builder: *MLIRBuilder,

@@ -439,7 +439,7 @@ pub fn matmul(builder: *MLIRBuilder, a: Tensor, b: Tensor) !Tensor {
     }
 
     // Use StableHLO dialect wrapper
-    const operation = hlo.dot_general(builder.ctx, a.value, b.value, .{
+    const operation = try hlo.dot_general(builder.allocator, builder.ctx, a.value, b.value, .{
         .dot_dimension_numbers = dot_dims,
     });
 
@@ -473,7 +473,7 @@ pub fn transpose(builder: *MLIRBuilder, a: Tensor, permutation: []const i64) !Te
     }
 
     // Use StableHLO dialect wrapper
-    const operation = hlo.transpose(builder.ctx, a.value, permutation, builder.loc);
+    const operation = try hlo.transpose(builder.allocator, builder.ctx, a.value, permutation, builder.loc);
 
     // MUST use the helper that appends the operation
     return try builder.createAndAppendOp(operation);
@@ -691,6 +691,18 @@ pub fn tanh(builder: *MLIRBuilder, a: Tensor) !Tensor {
     const operation = hlo.tanh(builder.ctx, a.value, builder.loc);
 
     return try builder.createAndAppendOp(operation);
+}
+
+/// Sigmoid activation: 1 / (1 + exp(-x))
+pub fn sigmoid(builder: *MLIRBuilder, a: Tensor) !Tensor {
+    const operation = try hlo.logistic(builder.allocator, builder.ctx, a.value, builder.loc);
+    return try builder.createAndAppendOp(operation);
+}
+
+/// SiLU (Swish) activation: x * sigmoid(x)
+pub fn silu(builder: *MLIRBuilder, a: Tensor) !Tensor {
+    const sig = try sigmoid(builder, a);
+    return try multiply(builder, a, sig);
 }
 
 /// Element-wise natural logarithm

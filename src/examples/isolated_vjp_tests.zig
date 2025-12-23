@@ -60,7 +60,7 @@ pub const ExecutionHelper = struct {
         const vmfb_binary = try mlir_context.compileToVMFB(self.allocator, mlir_source, backend.toIreeCompilationTarget(), null);
         defer self.allocator.free(vmfb_binary);
 
-        var iree_backend = try IreeBackend.init(self.allocator, backend);
+        var iree_backend = try IreeBackend.init(self.allocator, backend, 0);
         defer iree_backend.deinit();
 
         // This is the call that was previously causing the NOT_FOUND error.
@@ -88,7 +88,7 @@ pub fn testMultiplyVJP(allocator: Allocator) !void {
     // -- Create forward function: `func.func @forward_mul(...)` --
     const f32_type = mlir.Type.f32Type(context);
     const scalar_type = mlir.Type.rankedTensorType(context, &.{}, f32_type);
-    const func_type = mlir.Type.functionType(context, &.{scalar_type, scalar_type}, &.{scalar_type});
+    const func_type = try mlir.Type.functionType(allocator, context, &.{scalar_type, scalar_type}, &.{scalar_type});
     
     const fwd_result = try builder.createFunction("forward_mul", func_type);
     builder.setInsertionBlock(fwd_result.entry_block);
@@ -169,7 +169,7 @@ pub fn testAddVJP(allocator: Allocator) !void {
     // 1. Build Module
     const f32_type = mlir.Type.f32Type(context);
     const scalar_type = mlir.Type.rankedTensorType(context, &.{}, f32_type);
-    const func_type = mlir.Type.functionType(context, &.{scalar_type, scalar_type}, &.{scalar_type});
+    const func_type = try mlir.Type.functionType(allocator, context, &.{scalar_type, scalar_type}, &.{scalar_type});
     
     const fwd_result = try builder.createFunction("forward_add", func_type);
     builder.setInsertionBlock(fwd_result.entry_block);
@@ -241,7 +241,7 @@ pub fn testSubtractVJP(allocator: Allocator) !void {
     // 1. Build Module
     const f32_type = mlir.Type.f32Type(context);
     const scalar_type = mlir.Type.rankedTensorType(context, &.{}, f32_type);
-    const func_type = mlir.Type.functionType(context, &.{scalar_type, scalar_type}, &.{scalar_type});
+    const func_type = try mlir.Type.functionType(allocator, context, &.{scalar_type, scalar_type}, &.{scalar_type});
     
     const fwd_result = try builder.createFunction("forward_subtract", func_type);
     builder.setInsertionBlock(fwd_result.entry_block);
@@ -313,7 +313,7 @@ pub fn testDivideVJP(allocator: Allocator) !void {
     // 1. Build Module
     const f32_type = mlir.Type.f32Type(context);
     const scalar_type = mlir.Type.rankedTensorType(context, &.{}, f32_type);
-    const func_type = mlir.Type.functionType(context, &.{scalar_type, scalar_type}, &.{scalar_type});
+    const func_type = try mlir.Type.functionType(allocator, context, &.{scalar_type, scalar_type}, &.{scalar_type});
     
     const fwd_result = try builder.createFunction("forward_divide", func_type);
     builder.setInsertionBlock(fwd_result.entry_block);
@@ -387,7 +387,7 @@ pub fn testMatmulVJP(allocator: Allocator) !void {
     // 1. Build the MLIR module with forward and grad functions
     const f32_type = mlir.Type.f32Type(context);
     const matrix_type = mlir.Type.rankedTensorType(context, &.{2, 2}, f32_type);
-    const func_type = mlir.Type.functionType(context, &.{matrix_type, matrix_type}, &.{matrix_type});
+    const func_type = try mlir.Type.functionType(allocator, context, &.{matrix_type, matrix_type}, &.{matrix_type});
     
     const fwd_result = try builder.createFunction("forward_matmul", func_type);
     builder.setInsertionBlock(fwd_result.entry_block);
@@ -473,7 +473,7 @@ pub fn testTransposeVJP(allocator: Allocator) !void {
     const f32_type = mlir.Type.f32Type(context);
     const matrix_type = mlir.Type.rankedTensorType(context, &.{2, 3}, f32_type); // Use a non-square matrix
     const transposed_type = mlir.Type.rankedTensorType(context, &.{3, 2}, f32_type);
-    const func_type = mlir.Type.functionType(context, &.{matrix_type}, &.{transposed_type});
+    const func_type = try mlir.Type.functionType(allocator, context, &.{matrix_type}, &.{transposed_type});
     
     const fwd_result = try builder.createFunction("forward_transpose", func_type);
     builder.setInsertionBlock(fwd_result.entry_block);
@@ -544,7 +544,7 @@ pub fn testReshapeVJP(allocator: Allocator) !void {
     const f32_type = mlir.Type.f32Type(context);
     const input_type = mlir.Type.rankedTensorType(context, &.{2, 3}, f32_type);
     const output_type = mlir.Type.rankedTensorType(context, &.{6}, f32_type);
-    const func_type = mlir.Type.functionType(context, &.{input_type}, &.{output_type});
+    const func_type = try mlir.Type.functionType(allocator, context, &.{input_type}, &.{output_type});
     
     const fwd_result = try builder.createFunction("forward_reshape", func_type);
     builder.setInsertionBlock(fwd_result.entry_block);
@@ -615,7 +615,7 @@ pub fn testReduceSumVJP(allocator: Allocator) !void {
     const f32_type = mlir.Type.f32Type(context);
     const input_type = mlir.Type.rankedTensorType(context, &.{2, 3}, f32_type);
     const output_type = mlir.Type.rankedTensorType(context, &.{}, f32_type); // Scalar
-    const func_type = mlir.Type.functionType(context, &.{input_type}, &.{output_type});
+    const func_type = try mlir.Type.functionType(allocator, context, &.{input_type}, &.{output_type});
     
     const fwd_result = try builder.createFunction("forward_reducesum", func_type);
     builder.setInsertionBlock(fwd_result.entry_block);
@@ -682,7 +682,7 @@ pub fn testExpVJP(allocator: Allocator) !void {
     // Build Module
     const f32_type = mlir.Type.f32Type(context);
     const scalar_type = mlir.Type.rankedTensorType(context, &.{}, f32_type);
-    const func_type = mlir.Type.functionType(context, &.{scalar_type}, &.{scalar_type});
+    const func_type = try mlir.Type.functionType(allocator, context, &.{scalar_type}, &.{scalar_type});
 
     const fwd_result = try builder.createFunction("forward_exp", func_type);
     builder.setInsertionBlock(fwd_result.entry_block);
@@ -731,7 +731,7 @@ pub fn testLogVJP(allocator: Allocator) !void {
 
     const f32_type = mlir.Type.f32Type(context);
     const scalar_type = mlir.Type.rankedTensorType(context, &.{}, f32_type);
-    const func_type = mlir.Type.functionType(context, &.{scalar_type}, &.{scalar_type});
+    const func_type = try mlir.Type.functionType(allocator, context, &.{scalar_type}, &.{scalar_type});
 
     const fwd_result = try builder.createFunction("forward_log", func_type);
     builder.setInsertionBlock(fwd_result.entry_block);
@@ -767,7 +767,7 @@ pub fn testRsqrtVJP(allocator: Allocator) !void {
 
     const f32_type = mlir.Type.f32Type(context);
     const scalar_type = mlir.Type.rankedTensorType(context, &.{}, f32_type);
-    const func_type = mlir.Type.functionType(context, &.{scalar_type}, &.{scalar_type});
+    const func_type = try mlir.Type.functionType(allocator, context, &.{scalar_type}, &.{scalar_type});
 
     const fwd_result = try builder.createFunction("forward_rsqrt", func_type);
     builder.setInsertionBlock(fwd_result.entry_block);
@@ -809,7 +809,7 @@ pub fn testSelectVJP(allocator: Allocator) !void {
     const tensor_f32 = mlir.Type.rankedTensorType(context, &.{2}, f32_type);
     const tensor_i1 = mlir.Type.rankedTensorType(context, &.{2}, i1_type);
 
-    const func_type = mlir.Type.functionType(context, &.{tensor_i1, tensor_f32, tensor_f32}, &.{tensor_f32});
+    const func_type = try mlir.Type.functionType(allocator, context, &.{tensor_i1, tensor_f32, tensor_f32}, &.{tensor_f32});
 
     const fwd_result = try builder.createFunction("forward_select", func_type);
     builder.setInsertionBlock(fwd_result.entry_block);
@@ -933,6 +933,80 @@ pub fn testCosVJP(allocator: Allocator) !void {
     std.debug.print("✓ cosVJP verified: f'(1.0) = {d:.5}\n", .{grad_x});
 }
 
+/// Test siluVJP: f(x) = x * sigmoid(x)
+/// Mathematical verification at x = 1.0:
+/// sigmoid(1.0) ≈ 0.7310586
+/// f(1.0) = 1.0 * 0.7310586 ≈ 0.7310586
+/// f'(x) = sigmoid(x) + x * sigmoid(x) * (1 - sigmoid(x))
+/// f'(1.0) = 0.7310586 + 1.0 * 0.7310586 * (1 - 0.7310586)
+/// f'(1.0) = 0.7310586 + 0.1966119 ≈ 0.9276705
+pub fn testSiluVJP(allocator: Allocator) !void {
+    std.debug.print("\n=== Testing SiLU (x * sigmoid(x)) Isolated Execution ===\n", .{});
+
+    try initGlobalMLIRContext(allocator);
+    const context = global_mlir_context.?.getContext();
+    var helper = ExecutionHelper{.allocator = allocator};
+    var builder = try MLIRBuilder.init(allocator, context);
+    defer builder.deinit();
+
+    // 1. Build the MLIR module
+    const f32_type = mlir.Type.f32Type(context);
+    const scalar_type = mlir.Type.rankedTensorType(context, &.{}, f32_type);
+    const func_type = try mlir.Type.functionType(allocator, context, &.{scalar_type}, &.{scalar_type});
+
+    const fwd_result = try builder.createFunction("forward_silu", func_type);
+    builder.setInsertionBlock(fwd_result.entry_block);
+
+    const x_tensor = try builder.newTensor(fwd_result.entry_block.getArgument(0));
+
+    // SiLU implementation: x * sigmoid(x)
+    const result = try ops.silu(&builder, x_tensor);
+
+    _ = try builder.createAndAttach("func.return", &.{result.value}, &.{}, .{});
+
+    // 2. Generate the gradient function
+    _ = try autodiff.buildGradientGraph(allocator, &builder, fwd_result.func_op);
+
+    // 3. Test the FORWARD pass
+    std.debug.print("--- Verifying SiLU Forward Pass ---\n", .{});
+    {
+        const input_x = [_]f32{1.0};
+        var inputs_bytes = [_][]const u8{ std.mem.sliceAsBytes(&input_x) };
+        var shapes = [_][]const i64{ &[_]i64{} };
+
+        const outputs = try helper.executeModule(builder.module, "forward_silu", &inputs_bytes, &shapes, null);
+        defer { for(outputs) |o| allocator.free(o); allocator.free(outputs); }
+
+        const forward_result: f32 = @bitCast(std.mem.readInt(u32, outputs[0][0..4], .little));
+        try std.testing.expectApproxEqAbs(0.7310586, forward_result, 1e-5);
+        std.debug.print("✓ SiLU forward pass verified: f(1.0) = {d:.5}\n", .{forward_result});
+    }
+
+    // 4. Test the BACKWARD pass
+    std.debug.print("--- Verifying SiLU Backward Pass ---\n", .{});
+    {
+        const primal_x = [_]f32{1.0};
+        const grad_out = [_]f32{1.0};
+
+        var inputs_bytes = [_][]const u8{
+            std.mem.sliceAsBytes(&primal_x),
+            std.mem.sliceAsBytes(&grad_out),
+        };
+        var shapes = [_][]const i64{ &[_]i64{}, &[_]i64{} };
+
+        const grad_outputs = try helper.executeModule(builder.module, "forward_silu_grad", &inputs_bytes, &shapes, null);
+        defer { for(grad_outputs) |o| allocator.free(o); allocator.free(grad_outputs); }
+
+        const grad_x: f32 = @bitCast(std.mem.readInt(u32, grad_outputs[0][0..4], .little));
+
+        std.debug.print("Gradient: df/dx = {d:.5} (Expected: ~0.92767)\n", .{grad_x});
+        try std.testing.expectApproxEqAbs(0.9276705, grad_x, 1e-5);
+        std.debug.print("✓ SiLU gradient verification passed!\n", .{});
+    }
+
+    std.debug.print("✓ siluVJP isolated test PASSED\n", .{});
+}
+
 /// Test RoPE rotation component VJP
 pub fn testRoPEComponentVJP(allocator: Allocator) !void {
     std.debug.print("\n=== Testing RoPE Rotation Logic VJP ===\n", .{});
@@ -968,7 +1042,7 @@ pub fn testRoPEComponentVJP(allocator: Allocator) !void {
     const y2 = try ops.add(&builder, term3, term4);
 
     const hlo = @import("../mlir/dialects/stablehlo.zig");
-    const concat_op = hlo.concatenate(context, &.{y1.value, y2.value}, 0, builder.loc);
+    const concat_op = try hlo.concatenate(allocator, context, &.{y1.value, y2.value}, 0, builder.loc);
     builder.insertion_block.appendOwnedOperation(concat_op);
 
     _ = try builder.createAndAttach("func.return", &.{concat_op.getResult(0)}, &.{}, .{});
@@ -1023,7 +1097,7 @@ pub fn testConcatenateVJP(allocator: Allocator) !void {
     const val_b = fwd_result.entry_block.getArgument(1);
 
     const hlo = @import("../mlir/dialects/stablehlo.zig");
-    const concat_op = hlo.concatenate(context, &.{val_a, val_b}, 0, builder.loc);
+    const concat_op = try hlo.concatenate(allocator, context, &.{val_a, val_b}, 0, builder.loc);
     builder.insertion_block.appendOwnedOperation(concat_op);
 
     _ = try builder.createAndAttach("func.return", &.{concat_op.getResult(0)}, &.{}, .{});
@@ -1075,7 +1149,7 @@ pub fn testChainRule(allocator: Allocator) !void {
     const scalar_type = mlir.Type.rankedTensorType(context, &.{}, f32_type); // Scalar tensor
     
     // Create function type: (scalar, scalar, scalar) -> scalar
-    const func_type = mlir.Type.functionType(context, &.{scalar_type, scalar_type, scalar_type}, &.{scalar_type});
+    const func_type = try mlir.Type.functionType(allocator, context, &.{scalar_type, scalar_type, scalar_type}, &.{scalar_type});
     const forward_fn_result = try builder.createFunction("forward_chain", func_type);
     const forward_fn = forward_fn_result.func_op;
     const func_block = forward_fn_result.entry_block;
@@ -1101,7 +1175,7 @@ pub fn testChainRule(allocator: Allocator) !void {
     const result = try ops.add(&builder, intermediate, b_tensor);
     
     // Create return operation
-    const return_op = mlir.Operation.create(context, "func.return", .{
+    const return_op = try mlir.Operation.create(allocator, context, "func.return", .{
         .operands = &.{result.value},
         .location = builder.loc,
     });
@@ -1248,6 +1322,7 @@ pub fn main() !void {
     // TRIG AND ROPE TESTS
     try testSinVJP(allocator);
     try testCosVJP(allocator);
+    try testSiluVJP(allocator);
     try testRoPEComponentVJP(allocator);
     try testConcatenateVJP(allocator);
 

@@ -401,7 +401,7 @@ pub fn select(allocator: std.mem.Allocator, ctx: mlir.Context, pred: mlir.Value,
 }
 
 /// Creates a stablehlo.transpose operation
-pub fn transpose(ctx: mlir.Context, operand: mlir.Value, permutation: []const i64, loc: mlir.Location) mlir.Operation {
+pub fn transpose(allocator: std.mem.Allocator, ctx: mlir.Context, operand: mlir.Value, permutation: []const i64, loc: mlir.Location) !mlir.Operation {
     const perm_attr = mlir.Attribute.denseI64ArrayAttr(ctx, permutation);
     
     // Calculate result type with transposed dimensions
@@ -415,8 +415,8 @@ pub fn transpose(ctx: mlir.Context, operand: mlir.Value, permutation: []const i6
     }
     
     const result_type = mlir.Type.tensor(result_dims.items, input_type.getElementType());
-    
-    return mlir.Operation.create(ctx, "stablehlo.transpose", .{
+
+    return mlir.Operation.create(allocator, ctx, "stablehlo.transpose", .{
         .operands = &.{operand},
         .results = &.{result_type},
         .attributes = &.{.{ "permutation", perm_attr }},
@@ -570,7 +570,7 @@ pub fn broadcast_in_dim(allocator: std.mem.Allocator, ctx: mlir.Context, operand
 }
 
 /// Creates a stablehlo.concatenate operation
-pub fn concatenate(ctx: mlir.Context, operands: []const mlir.Value, dimension: i64, loc: mlir.Location) mlir.Operation {
+pub fn concatenate(allocator: std.mem.Allocator, ctx: mlir.Context, operands: []const mlir.Value, dimension: i64, loc: mlir.Location) !mlir.Operation {
     // All operands should have the same type except for the concatenation dimension
     const first_type = operands[0].getType().as(mlir.RankedTensorType).?;
     
@@ -593,16 +593,8 @@ pub fn concatenate(ctx: mlir.Context, operands: []const mlir.Value, dimension: i
     
     const result_type = mlir.Type.tensor(result_dims.items, first_type.getElementType());
     const dimension_attr = mlir.Attribute.integerAttr(ctx, dimension, mlir.Type.i64Type(ctx));
-    
-    // Convert []const mlir.Value to [*]*c.c.MlirValue for C API
-    var c_operands = std.ArrayList(*c.c.MlirValue).init(std.heap.page_allocator);
-    defer c_operands.deinit();
-    
-    for (operands) |operand| {
-        c_operands.append(operand.handle) catch @panic("OOM");
-    }
-    
-    return mlir.Operation.create(ctx, "stablehlo.concatenate", .{
+
+    return mlir.Operation.create(allocator, ctx, "stablehlo.concatenate", .{
         .operands = operands,
         .results = &.{result_type},
         .attributes = &.{.{ "dimension", dimension_attr }},
@@ -743,6 +735,15 @@ pub fn power(allocator: std.mem.Allocator, ctx: mlir.Context, lhs: mlir.Value, r
 /// Creates a stablehlo.tanh operation
 pub fn tanh(ctx: mlir.Context, operand: mlir.Value, loc: mlir.Location) mlir.Operation {
     return mlir.Operation.create(ctx, "stablehlo.tanh", .{
+        .operands = &.{operand},
+        .results = &.{operand.getType()},
+        .location = loc,
+    });
+}
+
+/// Creates a stablehlo.logistic operation (Sigmoid: 1 / (1 + exp(-x)))
+pub fn logistic(allocator: std.mem.Allocator, ctx: mlir.Context, operand: mlir.Value, loc: mlir.Location) !mlir.Operation {
+    return mlir.Operation.create(allocator, ctx, "stablehlo.logistic", .{
         .operands = &.{operand},
         .results = &.{operand.getType()},
         .location = loc,

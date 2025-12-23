@@ -1,6 +1,7 @@
 torch==2.3.0
 -f https://github.com/llvm/torch-mlir-release/releases/expanded_assets/dev-wheels
 torch-mlir
+ml_dtypes
 wandb>=0.16.0
 transformers
 accelerate

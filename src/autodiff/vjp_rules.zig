@@ -1337,6 +1337,132 @@ pub fn sliceVJP(
     return result.toOwnedSlice();
 }
 
+fn inferConcatDimension(
+    builder: *MLIRBuilder,
+    original_op: mlir.Operation,
+    primals: []const mlir.Value,
+) !i64 {
+    const result_type = original_op.getResult(0).getType().as(mlir.RankedTensorType) orelse return error.InvalidTensorType;
+    const result_shape = try result_type.getShape(builder.allocator);
+    defer builder.allocator.free(result_shape);
+
+    const rank = result_shape.len;
+    if (primals.len == 0) return error.ConcatDimensionNotFound;
+
+    var operand_shapes = std.ArrayList([]i64).init(builder.allocator);
+    defer {
+        for (operand_shapes.items) |shape| {
+            builder.allocator.free(shape);
+        }
+        operand_shapes.deinit();
+    }
+
+    for (primals) |operand| {
+        const operand_type = operand.getType().as(mlir.RankedTensorType) orelse return error.InvalidTensorType;
+        const operand_shape = try operand_type.getShape(builder.allocator);
+        if (operand_shape.len != rank) return error.InvalidTensorType;
+        try operand_shapes.append(operand_shape);
+    }
+
+    for (0..rank) |i| {
+        var dim_sum: i64 = 0;
+        for (operand_shapes.items) |shape| {
+            dim_sum += shape[i];
+        }
+        if (dim_sum != result_shape[i]) continue;
+
+        var ok = true;
+        for (0..rank) |j| {
+            if (j == i) continue;
+            const expected = result_shape[j];
+            for (operand_shapes.items) |shape| {
+                if (shape[j] != expected) {
+                    ok = false;
+                    break;
+                }
+            }
+            if (!ok) break;
+        }
+
+        if (ok) return @intCast(i);
+    }
+
+    return error.ConcatDimensionNotFound;
+}
+
+/// VJP rule for concatenate: slice the upstream gradient along concat dimension
+pub fn concatenateVJP(
+    builder: *MLIRBuilder,
+    original_op: mlir.Operation,
+    primals: []const mlir.Value,
+    adjoints: []const mlir.Value,
+) ![]mlir.Value {
+    const grad_out_raw = adjoints[0];
+
+    const result_type = original_op.getResult(0).getType();
+    const result_ranked_type = result_type.as(mlir.RankedTensorType) orelse return error.InvalidTensorType;
+    const result_shape = try result_ranked_type.getShape(builder.allocator);
+    defer builder.allocator.free(result_shape);
+
+    const grad_out_type = grad_out_raw.getType().as(mlir.RankedTensorType) orelse return error.InvalidTensorType;
+    const grad_out_shape = try grad_out_type.getShape(builder.allocator);
+    defer builder.allocator.free(grad_out_shape);
+
+    var grad_out = grad_out_raw;
+    if (!std.mem.eql(i64, result_shape, grad_out_shape)) {
+        const reshape_op = try builder.createAndAttach("stablehlo.reshape", &.{grad_out_raw}, &.{result_type}, .{});
+        grad_out = reshape_op.getResult(0);
+    }
+
+    var result = std.ArrayList(mlir.Value).init(builder.allocator);
+    defer result.deinit();
+
+    if (primals.len == 1) {
+        try result.append(grad_out);
+        return result.toOwnedSlice();
+    }
+
+    const concat_dim = try inferConcatDimension(builder, original_op, primals);
+    const rank = result_shape.len;
+    var offset: i64 = 0;
+
+    for (primals) |operand| {
+        const operand_type = operand.getType().as(mlir.RankedTensorType) orelse return error.InvalidTensorType;
+        const operand_shape = try operand_type.getShape(builder.allocator);
+        defer builder.allocator.free(operand_shape);
+
+        var start_indices = try builder.allocator.alloc(i64, rank);
+        defer builder.allocator.free(start_indices);
+        var limit_indices = try builder.allocator.alloc(i64, rank);
+        defer builder.allocator.free(limit_indices);
+        var strides = try builder.allocator.alloc(i64, rank);
+        defer builder.allocator.free(strides);
+
+        @memset(strides, 1);
+        for (0..rank) |i| {
+            start_indices[i] = 0;
+            limit_indices[i] = operand_shape[i];
+        }
+        start_indices[@intCast(concat_dim)] = offset;
+        limit_indices[@intCast(concat_dim)] = offset + operand_shape[@intCast(concat_dim)];
+        offset += operand_shape[@intCast(concat_dim)];
+
+        const slice_op = try hlo.slice(
+            builder.allocator,
+            builder.ctx,
+            grad_out,
+            start_indices,
+            limit_indices,
+            strides,
+            builder.loc,
+        );
+        builder.insertion_block.appendOwnedOperation(slice_op);
+        try result.append(slice_op.getResult(0));
+    }
+
+    return result.toOwnedSlice();
+}
+
 /// VJP rule for broadcast_in_dim: The inverse of broadcasting is to sum the gradients
 /// back into the original, smaller shape.
 pub fn broadcastInDimVJP(
@@ -1495,6 +1621,53 @@ pub fn logVJP(
     const grad_in_raw = try builder.createAndAttach("stablehlo.divide", &.{grad_in_broadcast.lhs, grad_in_broadcast.rhs}, &.{grad_in_type}, .{});
 
     const grad_in = try ops.reduceGradient(builder, grad_in_raw.getResult(0), a);
+    try result.append(grad_in);
+    return result.toOwnedSlice();
+}
+
+/// VJP rule for tanh: da = grad_out * (1 - tanh(a)^2)
+pub fn tanhVJP(
+    builder: *MLIRBuilder,
+    original_op: mlir.Operation,
+    primals: []const mlir.Value,
+    adjoints: []const mlir.Value,
+) ![]mlir.Value {
+    const grad_out_raw = adjoints[0];
+    const a = primals[0];
+
+    const result_type = original_op.getResult(0).getType();
+    const result_ranked_type = result_type.as(mlir.RankedTensorType) orelse return error.InvalidTensorType;
+    const result_shape = try result_ranked_type.getShape(builder.allocator);
+    defer builder.allocator.free(result_shape);
+
+    const grad_out_type = grad_out_raw.getType().as(mlir.RankedTensorType) orelse return error.InvalidTensorType;
+    const grad_out_shape = try grad_out_type.getShape(builder.allocator);
+    defer builder.allocator.free(grad_out_shape);
+
+    var grad_out = grad_out_raw;
+    if (!std.mem.eql(i64, result_shape, grad_out_shape)) {
+        const reshape_op = try builder.createAndAttach("stablehlo.reshape", &.{grad_out_raw}, &.{result_type}, .{});
+        grad_out = reshape_op.getResult(0);
+    }
+
+    var result = std.ArrayList(mlir.Value).init(builder.allocator);
+    defer result.deinit();
+
+    const tanh_op = try builder.createAndAttach("stablehlo.tanh", &.{a}, &.{a.getType()}, .{});
+    const tanh_val = tanh_op.getResult(0);
+    const tanh_sq = try builder.createAndAttach("stablehlo.multiply", &.{tanh_val, tanh_val}, &.{a.getType()}, .{});
+
+    const elem_type = result_ranked_type.getElementType();
+    const one_tensor = try ops.constant(builder, 1.0, result_shape, elem_type);
+    const one_val = one_tensor.value;
+    const one_minus = try builder.createAndAttach("stablehlo.subtract", &.{one_val, tanh_sq.getResult(0)}, &.{one_val.getType()}, .{});
+
+    const grad_broadcast = try ops.broadcastOperands(builder, grad_out, one_minus.getResult(0));
+    defer builder.allocator.free(grad_broadcast.shape);
+    const grad_type = grad_broadcast.lhs.getType();
+    const grad_raw = try builder.createAndAttach("stablehlo.multiply", &.{grad_broadcast.lhs, grad_broadcast.rhs}, &.{grad_type}, .{});
+
+    const grad_in = try ops.reduceGradient(builder, grad_raw.getResult(0), a);
     try result.append(grad_in);
     return result.toOwnedSlice();
 }

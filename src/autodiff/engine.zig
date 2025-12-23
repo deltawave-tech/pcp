@@ -47,12 +47,16 @@ fn getVjpFn(op_name: []const u8) ?VJPFn {
         return vjp_rules.gatherVJP;
     } else if (std.mem.eql(u8, op_name, "stablehlo.slice")) {
         return vjp_rules.sliceVJP;
+    } else if (std.mem.eql(u8, op_name, "stablehlo.concatenate")) {
+        return vjp_rules.concatenateVJP;
     } else if (std.mem.eql(u8, op_name, "stablehlo.broadcast_in_dim")) {
         return vjp_rules.broadcastInDimVJP;
     } else if (std.mem.eql(u8, op_name, "stablehlo.exponential")) {
         return vjp_rules.expVJP;
     } else if (std.mem.eql(u8, op_name, "stablehlo.log")) {
         return vjp_rules.logVJP;
+    } else if (std.mem.eql(u8, op_name, "stablehlo.tanh")) {
+        return vjp_rules.tanhVJP;
     } else if (std.mem.eql(u8, op_name, "stablehlo.rsqrt")) {
         return vjp_rules.rsqrtVJP;
     } else if (std.mem.eql(u8, op_name, "stablehlo.convert")) {

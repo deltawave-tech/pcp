@@ -327,13 +327,12 @@ fn addIreeDependencies(target: *std.Build.Step.Compile, b: *std.Build, iree_conf
     dialect_anchors_lib.addIncludePath(.{ .cwd_relative = b.fmt("{s}/llvm-project/tools/mlir/include", .{build_dir}) });
     dialect_anchors_lib.addIncludePath(.{ .cwd_relative = b.fmt("{s}/third_party/stablehlo", .{source_dir}) });
     dialect_anchors_lib.addIncludePath(.{ .cwd_relative = b.fmt("{s}/llvm-external-projects/stablehlo", .{build_dir}) });
-    dialect_anchors_lib.linkSystemLibrary("stdc++");
 
     target.linkLibrary(dialect_anchors_lib);
     target.step.dependOn(&dialect_anchors_lib.step);
 
     // --- Link All Required Libraries ---
-    target.linkSystemLibrary("stdc++");
+    target.linkLibCpp();
 
     // Core IREE
     target.linkSystemLibrary("IREECompiler");
@@ -577,7 +576,6 @@ pub fn build(b: *std.Build) void {
             },
             .flags = &.{"-std=c++17"},
         });
-        capnp_bridge_lib.linkSystemLibrary("stdc++"); // Link against libstdc++ for clang compatibility
 
         // NEW: Expose the public header directory to any executable that links this library.
         capnp_bridge_lib.addIncludePath(b.path("src/network"));
@@ -609,8 +607,8 @@ pub fn build(b: *std.Build) void {
         pcp.linkSystemLibrary("capnp");
         pcp.linkSystemLibrary("kj");
 
-        // Ensure libstdc++ is linked after Cap'n Proto libraries for proper symbol resolution
-        pcp.linkSystemLibrary("stdc++");
+        // Link the platform C++ standard library (libc++ on macOS, libstdc++ on Linux, etc).
+        pcp.linkLibCpp();
 
         std.debug.print("==> Cap'n Proto bridge library configured successfully\n", .{});
     }

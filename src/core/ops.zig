@@ -640,7 +640,10 @@ pub fn iota(builder: *MLIRBuilder, shape: []const i64, iota_dimension: i64, elem
 /// Compare operation for element-wise comparisons
 pub fn compare(builder: *MLIRBuilder, lhs: Tensor, rhs: Tensor, direction: hlo.CompareDirection) !Tensor {
     const elem_type = lhs.value.getType().as(mlir.RankedTensorType).?.getElementType();
-    const compare_type = elem_type.getStableHLOCompareType();
+    const compare_type: hlo.CompareType = if (elem_type.isInteger() or elem_type.isIndex())
+        hlo.CompareType.SIGNED
+    else
+        hlo.CompareType.FLOAT;
 
     const operation = hlo.compare(builder.ctx, lhs.value, rhs.value, direction, compare_type, builder.loc);
     return try builder.createAndAppendOp(operation);

@@ -59,6 +59,8 @@ fn getVjpFn(op_name: []const u8) ?VJPFn {
         return vjp_rules.tanhVJP;
     } else if (std.mem.eql(u8, op_name, "stablehlo.rsqrt")) {
         return vjp_rules.rsqrtVJP;
+    } else if (std.mem.eql(u8, op_name, "stablehlo.power")) {
+        return vjp_rules.powerVJP;
     } else if (std.mem.eql(u8, op_name, "stablehlo.convert")) {
         return vjp_rules.convertVJP;
     } else if (std.mem.eql(u8, op_name, "stablehlo.select")) {

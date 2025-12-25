@@ -62,9 +62,10 @@ pub const IreeBackend = struct {
             .f32 => c.IREE_HAL_ELEMENT_TYPE_FLOAT_32,
             .f64 => c.IREE_HAL_ELEMENT_TYPE_FLOAT_64,
             .f16 => c.IREE_HAL_ELEMENT_TYPE_FLOAT_16,
+            .bf16 => c.IREE_HAL_ELEMENT_TYPE_BFLOAT_16,
             .i32 => c.IREE_HAL_ELEMENT_TYPE_SINT_32,
             .i64 => c.IREE_HAL_ELEMENT_TYPE_SINT_64,
-            .bool => c.IREE_HAL_ELEMENT_TYPE_BOOL_8, // IREE treats i1 as 8-bit bool
+            .bool => c.IREE_HAL_ELEMENT_TYPE_BOOL_8,
         };
     }
 

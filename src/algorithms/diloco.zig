@@ -56,6 +56,7 @@ pub const DiLoCoConfig = struct {
 
     checkpoint_dir: []const u8,
     resume_training: bool,
+    dtype: tensor.DType = .f32,
 
     pub fn default() DiLoCoConfig {
         return DiLoCoConfig{
@@ -115,7 +116,7 @@ pub const DiLoCo = struct {
 
     // Change the init signature to accept the generic executor (dataset now loaded by workers)
     pub fn init(allocator: Allocator, coordinator: *Shepherd, config: DiLoCoConfig, executor: Executor, mlir_builder: *MLIRBuilder) !Self {
-        const element_type = mlir.Type.f32Type(mlir_builder.ctx);
+        const element_type = config.dtype.toMLIRType(mlir_builder.ctx);
 
         const recovery_path = try std.fs.path.join(allocator, &[_][]const u8{ config.checkpoint_dir, "recovery", RECOVERY_FILENAME });
         defer allocator.free(recovery_path);
@@ -431,9 +432,8 @@ pub const DiLoCo = struct {
                 param.* = rng.random().floatNorm(f32) * scale;
             }
 
-            // Convert to MLIR tensor
             const byte_data = std.mem.sliceAsBytes(param_data);
-            param_tensor.* = try Tensor.fromBytes(self.mlir_builder, byte_data, shape, .f32);
+            param_tensor.* = try Tensor.fromBytes(self.mlir_builder, byte_data, shape, self.config.dtype);
         }
 
         self.master_parameters = param_tensors;

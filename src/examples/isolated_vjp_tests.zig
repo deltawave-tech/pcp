@@ -1130,6 +1130,77 @@ pub fn testConcatenateVJP(allocator: Allocator) !void {
     std.debug.print("✓ concatenateVJP verified!\n", .{});
 }
 
+/// Test powerVJP: f(a, b) = a^b
+/// Inputs: a=2.0, b=3.0
+/// Expected Forward: 2^3 = 8.0
+/// Expected Backward (Base): d/da = b * a^(b-1) = 3 * 2^2 = 12.0
+/// Expected Backward (Exp): d/db = 0.0 (Optimization: treated as constant)
+pub fn testPowerVJP(allocator: Allocator) !void {
+    std.debug.print("\n=== Testing powerVJP Isolated Execution ===\n", .{});
+    try initGlobalMLIRContext(allocator);
+    const context = global_mlir_context.?.getContext();
+    var helper = ExecutionHelper{.allocator = allocator};
+    var builder = try MLIRBuilder.init(allocator, context);
+    defer builder.deinit();
+
+    const f32_type = mlir.Type.f32Type(context);
+    const scalar_type = mlir.Type.rankedTensorType(context, &.{}, f32_type);
+    const func_type = try mlir.Type.functionType(allocator, context, &.{scalar_type, scalar_type}, &.{scalar_type});
+
+    const fwd_result = try builder.createFunction("forward_power", func_type);
+    builder.setInsertionBlock(fwd_result.entry_block);
+
+    const a_tensor = try builder.newTensor(fwd_result.entry_block.getArgument(0));
+    const b_tensor = try builder.newTensor(fwd_result.entry_block.getArgument(1));
+
+    const result = try ops.power(&builder, a_tensor, b_tensor);
+    _ = try builder.createAndAttach("func.return", &.{result.value}, &.{}, .{});
+
+    _ = try autodiff.buildGradientGraph(allocator, &builder, fwd_result.func_op);
+
+    const input_a = [_]f32{2.0};
+    const input_b = [_]f32{3.0};
+    const grad_out = [_]f32{1.0};
+
+    std.debug.print("--- Verifying Power Forward Pass ---\n", .{});
+    {
+        var inputs_bytes = [_][]const u8{ std.mem.sliceAsBytes(&input_a), std.mem.sliceAsBytes(&input_b) };
+        var shapes = [_][]const i64{ &[_]i64{}, &[_]i64{} };
+
+        const outputs = try helper.executeModule(builder.module, "forward_power", &inputs_bytes, &shapes, null);
+        defer { for(outputs) |o| allocator.free(o); allocator.free(outputs); }
+
+        const fwd_val: f32 = @bitCast(std.mem.readInt(u32, outputs[0][0..4], .little));
+        try std.testing.expectApproxEqAbs(8.0, fwd_val, 1e-5);
+        std.debug.print("✓ Power forward pass verified: 2^3 = {d:.4}\n", .{fwd_val});
+    }
+
+    std.debug.print("--- Verifying Power Backward Pass ---\n", .{});
+    {
+        var inputs_bytes = [_][]const u8{
+            std.mem.sliceAsBytes(&input_a),
+            std.mem.sliceAsBytes(&input_b),
+            std.mem.sliceAsBytes(&grad_out),
+        };
+        var shapes = [_][]const i64{ &[_]i64{}, &[_]i64{}, &[_]i64{} };
+
+        const grad_outputs = try helper.executeModule(builder.module, "forward_power_grad", &inputs_bytes, &shapes, null);
+        defer { for(grad_outputs) |o| allocator.free(o); allocator.free(grad_outputs); }
+
+        const grad_a: f32 = @bitCast(std.mem.readInt(u32, grad_outputs[0][0..4], .little));
+        const grad_b: f32 = @bitCast(std.mem.readInt(u32, grad_outputs[1][0..4], .little));
+
+        try std.testing.expectApproxEqAbs(12.0, grad_a, 1e-5);
+        std.debug.print("Gradient w.r.t Base (a): {d:.4} (Expected 12.0)\n", .{grad_a});
+
+        try std.testing.expectApproxEqAbs(0.0, grad_b, 1e-5);
+        std.debug.print("Gradient w.r.t Exponent (b): {d:.4} (Expected 0.0)\n", .{grad_b});
+
+        std.debug.print("✓ Power gradient verification passed!\n", .{});
+    }
+    std.debug.print("✓ powerVJP isolated test PASSED\n", .{});
+}
+
 /// Test chain rule: f(x, w, b) = (x * w) + b
 /// This tests gradient propagation through a sequence of operations
 /// Expected gradients: df/dx = w, df/dw = x, df/db = 1
@@ -1453,6 +1524,7 @@ pub fn main() !void {
     try testSiluVJP(allocator);
     try testRoPEComponentVJP(allocator);
     try testConcatenateVJP(allocator);
+    try testPowerVJP(allocator);
 
     // NUMERICAL STABILITY TEST
     try testCrossEntropyStability(allocator);

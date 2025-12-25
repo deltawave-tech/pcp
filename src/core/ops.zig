@@ -50,9 +50,8 @@ pub const MLIRBuilder = struct {
     }
 
     /// Helper to create scalar constant tensors
-    pub fn scalarConstant(self: *Self, value: f32) !Tensor {
-        const element_type = mlir.Type.f32Type(self.ctx);
-        return constant(self, @floatCast(value), &.{}, element_type);
+    pub fn scalarConstant(self: *Self, value: f64, element_type: mlir.Type) !Tensor {
+        return constant(self, value, &.{}, element_type);
     }
 
     /// Temporarily sets the insertion point to a new block.
@@ -640,9 +639,8 @@ pub fn iota(builder: *MLIRBuilder, shape: []const i64, iota_dimension: i64, elem
 
 /// Compare operation for element-wise comparisons
 pub fn compare(builder: *MLIRBuilder, lhs: Tensor, rhs: Tensor, direction: hlo.CompareDirection) !Tensor {
-    // Determine compare_type based on element type
     const elem_type = lhs.value.getType().as(mlir.RankedTensorType).?.getElementType();
-    const compare_type = if (@intFromPtr(elem_type.handle.ptr) == @intFromPtr(mlir.Type.i32Type(builder.ctx).handle.ptr)) hlo.CompareType.SIGNED else hlo.CompareType.FLOAT; // Adjust as needed
+    const compare_type = elem_type.getStableHLOCompareType();
 
     const operation = hlo.compare(builder.ctx, lhs.value, rhs.value, direction, compare_type, builder.loc);
     return try builder.createAndAppendOp(operation);

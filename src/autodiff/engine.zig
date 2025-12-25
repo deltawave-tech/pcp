@@ -23,6 +23,8 @@ fn getVjpFn(op_name: []const u8) ?VJPFn {
         return vjp_rules.multiplyVJP;
     } else if (std.mem.eql(u8, op_name, "stablehlo.divide")) {
         return vjp_rules.divideVJP;
+    } else if (std.mem.eql(u8, op_name, "stablehlo.power")) {
+        return vjp_rules.powerVJP;
     } else if (std.mem.eql(u8, op_name, "stablehlo.negate")) {
         return vjp_rules.negateVJP;
     } else if (std.mem.eql(u8, op_name, "stablehlo.transpose")) {

@@ -408,6 +408,10 @@ pub const Context = struct {
             return Self{ .handle = c.c.floatTypeGetF64(context.handle) };
         }
 
+        pub fn bf16Type(context: Context) Self {
+            return Self{ .handle = c.c.floatTypeGetBF16(context.handle) };
+        }
+
         pub fn i32Type(context: Context) Self {
             return Self{ .handle = c.c.mlirIntegerTypeGet(context.handle, 32) };
         }
@@ -455,8 +459,34 @@ pub const Context = struct {
             return c.c.typeIsAIndex(self.handle);
         }
 
+        pub fn isF32(self: Self, ctx: Context) bool {
+            const f32_type = Type.f32Type(ctx);
+            return self.isEqual(f32_type);
+        }
+
+        pub fn isBF16(self: Self, ctx: Context) bool {
+            const bf16_type = Type.bf16Type(ctx);
+            return self.isEqual(bf16_type);
+        }
+
+        pub fn isF64(self: Self, ctx: Context) bool {
+            const f64_type = Type.f64Type(ctx);
+            return self.isEqual(f64_type);
+        }
+
+        pub fn getStableHLOCompareType(self: Self) @import("dialects/stablehlo.zig").CompareType {
+            if (self.isInteger() or self.isIndex()) {
+                return .SIGNED;
+            }
+            return .FLOAT;
+        }
+
         pub fn isEqual(self: Self, other: Self) bool {
             return c.c.mlirTypeEqual(self.handle, other.handle);
+        }
+
+        pub fn getContext(self: Self) Context {
+            return Context{ .handle = c.c.typeGetContext(self.handle) };
         }
 
         pub fn functionType(allocator: std.mem.Allocator, context: Context, inputs: []const Type, results: []const Type) !Self {

@@ -40,7 +40,8 @@ fn getVjpFn(op_name: []const u8) ?VJPFn {
     } else if (std.mem.eql(u8, op_name, "stablehlo.reduce_sum")) {
         return vjp_rules.reduceSumVJP;
     } else if (std.mem.eql(u8, op_name, "stablehlo.reduce")) {
-        return vjp_rules.reduceSumVJP;
+        // Return null to trigger special handling in processOperationVJP
+        return null;
     } else if (std.mem.eql(u8, op_name, "stablehlo.gather")) {
         return vjp_rules.gatherVJP;
     } else if (std.mem.eql(u8, op_name, "stablehlo.slice")) {
@@ -165,7 +166,7 @@ pub fn buildGradientGraph(
     try processGradientsWithUseCounting(allocator, builder, forward_fn, &adjoint_map, &value_map);
 
     // Collect gradients and create return statement using the SHARED builder
-    try finalizeGradientFunction(allocator, builder, gradient_fn, forward_fn, &adjoint_map);
+    try finalizeGradientFunction(allocator, builder, gradient_fn, forward_fn, &adjoint_map, &value_map);
 
     // Gradient function built successfully
 
@@ -192,7 +193,35 @@ fn processOperationVJP(
     if (output_gradients.len == 0) return;
     if (std.mem.eql(u8, op_name, "stablehlo.constant")) return;
 
-    if (getVjpFn(op_name)) |vjp_rule| {
+    // Special handling for stablehlo.reduce - inspect the body to determine VJP rule
+    var vjp_rule: ?VJPFn = getVjpFn(op_name);
+    if (vjp_rule == null and std.mem.eql(u8, op_name, "stablehlo.reduce")) {
+        // Inspect the reduction region to decide VJP rule
+        const region = op.getRegion(0);
+        const block = region.getBlock(0);
+
+        var is_max = false;
+        var maybe_op = block.getFirstOp();
+
+        // Iterate through ops in the reduce body (usually just one math op and a return)
+        while (maybe_op) |body_op| {
+            const name = body_op.getName();
+            if (std.mem.eql(u8, name, "stablehlo.maximum")) {
+                is_max = true;
+                break;
+            }
+            maybe_op = body_op.getNext();
+        }
+
+        if (is_max) {
+            vjp_rule = vjp_rules.reduceMaxVJP;
+        } else {
+            // Default to Sum for stablehlo.add or complex reductions (safe fallback for now)
+            vjp_rule = vjp_rules.reduceSumVJP;
+        }
+    }
+
+    if (vjp_rule) |rule| {
         var mapped_primals = std.ArrayList(mlir.Value).init(allocator);
         defer mapped_primals.deinit();
 
@@ -202,7 +231,7 @@ fn processOperationVJP(
             try mapped_primals.append(mapped_operand);
         }
 
-        const input_gradients = try vjp_rule(builder, op, mapped_primals.items, output_gradients);
+        const input_gradients = try rule(builder, op, mapped_primals.items, output_gradients);
         defer builder.allocator.free(input_gradients); // Ensure VJP result slice is freed
 
         try addInputGradients(builder, op, input_gradients, adjoint_map);
@@ -391,8 +420,6 @@ fn addInputGradients(
     input_gradients: []const mlir.Value,
     adjoint_map: *std.AutoHashMap(mlir.Value, mlir.Value),
 ) !void {
-    // Add gradients for each input operand to the adjoint map
-    // If a gradient already exists, sum them
     const num_operands = op.getNumOperands();
 
     for (0..num_operands) |i| {
@@ -404,10 +431,10 @@ fn addInputGradients(
         // Ensure gradient matches operand shape using reduceGradient
         const grad_matched = try ops.reduceGradient(builder, grad, operand);
 
-        // If a gradient for this operand already exists, add the new one to it.
         if (adjoint_map.get(operand)) |existing_grad| {
             const op_name = op.getName();
-            std.debug.print("DEBUG addInputGradients: Adding gradients for operand {} of operation: {s}\n", .{i, op_name});
+            const operand_ptr = @intFromPtr(operand.handle.ptr);
+            std.debug.print("DEBUG addInputGradients: Adding gradients for operand {} (ptr={}) of operation: {s}\n", .{i, operand_ptr, op_name});
 
             // Debug: print shapes
             const operand_type = operand.getType().as(mlir.RankedTensorType);
@@ -445,12 +472,14 @@ fn addInputGradients(
             const sum_op = try builder.createAndAttach("stablehlo.add", &.{ add_broadcast.lhs, add_broadcast.rhs }, &.{add_type}, .{});
             try adjoint_map.put(operand, sum_op.getResult(0));
         } else {
+            const operand_ptr = @intFromPtr(operand.handle.ptr);
+            std.debug.print("DEBUG addInputGradients: First gradient for operand {} (ptr={})\n", .{i, operand_ptr});
             try adjoint_map.put(operand, grad_matched);
         }
     }
 }
 
-fn finalizeGradientFunction(allocator: Allocator, builder: *MLIRBuilder, gradient_fn: mlir.Operation, forward_fn: mlir.Operation, adjoint_map: *std.AutoHashMap(mlir.Value, mlir.Value)) !void {
+fn finalizeGradientFunction(allocator: Allocator, builder: *MLIRBuilder, gradient_fn: mlir.Operation, forward_fn: mlir.Operation, adjoint_map: *std.AutoHashMap(mlir.Value, mlir.Value), value_map: *std.AutoHashMap(mlir.Value, mlir.Value)) !void {
     _ = gradient_fn;
     const forward_region = forward_fn.getRegion(0);
     const forward_block = forward_region.getBlock(0);
@@ -458,13 +487,60 @@ fn finalizeGradientFunction(allocator: Allocator, builder: *MLIRBuilder, gradien
     var input_gradients = std.ArrayList(mlir.Value).init(allocator);
     defer input_gradients.deinit();
 
+    std.debug.print("\n=== FINALIZING GRADIENT FUNCTION ===\n", .{});
     std.debug.print("Finalizing gradient function with {} forward function arguments\n", .{num_args});
+    std.debug.print("Adjoint map has {} entries\n", .{adjoint_map.count()});
 
+    // DEBUG: Print what's in the adjoint map
+    var adj_iter = adjoint_map.iterator();
+    var adj_count: usize = 0;
+    while (adj_iter.next()) |entry| : (adj_count += 1) {
+        if (adj_count < 5) { // Only print first 5 to avoid spam
+            const val_ptr = @intFromPtr(entry.key_ptr.*.handle.ptr);
+            std.debug.print("  Adjoint map entry {}: value ptr={}\n", .{adj_count, val_ptr});
+        }
+    }
+    if (adjoint_map.count() > 5) {
+        std.debug.print("  ... and {} more entries\n", .{adjoint_map.count() - 5});
+    }
+
+    std.debug.print("\nLooking for gradients for forward function arguments:\n", .{});
     for (0..num_args) |i| {
         const arg = forward_block.getArgument(i);
-        if (adjoint_map.get(arg)) |gradient| {
+        if (i < 5) {
+            const arg_ptr = @intFromPtr(arg.handle.ptr);
+            std.debug.print("  Forward arg {}: value ptr={}\n", .{i, arg_ptr});
+        }
+
+        const mapped_arg = value_map.get(arg) orelse {
+            std.debug.print("  WARNING: No mapped value for argument {}\n", .{i});
+            const arg_type = arg.getType();
+            const ranked_type = arg_type.as(mlir.RankedTensorType) orelse return error.InvalidTensorType;
+            const shape = try ranked_type.getShape(allocator);
+            defer allocator.free(shape);
+            const elem_type = ranked_type.getElementType();
+            const zero_tensor = try ops.constant(builder, 0.0, shape, elem_type);
+            try input_gradients.append(zero_tensor.value);
+            std.debug.print("  Created ZERO gradient for argument {}\n", .{i});
+            continue;
+        };
+
+        if (i < 5) {
+            const mapped_arg_ptr = @intFromPtr(mapped_arg.handle.ptr);
+            std.debug.print("  Mapped arg {}: value ptr={}\n", .{i, mapped_arg_ptr});
+        }
+
+        if (adjoint_map.get(mapped_arg)) |gradient| {
             try input_gradients.append(gradient);
-            std.debug.print("  Found gradient for argument {}\n", .{i});
+
+            // DEBUG: Print gradient tensor info
+            const grad_type = gradient.getType().as(mlir.RankedTensorType) orelse {
+                std.debug.print("  Arg {} gradient: NOT A RANKED TENSOR\n", .{i});
+                continue;
+            };
+            const grad_shape = try grad_type.getShape(allocator);
+            defer allocator.free(grad_shape);
+            std.debug.print("  Arg {} gradient shape: {any}\n", .{i, grad_shape});
         } else {
             // Create zero gradient using safe builder constant helper
             const arg_type = arg.getType();
@@ -478,7 +554,7 @@ fn finalizeGradientFunction(allocator: Allocator, builder: *MLIRBuilder, gradien
             const zero_tensor = try ops.constant(builder, 0.0, shape, elem_type);
             try input_gradients.append(zero_tensor.value);
 
-            std.debug.print("  Created zero gradient for argument {}\n", .{i});
+            std.debug.print("  Created ZERO gradient for argument {}\n", .{i});
         }
     }
 

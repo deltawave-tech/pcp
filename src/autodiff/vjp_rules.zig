@@ -615,6 +615,111 @@ pub fn reduceSumVJP(builder: *MLIRBuilder, original_op: mlir.Operation, primals:
     return result.toOwnedSlice();
 }
 
+/// VJP rule for reduce_max: gradient flows only to the maximum elements
+pub fn reduceMaxVJP(
+    builder: *MLIRBuilder,
+    original_op: mlir.Operation,
+    primals: []const mlir.Value,
+    adjoints: []const mlir.Value,
+) ![]mlir.Value {
+    const grad_out = adjoints[0];
+    const input = primals[0];
+
+    // DEBUG: Print operation info
+    std.debug.print("\n=== DEBUG reduceMaxVJP ===\n", .{});
+    std.debug.print("Operation name: {s}\n", .{original_op.getName()});
+
+    // 1. Extract Dimensions
+    const dimensions_ref = c.stringRefFromString("dimensions");
+    const dimensions_attr = c.operationGetAttributeByName(original_op.handle, dimensions_ref);
+    std.debug.print("dimensions_attr ptr: {}\n", .{@intFromPtr(dimensions_attr.ptr)});
+    if (@intFromPtr(dimensions_attr.ptr) == 0) return error.MissingDimensionsAttribute;
+
+    // Check if it's a DenseI64Array
+    const is_dense_i64_array = c.attributeIsADenseI64Array(dimensions_attr);
+    std.debug.print("DEBUG reduceMaxVJP: Op {s}, is_dense_i64_array: {}\n", .{ original_op.getName(), is_dense_i64_array });
+
+    const num_dims = c.mlirDenseArrayGetNumElements(dimensions_attr);
+    std.debug.print("DEBUG reduceMaxVJP: Op {s}, Num Dims: {}\n", .{ original_op.getName(), num_dims });
+    var reduce_dims = try builder.allocator.alloc(i64, @intCast(num_dims));
+    defer builder.allocator.free(reduce_dims);
+
+    for (0..@intCast(num_dims)) |i| {
+        reduce_dims[i] = c.denseI64ArrayGetElement(dimensions_attr, @intCast(i));
+    }
+    std.debug.print("DEBUG reduceMaxVJP: Extracted reduce_dims: {any}\n", .{reduce_dims});
+
+    // 2. Recompute Max (Raw Reduce)
+    const input_tensor = try builder.newTensor(input);
+    // Use raw hlo.reduce_max to get the reduced shape tensor
+    const max_op = try hlo.reduce_max(builder.ctx, builder, input, reduce_dims, builder.loc);
+    builder.insertion_block.appendOwnedOperation(max_op);
+    const max_val_raw = max_op.getResult(0);
+
+    // 3. Calculate "Kept Dims" Shape (e.g., [2048, 65] -> reduce dim 1 -> [2048, 1])
+    const input_type = input.getType().as(mlir.RankedTensorType) orelse return error.InvalidTensorType;
+    const input_shape = try input_type.getShape(builder.allocator);
+    defer builder.allocator.free(input_shape);
+    const input_rank = input_shape.len;
+
+    var kept_dims_shape = try builder.allocator.alloc(i64, input_rank);
+    defer builder.allocator.free(kept_dims_shape);
+
+    // Create simple 0..N identity mapping for broadcast dimensions
+    var broadcast_dims = try builder.allocator.alloc(i64, input_rank);
+    defer builder.allocator.free(broadcast_dims);
+
+    for (0..input_rank) |i| {
+        var is_reduced = false;
+        for (reduce_dims) |d| {
+            if (d == @as(i64, @intCast(i))) {
+                is_reduced = true;
+                break;
+            }
+        }
+        if (is_reduced) {
+            kept_dims_shape[i] = 1; // Collapsed dim becomes 1
+        } else {
+            kept_dims_shape[i] = input_shape[i]; // Maintained dim
+        }
+        broadcast_dims[i] = @intCast(i);
+    }
+
+    // 4. Reshape Max and Grad to [Dimensions... 1 ... Dimensions]
+    // This explicitly aligns ranks so broadcasting works correctly
+    const max_tensor_wrapper = try builder.newTensor(max_val_raw);
+    const max_reshaped = try ops.reshape(builder, max_tensor_wrapper, kept_dims_shape);
+
+    const grad_tensor_wrapper = try builder.newTensor(grad_out);
+    const grad_reshaped = try ops.reshape(builder, grad_tensor_wrapper, kept_dims_shape);
+
+    // 5. Broadcast back to full Input Shape
+    // Now we broadcast from e.g. [2048, 1] -> [2048, 65] safely
+    const max_broadcast = try ops.broadcastInDim(builder, max_reshaped, input_shape, broadcast_dims);
+    const grad_broadcast = try ops.broadcastInDim(builder, grad_reshaped, input_shape, broadcast_dims);
+
+    // 6. Create Mask (input == max) and Select Gradients
+    const mask = try ops.compare(builder, input_tensor, max_broadcast, .EQ);
+
+    const zero = try ops.constant(builder, 0.0, input_shape, input_type.getElementType());
+    const grad_input = try ops.select(builder, mask, grad_broadcast, zero);
+
+    var result = std.ArrayList(mlir.Value).init(builder.allocator);
+    try result.append(grad_input.value);
+
+    // Handle init_value operand if present (needs zero gradient)
+    if (original_op.getNumOperands() > 1) {
+        const init_val = original_op.getOperand(1);
+        const init_type = init_val.getType().as(mlir.RankedTensorType) orelse return error.InvalidInitType;
+        const init_shape = try init_type.getShape(builder.allocator);
+        defer builder.allocator.free(init_shape);
+        const zero_init = try ops.constant(builder, 0.0, init_shape, init_type.getElementType());
+        try result.append(zero_init.value);
+    }
+
+    return result.toOwnedSlice();
+}
+
 /// Helper for gatherVJP: Attempts to handle vector index gather via linearization
 /// Returns the gradient value if successful, null otherwise
 pub fn tryVectorIndexLinearization(

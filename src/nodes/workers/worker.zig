@@ -489,6 +489,26 @@ pub const Worker = struct {
         defer reader.deinit();
         const initial_params_bytes_temp = try reader.getParams();
 
+        // Validate Received Parameters
+        var sum: f64 = 0.0;
+        var non_zero_count: usize = 0;
+        const f32_view = std.mem.bytesAsSlice(f32, initial_params_bytes_temp);
+
+        for (f32_view) |val| {
+            if (val != 0.0) non_zero_count += 1;
+            sum += @abs(val);
+        }
+
+        std.log.warn("🔍 PARAMETER INTEGRITY CHECK:", .{});
+        std.log.warn("   Bytes Received: {}", .{initial_params_bytes_temp.len});
+        std.log.warn("   Non-Zero Elements: {} / {}", .{non_zero_count, f32_view.len});
+        std.log.warn("   Abs Sum: {d:.4}", .{sum});
+
+        if (non_zero_count == 0) {
+            std.log.err("🚨 CRITICAL: Worker received ALL-ZERO parameters! Training will produce NaN.", .{});
+            return error.ReceivedZeroParameters;
+        }
+
         // Save a persistent copy of initial params for delta calculation later
         const initial_params_bytes = try self.allocator.dupe(u8, initial_params_bytes_temp);
         defer self.allocator.free(initial_params_bytes);

@@ -15,6 +15,8 @@ pub const CharTokenizer = struct {
     int_to_char: std.AutoHashMap(u32, u8),
     vocab_size: usize,
 
+    const MAX_VOCAB_SIZE = 65;
+
     // Reads a text file and builds the character vocabulary
     pub fn initFromFile(allocator: Allocator, path: []const u8) !CharTokenizer {
         const text = try std.fs.cwd().readFileAlloc(allocator, path, 2 * 1024 * 1024); // 2MB limit
@@ -28,20 +30,24 @@ pub const CharTokenizer = struct {
 
         var char_to_int = std.AutoHashMap(u8, u32).init(allocator);
         var int_to_char = std.AutoHashMap(u32, u8).init(allocator);
-        
+
         var it = char_set.keyIterator();
-        var i = @as(u32, 0);
+        var i: u32 = 0;
         while (it.next()) |char_ptr| {
+            if (i >= MAX_VOCAB_SIZE) {
+                std.log.warn("Dataset has more characters than model vocab ({}). Ignoring char '{c}'", .{ MAX_VOCAB_SIZE, char_ptr.* });
+                continue;
+            }
             try char_to_int.put(char_ptr.*, i);
             try int_to_char.put(i, char_ptr.*);
             i += 1;
         }
 
-        return CharTokenizer {
+        return CharTokenizer{
             .allocator = allocator,
             .char_to_int = char_to_int,
             .int_to_char = int_to_char,
-            .vocab_size = char_to_int.count(),
+            .vocab_size = i,
         };
     }
 
@@ -53,7 +59,11 @@ pub const CharTokenizer = struct {
     pub fn encode(self: *CharTokenizer, text: []const u8) ![]u32 {
         const tokens = try self.allocator.alloc(u32, text.len);
         for (text, 0..) |char, i| {
-            tokens[i] = self.char_to_int.get(char) orelse return error.UnknownCharacter;
+            if (self.char_to_int.get(char)) |token| {
+                tokens[i] = token;
+            } else {
+                tokens[i] = 0;
+            }
         }
         return tokens;
     }

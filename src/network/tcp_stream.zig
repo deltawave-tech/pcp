@@ -55,6 +55,16 @@ pub const TcpStreamManager = struct {
             return err;
         };
         std.log.debug("Successfully read {} bytes for length prefix", .{bytes_read});
+        if (bytes_read != length_bytes.len) {
+            // `readAll` may return fewer bytes without error on EOF.
+            if (bytes_read == 0) {
+                std.log.warn("TCP connection closed while reading length prefix", .{});
+            } else {
+                std.log.err("Incomplete length prefix: got {} bytes, expected {}", .{ bytes_read, length_bytes.len });
+            }
+            return error.ConnectionClosed;
+        }
+
         const data_length = std.mem.readInt(u32, &length_bytes, .little);
         
         // Debug: Log raw bytes and parsed length (only for invalid messages)
@@ -80,7 +90,16 @@ pub const TcpStreamManager = struct {
         const json_data = try allocator.alloc(u8, data_length);
         // DO NOT defer allocator.free(json_data) here; we are returning it.
         
-        _ = try stream.readAll(json_data);
+        const json_bytes_read = stream.readAll(json_data) catch |err| {
+            allocator.free(json_data);
+            std.log.err("Failed to read message body from TCP stream: {}", .{err});
+            return err;
+        };
+        if (json_bytes_read != data_length) {
+            allocator.free(json_data);
+            std.log.err("TCP connection closed while reading message body: got {} bytes, expected {}", .{ json_bytes_read, data_length });
+            return error.ConnectionClosed;
+        }
         
         const parsed = try std.json.parseFromSlice(MessageEnvelope, allocator, json_data, .{});
         

@@ -24,27 +24,35 @@ const DType = pcp.tensor.DType;
 
 // Helper to check for IREE errors
 fn ireeCheck(status: c.iree_status_t) !void {
+    return ireeCheckCtx(status, null);
+}
+
+fn ireeCheckCtx(status: c.iree_status_t, ctx: ?[]const u8) !void {
     // In IREE, null status indicates success, non-null indicates error
-    if (status != null) {
-        // Try to get more detailed error information
-        std.debug.print("IREE Error Details:\n", .{});
+    if (status == null) return;
 
-        // Get error code if available
-        const code = c.iree_status_code(status);
-        std.debug.print("  Status code: {}\n", .{code});
+    std.debug.print("IREE Error Details:\n", .{});
+    if (ctx) |label| {
+        std.debug.print("  Context: {s}\n", .{label});
+    }
 
-        // Try to get error message
-        var buffer: [1024]u8 = undefined;
-        var out_length: c.iree_host_size_t = 0;
-        _ = c.iree_status_format(status, buffer.len, &buffer, &out_length);
-        if (out_length > 0 and out_length < buffer.len) {
-            const msg_len: usize = @intCast(out_length);
+    const code = c.iree_status_code(status);
+    std.debug.print("  Status code: {}\n", .{code});
+
+    var buffer: [2048]u8 = undefined;
+    var out_length: c.iree_host_size_t = 0;
+    _ = c.iree_status_format(status, buffer.len, buffer[0..].ptr, &out_length);
+    if (out_length > 0) {
+        var msg_len: usize = @intCast(out_length);
+        if (msg_len > buffer.len) msg_len = buffer.len;
+        while (msg_len > 0 and (buffer[msg_len - 1] == 0 or buffer[msg_len - 1] == '\n')) : (msg_len -= 1) {}
+        if (msg_len > 0) {
             std.debug.print("  Error message: {s}\n", .{buffer[0..msg_len]});
         }
-
-        c.iree_status_free(status);
-        return error.IreeRuntimeError;
     }
+
+    c.iree_status_free(status);
+    return error.IreeRuntimeError;
 }
 
 pub const IreeBackend = struct {
@@ -166,21 +174,21 @@ pub const IreeBackend = struct {
         var temp_session: ?*c.iree_runtime_session_t = null;
         var session_options: c.iree_runtime_session_options_t = undefined;
         c.iree_runtime_session_options_initialize(&session_options);
-        try ireeCheck(c.iree_runtime_session_create_with_device(
+        try ireeCheckCtx(c.iree_runtime_session_create_with_device(
             self.instance.?,
             &session_options,
             self.device.?,
             c.iree_runtime_instance_host_allocator(self.instance.?),
             &temp_session,
-        ));
+        ), "iree_runtime_session_create_with_device");
         defer c.iree_runtime_session_release(temp_session.?);
 
         // 2. Load the .vmfb module into the temporary session
-        try ireeCheck(c.iree_runtime_session_append_bytecode_module_from_memory(
+        try ireeCheckCtx(c.iree_runtime_session_append_bytecode_module_from_memory(
             temp_session.?,
             .{ .data = vmfb_bytes.ptr, .data_length = vmfb_bytes.len },
             c.iree_allocator_null(), // We don't own the flatbuffer data
-        ));
+        ), "iree_runtime_session_append_bytecode_module_from_memory");
 
         // 3. Initialize a call to the specified function
         var call: c.iree_runtime_call_t = undefined;
@@ -190,7 +198,7 @@ pub const IreeBackend = struct {
         defer self.allocator.free(full_fn_name);
 
         const fn_name_view = c.iree_string_view_t{ .data = full_fn_name.ptr, .size = full_fn_name.len };
-        try ireeCheck(c.iree_runtime_call_initialize_by_name(temp_session.?, fn_name_view, &call));
+        try ireeCheckCtx(c.iree_runtime_call_initialize_by_name(temp_session.?, fn_name_view, &call), "iree_runtime_call_initialize_by_name");
         defer c.iree_runtime_call_deinitialize(&call);
 
         // 3. Create IREE buffer views from input data using the simpler allocate_buffer_copy API
@@ -209,11 +217,13 @@ pub const IreeBackend = struct {
 
             // Create buffer view directly from data - much simpler than manual mapping!
             var buffer_view: ?*c.iree_hal_buffer_view_t = null;
-            try ireeCheck(c.iree_hal_buffer_view_allocate_buffer_copy(
+            var ctx_buf: [96]u8 = undefined;
+            const ctx = std.fmt.bufPrint(&ctx_buf, "iree_hal_buffer_view_allocate_buffer_copy(input {d})", .{i}) catch "iree_hal_buffer_view_allocate_buffer_copy";
+            try ireeCheckCtx(c.iree_hal_buffer_view_allocate_buffer_copy(
                 c.iree_runtime_session_device(temp_session.?),
                 c.iree_runtime_session_device_allocator(temp_session.?),
                 @intCast(shape_slice.len),
-                iree_shape.ptr,
+                if (shape_slice.len == 0) null else iree_shape.ptr,
                 element_type, // Use dynamic type
                 c.IREE_HAL_ENCODING_TYPE_DENSE_ROW_MAJOR,
                 .{
@@ -225,14 +235,14 @@ pub const IreeBackend = struct {
                 },
                 .{ .data = input_slice.ptr, .data_length = input_slice.len },
                 @ptrCast(&buffer_view),
-            ));
+            ), ctx);
             defer c.iree_hal_buffer_view_release(buffer_view.?);
             
-            try ireeCheck(c.iree_runtime_call_inputs_push_back_buffer_view(&call, buffer_view.?));
+            try ireeCheckCtx(c.iree_runtime_call_inputs_push_back_buffer_view(&call, buffer_view.?), "iree_runtime_call_inputs_push_back_buffer_view");
         }
         
         // 4. Invoke the function
-        try ireeCheck(c.iree_runtime_call_invoke(&call, 0)); // flags = 0
+        try ireeCheckCtx(c.iree_runtime_call_invoke(&call, 0), "iree_runtime_call_invoke"); // flags = 0
 
         // 5. Get the outputs from the call using VM list API
         var outputs_list = std.ArrayList([]u8).init(self.allocator);
@@ -247,7 +257,7 @@ pub const IreeBackend = struct {
         var i: c.iree_host_size_t = 0;
         while (i < output_count) : (i += 1) {
             var output_buffer_view: ?*c.iree_hal_buffer_view_t = null;
-            try ireeCheck(c.iree_runtime_call_outputs_pop_front_buffer_view(&call, @ptrCast(&output_buffer_view)));
+            try ireeCheckCtx(c.iree_runtime_call_outputs_pop_front_buffer_view(&call, @ptrCast(&output_buffer_view)), "iree_runtime_call_outputs_pop_front_buffer_view");
             defer c.iree_hal_buffer_view_release(output_buffer_view.?);
 
             // Get the buffer from the view and copy its data
@@ -257,7 +267,7 @@ pub const IreeBackend = struct {
             
             // Allocate output data and read from buffer
             const output_data = try self.allocator.alloc(u8, @intCast(buffer_byte_length));
-            try ireeCheck(c.iree_hal_device_transfer_d2h(
+            try ireeCheckCtx(c.iree_hal_device_transfer_d2h(
                 c.iree_runtime_session_device(temp_session.?),
                 output_buffer,
                 0, // source_offset
@@ -265,7 +275,7 @@ pub const IreeBackend = struct {
                 @intCast(buffer_byte_length),
                 c.IREE_HAL_TRANSFER_BUFFER_FLAG_DEFAULT,
                 c.iree_infinite_timeout(),
-            ));
+            ), "iree_hal_device_transfer_d2h");
             
             try outputs_list.append(output_data);
         }

@@ -156,10 +156,14 @@ pub const MLIRContext = struct {
 
         var hip_target_arg: ?[]u8 = null;
         var cuda_arch_arg: ?[]u8 = null;
+                var cuda_target_arg: ?[]u8 = null;
+        var cuda_target_features_arg: ?[]u8 = null;
         // var tiling_flag: ?[]u8 = null;
         // var dump_dir: ?[]u8 = null;
         defer if (hip_target_arg) |arg| allocator.free(arg);
         defer if (cuda_arch_arg) |arg| allocator.free(arg);
+        defer if (cuda_target_arg) |arg| allocator.free(arg);
+        defer if (cuda_target_features_arg) |arg| allocator.free(arg);
         // defer if (tiling_flag) |arg| allocator.free(arg);
         // defer if (dump_dir) |arg| allocator.free(arg);
 
@@ -180,6 +184,32 @@ pub const MLIRContext = struct {
             std.log.info("Compiling for CUDA target: {s}", .{arch});
             cuda_arch_arg = try std.fmt.allocPrint(allocator, "--iree-hal-target-device=cuda://{s}", .{arch});
             try argv.append(cuda_arch_arg.?);
+
+            // Optional overrides for CUDA compilation.
+            //
+            // By default, we *do not* force a PTX version or NVPTX target, since production
+            // clusters (e.g., V100/A100) typically have modern drivers/toolchains.
+            //
+            // Some older drivers (e.g., 470.x) cannot JIT newer PTX versions, which manifests
+            // at runtime as `CUDA_ERROR_UNSUPPORTED_PTX_VERSION`. For those environments, set:
+            //
+            //   export PCP_IREE_CUDA_TARGET_FEATURES=+ptx74
+            //
+            // (and optionally `PCP_IREE_CUDA_TARGET=sm_61`, etc).
+            const env_cuda_target = std.posix.getenv("PCP_IREE_CUDA_TARGET");
+            const env_cuda_features = std.posix.getenv("PCP_IREE_CUDA_TARGET_FEATURES");
+
+            if (env_cuda_target != null or env_cuda_features != null) {
+                const target: []const u8 = if (env_cuda_target) |t| t else arch;
+                cuda_target_arg = try std.fmt.allocPrint(allocator, "--iree-cuda-target={s}", .{target});
+                try argv.append(cuda_target_arg.?);
+            }
+            if (env_cuda_features) |features_z| {
+                const features: []const u8 = features_z;
+                cuda_target_features_arg = try std.fmt.allocPrint(allocator, "--iree-cuda-target-features={s}", .{features});
+                try argv.append(cuda_target_features_arg.?);
+                std.log.warn("Using PCP_IREE_CUDA_TARGET_FEATURES={s}", .{features});
+            }
 
             // Disable all advanced CUDA codegen features to avoid LLVM lowering issues
             try argv.append("--iree-codegen-llvmgpu-use-vector-distribution=false");

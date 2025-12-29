@@ -15,6 +15,8 @@ pub fn AdamMLIRConfiguration(comptime DataType: type) type {
         epsilon: DataType = 1e-8,
         weight_decay: DataType = 0.01,
         max_grad_norm: DataType = 1.0,
+        gradient_clip_min: DataType = -100.0,
+        gradient_clip_max: DataType = 100.0,
         pub fn default_configuration() @This() { return .{}; }
     };
 }

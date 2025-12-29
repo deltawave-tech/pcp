@@ -46,7 +46,9 @@ pub const GraphBuilder = struct {
 
         // === PHASE 3: AUTODIFF ===
         std.debug.print("GraphBuilder: Running Autodiff...\n", .{});
-        _ = try autodiff.buildGradientGraph(allocator, builder, cloned_forward_fn);
+        const gradient_clip_min = @as(f64, @floatCast(optimizer.conf.gradient_clip_min));
+        const gradient_clip_max = @as(f64, @floatCast(optimizer.conf.gradient_clip_max));
+        _ = try autodiff.buildGradientGraph(allocator, builder, cloned_forward_fn, gradient_clip_min, gradient_clip_max);
         const grad_fn_name = "model_forward_pass_grad";
 
         // === PHASE 4: BUILD ORCHESTRATOR 'main' ===

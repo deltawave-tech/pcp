@@ -812,18 +812,27 @@ pub fn oneHot(builder: *MLIRBuilder, indices: Tensor, depth: i64, on_value: f64,
 /// Creates a constant tensor from a scalar value, broadcasting to a given shape.
 /// This is now the single source of truth for creating constants.
 pub fn constant(builder: *MLIRBuilder, value: f64, shape: []const i64, element_type: mlir.Type) !Tensor {
-    const tensor_type = mlir.Type.rankedTensorType(builder.ctx, shape, element_type);
+    const f32_type = mlir.Type.f32Type(builder.ctx);
+    const f64_type = mlir.Type.f64Type(builder.ctx);
 
+    if (element_type.isBF16(builder.ctx) or
+        (!element_type.isEqual(f32_type) and
+         !element_type.isEqual(f64_type) and
+         !element_type.isInteger() and
+         !element_type.isIndex()))
+    {
+        const f32_constant = try constant(builder, value, shape, f32_type);
+        return convert(builder, f32_constant, element_type);
+    }
+
+    const tensor_type = mlir.Type.rankedTensorType(builder.ctx, shape, element_type);
     var attr: mlir.Attribute = undefined;
 
     if (element_type.isInteger() or element_type.isIndex()) {
-        // Handle Integer/Index types
         const i_val: i64 = @intFromFloat(value);
         const element_attr = mlir.Attribute.integerAttr(builder.ctx, i_val, element_type);
         attr = mlir.Attribute.denseElementsAttrSplat(tensor_type, element_attr);
     } else {
-        // Handle Float types
-        // Use the specific FloatSplat for floats to ensure correct bit representation
         attr = mlir.Attribute.denseElementsAttrFloatSplat(tensor_type, value);
     }
 

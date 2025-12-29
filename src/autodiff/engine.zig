@@ -10,6 +10,7 @@ const Allocator = std.mem.Allocator;
 const MLIRBuilder = ops.MLIRBuilder;
 const VJPFn = vjp_rules.VJPFn;
 
+
 /// MLIR-based Automatic Differentiation using Graph-to-Graph Transformation
 /// This implements reverse-mode AD on MLIR computation graphs using VJP rules
 
@@ -80,6 +81,8 @@ pub fn buildGradientGraph(
     allocator: Allocator,
     builder: *MLIRBuilder,
     forward_fn: mlir.Operation,
+    gradient_clip_min: f64,
+    gradient_clip_max: f64,
 ) !mlir.Operation {
     std.debug.print("Building gradient graph from forward function...\n", .{});
 
@@ -165,7 +168,7 @@ pub fn buildGradientGraph(
 
     // Second pass: Compute gradients using use-counting (reverse Kahn's algorithm)
     std.debug.print("Second pass: Computing gradients using use-counting...\n", .{});
-    try processGradientsWithUseCounting(allocator, builder, forward_fn, &adjoint_map, &value_map);
+    try processGradientsWithUseCounting(allocator, builder, forward_fn, &adjoint_map, &value_map, gradient_clip_min, gradient_clip_max);
 
     // Collect gradients and create return statement using the SHARED builder
     try finalizeGradientFunction(allocator, builder, gradient_fn, forward_fn, &adjoint_map, &value_map);
@@ -183,6 +186,8 @@ fn processOperationVJP(
     op: mlir.Operation,
     adjoint_map: *std.AutoHashMap(mlir.Value, mlir.Value),
     value_map: *std.AutoHashMap(mlir.Value, mlir.Value),
+    gradient_clip_min: f64,
+    gradient_clip_max: f64,
 ) !void {
     const op_name = op.getName();
     // Get gradients (now safely handles empty case)
@@ -236,7 +241,7 @@ fn processOperationVJP(
         const input_gradients = try rule(builder, op, mapped_primals.items, output_gradients);
         defer builder.allocator.free(input_gradients); // Ensure VJP result slice is freed
 
-        try addInputGradients(builder, op, input_gradients, adjoint_map);
+        try addInputGradients(builder, op, input_gradients, adjoint_map, gradient_clip_min, gradient_clip_max);
     }
 }
 
@@ -290,6 +295,8 @@ fn processGradientsWithUseCounting(
     forward_fn: mlir.Operation,
     adjoint_map: *std.AutoHashMap(mlir.Value, mlir.Value),
     value_map: *std.AutoHashMap(mlir.Value, mlir.Value),
+    gradient_clip_min: f64,
+    gradient_clip_max: f64,
 ) !void {
     const forward_block = forward_fn.getRegion(0).getBlock(0);
 
@@ -325,7 +332,7 @@ fn processGradientsWithUseCounting(
         const current_op = ready_queue.orderedRemove(0);
 
         std.debug.print("Processing operation VJP for: {s}\n", .{current_op.getName()});
-        try processOperationVJP(allocator, builder, current_op, adjoint_map, value_map);
+        try processOperationVJP(allocator, builder, current_op, adjoint_map, value_map, gradient_clip_min, gradient_clip_max);
 
         // Decrement use counts for producers and add to queue when ready
         for (0..current_op.getNumOperands()) |i| {
@@ -421,6 +428,8 @@ fn addInputGradients(
     op: mlir.Operation,
     input_gradients: []const mlir.Value,
     adjoint_map: *std.AutoHashMap(mlir.Value, mlir.Value),
+    gradient_clip_min: f64,
+    gradient_clip_max: f64,
 ) !void {
     const num_operands = op.getNumOperands();
 
@@ -430,53 +439,55 @@ fn addInputGradients(
         const operand = op.getOperand(i);
         const grad = input_gradients[i];
 
-        // Ensure gradient matches operand shape using reduceGradient
         const grad_matched = try ops.reduceGradient(builder, grad, operand);
 
+        const grad_type = grad_matched.getType().as(mlir.RankedTensorType) orelse return error.NotRankedTensor;
+        const elem_type = grad_type.getElementType();
+
+        var safe_grad = grad_matched;
+
+        if (!elem_type.isInteger() and !elem_type.isIndex()) {
+            const grad_shape = try grad_type.getShape(builder.allocator);
+            defer builder.allocator.free(grad_shape);
+
+            const grad_tensor = try builder.newTensor(grad_matched);
+            const f32_type = mlir.Type.f32Type(builder.ctx);
+
+            const grad_f32 = if (!elem_type.isEqual(f32_type)) blk: {
+                const target_type = mlir.Type.rankedTensorType(builder.ctx, grad_shape, f32_type);
+                const convert_op = try builder.createAndAttach("stablehlo.convert", &.{grad_matched}, &.{target_type}, .{});
+                break :blk try builder.newTensor(convert_op.getResult(0));
+            } else grad_tensor;
+
+            const min_val_f32 = try ops.constant(builder, gradient_clip_min, grad_shape, f32_type);
+            const max_val_f32 = try ops.constant(builder, gradient_clip_max, grad_shape, f32_type);
+
+            const clamped_1 = try ops.maximum(builder, grad_f32, min_val_f32);
+            const clamped_final = try ops.minimum(builder, clamped_1, max_val_f32);
+
+            safe_grad = if (!elem_type.isEqual(f32_type)) blk: {
+                const target_type = mlir.Type.rankedTensorType(builder.ctx, grad_shape, elem_type);
+                const convert_op = try builder.createAndAttach("stablehlo.convert", &.{clamped_final.value}, &.{target_type}, .{});
+                break :blk convert_op.getResult(0);
+            } else clamped_final.value;
+        }
+
         if (adjoint_map.get(operand)) |existing_grad| {
-            const op_name = op.getName();
-            const operand_ptr = @intFromPtr(operand.handle.ptr);
-            std.debug.print("DEBUG addInputGradients: Adding gradients for operand {} (ptr={}) of operation: {s}\n", .{i, operand_ptr, op_name});
-
-            // Debug: print shapes
-            const operand_type = operand.getType().as(mlir.RankedTensorType);
-            if (operand_type) |ot| {
-                const operand_shape = try ot.getShape(builder.allocator);
-                defer builder.allocator.free(operand_shape);
-                std.debug.print("  Operand shape: {any}\n", .{operand_shape});
-            }
-            const existing_grad_type = existing_grad.getType().as(mlir.RankedTensorType);
-            if (existing_grad_type) |egt| {
-                const existing_grad_shape = try egt.getShape(builder.allocator);
-                defer builder.allocator.free(existing_grad_shape);
-                std.debug.print("  Existing grad shape: {any}\n", .{existing_grad_shape});
-            }
-            const grad_matched_type = grad_matched.getType().as(mlir.RankedTensorType);
-            if (grad_matched_type) |gmt| {
-                const grad_matched_shape = try gmt.getShape(builder.allocator);
-                defer builder.allocator.free(grad_matched_shape);
-                std.debug.print("  New grad shape (after reduceGradient): {any}\n", .{grad_matched_shape});
-            }
-
-            // Ensure existing gradient matches operand shape
-            // Get operand shape
             const operand_ranked_type = operand.getType().as(mlir.RankedTensorType) orelse return error.NotRankedTensor;
             const operand_shape_arr = try operand_ranked_type.getShape(builder.allocator);
             defer builder.allocator.free(operand_shape_arr);
 
-            // Broadcast existing_grad to operand shape if needed
             const existing_grad_matched = try ops.broadcastToShape(builder, existing_grad, operand_shape_arr);
 
-            // Both gradients should now match operand shape, so broadcast should work
-            const add_broadcast = try ops.broadcastOperands(builder, existing_grad_matched, grad_matched);
+            const add_broadcast = try ops.broadcastOperands(builder, existing_grad_matched, safe_grad);
             defer builder.allocator.free(add_broadcast.shape);
+
             const add_type = add_broadcast.lhs.getType();
             const sum_op = try builder.createAndAttach("stablehlo.add", &.{ add_broadcast.lhs, add_broadcast.rhs }, &.{add_type}, .{});
+
             try adjoint_map.put(operand, sum_op.getResult(0));
         } else {
-            const operand_ptr = @intFromPtr(operand.handle.ptr);
-            std.debug.print("DEBUG addInputGradients: First gradient for operand {} (ptr={})\n", .{i, operand_ptr});
-            try adjoint_map.put(operand, grad_matched);
+            try adjoint_map.put(operand, safe_grad);
         }
     }
 }

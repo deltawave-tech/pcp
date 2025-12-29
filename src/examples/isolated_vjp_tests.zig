@@ -99,7 +99,7 @@ pub fn testMultiplyVJP(allocator: Allocator) !void {
     _ = try builder.createAndAttach("func.return", &.{result.value}, &.{}, .{});
 
     // -- Generate the gradient function: `func.func @forward_mul_grad(...)` --
-    _ = try autodiff.buildGradientGraph(allocator, &builder, fwd_result.func_op);
+    _ = try autodiff.buildGradientGraph(allocator, &builder, fwd_result.func_op, -100.0, 100.0);
 
     // At this point, `builder.module` contains both functions.
     std.debug.print("--- Generated Module for Test ---\n", .{});
@@ -179,7 +179,7 @@ pub fn testAddVJP(allocator: Allocator) !void {
     const result = try ops.add(&builder, a_tensor, b_tensor);
     _ = try builder.createAndAttach("func.return", &.{result.value}, &.{}, .{});
 
-    _ = try autodiff.buildGradientGraph(allocator, &builder, fwd_result.func_op);
+    _ = try autodiff.buildGradientGraph(allocator, &builder, fwd_result.func_op, -100.0, 100.0);
 
     // 2. Test Forward Pass
     std.debug.print("--- Verifying Add Forward Pass ---\n", .{});
@@ -251,7 +251,7 @@ pub fn testSubtractVJP(allocator: Allocator) !void {
     const result = try ops.subtract(&builder, a_tensor, b_tensor);
     _ = try builder.createAndAttach("func.return", &.{result.value}, &.{}, .{});
 
-    _ = try autodiff.buildGradientGraph(allocator, &builder, fwd_result.func_op);
+    _ = try autodiff.buildGradientGraph(allocator, &builder, fwd_result.func_op, -100.0, 100.0);
 
     // 2. Test Forward Pass
     std.debug.print("--- Verifying Subtract Forward Pass ---\n", .{});
@@ -323,7 +323,7 @@ pub fn testDivideVJP(allocator: Allocator) !void {
     const result = try ops.divide(&builder, a_tensor, b_tensor);
     _ = try builder.createAndAttach("func.return", &.{result.value}, &.{}, .{});
 
-    _ = try autodiff.buildGradientGraph(allocator, &builder, fwd_result.func_op);
+    _ = try autodiff.buildGradientGraph(allocator, &builder, fwd_result.func_op, -100.0, 100.0);
 
     // 2. Test Forward Pass
     std.debug.print("--- Verifying Divide Forward Pass ---\n", .{});
@@ -397,7 +397,7 @@ pub fn testMatmulVJP(allocator: Allocator) !void {
     const product = try ops.matmul(&builder, a_tensor, b_tensor);
     _ = try builder.createAndAttach("func.return", &.{product.value}, &.{}, .{});
 
-    _ = try autodiff.buildGradientGraph(allocator, &builder, fwd_result.func_op);
+    _ = try autodiff.buildGradientGraph(allocator, &builder, fwd_result.func_op, -100.0, 100.0);
     
     std.debug.print("--- Generated Matmul Module for Test ---\n", .{});
     builder.module.op().dump();
@@ -483,7 +483,7 @@ pub fn testTransposeVJP(allocator: Allocator) !void {
     const result = try ops.transpose(&builder, a_tensor, &permutation);
     _ = try builder.createAndAttach("func.return", &.{result.value}, &.{}, .{});
 
-    _ = try autodiff.buildGradientGraph(allocator, &builder, fwd_result.func_op);
+    _ = try autodiff.buildGradientGraph(allocator, &builder, fwd_result.func_op, -100.0, 100.0);
 
     // 2. Test Forward Pass
     std.debug.print("--- Verifying Transpose Forward Pass ---\n", .{});
@@ -554,7 +554,7 @@ pub fn testReshapeVJP(allocator: Allocator) !void {
     const result = try ops.reshape(&builder, a_tensor, &new_shape);
     _ = try builder.createAndAttach("func.return", &.{result.value}, &.{}, .{});
 
-    _ = try autodiff.buildGradientGraph(allocator, &builder, fwd_result.func_op);
+    _ = try autodiff.buildGradientGraph(allocator, &builder, fwd_result.func_op, -100.0, 100.0);
 
     // 2. Test Forward Pass
     std.debug.print("--- Verifying Reshape Forward Pass ---\n", .{});
@@ -625,7 +625,7 @@ pub fn testReduceSumVJP(allocator: Allocator) !void {
     const result = try ops.reduceSum(&builder, a_tensor, &axes, false);
     _ = try builder.createAndAttach("func.return", &.{result.value}, &.{}, .{});
 
-    _ = try autodiff.buildGradientGraph(allocator, &builder, fwd_result.func_op);
+    _ = try autodiff.buildGradientGraph(allocator, &builder, fwd_result.func_op, -100.0, 100.0);
 
     // 2. Test Forward Pass
     std.debug.print("--- Verifying ReduceSum Forward Pass ---\n", .{});
@@ -690,7 +690,7 @@ pub fn testTanhVJP(allocator: Allocator) !void {
     const result = try ops.tanh(&builder, x_tensor);
     _ = try builder.createAndAttach("func.return", &.{result.value}, &.{}, .{});
 
-    _ = try autodiff.buildGradientGraph(allocator, &builder, fwd_result.func_op);
+    _ = try autodiff.buildGradientGraph(allocator, &builder, fwd_result.func_op, -100.0, 100.0);
 
     const input_x = [_]f32{1.0};
     const grad_out = [_]f32{1.0};
@@ -736,7 +736,7 @@ pub fn testReduceMaxVJP(allocator: Allocator) !void {
     const result = try ops.reduceMax(&builder, x_tensor, &axes, false);
     _ = try builder.createAndAttach("func.return", &.{result.value}, &.{}, .{});
 
-    _ = try autodiff.buildGradientGraph(allocator, &builder, fwd_result.func_op);
+    _ = try autodiff.buildGradientGraph(allocator, &builder, fwd_result.func_op, -100.0, 100.0);
 
     const input_data = [_]f32{1.0, 5.0, 3.0};
     const grad_out = [_]f32{1.0}; // Propagate 1.0 back
@@ -781,7 +781,7 @@ pub fn testExpVJP(allocator: Allocator) !void {
     const exp_op = try builder.createAndAttach("stablehlo.exponential", &.{arg.value}, &.{scalar_type}, .{});
     _ = try builder.createAndAttach("func.return", &.{exp_op.getResult(0)}, &.{}, .{});
 
-    _ = try autodiff.buildGradientGraph(allocator, &builder, fwd_result.func_op);
+    _ = try autodiff.buildGradientGraph(allocator, &builder, fwd_result.func_op, -100.0, 100.0);
 
     // Test Data: x = 2.0, grad_out = 1.0
     const input = [_]f32{2.0};
@@ -828,7 +828,7 @@ pub fn testLogVJP(allocator: Allocator) !void {
     const log_op = try builder.createAndAttach("stablehlo.log", &.{arg.value}, &.{scalar_type}, .{});
     _ = try builder.createAndAttach("func.return", &.{log_op.getResult(0)}, &.{}, .{});
 
-    _ = try autodiff.buildGradientGraph(allocator, &builder, fwd_result.func_op);
+    _ = try autodiff.buildGradientGraph(allocator, &builder, fwd_result.func_op, -100.0, 100.0);
 
     const input = [_]f32{2.0};
     const grad_out = [_]f32{1.0};
@@ -864,7 +864,7 @@ pub fn testRsqrtVJP(allocator: Allocator) !void {
     const op = try builder.createAndAttach("stablehlo.rsqrt", &.{arg.value}, &.{scalar_type}, .{});
     _ = try builder.createAndAttach("func.return", &.{op.getResult(0)}, &.{}, .{});
 
-    _ = try autodiff.buildGradientGraph(allocator, &builder, fwd_result.func_op);
+    _ = try autodiff.buildGradientGraph(allocator, &builder, fwd_result.func_op, -100.0, 100.0);
 
     const input = [_]f32{4.0};
     const grad_out = [_]f32{1.0};
@@ -909,7 +909,7 @@ pub fn testSelectVJP(allocator: Allocator) !void {
     const op = try builder.createAndAttach("stablehlo.select", &.{pred, on_true, on_false}, &.{tensor_f32}, .{});
     _ = try builder.createAndAttach("func.return", &.{op.getResult(0)}, &.{}, .{});
 
-    _ = try autodiff.buildGradientGraph(allocator, &builder, fwd_result.func_op);
+    _ = try autodiff.buildGradientGraph(allocator, &builder, fwd_result.func_op, -100.0, 100.0);
 
     // Inputs: pred=[true, false], on_true=[1.0, 1.0], on_false=[2.0, 2.0]
     // IREE expects i1 as i8 (byte) usually, 1=true, 0=false
@@ -971,7 +971,7 @@ pub fn testSinVJP(allocator: Allocator) !void {
     const result = try ops.sin(&builder, x_tensor);
     _ = try builder.createAndAttach("func.return", &.{result.value}, &.{}, .{});
 
-    _ = try autodiff.buildGradientGraph(allocator, &builder, fwd_result.func_op);
+    _ = try autodiff.buildGradientGraph(allocator, &builder, fwd_result.func_op, -100.0, 100.0);
 
     const input_x = [_]f32{1.0};
     const grad_out = [_]f32{1.0};
@@ -1007,7 +1007,7 @@ pub fn testCosVJP(allocator: Allocator) !void {
     const result = try ops.cos(&builder, x_tensor);
     _ = try builder.createAndAttach("func.return", &.{result.value}, &.{}, .{});
 
-    _ = try autodiff.buildGradientGraph(allocator, &builder, fwd_result.func_op);
+    _ = try autodiff.buildGradientGraph(allocator, &builder, fwd_result.func_op, -100.0, 100.0);
 
     const input_x = [_]f32{1.0};
     const grad_out = [_]f32{1.0};
@@ -1054,7 +1054,7 @@ pub fn testSiluVJP(allocator: Allocator) !void {
     _ = try builder.createAndAttach("func.return", &.{result.value}, &.{}, .{});
 
     // 2. Generate the gradient function
-    _ = try autodiff.buildGradientGraph(allocator, &builder, fwd_result.func_op);
+    _ = try autodiff.buildGradientGraph(allocator, &builder, fwd_result.func_op, -100.0, 100.0);
 
     // 3. Test the FORWARD pass
     std.debug.print("--- Verifying SiLU Forward Pass ---\n", .{});
@@ -1136,7 +1136,7 @@ pub fn testRoPEComponentVJP(allocator: Allocator) !void {
 
     _ = try builder.createAndAttach("func.return", &.{concat_op.getResult(0)}, &.{}, .{});
 
-    _ = try autodiff.buildGradientGraph(allocator, &builder, fwd_result.func_op);
+    _ = try autodiff.buildGradientGraph(allocator, &builder, fwd_result.func_op, -100.0, 100.0);
 
     const x_data = [_]f32{1.0, 2.0};
     const th_data = [_]f32{0.5};
@@ -1191,7 +1191,7 @@ pub fn testConcatenateVJP(allocator: Allocator) !void {
 
     _ = try builder.createAndAttach("func.return", &.{concat_op.getResult(0)}, &.{}, .{});
 
-    _ = try autodiff.buildGradientGraph(allocator, &builder, fwd_result.func_op);
+    _ = try autodiff.buildGradientGraph(allocator, &builder, fwd_result.func_op, -100.0, 100.0);
 
     const data_a = [_]f32{1.0, 2.0};
     const data_b = [_]f32{3.0, 4.0, 5.0};
@@ -1245,7 +1245,7 @@ pub fn testPowerVJP(allocator: Allocator) !void {
     const result = try ops.power(&builder, a_tensor, b_tensor);
     _ = try builder.createAndAttach("func.return", &.{result.value}, &.{}, .{});
 
-    _ = try autodiff.buildGradientGraph(allocator, &builder, fwd_result.func_op);
+    _ = try autodiff.buildGradientGraph(allocator, &builder, fwd_result.func_op, -100.0, 100.0);
 
     const input_a = [_]f32{2.0};
     const input_b = [_]f32{3.0};
@@ -1344,7 +1344,7 @@ pub fn testChainRule(allocator: Allocator) !void {
     std.debug.print("✓ Forward sequential graph created: f(x,w,b) = (x*w) + b\n", .{});
     
     // 2. Generate gradient graph using autodiff
-    _ = try autodiff.buildGradientGraph(allocator, &builder, forward_fn);
+    _ = try autodiff.buildGradientGraph(allocator, &builder, forward_fn, -100.0, 100.0);
     std.debug.print("✓ Chain rule gradient graph generated\n", .{});
     
     // 3. Execute forward pass
@@ -1509,7 +1509,7 @@ pub fn testCrossEntropyStability(allocator: Allocator) !void {
     _ = try builder.createAndAttach("func.return", &.{loss_scalar.value}, &.{}, .{});
 
     // Generate gradient function
-    _ = try autodiff.buildGradientGraph(allocator, &builder, fwd_result.func_op);
+    _ = try autodiff.buildGradientGraph(allocator, &builder, fwd_result.func_op, -100.0, 100.0);
 
     std.debug.print("--- Generated Cross-Entropy Module ---\n", .{});
     builder.module.op().dump();

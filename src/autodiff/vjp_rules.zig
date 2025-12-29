@@ -578,7 +578,10 @@ pub fn reduceSumVJP(builder: *MLIRBuilder, original_op: mlir.Operation, primals:
     var result = std.ArrayList(mlir.Value).init(builder.allocator);
 
     if (!isValueFromConstantOp(input)) {
+        const input_type = input.getType().as(mlir.RankedTensorType) orelse return error.InvalidTensorType;
+        const input_rank = input_type.getRank();
         const original_shape_type = input.getType();
+
         const dimensions_ref = c.stringRefFromString("dimensions");
         const dimensions_attr = c.operationGetAttributeByName(original_op.handle, dimensions_ref);
 
@@ -586,27 +589,38 @@ pub fn reduceSumVJP(builder: *MLIRBuilder, original_op: mlir.Operation, primals:
             var broadcast_dims = std.ArrayList(i64).init(builder.allocator);
             defer broadcast_dims.deinit();
 
-            const grad_rank = result_ranked_type.getRank();
+            const num_reduced_dims = c.mlirDenseArrayGetNumElements(dimensions_attr);
+            var reduced_dims_list = std.ArrayList(i64).init(builder.allocator);
+            defer reduced_dims_list.deinit();
 
-            if (grad_rank == 0) {
-                const empty_dims: [0]i64 = .{};
-                const empty_broadcast_dims_attr = mlir.Attribute.denseI64ArrayAttr(builder.ctx, &empty_dims);
-                const broadcast_op = try builder.createAndAttach("stablehlo.broadcast_in_dim",
-                    &.{grad_out},
-                    &.{original_shape_type},
-                    .{ .attributes = &.{.{ "broadcast_dimensions", empty_broadcast_dims_attr }} }
-                );
-                try result.append(broadcast_op.getResult(0));
-            } else {
-                for (0..@intCast(grad_rank)) |i| try broadcast_dims.append(@intCast(i));
-                const broadcast_dims_attr = mlir.Attribute.denseI64ArrayAttr(builder.ctx, broadcast_dims.items);
-                const broadcast_op = try builder.createAndAttach("stablehlo.broadcast_in_dim",
-                    &.{grad_out},
-                    &.{original_shape_type},
-                    .{ .attributes = &.{.{ "broadcast_dimensions", broadcast_dims_attr }} }
-                );
-                try result.append(broadcast_op.getResult(0));
+            for (0..@intCast(num_reduced_dims)) |i| {
+                const d = c.denseI64ArrayGetElement(dimensions_attr, @intCast(i));
+                try reduced_dims_list.append(d);
             }
+
+            for (0..input_rank) |i| {
+                const dim_idx = @as(i64, @intCast(i));
+                var is_reduced = false;
+                for (reduced_dims_list.items) |r| {
+                    if (r == dim_idx) {
+                        is_reduced = true;
+                        break;
+                    }
+                }
+
+                if (!is_reduced) {
+                    try broadcast_dims.append(dim_idx);
+                }
+            }
+
+            const broadcast_dims_attr = mlir.Attribute.denseI64ArrayAttr(builder.ctx, broadcast_dims.items);
+            const broadcast_op = try builder.createAndAttach("stablehlo.broadcast_in_dim",
+                &.{grad_out},
+                &.{original_shape_type},
+                .{ .attributes = &.{.{ "broadcast_dimensions", broadcast_dims_attr }} }
+            );
+            try result.append(broadcast_op.getResult(0));
+
         } else {
             const grad_input = try builder.createAndAttach("stablehlo.broadcast", &.{grad_out}, &.{original_shape_type}, .{});
             try result.append(grad_input.getResult(0));

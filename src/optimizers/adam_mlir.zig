@@ -13,7 +13,8 @@ pub fn AdamMLIRConfiguration(comptime DataType: type) type {
         beta1: DataType = 0.9,
         beta2: DataType = 0.999,
         epsilon: DataType = 1e-8,
-        weight_decay: DataType = 0.01, // Added for AdamW
+        weight_decay: DataType = 0.01,
+        max_grad_norm: DataType = 1.0,
         pub fn default_configuration() @This() { return .{}; }
     };
 }
@@ -56,28 +57,45 @@ pub fn AdamMLIR(comptime T: type) type {
             const dims = try params.shape.getDims(b.allocator);
             defer b.allocator.free(dims);
 
-            // 1. Create Scalar Constants
             const beta1 = try ops.constant(b, @as(f64, @floatCast(self.conf.beta1)), dims, self.element_type);
             const beta2 = try ops.constant(b, @as(f64, @floatCast(self.conf.beta2)), dims, self.element_type);
             const one = try ops.constant(b, 1.0, dims, self.element_type);
             const lr = try ops.constant(b, @as(f64, @floatCast(self.conf.learning_rate)), dims, self.element_type);
             const eps = try ops.constant(b, @as(f64, @floatCast(self.conf.epsilon)), dims, self.element_type);
             const decay = try ops.constant(b, @as(f64, @floatCast(self.conf.weight_decay)), dims, self.element_type);
+            const max_norm = try ops.constant(b, @as(f64, @floatCast(self.conf.max_grad_norm)), dims, self.element_type);
 
-            // 2. Update m_state: m = beta1 * m + (1 - beta1) * g
+            // Tensor-wise L2 Gradient Clipping
+            const g_squared = try ops.multiply(b, grads, grads);
+
+            var all_dims = std.ArrayList(i64).init(b.allocator);
+            defer all_dims.deinit();
+            for (0..params.shape.rank()) |i| try all_dims.append(@intCast(i));
+
+            const sum_sq = try ops.reduceSum(b, g_squared, all_dims.items, true);
+
+            const norm_raw = try ops.sqrt(b, sum_sq);
+            const norm = try ops.add(b, norm_raw, eps);
+
+            const max_val = try ops.maximum(b, norm, max_norm);
+            const clip_scale = try ops.divide(b, max_norm, max_val);
+
+            const clipped_grads = try ops.multiply(b, grads, clip_scale);
+
+            // Update m_state
             const one_minus_beta1 = try ops.subtract(b, one, beta1);
             const term1_m = try ops.multiply(b, beta1, m_state);
-            const term2_m = try ops.multiply(b, one_minus_beta1, grads);
+            const term2_m = try ops.multiply(b, one_minus_beta1, clipped_grads);
             const new_m = try ops.add(b, term1_m, term2_m);
 
-            // 3. Update v_state: v = beta2 * v + (1 - beta2) * g^2
+            // Update v_state
             const one_minus_beta2 = try ops.subtract(b, one, beta2);
             const term1_v = try ops.multiply(b, beta2, v_state);
-            const grads_sq = try ops.multiply(b, grads, grads);
-            const term2_v = try ops.multiply(b, one_minus_beta2, grads_sq);
+            const clipped_grads_sq = try ops.multiply(b, clipped_grads, clipped_grads);
+            const term2_v = try ops.multiply(b, one_minus_beta2, clipped_grads_sq);
             const new_v = try ops.add(b, term1_v, term2_v);
 
-            // 4. Bias Correction
+            // Bias Correction
             const beta1_pow = try ops.power(b, beta1, timestep);
             const beta2_pow = try ops.power(b, beta2, timestep);
             const m_corr_denom = try ops.subtract(b, one, beta1_pow);
@@ -86,14 +104,12 @@ pub fn AdamMLIR(comptime T: type) type {
             const m_hat = try ops.divide(b, new_m, m_corr_denom);
             const v_hat = try ops.divide(b, new_v, v_corr_denom);
 
-            // 5. AdamW Update
-            // denom = sqrt(v_hat) + epsilon
+            // AdamW Update
             const sqrt_v = try ops.sqrt(b, v_hat);
             const denom = try ops.add(b, sqrt_v, eps);
 
-            // step = lr * (m_hat / denom + weight_decay * params)
             const ratio = try ops.divide(b, m_hat, denom);
-            const decay_term = try ops.multiply(b, decay, params); // AdamW specific
+            const decay_term = try ops.multiply(b, decay, params);
             const combined = try ops.add(b, ratio, decay_term);
 
             const scaled_step = try ops.multiply(b, lr, combined);

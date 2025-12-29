@@ -675,22 +675,6 @@ pub fn build(b: *std.Build) void {
     const run_isolated_vjp_tests_step = b.step("run-isolated-vjp-tests", "Run isolated VJP numerical verification tests");
     run_isolated_vjp_tests_step.dependOn(&run_isolated_vjp_tests_cmd.step);
 
-    // Verify Real Forward Pass - Diagnose NaN issues with real data
-    const verify_real_forward = b.addExecutable(.{
-        .name = "verify_real_forward",
-        .root_source_file = b.path("src/examples/verify_real_forward.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    verify_real_forward.root_module.addImport("pcp", pcp_module);
-    addIreeDependencies(verify_real_forward, b, iree_config);
-    b.installArtifact(verify_real_forward);
-
-    const run_verify_real_forward_cmd = b.addRunArtifact(verify_real_forward);
-    run_verify_real_forward_cmd.step.dependOn(&verify_real_forward.step);
-    const run_verify_real_forward_step = b.step("run-verify-real-forward", "Run real data forward pass verification");
-    run_verify_real_forward_step.dependOn(&run_verify_real_forward_cmd.step);
-
     // MLIR Optimizer Tests - Numerical verification of Adam and Nesterov optimizers
     const mlir_optimizer_tests = b.addExecutable(.{
         .name = "mlir_optimizer_tests",

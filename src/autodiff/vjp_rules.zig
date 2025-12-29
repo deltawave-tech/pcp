@@ -1634,3 +1634,50 @@ pub fn selectVJP(builder: *MLIRBuilder, original_op: mlir.Operation, primals: []
     try result.append(grad_false.getResult(0));
     return result.toOwnedSlice();
 }
+
+/// VJP rule for tanh: d(tanh(x)) = (1 - tanh(x)^2) * dx
+pub fn tanhVJP(
+    builder: *MLIRBuilder,
+    original_op: mlir.Operation,
+    primals: []const mlir.Value,
+    adjoints: []const mlir.Value,
+) ![]mlir.Value {
+    const grad_out_raw = adjoints[0];
+    const x = primals[0];
+
+    const result_type = original_op.getResult(0).getType();
+    const result_ranked_type = result_type.as(mlir.RankedTensorType) orelse return error.InvalidTensorType;
+    const result_shape = try result_ranked_type.getShape(builder.allocator);
+    defer builder.allocator.free(result_shape);
+
+    const grad_out_type = grad_out_raw.getType().as(mlir.RankedTensorType) orelse return error.InvalidTensorType;
+    const grad_out_shape = try grad_out_type.getShape(builder.allocator);
+    defer builder.allocator.free(grad_out_shape);
+
+    var grad_out = grad_out_raw;
+    if (!std.mem.eql(i64, result_shape, grad_out_shape)) {
+        const reshape_op = try builder.createAndAttach("stablehlo.reshape", &.{grad_out_raw}, &.{result_type}, .{});
+        grad_out = reshape_op.getResult(0);
+    }
+
+    var result = std.ArrayList(mlir.Value).init(builder.allocator);
+    defer result.deinit();
+
+    // Recompute tanh(x) in gradient graph
+    const tanh_op = try builder.createAndAttach("stablehlo.tanh", &.{x}, &.{x.getType()}, .{});
+    const y = try builder.newTensor(tanh_op.getResult(0));
+
+    // Calculate 1.0 - y^2
+    const y_sq = try ops.multiply(builder, y, y);
+    const one = try ops.constant(builder, 1.0, result_shape, result_ranked_type.getElementType());
+    const one_minus_sq = try ops.subtract(builder, one, y_sq);
+
+    // grad_in = grad_out * (1 - y^2)
+    const grad_tensor = try builder.newTensor(grad_out);
+    const grad_x_raw = try ops.multiply(builder, grad_tensor, one_minus_sq);
+
+    const grad_x = try ops.reduceGradient(builder, grad_x_raw.value, x);
+    try result.append(grad_x);
+
+    return result.toOwnedSlice();
+}

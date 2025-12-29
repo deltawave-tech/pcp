@@ -669,6 +669,95 @@ pub fn testReduceSumVJP(allocator: Allocator) !void {
     std.debug.print("✓ reduceSumVJP isolated test PASSED\n", .{});
 }
 
+/// Test tanhVJP: f(x) = tanh(x)
+/// Expected: forward = tanh(x), dx = grad_out * (1 - tanh(x)^2)
+pub fn testTanhVJP(allocator: Allocator) !void {
+    std.debug.print("\n=== Testing tanhVJP Isolated Execution ===\n", .{});
+    try initGlobalMLIRContext(allocator);
+    const context = global_mlir_context.?.getContext();
+    var helper = ExecutionHelper{.allocator = allocator};
+    var builder = try MLIRBuilder.init(allocator, context);
+    defer builder.deinit();
+
+    const f32_type = mlir.Type.f32Type(context);
+    const scalar_type = mlir.Type.rankedTensorType(context, &.{}, f32_type);
+    const func_type = try mlir.Type.functionType(allocator, context, &.{scalar_type}, &.{scalar_type});
+
+    const fwd_result = try builder.createFunction("forward_tanh", func_type);
+    builder.setInsertionBlock(fwd_result.entry_block);
+
+    const x_tensor = try builder.newTensor(fwd_result.entry_block.getArgument(0));
+    const result = try ops.tanh(&builder, x_tensor);
+    _ = try builder.createAndAttach("func.return", &.{result.value}, &.{}, .{});
+
+    _ = try autodiff.buildGradientGraph(allocator, &builder, fwd_result.func_op);
+
+    const input_x = [_]f32{1.0};
+    const grad_out = [_]f32{1.0};
+    var inputs = [_][]const u8{ std.mem.sliceAsBytes(&input_x), std.mem.sliceAsBytes(&grad_out) };
+    var shapes = [_][]const i64{ &[_]i64{}, &[_]i64{} };
+
+    const outputs = try helper.executeModule(builder.module, "forward_tanh_grad", &inputs, &shapes, null);
+    defer { for(outputs) |o| allocator.free(o); allocator.free(outputs); }
+
+    const grad_x: f32 = @bitCast(std.mem.readInt(u32, outputs[0][0..4], .little));
+
+    // Math: tanh(1.0) approx 0.76159
+    // d/dx = 1 - tanh^2(x) = 1 - 0.76159^2 = 1 - 0.5800 = 0.41997
+    try std.testing.expectApproxEqAbs(0.419974, grad_x, 1e-5);
+    std.debug.print("✓ tanhVJP verified: f'(1.0) = {d:.6}\n", .{grad_x});
+}
+
+/// Test reduceMaxVJP: f(x) = max(x)
+/// Checks that gradient only flows to the maximum element (Masking logic)
+pub fn testReduceMaxVJP(allocator: Allocator) !void {
+    std.debug.print("\n=== Testing reduceMaxVJP Isolated Execution ===\n", .{});
+    try initGlobalMLIRContext(allocator);
+    const context = global_mlir_context.?.getContext();
+    var helper = ExecutionHelper{.allocator = allocator};
+    var builder = try MLIRBuilder.init(allocator, context);
+    defer builder.deinit();
+
+    // Input: [1.0, 5.0, 3.0] -> Max is 5.0 at index 1
+    const f32_type = mlir.Type.f32Type(context);
+    const vec_type = mlir.Type.rankedTensorType(context, &.{3}, f32_type);
+    const scalar_type = mlir.Type.rankedTensorType(context, &.{}, f32_type);
+
+    const func_type = try mlir.Type.functionType(allocator, context, &.{vec_type}, &.{scalar_type});
+
+    const fwd_result = try builder.createFunction("forward_reducemax", func_type);
+    builder.setInsertionBlock(fwd_result.entry_block);
+
+    const x_tensor = try builder.newTensor(fwd_result.entry_block.getArgument(0));
+
+    // Reduce along dim 0
+    const axes = [_]i64{0};
+    // keep_dims=false results in scalar
+    const result = try ops.reduceMax(&builder, x_tensor, &axes, false);
+    _ = try builder.createAndAttach("func.return", &.{result.value}, &.{}, .{});
+
+    _ = try autodiff.buildGradientGraph(allocator, &builder, fwd_result.func_op);
+
+    const input_data = [_]f32{1.0, 5.0, 3.0};
+    const grad_out = [_]f32{1.0}; // Propagate 1.0 back
+
+    var inputs = [_][]const u8{ std.mem.sliceAsBytes(&input_data), std.mem.sliceAsBytes(&grad_out) };
+    var shapes = [_][]const i64{ &[_]i64{3}, &[_]i64{} };
+
+    const outputs = try helper.executeModule(builder.module, "forward_reducemax_grad", &inputs, &shapes, null);
+    defer { for(outputs) |o| allocator.free(o); allocator.free(outputs); }
+
+    const grads = @as([*]const f32, @ptrCast(@alignCast(outputs[0].ptr)))[0..3];
+    std.debug.print("Grads: {any}\n", .{grads});
+
+    // Expect: [0.0, 1.0, 0.0] because 5.0 was the max
+    try std.testing.expectApproxEqAbs(0.0, grads[0], 1e-6);
+    try std.testing.expectApproxEqAbs(1.0, grads[1], 1e-6);
+    try std.testing.expectApproxEqAbs(0.0, grads[2], 1e-6);
+
+    std.debug.print("✓ reduceMaxVJP verified: Gradient correctly routed to max element\n", .{});
+}
+
 /// Test expVJP: f(x) = exp(x) with x=2.0
 /// Expected: forward=e^2=7.389056, dx = grad_out * e^x
 pub fn testExpVJP(allocator: Allocator) !void {
@@ -1511,8 +1600,8 @@ pub fn main() !void {
     try testTransposeVJP(allocator);
     try testReshapeVJP(allocator);
     try testReduceSumVJP(allocator);
-
-    // NEW TESTS FOR GPT-2 OPS
+    try testTanhVJP(allocator);
+    try testReduceMaxVJP(allocator);
     try testExpVJP(allocator);
     try testLogVJP(allocator);
     try testRsqrtVJP(allocator);

@@ -68,6 +68,8 @@ fn getVjpFn(op_name: []const u8) ?VJPFn {
         return vjp_rules.cosVJP;
     } else if (std.mem.eql(u8, op_name, "stablehlo.concatenate")) {
         return vjp_rules.concatenateVJP;
+    } else if (std.mem.eql(u8, op_name, "stablehlo.tanh")) {
+        return vjp_rules.tanhVJP;
     } else {
         return null;
     }
@@ -530,7 +532,7 @@ fn finalizeGradientFunction(allocator: Allocator, builder: *MLIRBuilder, gradien
             std.debug.print("  Mapped arg {}: value ptr={}\n", .{i, mapped_arg_ptr});
         }
 
-        if (adjoint_map.get(mapped_arg)) |gradient| {
+        if (adjoint_map.get(arg)) |gradient| {
             try input_gradients.append(gradient);
 
             // DEBUG: Print gradient tensor info

@@ -1,3 +1,31 @@
+"""
+NanoChat GPT ops compatibility checks (script-style).
+
+This file compares a couple of core implementations in `nanochat.gpt` against
+PyTorch references so we catch subtle semantic differences early.
+
+What it checks:
+- `nanochat.gpt.norm` vs a manual RMSNorm reference (and `F.rms_norm` if available).
+- `nanochat.gpt.scaled_dot_product_attention` vs `F.scaled_dot_product_attention`,
+  including the GQA path when supported.
+
+How to run (recommended, from `pcp/`):
+  nix develop -c ./venv/bin/python test/nanochat/test_gpt_ops_compat.py
+
+Results:
+==> test_norm
+input shape: (2, 3, 4) dtype=torch.float32 device=cpu
+norm vs manual: max_diff=0.0 ref_max=1.9249376058578491 tol=2.9249376058578494e-05
+F.rms_norm available: no
+==> test_sdpa
+q=(2, 4, 3, 8) k=(2, 2, 5, 8) v=(2, 2, 5, 8) dtype=torch.float32 device=cpu
+F.scaled_dot_product_attention enable_gqa: no (using manual GQA)
+sdpa gqa: max_diff=0.0 ref_max=1.8803761005401611 tol=2.8803761005401614e-05
+q2=(2, 2, 3, 8) k2=(2, 2, 5, 8) v2=(2, 2, 5, 8) dtype=torch.float32 device=cpu
+sdpa non-gqa causal: max_diff=0.0 ref_max=2.1292507648468018 tol=3.129250764846802e-05
+OK: gpt.py compatibility checks passed.
+"""
+
 import inspect
 import sys
 from pathlib import Path

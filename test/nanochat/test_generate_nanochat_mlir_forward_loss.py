@@ -1,3 +1,38 @@
+"""
+End-to-end MLIR forward-loss parity test for NanoChat (script-style).
+
+This test validates the whole path:
+  PyTorch weights + inputs
+    → `tools/generate_nanochat.py` (StableHLO MLIR export)
+    → `iree-compile` (VMFB)
+    → `iree-run-module` (execute)
+and checks that the scalar loss matches eager PyTorch within tolerance.
+
+Notes:
+- This is a *forward-only* check; it does not validate gradients/training parity.
+- It assumes IREE CLI tools are on PATH (recommended: run under `nix develop`).
+- The IREE compile target in this test is `llvm-cpu` (so it does not validate GPU codegen).
+
+How to run (recommended, from `pcp/`):
+  nix develop -c ./venv/bin/python test/nanochat/test_generate_nanochat_mlir_forward_loss.py
+
+
+Results:
+Compiling nanochat with layers=2, embd=64, heads=4...
+Exported params: 14 tensors
+Output: /tmp/nix-shell.2rkevO/nanochat_mlir_8udg9t9g/nanochat_forward_32.mlir
+Signature check: Signature check passed.
+Warning: MLIR uses ops without VJP coverage:
+    stablehlo.and, stablehlo.ceil, stablehlo.compare, stablehlo.dynamic_iota, stablehlo.iota
+batch0 loss_pt:   4.3792643547058105
+batch0 loss_mlir: 4.379264831542969
+batch0 abs diff:  4.76837158203125e-07
+batch1 loss_pt:   4.349891185760498
+batch1 loss_mlir: 4.349894046783447
+batch1 abs diff:  2.86102294921875e-06
+OK: generate_nanochat MLIR matches PyTorch loss (2 batches).
+"""
+
 import ast
 import re
 import shutil
@@ -22,7 +57,7 @@ if str(NANOCHAT_ROOT) not in sys.path:
 from nanochat.gpt import GPT, GPTConfig
 
 
-_DTYPE_TO_NPY_DESCR = {
+_DTYPE_TO_NPY_DESCR = { 
     torch.float32: "<f4",
     torch.int64: "<i8",
 }
@@ -88,7 +123,7 @@ def load_npy_scalar_f32(path: Path) -> float:
         return struct.unpack("<f", data)[0]
 
 
-def build_model_and_inputs():
+def build_model_and_params():
     torch.manual_seed(0)
     cfg = GPTConfig(
         sequence_len=32,
@@ -100,20 +135,100 @@ def build_model_and_inputs():
     )
     model = GPT(cfg).eval()
 
-    idx = torch.randint(0, cfg.vocab_size, (64, 32), dtype=torch.int64)
-    targets = torch.randint(0, cfg.vocab_size, (64, 32), dtype=torch.int64)
-
-    loss_pt = model(idx, targets)
-
     params = dict(model.named_parameters())
     param_names = list(params.keys())
     param_values = list(params.values())
 
-    inputs = [p.detach().cpu() for p in param_values]
-    inputs.append(idx.cpu())
-    inputs.append(targets.cpu())
+    param_values = [p.detach().cpu() for p in param_values]
 
-    return cfg, loss_pt.item(), inputs, param_names
+    return cfg, model, param_values, param_names
+
+
+def make_batch_inputs(cfg: GPTConfig, seed: int):
+    g = torch.Generator(device="cpu")
+    g.manual_seed(seed)
+    idx = torch.randint(0, cfg.vocab_size, (64, 32), dtype=torch.int64, generator=g)
+    targets = torch.randint(0, cfg.vocab_size, (64, 32), dtype=torch.int64, generator=g)
+    return idx, targets
+
+
+def parse_main_signature(mlir_text: str):
+    match = re.search(r"func\.func @main\(([^)]*)\) -> ([^{\n]+)", mlir_text)
+    if not match:
+        raise SystemExit("Could not find func.func @main signature in exported MLIR.")
+
+    args_str = match.group(1).strip()
+    ret_str = match.group(2).strip()
+    args = [arg.strip() for arg in args_str.split(",") if arg.strip()]
+
+    def arg_type(arg: str) -> str:
+        return arg.split(":", 1)[1].strip() if ":" in arg else arg.strip()
+
+    return [arg_type(a) for a in args], ret_str
+
+
+def parse_tensor_type(type_str: str):
+    type_str = type_str.strip()
+    if not type_str.startswith("tensor<") or not type_str.endswith(">"):
+        return None
+    inner = type_str[len("tensor<") : -1]
+    parts = inner.split("x")
+    if not parts:
+        return None
+    elem = parts[-1]
+    dims = parts[:-1]
+    return dims, elem
+
+
+def assert_signature_matches_inputs(mlir_path: Path, inputs):
+    mlir_text = mlir_path.read_text()
+    arg_types, ret_type = parse_main_signature(mlir_text)
+
+    if len(arg_types) != len(inputs):
+        raise SystemExit(
+            f"MLIR @main arg count mismatch: mlir={len(arg_types)} inputs={len(inputs)}"
+        )
+
+    if "f32" not in ret_type:
+        raise SystemExit(f"Unexpected return type (expected f32): {ret_type}")
+
+    for i, tensor in enumerate(inputs):
+        ty = arg_types[i]
+        parsed = parse_tensor_type(ty)
+        if parsed is None:
+            raise SystemExit(f"Unsupported arg type syntax at arg {i}: {ty}")
+        dims, elem = parsed
+
+        expected_elem = "f32" if tensor.dtype == torch.float32 else "i64"
+        if expected_elem != elem:
+            raise SystemExit(
+                f"Arg {i} dtype mismatch: mlir={elem} expected={expected_elem}"
+            )
+
+        is_idx_or_targets = i >= (len(inputs) - 2)
+        dims_are_unranked = dims == ["*"]
+
+        if is_idx_or_targets:
+            if dims_are_unranked or len(dims) != tensor.dim():
+                raise SystemExit(
+                    f"Arg {i} rank mismatch: mlir={len(dims)} expected={tensor.dim()} ({ty})"
+                )
+            for d_mlir, d_expected in zip(dims, tensor.shape):
+                if not d_mlir.isdigit() or int(d_mlir) != int(d_expected):
+                    raise SystemExit(
+                        f"Arg {i} shape mismatch: mlir_dim={d_mlir} expected_dim={int(d_expected)} ({ty})"
+                    )
+        else:
+            if not dims_are_unranked and len(dims) != tensor.dim():
+                raise SystemExit(
+                    f"Arg {i} rank mismatch: mlir={len(dims)} expected={tensor.dim()} ({ty})"
+                )
+            if not dims_are_unranked:
+                for d_mlir, d_expected in zip(dims, tensor.shape):
+                    if d_mlir.isdigit() and int(d_mlir) != int(d_expected):
+                        raise SystemExit(
+                            f"Arg {i} shape mismatch: mlir_dim={d_mlir} expected_dim={int(d_expected)} ({ty})"
+                        )
 
 
 def run_generate_nanochat(output_path):
@@ -206,7 +321,7 @@ def run_iree(vmfb_path, inputs, tmpdir):
 
 
 def main():
-    cfg, loss_pt, inputs, param_names = build_model_and_inputs()
+    cfg, model, param_values, param_names = build_model_and_params()
     _ = cfg, param_names  # silence unused warnings for future debugging
 
     with tempfile.TemporaryDirectory(prefix="nanochat_mlir_") as tmp:
@@ -215,17 +330,32 @@ def main():
         vmfb_path = tmpdir / "nanochat_forward_32.vmfb"
 
         run_generate_nanochat(mlir_path)
+        idx0, targets0 = make_batch_inputs(cfg, seed=1)
+        inputs0 = param_values + [idx0.cpu(), targets0.cpu()]
+        assert_signature_matches_inputs(mlir_path, inputs0)
         compile_with_iree(mlir_path, vmfb_path)
-        loss_mlir = run_iree(vmfb_path, inputs, tmpdir)
 
-    diff = abs(loss_pt - loss_mlir)
+        idx1, targets1 = make_batch_inputs(cfg, seed=2)
+        inputs1 = param_values + [idx1.cpu(), targets1.cpu()]
+
+        loss_pt0 = model(idx0, targets0).item()
+        loss_mlir0 = run_iree(vmfb_path, inputs0, tmpdir)
+        loss_pt1 = model(idx1, targets1).item()
+        loss_mlir1 = run_iree(vmfb_path, inputs1, tmpdir)
+
     tol = 1e-4
-    print(f"loss_pt:   {loss_pt}")
-    print(f"loss_mlir: {loss_mlir}")
-    print(f"abs diff:  {diff}")
-    if diff > tol:
-        raise SystemExit(f"MLIR mismatch: diff={diff} tol={tol}")
-    print("OK: generate_nanochat MLIR matches PyTorch loss.")
+    for label, loss_pt, loss_mlir in [
+        ("batch0", loss_pt0, loss_mlir0),
+        ("batch1", loss_pt1, loss_mlir1),
+    ]:
+        diff = abs(loss_pt - loss_mlir)
+        print(f"{label} loss_pt:   {loss_pt}")
+        print(f"{label} loss_mlir: {loss_mlir}")
+        print(f"{label} abs diff:  {diff}")
+        if diff > tol:
+            raise SystemExit(f"MLIR mismatch ({label}): diff={diff} tol={tol}")
+
+    print("OK: generate_nanochat MLIR matches PyTorch loss (2 batches).")
 
 
 if __name__ == "__main__":

@@ -1,3 +1,22 @@
+"""
+Smoke test for `torch.export` compatibility (script-style).
+
+This checks that NanoChat's `GPT` forward+loss can be captured by `torch.export`
+and executed, producing the same scalar loss as eager PyTorch.
+
+This is an early warning signal: if `torch.export` can’t capture the model,
+downstream torch-mlir export is likely to fail or become brittle.
+
+How to run (recommended, from `pcp/`):
+  nix develop -c ./venv/bin/python test/nanochat/test_torch_export_smoke.py
+
+Results:
+loss_pt: 4.358511924743652
+loss_export: 4.358511924743652
+abs diff: 0.0
+OK: torch.export matches eager loss.
+"""
+
 import sys
 from pathlib import Path
 
@@ -43,6 +62,14 @@ full_inputs = param_values + [idx, targets]
 ep = torch.export.export(wrapper, tuple(full_inputs), strict=False)
 loss_export = ep.module()(*full_inputs)
 
+diff = (loss_pt - loss_export).abs().item()
+tol = 1e-5
+
 print("loss_pt:", loss_pt.item())
 print("loss_export:", loss_export.item())
-print("abs diff:", (loss_pt - loss_export).abs().item())
+print("abs diff:", diff)
+
+if diff > tol:
+    raise SystemExit(f"torch.export mismatch: diff={diff} tol={tol}")
+
+print("OK: torch.export matches eager loss.")

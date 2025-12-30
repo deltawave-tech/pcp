@@ -458,17 +458,17 @@ pub fn build(b: *std.Build) void {
     // Add dependency from GPT-2 to PCP
     gpt2_module.addImport("pcp", pcp_module);
 
-    const test_step = b.step("test", "Run unit tests");
-    for (test_targets) |t_target| {
-        const modules_with_tests = .{
-            "src/tensor.zig",
-            "src/autodiff.zig",
-            "src/ops.zig",
-            "src/network/message.zig",
-        };
-        // Add unit tests
-        inline for (modules_with_tests) |module| {
-            const unit_tests = b.addTest(.{
+	    const test_step = b.step("test", "Run unit tests");
+	    for (test_targets) |t_target| {
+	        const modules_with_tests = .{
+	            "src/core/tensor.zig",
+	            "src/autodiff/engine.zig",
+	            "src/core/ops.zig",
+	            "src/network/message.zig",
+	        };
+	        // Add unit tests
+	        inline for (modules_with_tests) |module| {
+	            const unit_tests = b.addTest(.{
                 .root_source_file = b.path(module),
                 .target = b.resolveTargetQuery(t_target),
                 .optimize = optimize,

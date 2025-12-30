@@ -1,0 +1,116 @@
+# Tests (NanoChat + PCP)
+
+This repo has two different “layers” of checks:
+
+- **Python script tests** in `test/nanochat/`: validate NanoChat’s PyTorch model code and the *export → StableHLO MLIR → IREE execution* path.
+- **PCP runs** via the Zig binary (`pcp`): exercise PCP’s own autodiff, optimizer injection, networking, and distributed training loop.
+
+The Python tests are meant to answer: “Does the model/math/export/forward-loss match?”  
+They do **not** prove that PCP’s training/gradients/distributed execution are correct.
+
+## Prerequisites
+
+You typically want **both** of these available when running the Python tests:
+
+- **Nix dev shell**: provides IREE tools (`iree-compile`, `iree-run-module`) + compatible runtime libs.
+- **Python venv**: provides `torch` and `torch-mlir` (`pip install -r requirements.txt`).
+
+Recommended way to run a test from `pcp/`:
+
+```bash
+nix develop -c ./venv/bin/python test/nanochat/<test_file>.py
+```
+
+## Python Tests
+
+### `test/nanochat/test_gpt_ops_compat.py`
+
+**Goal:** sanity-check that key ops implemented in `nanochat.gpt` match PyTorch behavior.
+
+**What it checks:**
+- `nanochat.gpt.norm(x)` matches a manual RMSNorm reference (and `torch.nn.functional.rms_norm` if available).
+- `nanochat.gpt.scaled_dot_product_attention(...)` matches `torch.nn.functional.scaled_dot_product_attention(...)`, including the GQA (`enable_gqa`) path when supported by your PyTorch.
+
+**How to run:**
+```bash
+nix develop -c ./venv/bin/python test/nanochat/test_gpt_ops_compat.py
+```
+
+**What a pass looks like:** printed max diffs + `OK: gpt.py compatibility checks passed.`
+
+---
+
+### `test/nanochat/test_torch_export_smoke.py`
+
+**Goal:** ensure NanoChat’s `GPT` forward+loss can be captured and executed via `torch.export`.
+
+**Why this exists:** if `torch.export` can’t capture the model, downstream steps like torch-mlir export will be fragile or impossible.
+
+**What it checks:**
+- Builds a small deterministic `GPT`.
+- Computes eager PyTorch loss.
+- Exports a stateless wrapper using `torch.export.export(...)`.
+- Runs the exported program and asserts the loss matches eager within tolerance.
+
+**How to run:**
+```bash
+nix develop -c ./venv/bin/python test/nanochat/test_torch_export_smoke.py
+```
+
+---
+
+### `test/nanochat/test_generate_nanochat_mlir_forward_loss.py`
+
+**Goal:** end-to-end check that `tools/generate_nanochat.py` produces StableHLO MLIR that (when compiled and run with IREE) matches PyTorch’s **forward loss**.
+
+**Pipeline:**
+1. Build a deterministic PyTorch `GPT` and extract its parameters.
+2. Run `tools/generate_nanochat.py` to generate StableHLO MLIR (`func.func @main`).
+3. Validate the MLIR `@main` signature matches the inputs we will pass (param count/dtypes, and strict shape for `idx/targets`).
+4. Compile MLIR → VMFB using `iree-compile`.
+5. Run VMFB using `iree-run-module` and compare `loss_mlir` vs `loss_pt` on 2 different random batches.
+
+**How to run:**
+```bash
+nix develop -c ./venv/bin/python test/nanochat/test_generate_nanochat_mlir_forward_loss.py
+```
+
+**Important limitation:** this is **forward-only**. It does not validate gradients or PCP’s Zig autodiff/VJP rules.
+If `tools/generate_nanochat.py` prints “ops without VJP coverage”, forward correctness can still be fine, but PCP training/backprop may be incomplete until those VJPs exist.
+
+## PCP Run (Shepherd)
+
+Example command:
+
+```bash
+cd /home/ahmet/project/nanochat/pcp
+./result/bin/pcp --shepherd --config experiments/nanochat.json --host 0.0.0.0 --port 18080 --workers 1
+```
+
+**What it does:**
+- Starts PCP in **Shepherd** mode (coordinator).
+- Loads hyperparameters and paths from `experiments/nanochat.json`.
+- Binds a TCP server on `0.0.0.0:18080`.
+- Waits until `--workers 1` worker connects, then starts the training loop.
+
+To actually run training, you also need a worker process. For a single-machine CPU smoke run:
+
+```bash
+./result/bin/pcp --worker --host 127.0.0.1 --port 18080 --backend cpu
+```
+
+On a multi-GPU node, use the node manager (spawns supervised workers):
+
+```bash
+./result/bin/pcp --node-manager --scale 8 --host <SHEPHERD_IP> --port 18080 --backend cuda --target sm_90a
+```
+
+## “Robust on a bigger machine” checklist (what to add next)
+
+If you want confidence beyond forward-loss parity:
+
+- **Training-step sanity:** run a few PCP training steps and assert loss stays finite (no NaNs) and changes as expected.
+- **VJP/autodiff coverage gating:** treat “ops without VJP coverage” warnings as failures (or add missing VJPs).
+- **Backend coverage:** at least one smoke run per backend you care about (CPU, CUDA, ROCm), because codegen/runtime differences can matter.
+- **Distributed correctness:** 2+ workers, verify synchronization works and runs don’t deadlock.
+- **Checkpoint/resume:** start, checkpoint, restart with `--resume`, confirm training continues from the same run state.

@@ -63,6 +63,7 @@ pub const Worker = struct {
     // RL / Generation State
     kv_cache: ?[][]u8,        // Persistent KV Cache buffers on Host (to be sent to device)
     sampler: math.Sampler,    // Token sampler
+    weight_blob: ?[]u8,       // Flat weight buffer for RL generation (updated by Shepherd)
 
     const Self = @This();
 
@@ -85,6 +86,7 @@ pub const Worker = struct {
             .supervisor_id = supervisor_id,
             .kv_cache = null,
             .sampler = math.Sampler.init(@intCast(std.time.timestamp())),
+            .weight_blob = null,
         };
     }
     
@@ -122,6 +124,11 @@ pub const Worker = struct {
         if (self.kv_cache) |cache_buffers| {
             for (cache_buffers) |buf| self.allocator.free(buf);
             self.allocator.free(cache_buffers);
+        }
+
+        // Cleanup weight blob
+        if (self.weight_blob) |blob| {
+            self.allocator.free(blob);
         }
 
         self.client.deinit();
@@ -217,6 +224,8 @@ pub const Worker = struct {
                 try self.handleStartInnerLoop(msg);
             } else if (std.mem.eql(u8, msg.msg_type, MessageType.START_ROLLOUT)) {
                 try self.handleStartRollout(msg);
+            } else if (std.mem.eql(u8, msg.msg_type, MessageType.UPDATE_WEIGHTS)) {
+                try self.handleUpdateWeights(msg);
             } else if (std.mem.eql(u8, msg.msg_type, MessageType.SHUTDOWN)) {
                 self.handleShutdown(msg);
                 break;
@@ -288,18 +297,36 @@ pub const Worker = struct {
             .object => |obj| obj,
             else => return error.InvalidMessageFormat,
         };
-        
-        // 2. Decode and cache the VMFB
-        const b64_vmfb_val = payload.get("vmfb") orelse return error.MissingVmfbField;
-        const vmfb_string = switch (b64_vmfb_val) {
-            .string => |s| s,
-            else => return error.InvalidVmfbFormat,
-        };
-        
-        const decoded_len = try std.base64.standard.Decoder.calcSizeForSlice(vmfb_string);
-        const vmfb_bytes = try self.allocator.alloc(u8, decoded_len);
-        try std.base64.standard.Decoder.decode(vmfb_bytes, vmfb_string);
-        self.cached_vmfb = vmfb_bytes;
+
+        // 2. Load VMFB (either from path or from base64-encoded bytes)
+        if (payload.get("vmfb_path")) |vmfb_path_val| {
+            // Load from filesystem
+            const vmfb_path = switch (vmfb_path_val) {
+                .string => |s| s,
+                else => return error.InvalidVmfbPathFormat,
+            };
+            std.log.info("Loading VMFB from path: {s}", .{vmfb_path});
+            const vmfb_bytes = try std.fs.cwd().readFileAlloc(
+                self.allocator,
+                vmfb_path,
+                10 * 1024 * 1024 * 1024, // 10GB limit
+            );
+            self.cached_vmfb = vmfb_bytes;
+            std.log.info("✓ Loaded VMFB from disk ({} bytes)", .{vmfb_bytes.len});
+        } else if (payload.get("vmfb")) |b64_vmfb_val| {
+            // Legacy: decode from base64
+            const vmfb_string = switch (b64_vmfb_val) {
+                .string => |s| s,
+                else => return error.InvalidVmfbFormat,
+            };
+            const decoded_len = try std.base64.standard.Decoder.calcSizeForSlice(vmfb_string);
+            const vmfb_bytes = try self.allocator.alloc(u8, decoded_len);
+            try std.base64.standard.Decoder.decode(vmfb_bytes, vmfb_string);
+            self.cached_vmfb = vmfb_bytes;
+            std.log.info("✓ Decoded VMFB from base64 ({} bytes)", .{vmfb_bytes.len});
+        } else {
+            return error.MissingVmfbField;
+        }
 
         // 3. Parse and cache the parameter shapes
         const param_shapes_json = payload.get("parameter_shapes") orelse return error.MissingParameterShapesField;
@@ -718,11 +745,41 @@ pub const Worker = struct {
         try self.client.send(response);
         self.state = .connected;
     }
-    
-    
-    
-    
-    
+    /// Handle weight update from Shepherd
+    fn handleUpdateWeights(self: *Self, msg: MessageEnvelope) !void {
+        std.log.info("Worker {}: Receiving weight update...", .{self.node_id.?});
+
+        const payload = switch (msg.data) {
+            .object => |o| o,
+            else => return error.InvalidFormat,
+        };
+
+        const weights_value = payload.get("weights") orelse return error.MissingWeights;
+        const b64_weights = switch (weights_value) {
+            .string => |s| s,
+            else => return error.InvalidWeightsFormat,
+        };
+
+        // Decode Base64
+        const decoded_len = try std.base64.standard.Decoder.calcSizeForSlice(b64_weights);
+
+        // Free old weight blob if exists
+        if (self.weight_blob) |old_blob| {
+            self.allocator.free(old_blob);
+        }
+
+        // Allocate and decode new weights
+        self.weight_blob = try self.allocator.alloc(u8, decoded_len);
+        errdefer {
+            self.allocator.free(self.weight_blob.?);
+            self.weight_blob = null;
+        }
+
+        _ = try std.base64.standard.Decoder.decode(self.weight_blob.?, b64_weights);
+
+        std.log.info("Worker {}: Weights updated ({} bytes)", .{ self.node_id.?, decoded_len });
+    }
+
     /// Handle a Rollout Request (RL Generation)
     fn handleStartRollout(self: *Self, msg: MessageEnvelope) !void {
         self.state = .training; // Reuse status or add .generating

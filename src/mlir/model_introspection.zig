@@ -34,7 +34,7 @@ pub const ModelInspector = struct {
         const func_type = forward_fn.getType().as(mlir.FunctionType) orelse return error.NotAFunctionType;
 
         // 3. Validate inputs
-        if (func_type.getNumInputs() <= num_data_inputs) {
+        if (func_type.getNumInputs() < num_data_inputs) {
             return error.NotEnoughInputsInModel;
         }
         const num_params = func_type.getNumInputs() - num_data_inputs;

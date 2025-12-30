@@ -185,6 +185,7 @@ pub const MessageType = struct {
     // RL / GRPO Protocol
     pub const START_ROLLOUT = "StartRollout";       // Shepherd -> Worker: "Generate text for these prompts"
     pub const ROLLOUT_COMPLETE = "RolloutComplete"; // Worker -> Shepherd: "Here are the token IDs and LogProbs"
+    pub const UPDATE_WEIGHTS = "UpdateWeights";     // Shepherd -> Worker: "Here are the new model weights"
 };
 
 pub const MessageHandler = *const fn (MessageEnvelope) anyerror!void;

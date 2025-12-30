@@ -10,6 +10,8 @@ const Allocator = std.mem.Allocator;
 const shepherd = @import("nodes/controllers/shepherd.zig");
 const worker = @import("nodes/workers/worker.zig");
 const diloco = @import("algorithms/diloco.zig");
+const grpo = @import("algorithms/grpo.zig");
+const rl_shepherd = @import("nodes/controllers/rl_shepherd.zig");
 const training_algorithm = @import("algorithms/training_algorithm.zig");
 const backend_selection = @import("backends/selection.zig");
 const ops = @import("core/ops.zig");
@@ -76,6 +78,7 @@ const Args = struct {
     device_id: usize,
     scale: usize,
     should_resume: bool,
+    rl_mode: bool,
     child_args: std.ArrayList([]const u8),
 
     const Mode = enum {
@@ -102,6 +105,7 @@ const Args = struct {
                 .device_id = 0,
                 .scale = 1,
                 .should_resume = false,
+                .rl_mode = false,
                 .child_args = child_args_list,
             };
         }
@@ -119,6 +123,7 @@ const Args = struct {
         var device_id: usize = 0;
         var scale: usize = 1;
         var should_resume: bool = false;
+        var rl_mode: bool = false;
 
         var i: usize = 1;
         while (i < args.len) {
@@ -207,6 +212,8 @@ const Args = struct {
                 }
             } else if (std.mem.eql(u8, args[i], "--resume")) {
                 should_resume = true;
+            } else if (std.mem.eql(u8, args[i], "--rl")) {
+                rl_mode = true;
             } else if (std.mem.eql(u8, args[i], "--supervise")) {
                 supervise = true;
                 i += 1;
@@ -232,6 +239,7 @@ const Args = struct {
             .device_id = device_id,
             .scale = scale,
             .should_resume = should_resume,
+            .rl_mode = rl_mode,
             .child_args = child_args_list,
         };
     }
@@ -250,6 +258,7 @@ const Args = struct {
         print("  --workers <count>    Number of workers to wait for (default: 2)\n", .{});
         print("  --model <path>       Path to MLIR model file (Shepherd only, overrides config)\n", .{});
         print("  --resume             Resume from previous training state\n", .{});
+        print("  --rl                 Enable RL mode with GRPO algorithm (Shepherd only)\n", .{});
         print("  --backend <type>     Backend to use: cpu, cuda, metal, vulkan, rocm (default: auto)\n", .{});
         print("  --target <arch>      GPU target architecture (e.g., gfx942 for MI300X, sm_80 for A100)\n", .{});
         print("  --device-id <id>     GPU device ID to use (default: 0, for multi-GPU nodes)\n", .{});
@@ -292,8 +301,51 @@ fn loadConfig(allocator: Allocator, path: ?[]const u8) !ConfigResult {
     };
 }
 
+/// Run as RL Shepherd coordinator with GRPO
+fn runRLShepherd(allocator: Allocator, args: Args) !void {
+    print("Starting RL Shepherd coordinator with GRPO...\n", .{});
+
+    // Create RLShepherd instance
+    var rl_shepherd_controller = rl_shepherd.RLShepherd.init(allocator);
+    defer rl_shepherd_controller.deinit();
+
+    // Start listening in a separate thread
+    const listen_thread = try std.Thread.spawn(.{}, rlShepherdListenThread, .{ &rl_shepherd_controller, args.host, args.port });
+    defer listen_thread.join();
+
+    // Give the listen thread time to start
+    std.time.sleep(500 * std.time.ns_per_ms);
+
+    // Create GRPO algorithm
+    const grpo_config = grpo.GRPOConfig{
+        .num_iterations = 10,
+        .group_size = 4,
+        .learning_rate = 1e-6,
+        .beta = 0.1,
+    };
+
+    var grpo_algo = grpo.GRPO.init(allocator, &rl_shepherd_controller, grpo_config);
+    var training_algo = grpo_algo.asTrainingAlgorithm();
+
+    // Run GRPO training loop
+    print("Starting GRPO training...\n", .{});
+    try training_algo.run();
+
+    print("GRPO training completed!\n", .{});
+}
+
+/// RL Shepherd listening thread
+fn rlShepherdListenThread(rl_shepherd_controller: *rl_shepherd.RLShepherd, host: []const u8, port: u16) !void {
+    try rl_shepherd_controller.listen(host, port);
+}
+
 /// Run as Shepherd coordinator
 fn runShepherd(allocator: Allocator, args: Args) !void {
+    // Check if RL mode is enabled
+    if (args.rl_mode) {
+        return runRLShepherd(allocator, args);
+    }
+
     const LATEST_RUN_FILE = ".pcp_latest_run";
     var run_id_buf: [64]u8 = undefined;
     var run_id: []const u8 = undefined;

@@ -1178,3 +1178,21 @@ pub fn pad(
     });
 }
 
+/// Creates a stablehlo.dynamic_update_slice operation
+/// Used for efficient KV cache updates (inserting new token data into the cache buffer)
+pub fn dynamic_update_slice(
+    allocator: std.mem.Allocator,
+    ctx: mlir.Context,
+    operand: mlir.Value,
+    update: mlir.Value,
+    start_indices: mlir.Value,
+    loc: mlir.Location
+) !mlir.Operation {
+    return mlir.Operation.create(allocator, ctx, "stablehlo.dynamic_update_slice", .{
+        .operands = &.{ operand, update, start_indices },
+        // The result type is always the same as the operand (the cache tensor)
+        .results = &.{operand.getType()},
+        .location = loc,
+    });
+}
+

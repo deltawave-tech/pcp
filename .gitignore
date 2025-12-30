@@ -45,6 +45,9 @@ data/*
 checkpoint_*.bin
 shepherd_state.bin
 
+# Large model files
+models/qwen_rl_generation.mlir
+
 # Nix artifacts
 result
 build*.log

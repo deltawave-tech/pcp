@@ -281,6 +281,11 @@ pub fn Tensor(comptime T: type) type {
             return try ops_mod.relu(self.builder, self);
         }
 
+        pub fn dynamicUpdate(self: Self, update: Self, start_indices: Self) !Self {
+            const ops_mod = @import("ops.zig");
+            return try ops_mod.dynamicUpdateSlice(self.builder, self, update, start_indices);
+        }
+
         /// Create a generic Tensor from a raw byte slice and shape.
         /// Effectively wraps a stablehlo.constant.
         pub fn fromBytes(builder: *MLIRBuilder, bytes: []const u8, shape_dims: []const i64, dtype: DType) !Self {

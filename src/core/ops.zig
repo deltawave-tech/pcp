@@ -629,6 +629,21 @@ pub fn slice(builder: *MLIRBuilder, a: Tensor, start_indices: []const i64, limit
     return try builder.createAndAppendOp(operation);
 }
 
+/// Dynamic update slice operation
+/// Updates 'operand' with values from 'update' starting at 'start_indices'.
+/// Crucial for ring-buffer KV caches.
+pub fn dynamicUpdateSlice(builder: *MLIRBuilder, operand: Tensor, update: Tensor, start_indices: Tensor) !Tensor {
+    const operation = try hlo.dynamic_update_slice(
+        builder.allocator,
+        builder.ctx,
+        operand.value,
+        update.value,
+        start_indices.value,
+        builder.loc
+    );
+    return try builder.createAndAppendOp(operation);
+}
+
 /// Iota operation to create tensors with incrementing values along a dimension
 pub fn iota(builder: *MLIRBuilder, shape: []const i64, iota_dimension: i64, element_type: mlir.Type) !Tensor {
     // Use StableHLO dialect wrapper

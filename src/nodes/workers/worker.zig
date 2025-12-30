@@ -11,6 +11,7 @@ const worker_backend = @import("../../backends/worker_backend.zig");
 const backend_selection = @import("../../backends/selection.zig");
 const dataset_mod = @import("../../data/dataset.zig");
 const loader = @import("../../data/loader.zig");
+const math = @import("../../core/math.zig");
 
 const TcpClient = tcp_stream.TcpClient;
 const TcpStreamManager = tcp_stream.TcpStreamManager;
@@ -59,6 +60,10 @@ pub const Worker = struct {
     // Supervisor Pattern: ID of the supervisor managing this worker
     supervisor_id: ?i64,
 
+    // RL / Generation State
+    kv_cache: ?[][]u8,        // Persistent KV Cache buffers on Host (to be sent to device)
+    sampler: math.Sampler,    // Token sampler
+
     const Self = @This();
 
     pub fn init(allocator: Allocator, backend: WorkerBackend, supervisor_id: ?i64) !Self {
@@ -78,6 +83,8 @@ pub const Worker = struct {
             .dataset = null,
             .current_chunk_id = null,
             .supervisor_id = supervisor_id,
+            .kv_cache = null,
+            .sampler = math.Sampler.init(@intCast(std.time.timestamp())),
         };
     }
     
@@ -109,6 +116,12 @@ pub const Worker = struct {
         if (self.v_states) |states| {
             for (states) |s| self.allocator.free(s);
             self.allocator.free(states);
+        }
+
+        // Cleanup KV cache buffers
+        if (self.kv_cache) |cache_buffers| {
+            for (cache_buffers) |buf| self.allocator.free(buf);
+            self.allocator.free(cache_buffers);
         }
 
         self.client.deinit();
@@ -202,6 +215,8 @@ pub const Worker = struct {
                 try self.handleInitializeGraph(msg);
             } else if (std.mem.eql(u8, msg.msg_type, MessageType.START_INNER_LOOP)) {
                 try self.handleStartInnerLoop(msg);
+            } else if (std.mem.eql(u8, msg.msg_type, MessageType.START_ROLLOUT)) {
+                try self.handleStartRollout(msg);
             } else if (std.mem.eql(u8, msg.msg_type, MessageType.SHUTDOWN)) {
                 self.handleShutdown(msg);
                 break;
@@ -708,10 +723,171 @@ pub const Worker = struct {
     
     
     
-    
-    
-    
-    
+    /// Handle a Rollout Request (RL Generation)
+    fn handleStartRollout(self: *Self, msg: MessageEnvelope) !void {
+        self.state = .training; // Reuse status or add .generating
+
+        // 1. Parse Payload
+        const payload = switch (msg.data) {
+            .object => |obj| obj,
+            else => return error.InvalidMessageFormat,
+        };
+
+        // Get Prompt (Input IDs)
+        // Assumes payload["prompt"] is array of integers
+        const prompt_json = payload.get("prompt") orelse return error.MissingPrompt;
+        var prompt_list = std.ArrayList(i64).init(self.allocator);
+        defer prompt_list.deinit();
+
+        switch (prompt_json) {
+            .array => |arr| {
+                for (arr.items) |item| {
+                    try prompt_list.append(item.integer);
+                }
+            },
+            else => return error.InvalidPromptFormat,
+        }
+
+        const max_new_tokens = 128; // Configurable limit
+        var generated_tokens = std.ArrayList(i64).init(self.allocator);
+        defer generated_tokens.deinit();
+
+        // 2. Allocate KV Cache if not ready
+        // Qwen has N layers. Our export script put KV arguments AFTER token and pos.
+        // Input Signature: [Token (1,1), Pos (1,1), K_0, V_0, K_1, V_1 ...]
+        // We need to look at cached_data_input_shapes to know KV sizes.
+        if (self.kv_cache == null) {
+            // Skip first 2 shapes (Token, Pos)
+            const kv_shapes = self.cached_data_input_shapes.?[2..];
+            const kv_buffers = try self.allocator.alloc([]u8, kv_shapes.len);
+
+            for (kv_shapes, 0..) |shape, i| {
+                var size: usize = 4; // f32
+                for (shape) |dim| size *= @intCast(dim);
+                kv_buffers[i] = try self.allocator.alloc(u8, size);
+                @memset(kv_buffers[i], 0); // Zero init
+            }
+            self.kv_cache = kv_buffers;
+        }
+
+        // 3. Generation Loop
+        var current_pos: i64 = 0;
+
+        // Prefill + Decode logic combined
+        // Ideally prefill is one step, but for simplicity we loop the prompt too
+        // (slower but safer for v1).
+
+        const total_len = prompt_list.items.len + max_new_tokens;
+
+        while (current_pos < total_len) {
+            // Determine input token
+            var input_token: i64 = 0;
+            if (current_pos < prompt_list.items.len) {
+                input_token = prompt_list.items[@intCast(current_pos)];
+            } else {
+                if (generated_tokens.items.len > 0) {
+                    input_token = generated_tokens.items[generated_tokens.items.len - 1];
+                }
+            }
+
+            // Prepare Inputs
+            var input_list = std.ArrayList([]const u8).init(self.allocator);
+            defer input_list.deinit();
+
+            // 1. Token
+            const token_i64 = [_]i64{input_token};
+            try input_list.append(std.mem.sliceAsBytes(&token_i64));
+
+            // 2. Position
+            const pos_i64 = [_]i64{current_pos};
+            try input_list.append(std.mem.sliceAsBytes(&pos_i64));
+
+            // 3. KV Cache
+            for (self.kv_cache.?) |buf| {
+                try input_list.append(buf);
+            }
+
+            // Prepare Shapes
+            // We use the cached shapes exactly
+
+            // Execute
+            const inputs_slice = try input_list.toOwnedSlice();
+            defer self.allocator.free(inputs_slice);
+
+            const outputs = try self.backend.executeTrainingStep(
+                self.cached_vmfb.?,
+                inputs_slice,
+                self.cached_data_input_shapes.?
+            );
+            defer {
+                for (outputs) |o| self.allocator.free(o);
+                self.allocator.free(outputs);
+            }
+
+            // Process Outputs
+            // Output 0: Logits [1, 1, Vocab]
+            // Output 1..N: New K/V slices
+
+            const logits_raw = outputs[0];
+            const logits_f32_unaligned = std.mem.bytesAsSlice(f32, logits_raw);
+            const logits_f32: []const f32 = @alignCast(logits_f32_unaligned);
+
+            // Sample if generating new tokens
+            if (current_pos >= prompt_list.items.len) {
+                const next_token = self.sampler.sample(logits_f32, 0.7); // Temp 0.7
+                try generated_tokens.append(next_token);
+                // Check EOS (Qwen 151643)
+                if (next_token == 151643) break;
+            }
+
+            // Update KV Cache (Host Side Update)
+            // Outputs 1..end are the updates.
+            // We copy them into self.kv_cache at the correct offset.
+            // Note: This manual copy is the "In-Out" pattern bottleneck,
+            // but necessary without `util.global` in MLIR.
+            const updates = outputs[1..];
+            for (updates, 0..) |update_bytes, i| {
+                const cache_buffer = self.kv_cache.?[i];
+
+                // Calculate offset in bytes: current_pos * head_dim * n_heads * 4
+                // We know the update is [1, heads, 1, dim], cache is [1, heads, max_seq, dim]
+                // This stride math depends on memory layout (Row Major).
+                // Simplified: We assume flattened 1D for memory copy.
+
+                const update_len = update_bytes.len;
+                const cache_stride = update_len; // Since update is 1 time step slice
+                const offset_bytes = @as(usize, @intCast(current_pos)) * cache_stride;
+
+                if (offset_bytes + update_len <= cache_buffer.len) {
+                    @memcpy(cache_buffer[offset_bytes .. offset_bytes + update_len], update_bytes);
+                }
+            }
+
+            current_pos += 1;
+        }
+
+        // 4. Send Results Back
+        var result_payload = std.json.ObjectMap.init(self.allocator);
+        defer result_payload.deinit();
+
+        var tokens_array = std.json.Array.init(self.allocator);
+        defer tokens_array.deinit();
+        for (generated_tokens.items) |t| try tokens_array.append(.{ .integer = t });
+
+        try result_payload.put("completion", .{ .array = tokens_array });
+
+        const response = message.MessageEnvelope{
+            .recipient_node = 0, .recipient_service = "shepherd",
+            .sender_node = self.node_id.?, .sender_service = "worker",
+            .msg_type = MessageType.ROLLOUT_COMPLETE,
+            .msg_id = msg.msg_id + 1,
+            .data = .{ .object = result_payload },
+        };
+
+        try self.client.send(response);
+        self.state = .connected;
+    }
+
     /// Handle Shutdown command from Shepherd
     fn handleShutdown(self: *Self, msg: MessageEnvelope) void {
         _ = msg;

@@ -12,10 +12,13 @@ How to run (recommended, from `pcp/`):
 
 Results:
 loss_pt: 4.358511924743652
-loss_export: 4.358511924743652
+rloss_export: 4.358511924743652
 abs diff: 0.0
 OK: torch.export matches eager loss.
 """
+
+from typing import Any
+
 
 import sys
 from pathlib import Path
@@ -54,7 +57,7 @@ class Wrapper(torch.nn.Module):
         self.base = base
         self.names = names
     def forward(self, *args):
-        params_dict = {n: p for n, p in zip(self.names, args[:-2])}
+        params_dict = {n: p for n, p in zip[tuple](self.names, args[:-2])}
         return functional_call(self.base, params_dict, (args[-2], args[-1]))
 
 wrapper = Wrapper(model, param_names)

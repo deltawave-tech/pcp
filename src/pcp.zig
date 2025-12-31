@@ -16,6 +16,11 @@ const ops = @import("core/ops.zig");
 const mlir = @import("mlir/wrapper.zig");
 const autodiff = @import("autodiff/engine.zig");
 const dashboard = @import("ui/dashboard.zig");
+const adam_mlir = @import("optimizers/adam_mlir.zig");
+const graph_builder = @import("compiler/graph_builder.zig");
+const model_introspection = @import("mlir/model_introspection.zig");
+const mlir_ctx = @import("mlir/context.zig");
+const sanitizer = @import("compiler/sanitizer.zig");
 
 const Shepherd = shepherd.Shepherd;
 const Worker = worker.Worker;
@@ -69,6 +74,7 @@ const Args = struct {
     workers: usize,
     config_path: ?[]const u8,
     model_path: ?[]const u8,
+    export_training_dir: ?[]const u8,
     backend: ?backend_selection.Backend,
     target_arch: ?[]const u8,
     supervisor_id: ?i64,
@@ -95,6 +101,7 @@ const Args = struct {
                 .workers = 2,
                 .config_path = null,
                 .model_path = null,
+                .export_training_dir = null,
                 .backend = null,
                 .target_arch = null,
                 .supervisor_id = null,
@@ -112,6 +119,7 @@ const Args = struct {
         var workers: usize = 2;
         var config_path: ?[]const u8 = null;
         var model_path: ?[]const u8 = null;
+        var export_training_dir: ?[]const u8 = null;
         var backend: ?backend_selection.Backend = null;
         var target_arch: ?[]const u8 = null;
         var supervisor_id: ?i64 = null;
@@ -165,6 +173,11 @@ const Args = struct {
                 i += 1;
                 if (i < args.len) {
                     model_path = args[i];
+                }
+            } else if (std.mem.eql(u8, args[i], "--export-training-artifacts")) {
+                i += 1;
+                if (i < args.len) {
+                    export_training_dir = args[i];
                 }
             } else if (std.mem.eql(u8, args[i], "--backend")) {
                 i += 1;
@@ -225,6 +238,7 @@ const Args = struct {
             .workers = workers,
             .config_path = config_path,
             .model_path = model_path,
+            .export_training_dir = export_training_dir,
             .backend = backend,
             .target_arch = target_arch,
             .supervisor_id = supervisor_id,
@@ -249,6 +263,7 @@ const Args = struct {
         print("  --port <port>        Port to bind/connect to (default: 8080)\n", .{});
         print("  --workers <count>    Number of workers to wait for (default: 2)\n", .{});
         print("  --model <path>       Path to MLIR model file (Shepherd only, overrides config)\n", .{});
+        print("  --export-training-artifacts <dir>  Export training MLIR/VMFB + metadata and exit\n", .{});
         print("  --resume             Resume from previous training state\n", .{});
         print("  --backend <type>     Backend to use: cpu, cuda, metal, vulkan, rocm (default: auto)\n", .{});
         print("  --target <arch>      GPU target architecture (e.g., gfx942 for MI300X, sm_80 for A100)\n", .{});
@@ -290,6 +305,171 @@ fn loadConfig(allocator: Allocator, path: ?[]const u8) !ConfigResult {
         .json_data = null,
         .allocator = allocator,
     };
+}
+
+/// Export training MLIR/VMFB + metadata without running a training session.
+fn exportTrainingArtifacts(allocator: Allocator, args: Args) !void {
+    const out_dir = args.export_training_dir orelse return error.MissingExportPath;
+
+    var config_result = try loadConfig(allocator, args.config_path);
+    defer config_result.deinit();
+    const exp_config = config_result.config;
+
+    var diloco_config = DiLoCoConfig.default();
+    diloco_config.model_mlir_path = exp_config.model_path;
+    diloco_config.data_path = exp_config.data_path;
+    diloco_config.tokenizer_type = exp_config.tokenizer;
+    diloco_config.tau = exp_config.tau;
+    diloco_config.base_config.learning_rate = exp_config.learning_rate;
+    diloco_config.base_config.outer_loop_steps = exp_config.outer_loop_steps;
+    diloco_config.nesterov_momentum = exp_config.nesterov_momentum;
+
+    if (args.model_path) |path| {
+        diloco_config.model_mlir_path = path;
+    }
+
+    const backend = args.backend orelse backend_selection.Backend.selectDefault();
+    const target_arch = args.target_arch;
+
+    std.log.info("Exporting training artifacts to: {s}", .{out_dir});
+    std.log.info("   Model: {s}", .{diloco_config.model_mlir_path});
+    std.log.info("   Backend: {s}", .{backend.toString()});
+    if (target_arch) |t| {
+        std.log.info("   Target: {s}", .{t});
+    }
+
+    // Initialize system to get a shared MLIR context for graph construction.
+    var system = try backend_selection.DistributedTrainingSystem.init(allocator, backend);
+    defer system.deinit();
+
+    const shared_mlir_context = system.executor.getContext();
+    var mlir_builder = try MLIRBuilder.init(allocator, shared_mlir_context);
+    defer mlir_builder.deinit();
+
+    const raw_mlir = try std.fs.cwd().readFileAlloc(allocator, diloco_config.model_mlir_path, 10 * 1024 * 1024);
+    defer allocator.free(raw_mlir);
+
+    const sanitized_mlir = try sanitizer.ModelSanitizer.applyStabilityPatches(allocator, raw_mlir);
+    defer allocator.free(sanitized_mlir);
+
+    const metadata = try model_introspection.ModelInspector.inspect(
+        allocator,
+        mlir_builder.ctx,
+        sanitized_mlir,
+        2, // num_data_inputs (input_ids, targets)
+    );
+    const parameter_shapes = metadata.parameter_shapes;
+    const data_input_shapes = metadata.data_input_shapes;
+    defer {
+        for (parameter_shapes) |s| allocator.free(s);
+        allocator.free(parameter_shapes);
+        for (data_input_shapes) |s| allocator.free(s);
+        allocator.free(data_input_shapes);
+    }
+
+    const AdamMLIR = adam_mlir.AdamMLIR(f32);
+    const adam_config = adam_mlir.AdamMLIRConfiguration(f32){
+        .learning_rate = diloco_config.base_config.learning_rate,
+        .beta1 = 0.9,
+        .beta2 = 0.999,
+        .epsilon = 1e-8,
+        .weight_decay = 0.01,
+        .max_grad_norm = 1.0,
+        .gradient_clip_min = -100.0,
+        .gradient_clip_max = 100.0,
+    };
+
+    const element_type = diloco_config.dtype.toMLIRType(mlir_builder.ctx);
+    const adam_optimizer = try allocator.create(AdamMLIR);
+    defer {
+        adam_optimizer.deinit();
+        allocator.destroy(adam_optimizer);
+    }
+    adam_optimizer.* = try AdamMLIR.init(allocator, &mlir_builder, adam_config, element_type);
+
+    const training_mlir = try graph_builder.GraphBuilder.buildTrainingGraph(
+        allocator,
+        &mlir_builder,
+        sanitized_mlir,
+        adam_optimizer,
+        parameter_shapes.len,
+    );
+    defer allocator.free(training_mlir);
+
+    try std.fs.cwd().makePath(out_dir);
+
+    const training_mlir_path = try std.fs.path.join(allocator, &[_][]const u8{ out_dir, "training.mlir" });
+    defer allocator.free(training_mlir_path);
+    try std.fs.cwd().writeFile(training_mlir_path, training_mlir);
+
+    var compile_ctx = try mlir_ctx.MLIRContext.init(allocator);
+    defer compile_ctx.deinit();
+
+    const vmfb = try compile_ctx.compileToVMFB(
+        allocator,
+        training_mlir,
+        backend.toIreeCompilationTarget(),
+        target_arch,
+    );
+    defer allocator.free(vmfb);
+
+    const vmfb_path = try std.fs.path.join(allocator, &[_][]const u8{ out_dir, "training.vmfb" });
+    defer allocator.free(vmfb_path);
+    try std.fs.cwd().writeFile(vmfb_path, vmfb);
+
+    const metadata_path = try std.fs.path.join(allocator, &[_][]const u8{ out_dir, "metadata.json" });
+    defer allocator.free(metadata_path);
+    const metadata_file = try std.fs.cwd().createFile(metadata_path, .{});
+    defer metadata_file.close();
+
+    var param_shape_array = std.json.Array.init(allocator);
+    defer param_shape_array.deinit();
+    for (parameter_shapes) |shape| {
+        var dim_array = std.json.Array.init(allocator);
+        for (shape) |dim| try dim_array.append(std.json.Value{ .integer = dim });
+        try param_shape_array.append(std.json.Value{ .array = dim_array });
+    }
+
+    var data_shape_array = std.json.Array.init(allocator);
+    defer data_shape_array.deinit();
+    for (data_input_shapes) |shape| {
+        var dim_array = std.json.Array.init(allocator);
+        for (shape) |dim| try dim_array.append(std.json.Value{ .integer = dim });
+        try data_shape_array.append(std.json.Value{ .array = dim_array });
+    }
+
+    var adam_obj = std.json.ObjectMap.init(allocator);
+    defer adam_obj.deinit();
+    try adam_obj.put("learning_rate", std.json.Value{ .float = @floatCast(adam_config.learning_rate) });
+    try adam_obj.put("beta1", std.json.Value{ .float = @floatCast(adam_config.beta1) });
+    try adam_obj.put("beta2", std.json.Value{ .float = @floatCast(adam_config.beta2) });
+    try adam_obj.put("epsilon", std.json.Value{ .float = @floatCast(adam_config.epsilon) });
+    try adam_obj.put("weight_decay", std.json.Value{ .float = @floatCast(adam_config.weight_decay) });
+    try adam_obj.put("max_grad_norm", std.json.Value{ .float = @floatCast(adam_config.max_grad_norm) });
+    try adam_obj.put("gradient_clip_min", std.json.Value{ .float = @floatCast(adam_config.gradient_clip_min) });
+    try adam_obj.put("gradient_clip_max", std.json.Value{ .float = @floatCast(adam_config.gradient_clip_max) });
+
+    var nesterov_obj = std.json.ObjectMap.init(allocator);
+    defer nesterov_obj.deinit();
+    try nesterov_obj.put("learning_rate", std.json.Value{ .float = @floatCast(diloco_config.base_config.learning_rate) });
+    try nesterov_obj.put("momentum", std.json.Value{ .float = @floatCast(diloco_config.nesterov_momentum) });
+
+    var root = std.json.ObjectMap.init(allocator);
+    defer root.deinit();
+    try root.put("num_params", std.json.Value{ .integer = @intCast(parameter_shapes.len) });
+    try root.put("parameter_shapes", std.json.Value{ .array = param_shape_array });
+    try root.put("data_input_shapes", std.json.Value{ .array = data_shape_array });
+    try root.put("adam", std.json.Value{ .object = adam_obj });
+    try root.put("nesterov", std.json.Value{ .object = nesterov_obj });
+    try root.put("dtype", std.json.Value{ .string = "f32" });
+    try root.put("main_function", std.json.Value{ .string = "main" });
+    try root.put("grad_function", std.json.Value{ .string = "model_forward_pass_grad" });
+    try root.put("timestep_start", std.json.Value{ .float = 1.0 });
+
+    var writer = metadata_file.writer();
+    try std.json.stringify(std.json.Value{ .object = root }, .{ .whitespace = .indent_2 }, writer);
+
+    std.log.info("Export complete: {s}", .{out_dir});
 }
 
 /// Run as Shepherd coordinator
@@ -512,6 +692,11 @@ pub fn main() !void {
     print("Port: {}\n", .{args.port});
     print("Workers: {}\n", .{args.workers});
     print("=====================================\n", .{});
+
+    if (args.export_training_dir != null) {
+        try exportTrainingArtifacts(allocator, args);
+        return;
+    }
 
     // Check if supervision is enabled
     if (args.supervise) {

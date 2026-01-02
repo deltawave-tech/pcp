@@ -8,6 +8,13 @@ This test:
 
 How to run (from `pcp/`):
   nix develop -c ./venv/bin/python test/nanochat/test_pcp_gradients_parity.py
+
+To run on GPU (example NVIDIA):
+  PCP_TEST_BACKEND=cuda PCP_TEST_TARGET=sm_89 PCP_TEST_IREE_DEVICE=cuda \
+    nix develop -c ./venv/bin/python test/nanochat/test_pcp_gradients_parity.py
+
+If you have an older NVIDIA driver (e.g., 470.x) and see `CUDA_ERROR_UNSUPPORTED_PTX_VERSION`,
+also set `PCP_IREE_CUDA_TARGET_FEATURES=+ptx74`.
 """
 
 import json

@@ -29,6 +29,69 @@ _NPY_DESCR_TO_DTYPE = {
     "<i8": torch.int64,
 }
 
+def _dedupe_keep_order(values: list[str]) -> list[str]:
+    seen: set[str] = set()
+    out: list[str] = []
+    for v in values:
+        if v and v not in seen:
+            seen.add(v)
+            out.append(v)
+    return out
+
+
+def _append_env_path(env: dict[str, str], var: str, paths: list[str]) -> None:
+    existing = env.get(var, "")
+    existing_parts = [p for p in existing.split(os.pathsep) if p] if existing else []
+    merged = _dedupe_keep_order(existing_parts + [p for p in paths if p])
+    env[var] = os.pathsep.join(merged)
+
+
+def _maybe_add_cuda_driver_to_ld_library_path(env: dict[str, str]) -> None:
+    override = env.get("PCP_TEST_CUDA_LIBRARY_PATH") or env.get("CUDA_DRIVER_LIBRARY_PATH")
+    override_paths = [p for p in (override.split(os.pathsep) if override else []) if p]
+
+    libcuda_candidates: list[Path] = []
+    for base in override_paths:
+        libcuda_candidates.append(Path(base) / "libcuda.so")
+        libcuda_candidates.append(Path(base) / "libcuda.so.1")
+
+    libcuda_candidates.extend(
+        [
+            Path("/run/opengl-driver/lib/libcuda.so"),
+            Path("/run/opengl-driver/lib/libcuda.so.1"),
+            Path("/run/opengl-driver-32/lib/libcuda.so"),
+            Path("/run/opengl-driver-32/lib/libcuda.so.1"),
+            Path("/usr/lib/wsl/lib/libcuda.so"),
+            Path("/usr/lib/wsl/lib/libcuda.so.1"),
+            Path("/usr/lib/x86_64-linux-gnu/libcuda.so"),
+            Path("/usr/lib/x86_64-linux-gnu/libcuda.so.1"),
+            Path("/usr/lib/x86_64-linux-gnu/nvidia/current/libcuda.so"),
+            Path("/usr/lib/x86_64-linux-gnu/nvidia/current/libcuda.so.1"),
+            Path("/usr/lib64/libcuda.so"),
+            Path("/usr/lib64/libcuda.so.1"),
+            Path("/usr/local/nvidia/lib64/libcuda.so"),
+            Path("/usr/local/nvidia/lib64/libcuda.so.1"),
+        ]
+    )
+
+    driver_dirs: list[str] = []
+    for candidate in libcuda_candidates:
+        if not candidate.exists():
+            continue
+        try:
+            resolved = candidate.resolve()
+        except OSError:
+            resolved = candidate
+        # Prefer the directory containing the *real* library to avoid adding broad
+        # system library roots (can break Nix binaries by shadowing glibc).
+        lib_dir = resolved.parent
+        if (lib_dir / "libc.so.6").exists() or (lib_dir / "libm.so.6").exists():
+            continue
+        driver_dirs.append(str(lib_dir))
+
+    if driver_dirs:
+        _append_env_path(env, "LD_LIBRARY_PATH", _dedupe_keep_order(driver_dirs))
+
 
 def find_pcp_binary() -> str:
     override = os.environ.get("PCP_BIN")
@@ -79,12 +142,16 @@ def run_generate_nanochat(output_path: Path) -> None:
 def export_training_artifacts(
     out_dir: Path,
     model_path: Path,
-    backend: str = "cpu",
+    backend: str | None = None,
     target: str | None = None,
     config_path: Path | None = None,
 ) -> None:
     pcp_bin = find_pcp_binary()
     config_arg = config_path if config_path is not None else (PCP_ROOT / "experiments" / "nanochat.json")
+    if backend is None:
+        backend = os.environ.get("PCP_TEST_BACKEND", "cpu")
+    if target is None:
+        target = os.environ.get("PCP_TEST_TARGET") or None
     cmd = [
         pcp_bin,
         "--export-training-artifacts",
@@ -93,9 +160,9 @@ def export_training_artifacts(
         str(model_path),
         "--config",
         str(config_arg),
-        "--backend",
-        backend,
     ]
+    if backend != "auto":
+        cmd.extend(["--backend", backend])
     if target:
         cmd.extend(["--target", target])
     subprocess.run(cmd, check=True, cwd=PCP_ROOT)
@@ -170,6 +237,7 @@ def run_iree_function(
     inputs: list[torch.Tensor],
     tmpdir: Path,
     output_count: int,
+    device: str | None = None,
 ) -> list[torch.Tensor]:
     iree_run = shutil.which("iree-run-module")
     if not iree_run:
@@ -177,6 +245,8 @@ def run_iree_function(
             "iree-run-module not found. Run `nix develop /home/ahmet/project/nanochat/pcp` "
             "or add the IREE SDK bin directory to PATH."
         )
+
+    env = os.environ.copy()
 
     input_flags = []
     for i, tensor in enumerate(inputs):
@@ -198,11 +268,37 @@ def run_iree_function(
         *input_flags,
         *output_flags,
     ]
-    result = subprocess.run(cmd, check=False, capture_output=True, text=True)
+    if device is None:
+        device = os.environ.get("PCP_TEST_IREE_DEVICE") or os.environ.get("IREE_DEVICE")
+    if device is None:
+        backend = os.environ.get("PCP_TEST_BACKEND")
+        if backend in {"cuda", "rocm", "vulkan", "metal"}:
+            device = backend
+    if device:
+        cmd.append(f"--device={device}")
+
+    if device and device.startswith("cuda"):
+        _maybe_add_cuda_driver_to_ld_library_path(env)
+    result = subprocess.run(cmd, check=False, capture_output=True, text=True, env=env)
     if result.returncode != 0:
+        hints: list[str] = []
+        stderr = result.stderr or ""
+        if "CUDA driver library 'libcuda.so'" in stderr or "CUDA driver library \"libcuda.so\"" in stderr:
+            hints.append(
+                "Hint: libcuda.so not found. Set PCP_TEST_CUDA_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu/nvidia/current "
+                "or otherwise ensure that directory is in LD_LIBRARY_PATH."
+            )
+        if "CUDA_ERROR_UNSUPPORTED_PTX_VERSION" in stderr or "Unsupported .version" in stderr:
+            hints.append(
+                "Hint: your NVIDIA driver can't JIT the PTX version produced by IREE. "
+                "Try exporting PCP_IREE_CUDA_TARGET_FEATURES=+ptx74 (for 470.x drivers) when running the test "
+                "so `pcp --export-training-artifacts` compiles compatible VMFBs."
+            )
         raise SystemExit(
             "iree-run-module failed.\n"
+            f"cmd:\n{' '.join(cmd)}\n\n"
             f"stdout:\n{result.stdout}\n\nstderr:\n{result.stderr}"
+            + ("" if not hints else ("\n\n" + "\n".join(hints)))
         )
 
     return [load_npy_tensor(path) for path in output_paths]

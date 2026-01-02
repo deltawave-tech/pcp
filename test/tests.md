@@ -109,6 +109,15 @@ If `tools/generate_nanochat.py` prints “ops without VJP coverage”, forward c
 nix develop -c ./venv/bin/python test/nanochat/test_pcp_gradients_parity.py
 ```
 
+**GPU (example NVIDIA):**
+```bash
+PCP_TEST_BACKEND=cuda PCP_TEST_TARGET=sm_89 PCP_TEST_IREE_DEVICE=cuda \
+  nix develop -c ./venv/bin/python test/nanochat/test_pcp_gradients_parity.py
+```
+
+If you have an older NVIDIA driver (e.g., 470.x) and see `CUDA_ERROR_UNSUPPORTED_PTX_VERSION`,
+also set `PCP_IREE_CUDA_TARGET_FEATURES=+ptx74`.
+
 ---
 
 ### `test/nanochat/test_pcp_training_step_parity.py`
@@ -124,6 +133,15 @@ nix develop -c ./venv/bin/python test/nanochat/test_pcp_gradients_parity.py
 ```bash
 nix develop -c ./venv/bin/python test/nanochat/test_pcp_training_step_parity.py
 ```
+
+**GPU (example NVIDIA):**
+```bash
+PCP_TEST_BACKEND=cuda PCP_TEST_TARGET=sm_89 PCP_TEST_IREE_DEVICE=cuda \
+  nix develop -c ./venv/bin/python test/nanochat/test_pcp_training_step_parity.py
+```
+
+If you have an older NVIDIA driver (e.g., 470.x) and see `CUDA_ERROR_UNSUPPORTED_PTX_VERSION`,
+also set `PCP_IREE_CUDA_TARGET_FEATURES=+ptx74`.
 
 ---
 

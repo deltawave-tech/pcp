@@ -4,6 +4,7 @@ const ops = @import("../core/ops.zig");
 const tensor = @import("../core/tensor.zig");
 const c = @import("../mlir/c.zig").c;
 const hlo = @import("../mlir/dialects/stablehlo.zig");
+const build_options = @import("build_options");
 
 const Allocator = std.mem.Allocator;
 const MLIRBuilder = ops.MLIRBuilder;
@@ -157,10 +158,20 @@ pub fn divideVJP(
     primals: []const mlir.Value,
     adjoints: []const mlir.Value,
 ) ![]mlir.Value {
+    if (build_options.pcp_verbose_logs) {
+        std.debug.print("DEBUG: Entering divideVJP\n", .{});
+    }
+
     if (adjoints.len < 1) {
+        if (build_options.pcp_verbose_logs) {
+            std.debug.print("FATAL: divideVJP adjoints empty\n", .{});
+        }
         return error.InvalidAdjoints;
     }
     if (primals.len < 2) {
+        if (build_options.pcp_verbose_logs) {
+            std.debug.print("FATAL: divideVJP primals < 2\n", .{});
+        }
         return error.InvalidPrimals;
     }
 
@@ -186,6 +197,9 @@ pub fn divideVJP(
     var result = std.ArrayList(mlir.Value).init(builder.allocator);
     errdefer result.deinit();
 
+    if (build_options.pcp_verbose_logs) {
+        std.debug.print("DEBUG: divideVJP: computing grad_a\n", .{});
+    }
     // da = grad_out / b with explicit broadcasting
     const grad_a_broadcast = try ops.broadcastOperands(builder, grad_out, b);
     defer builder.allocator.free(grad_a_broadcast.shape);
@@ -196,6 +210,9 @@ pub fn divideVJP(
     const grad_a = try ops.reduceGradient(builder, grad_a_raw.getResult(0), a);
     try result.append(grad_a);
 
+    if (build_options.pcp_verbose_logs) {
+        std.debug.print("DEBUG: divideVJP: computing grad_b\n", .{});
+    }
     // db = -grad_out * a / (b * b)
 
     // a * grad_out with explicit broadcasting
@@ -220,7 +237,14 @@ pub fn divideVJP(
     const grad_b = try ops.reduceGradient(builder, positive_grad_b_neg.getResult(0), b);
     try result.append(grad_b);
 
-    return result.toOwnedSlice();
+    if (build_options.pcp_verbose_logs) {
+        std.debug.print("DEBUG: divideVJP: converting to owned slice\n", .{});
+    }
+    const slice = try result.toOwnedSlice();
+    if (build_options.pcp_verbose_logs) {
+        std.debug.print("DEBUG: divideVJP allocated slice len={} ptr={*}\n", .{ slice.len, slice.ptr });
+    }
+    return slice;
 }
 
 /// VJP rule for power: d(a^b)/da = grad_out * b * a^(b-1)
@@ -660,20 +684,37 @@ pub fn reduceMaxVJP(
     const grad_out = adjoints[0];
     const input = primals[0];
 
+    if (build_options.pcp_verbose_logs) {
+        std.debug.print("\n=== DEBUG reduceMaxVJP ===\n", .{});
+        std.debug.print("Operation name: {s}\n", .{original_op.getName()});
+    }
+
     // 1. Extract Dimensions
     const dimensions_ref = c.stringRefFromString("dimensions");
     const dimensions_attr = c.operationGetAttributeByName(original_op.handle, dimensions_ref);
+    if (build_options.pcp_verbose_logs) {
+        std.debug.print("dimensions_attr ptr: {}\n", .{@intFromPtr(dimensions_attr.ptr)});
+    }
     if (@intFromPtr(dimensions_attr.ptr) == 0) return error.MissingDimensionsAttribute;
 
     // Check if it's a DenseI64Array
-    _ = c.attributeIsADenseI64Array(dimensions_attr);
+    if (build_options.pcp_verbose_logs) {
+        const is_dense_i64_array = c.attributeIsADenseI64Array(dimensions_attr);
+        std.debug.print("DEBUG reduceMaxVJP: Op {s}, is_dense_i64_array: {}\n", .{ original_op.getName(), is_dense_i64_array });
+    }
 
     const num_dims = c.mlirDenseArrayGetNumElements(dimensions_attr);
+    if (build_options.pcp_verbose_logs) {
+        std.debug.print("DEBUG reduceMaxVJP: Op {s}, Num Dims: {}\n", .{ original_op.getName(), num_dims });
+    }
     var reduce_dims = try builder.allocator.alloc(i64, @intCast(num_dims));
     defer builder.allocator.free(reduce_dims);
 
     for (0..@intCast(num_dims)) |i| {
         reduce_dims[i] = c.denseI64ArrayGetElement(dimensions_attr, @intCast(i));
+    }
+    if (build_options.pcp_verbose_logs) {
+        std.debug.print("DEBUG reduceMaxVJP: Extracted reduce_dims: {any}\n", .{reduce_dims});
     }
 
     // 2. Recompute Max (Raw Reduce)
@@ -779,6 +820,10 @@ pub fn tryVectorIndexLinearization(
     // Check for vector index gather that produces scalars (collapses all dims)
     if (slice_volume != 1 or index_vector_dim >= @as(i64, @intCast(indices_rank)) or indices_type.getDimension(@intCast(index_vector_dim)) <= 1) {
         return null;
+    }
+
+    if (build_options.pcp_verbose_logs) {
+        std.debug.print("DEBUG gatherVJP: Detected Scalar Gather with Vector Indices. Using Linearization.\n", .{});
     }
 
     // 1. Linearize Indices
@@ -1094,6 +1139,13 @@ pub fn gatherVJP(
     // Fall back to OneHot + MatMul approach
     const vocab_size = operand_type.getDimension(0);
 
+    if (build_options.pcp_verbose_logs) {
+        std.debug.print("DEBUG gatherVJP: vocab_size={}, operand_rank={}, indices_rank={}, grad_out_rank={}\n", .{
+            vocab_size, operand_type.getRank(), indices_type.getRank(), grad_out_type.getRank()
+        });
+        std.debug.print("DEBUG gatherVJP: About to create one-hot tensor...\n", .{});
+    }
+
     // Create one-hot: [Batch, Seq] -> [Batch, Seq, Vocab]
     const one_hot = try ops.oneHot(
         builder,
@@ -1102,6 +1154,9 @@ pub fn gatherVJP(
         1.0, 0.0, -1,
         grad_out_type.getElementType()
     );
+    if (build_options.pcp_verbose_logs) {
+        std.debug.print("DEBUG gatherVJP: One-hot created, rank={}\n", .{one_hot.shape.rank()});
+    }
 
     // Get one-hot shape - this determines N (number of index lookups)
     const one_hot_type = one_hot.value.getType().as(mlir.RankedTensorType) orelse return error.InvalidTensorType;
@@ -1114,6 +1169,10 @@ pub fn gatherVJP(
         n_dims *= one_hot_shape[i];
     }
     const vocab_dim = one_hot_shape[one_hot_shape.len - 1];
+
+    if (build_options.pcp_verbose_logs) {
+        std.debug.print("DEBUG gatherVJP: One-hot shape: {any}, n_dims={}\n", .{ one_hot_shape, n_dims });
+    }
 
     // Get embed_dim from grad_out shape (already extracted at top)
     const embed_dim = grad_out_shape[grad_out_shape.len - 1];
@@ -1135,6 +1194,10 @@ pub fn gatherVJP(
     }
     const expected_elements = n_dims * embed_dim;
 
+    if (build_options.pcp_verbose_logs) {
+        std.debug.print("DEBUG gatherVJP: grad_out has {} elements, need {} for [N={}, Embed={}]\n", .{ grad_out_elements, expected_elements, n_dims, embed_dim });
+    }
+
     // If grad_out has fewer elements than expected, broadcast/reshape appropriately
     const grad_out_flat: mlir.Value = if (grad_out_elements == expected_elements) blk: {
         // Can directly reshape
@@ -1154,6 +1217,10 @@ pub fn gatherVJP(
             grad_n *= grad_out_shape[i];
         }
 
+        if (build_options.pcp_verbose_logs) {
+            std.debug.print("DEBUG gatherVJP: Broadcasting grad_out from [{}, {}] to [{}, {}]\n", .{ grad_n, embed_dim, n_dims, embed_dim });
+        }
+
         // Broadcast to match n_dims
         const broadcast_shape = [_]i64{ n_dims, embed_dim };
 
@@ -1170,6 +1237,10 @@ pub fn gatherVJP(
         builder.insertion_block.appendOwnedOperation(broadcast_op);
         break :blk2 broadcast_op.getResult(0);
     };
+
+    if (build_options.pcp_verbose_logs) {
+        std.debug.print("DEBUG gatherVJP: Flattened shapes - one_hot: [{}, {}], grad_out: [{}, {}]\n", .{ n_dims, vocab_dim, n_dims, embed_dim });
+    }
 
     // Now do dot_general: [N, Vocab]^T @ [N, Embed] = [Vocab, Embed]
     const dot_dims = hlo.DotDimensionNumbersAttribute{
@@ -1284,6 +1355,9 @@ pub fn sliceVJP(
         builder.insertion_block.appendOwnedOperation(pad_op);
 
         try result.append(pad_op.getResult(0));
+        if (build_options.pcp_verbose_logs) {
+            std.debug.print("✓ sliceVJP: Created gradient flow using pad operation\n", .{});
+        }
     }
 
     return result.toOwnedSlice();

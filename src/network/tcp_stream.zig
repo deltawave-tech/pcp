@@ -4,6 +4,7 @@
 const std = @import("std");
 const net = std.net;
 const Allocator = std.mem.Allocator;
+const build_options = @import("build_options");
 
 /// Return type for receive operations
 pub const ReceiveResult = struct {
@@ -26,7 +27,9 @@ pub const TcpStreamManager = struct {
         
         const json_data = json_buffer.items;
         
-        if (json_data.len <= 2048) {
+        if (build_options.pcp_verbose_logs) {
+            std.log.debug("Sending JSON payload: {s}", .{json_data});
+        } else if (json_data.len <= 2048) {
             std.log.debug("Sending JSON payload: {s}", .{json_data});
         } else {
             std.log.debug("Sending JSON payload ({} bytes)", .{json_data.len});

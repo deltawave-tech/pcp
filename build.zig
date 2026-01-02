@@ -426,6 +426,11 @@ pub fn build(b: *std.Build) void {
     std.debug.print("==> Starting build script\n", .{});
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    const pcp_verbose_logs = b.option(bool, "pcp_verbose_logs", "Enable extremely verbose PCP internal debug logging") orelse false;
+
+    const options = b.addOptions();
+    options.addOption(bool, "pcp_verbose_logs", pcp_verbose_logs);
+    const options_module = options.createModule();
 
     // === STREAMLINED BUILD LOGIC ===
 
@@ -440,6 +445,7 @@ pub fn build(b: *std.Build) void {
     const pcp_module = b.addModule("pcp", .{
         .root_source_file = b.path("src/main.zig"),
     });
+    pcp_module.addImport("build_options", options_module);
     addIreeIncludes(pcp_module, b, iree_config); // REFACTORED
 
     // Add network include path for @cImport in capnp_zig_wrapper.zig
@@ -454,6 +460,7 @@ pub fn build(b: *std.Build) void {
     const gpt2_module = b.addModule("gpt2", .{
         .root_source_file = b.path("src/models/gpt2.zig"),
     });
+    gpt2_module.addImport("build_options", options_module);
 
     // Add dependency from GPT-2 to PCP
     gpt2_module.addImport("pcp", pcp_module);
@@ -473,6 +480,7 @@ pub fn build(b: *std.Build) void {
                 .target = b.resolveTargetQuery(t_target),
                 .optimize = optimize,
             });
+            unit_tests.root_module.addImport("build_options", options_module);
             const run_unit_tests = b.addRunArtifact(unit_tests);
             run_unit_tests.skip_foreign_checks = true;
             test_step.dependOn(&run_unit_tests.step);
@@ -491,6 +499,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     m3_pipeline_test.root_module.addImport("pcp", pcp_module);
+    m3_pipeline_test.root_module.addImport("build_options", options_module);
 
     // IREE dependencies
     addIreeDependencies(m3_pipeline_test, b, iree_config); // REFACTORED
@@ -509,6 +518,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     cpu_pipeline_test.root_module.addImport("pcp", pcp_module);
+    cpu_pipeline_test.root_module.addImport("build_options", options_module);
     addIreeDependencies(cpu_pipeline_test, b, iree_config); // REFACTORED
 
     const run_cpu_pipeline_test_cmd = b.addRunArtifact(cpu_pipeline_test);
@@ -525,6 +535,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     cuda_pipeline_test.root_module.addImport("pcp", pcp_module);
+    cuda_pipeline_test.root_module.addImport("build_options", options_module);
     addIreeDependencies(cuda_pipeline_test, b, iree_config);
 
     const run_cuda_pipeline_test_cmd = b.addRunArtifact(cuda_pipeline_test);
@@ -541,6 +552,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     rocm_pipeline_test.root_module.addImport("pcp", pcp_module);
+    rocm_pipeline_test.root_module.addImport("build_options", options_module);
     addIreeDependencies(rocm_pipeline_test, b, iree_config);
 
     const run_rocm_pipeline_test_cmd = b.addRunArtifact(rocm_pipeline_test);
@@ -558,6 +570,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     pcp.root_module.addImport("pcp", pcp_module);
+    pcp.root_module.addImport("build_options", options_module);
 
     // IREE dependencies
     addIreeDependencies(pcp, b, iree_config); // REFACTORED
@@ -646,6 +659,7 @@ pub fn build(b: *std.Build) void {
 
     // Add module dependencies for data pipeline test
     data_pipeline_test.root_module.addImport("pcp", pcp_module);
+    data_pipeline_test.root_module.addImport("build_options", options_module);
 
     // Install the executable
     b.installArtifact(data_pipeline_test);
@@ -667,6 +681,7 @@ pub fn build(b: *std.Build) void {
 
     // Add module dependencies
     isolated_vjp_tests.root_module.addImport("pcp", pcp_module);
+    isolated_vjp_tests.root_module.addImport("build_options", options_module);
 
     // IREE dependencies
     addIreeDependencies(isolated_vjp_tests, b, iree_config); // REFACTORED
@@ -691,6 +706,7 @@ pub fn build(b: *std.Build) void {
 
     // Add module dependencies
     mlir_optimizer_tests.root_module.addImport("pcp", pcp_module);
+    mlir_optimizer_tests.root_module.addImport("build_options", options_module);
 
     // IREE dependencies
     addIreeDependencies(mlir_optimizer_tests, b, iree_config); // REFACTORED

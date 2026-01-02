@@ -23,6 +23,19 @@ Recommended way to run a test from `pcp/`:
 nix develop -c ./venv/bin/python test/nanochat/<test_file>.py
 ```
 
+If importing `torch` fails with `OSError: libstdc++.so.6: cannot open shared object file`, prepend a GCC lib dir to `LD_LIBRARY_PATH`:
+
+```bash
+LD_LIBRARY_PATH="$(ls -d /nix/store/*gcc-*-lib/lib | head -n1):$LD_LIBRARY_PATH" \
+  nix develop -c ./venv/bin/python test/nanochat/<test_file>.py
+```
+
+If you need very verbose Zig-side debug logs, rebuild PCP with:
+
+```bash
+nix develop -c zig build -Dpcp_verbose_logs=true
+```
+
 ## Python Tests
 
 ### `test/nanochat/test_gpt_ops_compat.py`
@@ -141,6 +154,8 @@ cd /home/ahmet/project/nanochat/pcp
 ./result/bin/pcp --shepherd --config experiments/nanochat.json --host 0.0.0.0 --port 18080 --workers 1
 ```
 
+Tip: add `--no-dashboard` for non-interactive runs (CI, tmux logging, subprocess tests).
+
 **What it does:**
 - Starts PCP in **Shepherd** mode (coordinator).
 - Loads hyperparameters and paths from `experiments/nanochat.json`.
@@ -163,6 +178,7 @@ To actually run training, you also need a worker process. For a single-machine C
 - Launches a local shepherd and a local worker (CPU backend).
 - Runs a tiny config (1 outer step, 1 inner step).
 - Asserts: shepherd exits successfully, logs contain no `NaN`, and a checkpoint file is written.
+  - The shepherd is started with `--no-dashboard` so the TUI doesn’t interfere with non-interactive execution.
 
 **How to run:**
 ```bash

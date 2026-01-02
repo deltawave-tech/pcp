@@ -637,6 +637,16 @@ pub const Worker = struct {
                 final_loss = @as(f32, @bitCast(std.mem.readInt(u32, loss_bytes[0..4], .little)));
             }
 
+            if (!std.math.isFinite(final_loss)) {
+                std.log.err("Worker {} produced non-finite loss at inner step {}/{} (timestep={d})", .{
+                    self.node_id.?,
+                    step + 1,
+                    tau,
+                    self.timestep,
+                });
+                break;
+            }
+
             // Increment timestep for next iteration
             self.timestep += 1.0;
         }

@@ -348,7 +348,15 @@ pub const DiLoCo = struct {
             }
 
             // Streaming Accumulation: Collect and apply gradients on the fly
-            try self.accumulateAndApplyGradients(workers_assigned);
+            self.accumulateAndApplyGradients(workers_assigned) catch |err| {
+                if (err == error.NonFiniteLoss) {
+                    self.status = .failed;
+                    monitoring.setStatus(.error_state);
+                    std.log.err("Non-finite loss detected; aborting training", .{});
+                    break;
+                }
+                return err;
+            };
 
             // Save recovery state immediately after update
             try self.saveRecoveryState();
@@ -393,8 +401,10 @@ pub const DiLoCo = struct {
             }
         }
 
-        self.status = .completed;
-        monitoring.setStatus(.completed);
+        if (self.status != .failed) {
+            self.status = .completed;
+            monitoring.setStatus(.completed);
+        }
     }
 
     /// Initialize master parameters using MLIR for the loaded model
@@ -711,8 +721,16 @@ pub const DiLoCo = struct {
         }
 
         // Update metrics
-        self.metrics.loss = total_loss / divisor;
-        std.log.info("Round complete. Avg Loss: {d:.4}", .{self.metrics.loss});
+        const avg_loss = total_loss / divisor;
+        self.metrics.loss = avg_loss;
+
+        if (!std.math.isFinite(avg_loss)) {
+            std.log.err("Round complete with non-finite loss: {d}", .{avg_loss});
+            monitoring.setMetrics(self.current_epoch, avg_loss, self.coordinator.getWorkerCount());
+            return error.NonFiniteLoss;
+        }
+
+        std.log.info("Round complete. Avg Loss: {d:.4}", .{avg_loss});
     }
 
 

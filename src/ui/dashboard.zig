@@ -12,6 +12,15 @@ pub const Dashboard = struct {
     should_quit: bool = false,
     
     const Self = @This();
+
+    fn floatToUsizeSaturating(x: f64) usize {
+        if (!std.math.isFinite(x) or x <= 0) return 0;
+
+        const max_usize_f64: f64 = @floatFromInt(std.math.maxInt(usize));
+        if (x >= max_usize_f64) return std.math.maxInt(usize);
+
+        return @intFromFloat(x);
+    }
     
     pub fn init(allocator: Allocator) !Self {
         return Self{
@@ -125,8 +134,9 @@ pub const Dashboard = struct {
         drawBox("Metrics", 40);
         std.debug.print("  \x1b[37mOuter Loop Step:\x1b[0m  \x1b[32m{}\x1b[0m\n", .{metrics.outer_loop_step});
         
+        const loss_color = if (std.math.isFinite(metrics.average_loss)) "\x1b[32m" else "\x1b[31m";
         const loss_str = try std.fmt.bufPrint(&buf, "{d:.6}", .{metrics.average_loss});
-        std.debug.print("  \x1b[37mAverage Loss:\x1b[0m     \x1b[32m{s}\x1b[0m\n", .{loss_str});
+        std.debug.print("  \x1b[37mAverage Loss:\x1b[0m     {s}{s}\x1b[0m\n", .{ loss_color, loss_str });
         
         const lr_str = try std.fmt.bufPrint(&buf, "{d:.6}", .{metrics.learning_rate});
         std.debug.print("  \x1b[37mLearning Rate:\x1b[0m    \x1b[32m{s}\x1b[0m\n", .{lr_str});
@@ -140,9 +150,9 @@ pub const Dashboard = struct {
         std.debug.print("  \x1b[37mLast Epoch Time:\x1b[0m  \x1b[32m{s}\x1b[0m", .{time_str});
         
         const throughput = if (metrics.epoch_time_ms > 0) 
-            @as(f64, @floatFromInt(metrics.total_parameters)) / (@as(f64, @floatFromInt(metrics.epoch_time_ms)) / 1000.0)
+            (@as(f64, @floatFromInt(metrics.total_parameters)) * 4.0) / (@as(f64, @floatFromInt(metrics.epoch_time_ms)) / 1000.0)
         else 0.0;
-        const throughput_formatted = monitoring.formatBytes(@intFromFloat(throughput));
+        const throughput_formatted = monitoring.formatBytes(floatToUsizeSaturating(throughput));
         const throughput_str = try std.fmt.bufPrint(&buf, "{d:.1} {s}/s", .{ throughput_formatted.value, throughput_formatted.unit });
         std.debug.print("     \x1b[37mThroughput:\x1b[0m \x1b[32m{s}\x1b[0m\n", .{throughput_str});
         std.debug.print("\n", .{});
@@ -184,7 +194,17 @@ pub const Dashboard = struct {
     
     /// Draw loss history as a simple bar chart
     fn drawLossGraph(metrics: monitoring.TrainingMetrics) !void {
-        
+
+        // Bottom border of graph box
+        // Keep this as a defer so the box is always properly closed even on early returns.
+        defer {
+            std.debug.print("\x1b[90m└", .{});
+            for (0..68) |_| {
+                std.debug.print("─", .{});
+            }
+            std.debug.print("┘\x1b[0m\n", .{});
+        }
+
         if (metrics.loss_history_count == 0) {
             std.debug.print("  \x1b[90mNo data available yet...\x1b[0m\n", .{});
             return;
@@ -200,13 +220,23 @@ pub const Dashboard = struct {
             return;
         }
         
-        // Find min/max for scaling
-        var min_loss = history[0];
-        var max_loss = history[0];
+        // Find min/max for scaling (ignore NaN/Inf to prevent dashboard panics)
+        var min_loss: f32 = std.math.inf(f32);
+        var max_loss: f32 = -std.math.inf(f32);
+        var finite_count: usize = 0;
         for (history[0..count]) |loss| {
+            if (!std.math.isFinite(loss)) continue;
+            finite_count += 1;
             min_loss = @min(min_loss, loss);
             max_loss = @max(max_loss, loss);
         }
+
+        if (finite_count == 0) {
+            std.debug.print("  \x1b[31mLoss history contains only NaN/Inf\x1b[0m\n", .{});
+            return;
+        }
+
+        const non_finite_count = count - finite_count;
         
         // Avoid division by zero
         if (max_loss - min_loss < 0.001) {
@@ -226,9 +256,22 @@ pub const Dashboard = struct {
                     i;
                     
                 if (idx >= count) break;
-                
-                const normalized = (history[idx] - min_loss) / (max_loss - min_loss);
-                const bar_height = @as(usize, @intFromFloat(normalized * @as(f32, @floatFromInt(graph_height))));
+
+                if (!std.math.isFinite(history[idx])) {
+                    if (row == 0) {
+                        std.debug.print("\x1b[31m!\x1b[0m", .{});
+                    } else {
+                        std.debug.print(" ", .{});
+                    }
+                    continue;
+                }
+
+                var bar_height: usize = 0;
+                const normalized_raw = (history[idx] - min_loss) / (max_loss - min_loss);
+                if (std.math.isFinite(normalized_raw)) {
+                    const normalized = std.math.clamp(normalized_raw, 0.0, 1.0);
+                    bar_height = @intFromFloat(normalized * @as(f32, @floatFromInt(graph_height)));
+                }
                 
                 if (bar_height > (graph_height - row - 1)) {
                     if (row < graph_height / 2) {
@@ -243,11 +286,14 @@ pub const Dashboard = struct {
             
             // Y-axis labels
             if (row == 0) {
-                var buf: [16]u8 = undefined;
-                const max_str = try std.fmt.bufPrint(&buf, " Max: {d:.3}", .{max_loss});
+                var buf: [32]u8 = undefined;
+                const max_str = if (non_finite_count > 0)
+                    try std.fmt.bufPrint(&buf, " Max: {d:.3} NaN/Inf: {}", .{ max_loss, non_finite_count })
+                else
+                    try std.fmt.bufPrint(&buf, " Max: {d:.3}", .{max_loss});
                 std.debug.print("\x1b[37m{s}\x1b[0m", .{max_str});
             } else if (row == graph_height - 1) {
-                var buf: [16]u8 = undefined;
+                var buf: [32]u8 = undefined;
                 const min_str = try std.fmt.bufPrint(&buf, " Min: {d:.3}", .{min_loss});
                 std.debug.print("\x1b[37m{s}\x1b[0m", .{min_str});
             }
@@ -255,12 +301,6 @@ pub const Dashboard = struct {
             std.debug.print("\n", .{});
         }
         
-        // Bottom border of graph box
-        std.debug.print("\x1b[90m└", .{});
-        for (0..68) |_| {
-            std.debug.print("─", .{});
-        }
-        std.debug.print("┘\x1b[0m\n", .{});
     }
 };
 

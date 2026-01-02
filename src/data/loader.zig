@@ -31,23 +31,36 @@ pub const CharTokenizer = struct {
         var char_to_int = std.AutoHashMap(u8, u32).init(allocator);
         var int_to_char = std.AutoHashMap(u32, u8).init(allocator);
 
+        // Make vocab ordering deterministic (important for multi-process workers and PyTorch parity).
+        // Match the common char-level LM convention: sort unique bytes ascending.
+        var chars = std.ArrayList(u8).init(allocator);
+        defer chars.deinit();
+
         var it = char_set.keyIterator();
-        var i: u32 = 0;
         while (it.next()) |char_ptr| {
-            if (i >= MAX_VOCAB_SIZE) {
-                std.log.warn("Dataset has more characters than model vocab ({}). Ignoring char '{c}'", .{ MAX_VOCAB_SIZE, char_ptr.* });
-                continue;
+            try chars.append(char_ptr.*);
+        }
+
+        std.sort.heap(u8, chars.items, {}, std.sort.asc(u8));
+
+        const vocab_len: usize = @min(chars.items.len, MAX_VOCAB_SIZE);
+        for (chars.items[0..vocab_len], 0..) |ch, idx| {
+            const token: u32 = @intCast(idx);
+            try char_to_int.put(ch, token);
+            try int_to_char.put(token, ch);
+        }
+
+        if (chars.items.len > MAX_VOCAB_SIZE) {
+            for (chars.items[MAX_VOCAB_SIZE..]) |ch| {
+                std.log.warn("Dataset has more characters than model vocab ({}). Ignoring char '{c}'", .{ MAX_VOCAB_SIZE, ch });
             }
-            try char_to_int.put(char_ptr.*, i);
-            try int_to_char.put(i, char_ptr.*);
-            i += 1;
         }
 
         return CharTokenizer{
             .allocator = allocator,
             .char_to_int = char_to_int,
             .int_to_char = int_to_char,
-            .vocab_size = i,
+            .vocab_size = vocab_len,
         };
     }
 

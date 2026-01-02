@@ -43,6 +43,12 @@ pub const Dashboard = struct {
             std.debug.print("\x1b[H", .{});
             try self.render(metrics);
 
+            // Exit automatically once training is done (or errored), so shepherd can terminate cleanly.
+            if (metrics.training_status == .completed or metrics.training_status == .error_state) {
+                self.should_quit = true;
+                break;
+            }
+
             // Don't burn CPU, refresh every 500ms
             std.time.sleep(500 * std.time.ns_per_ms);
         }

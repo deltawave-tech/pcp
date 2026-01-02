@@ -90,8 +90,6 @@ pub fn buildGradientGraph(
     gradient_clip_min: f64,
     gradient_clip_max: f64,
 ) !mlir.Operation {
-    std.debug.print("Building gradient graph from forward function...\n", .{});
-
     // Derive the gradient function name from the forward function name
     const sym_name_ref = c.stringRefFromString("sym_name");
     const forward_fn_name_attr = c.operationGetAttributeByName(forward_fn.handle, sym_name_ref);
@@ -119,8 +117,6 @@ pub fn buildGradientGraph(
     builder.setInsertionBlock(grad_fn_block);
     defer builder.setInsertionBlock(original_insertion_block); // Restore on exit
 
-    std.debug.print("Using gradient function entry block\n", .{});
-
     // Map from forward-pass values (primals) to their gradients (adjoints)
     var adjoint_map = std.AutoHashMap(mlir.Value, mlir.Value).init(allocator);
     defer adjoint_map.deinit();
@@ -143,7 +139,6 @@ pub fn buildGradientGraph(
     try adjoint_map.put(loss_value, loss_grad_arg);
 
     // First pass: Clone forward operations into gradient function
-    std.debug.print("First pass: Building primal value mappings in forward order...\n", .{});
     const ops_forward = try getOperationsInForwardOrder(allocator, forward_fn);
     defer allocator.free(ops_forward);
 
@@ -173,7 +168,6 @@ pub fn buildGradientGraph(
     }
 
     // Second pass: Compute gradients using use-counting (reverse Kahn's algorithm)
-    std.debug.print("Second pass: Computing gradients using use-counting...\n", .{});
     try processGradientsWithUseCounting(allocator, builder, forward_fn, &adjoint_map, &value_map, gradient_clip_min, gradient_clip_max);
 
     // Collect gradients and create return statement using the SHARED builder
@@ -288,8 +282,6 @@ fn createGradientFunction(builder: *MLIRBuilder, forward_fn: mlir.Operation, nam
 
     // The builder automatically appends the entry block, but createFunction returns it.
     // We don't need to do anything else as createFunction handles the region/block setup.
-
-    std.debug.print("Created gradient function '{s}' via builder\n", .{name});
     return result.func_op;
 }
 
@@ -337,7 +329,6 @@ fn processGradientsWithUseCounting(
     while (ready_queue.items.len > 0) {
         const current_op = ready_queue.orderedRemove(0);
 
-        std.debug.print("Processing operation VJP for: {s}\n", .{current_op.getName()});
         try processOperationVJP(allocator, builder, current_op, adjoint_map, value_map, gradient_clip_min, gradient_clip_max);
 
         // Decrement use counts for producers and add to queue when ready
@@ -392,7 +383,6 @@ fn getReturnValue(fn_op: mlir.Operation) ?mlir.Value {
     }
 
     // 3. Fallback to the existing iteration method for full robustness, just in case.
-    std.debug.print("getReturnValue: Falling back to full iteration to find terminator.\n", .{});
     var maybe_op = block.getFirstOp();
     while (maybe_op) |op| {
         if (std.mem.eql(u8, op.getName(), "func.return")) {
@@ -506,33 +496,9 @@ fn finalizeGradientFunction(allocator: Allocator, builder: *MLIRBuilder, gradien
     var input_gradients = std.ArrayList(mlir.Value).init(allocator);
     defer input_gradients.deinit();
 
-    std.debug.print("\n=== FINALIZING GRADIENT FUNCTION ===\n", .{});
-    std.debug.print("Finalizing gradient function with {} forward function arguments\n", .{num_args});
-    std.debug.print("Adjoint map has {} entries\n", .{adjoint_map.count()});
-
-    // DEBUG: Print what's in the adjoint map
-    var adj_iter = adjoint_map.iterator();
-    var adj_count: usize = 0;
-    while (adj_iter.next()) |entry| : (adj_count += 1) {
-        if (adj_count < 5) { // Only print first 5 to avoid spam
-            const val_ptr = @intFromPtr(entry.key_ptr.*.handle.ptr);
-            std.debug.print("  Adjoint map entry {}: value ptr={}\n", .{adj_count, val_ptr});
-        }
-    }
-    if (adjoint_map.count() > 5) {
-        std.debug.print("  ... and {} more entries\n", .{adjoint_map.count() - 5});
-    }
-
-    std.debug.print("\nLooking for gradients for forward function arguments:\n", .{});
     for (0..num_args) |i| {
         const arg = forward_block.getArgument(i);
-        if (i < 5) {
-            const arg_ptr = @intFromPtr(arg.handle.ptr);
-            std.debug.print("  Forward arg {}: value ptr={}\n", .{i, arg_ptr});
-        }
-
-        const mapped_arg = value_map.get(arg) orelse {
-            std.debug.print("  WARNING: No mapped value for argument {}\n", .{i});
+        if (value_map.get(arg) == null) {
             const arg_type = arg.getType();
             const ranked_type = arg_type.as(mlir.RankedTensorType) orelse return error.InvalidTensorType;
             const shape = try ranked_type.getShape(allocator);
@@ -540,26 +506,11 @@ fn finalizeGradientFunction(allocator: Allocator, builder: *MLIRBuilder, gradien
             const elem_type = ranked_type.getElementType();
             const zero_tensor = try ops.constant(builder, 0.0, shape, elem_type);
             try input_gradients.append(zero_tensor.value);
-            std.debug.print("  Created ZERO gradient for argument {}\n", .{i});
             continue;
-        };
-
-        if (i < 5) {
-            const mapped_arg_ptr = @intFromPtr(mapped_arg.handle.ptr);
-            std.debug.print("  Mapped arg {}: value ptr={}\n", .{i, mapped_arg_ptr});
         }
 
         if (adjoint_map.get(arg)) |gradient| {
             try input_gradients.append(gradient);
-
-            // DEBUG: Print gradient tensor info
-            const grad_type = gradient.getType().as(mlir.RankedTensorType) orelse {
-                std.debug.print("  Arg {} gradient: NOT A RANKED TENSOR\n", .{i});
-                continue;
-            };
-            const grad_shape = try grad_type.getShape(allocator);
-            defer allocator.free(grad_shape);
-            std.debug.print("  Arg {} gradient shape: {any}\n", .{i, grad_shape});
         } else {
             // Create zero gradient using safe builder constant helper
             const arg_type = arg.getType();
@@ -572,14 +523,10 @@ fn finalizeGradientFunction(allocator: Allocator, builder: *MLIRBuilder, gradien
             // Use builder to create constant 0.0
             const zero_tensor = try ops.constant(builder, 0.0, shape, elem_type);
             try input_gradients.append(zero_tensor.value);
-
-            std.debug.print("  Created ZERO gradient for argument {}\n", .{i});
         }
     }
 
     // Create return operation using safe builder
     // func.return takes the input_gradients as operands
     _ = try builder.createAndAttach("func.return", input_gradients.items, &.{}, .{});
-
-    std.debug.print("Added func.return to gradient function with {} gradients\n", .{input_gradients.items.len});
 }

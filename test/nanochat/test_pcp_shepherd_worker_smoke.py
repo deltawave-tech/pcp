@@ -57,7 +57,7 @@ def main():
             "outer_loop_steps": 1,
             "nesterov_momentum": 0.9,
             "max_epochs": 1,
-            "wandb_project": None,
+            "wandb_project": "pcp-distributed",
             "wandb_entity": None,
             "wandb_run_name": "pcp-smoke-test",
             "wandb_api_key": None,
@@ -77,6 +77,7 @@ def main():
             "1",
             "--backend",
             "cpu",
+            "--no-dashboard",
         ]
         worker_cmd = [
             pcp_bin,
@@ -156,4 +157,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

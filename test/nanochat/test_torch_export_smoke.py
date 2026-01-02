@@ -57,7 +57,7 @@ class Wrapper(torch.nn.Module):
         self.base = base
         self.names = names
     def forward(self, *args):
-        params_dict = {n: p for n, p in zip[tuple](self.names, args[:-2])}
+        params_dict = {n: p for n, p in zip(self.names, args[:-2])}
         return functional_call(self.base, params_dict, (args[-2], args[-1]))
 
 wrapper = Wrapper(model, param_names)

@@ -19,10 +19,10 @@ pub const VJPFn = *const fn(
 
 /// Check if an mlir.Value comes from a constant operation at compile time
 fn isValueFromConstantOp(value: mlir.Value) bool {
-    // In a full implementation, this would check if the defining op is stablehlo.constant
-    // For now, we'll assume all values are non-constant to be conservative
-    _ = value;
-    return false;
+    if (!c.mlirValueIsAOpResult(value.handle)) return false;
+    const owner = mlir.Operation{ .handle = c.mlirOpResultGetOwner(value.handle) };
+    const name = owner.getName();
+    return std.mem.eql(u8, name, "stablehlo.constant") or std.mem.eql(u8, name, "arith.constant");
 }
 
 /// VJP rule for addition: both inputs get the same gradient
@@ -157,14 +157,10 @@ pub fn divideVJP(
     primals: []const mlir.Value,
     adjoints: []const mlir.Value,
 ) ![]mlir.Value {
-    std.debug.print("DEBUG: Entering divideVJP\n", .{});
-
     if (adjoints.len < 1) {
-        std.debug.print("FATAL: divideVJP adjoints empty\n", .{});
         return error.InvalidAdjoints;
     }
     if (primals.len < 2) {
-        std.debug.print("FATAL: divideVJP primals < 2\n", .{});
         return error.InvalidPrimals;
     }
 
@@ -190,7 +186,6 @@ pub fn divideVJP(
     var result = std.ArrayList(mlir.Value).init(builder.allocator);
     errdefer result.deinit();
 
-    std.debug.print("DEBUG: divideVJP: computing grad_a\n", .{});
     // da = grad_out / b with explicit broadcasting
     const grad_a_broadcast = try ops.broadcastOperands(builder, grad_out, b);
     defer builder.allocator.free(grad_a_broadcast.shape);
@@ -201,7 +196,6 @@ pub fn divideVJP(
     const grad_a = try ops.reduceGradient(builder, grad_a_raw.getResult(0), a);
     try result.append(grad_a);
 
-    std.debug.print("DEBUG: divideVJP: computing grad_b\n", .{});
     // db = -grad_out * a / (b * b)
 
     // a * grad_out with explicit broadcasting
@@ -226,11 +220,7 @@ pub fn divideVJP(
     const grad_b = try ops.reduceGradient(builder, positive_grad_b_neg.getResult(0), b);
     try result.append(grad_b);
 
-    std.debug.print("DEBUG: divideVJP: converting to owned slice\n", .{});
-    const slice = try result.toOwnedSlice();
-
-    std.debug.print("DEBUG: divideVJP allocated slice len={} ptr={*}\n", .{slice.len, slice.ptr});
-    return slice;
+    return result.toOwnedSlice();
 }
 
 /// VJP rule for power: d(a^b)/da = grad_out * b * a^(b-1)
@@ -264,11 +254,41 @@ pub fn powerVJP(
     var result = std.ArrayList(mlir.Value).init(builder.allocator);
     defer result.deinit();
 
-    const one_tensor = try ops.constant(builder, 1.0, result_shape, result_elem_type);
-    const exp_minus_1 = try builder.createAndAttach("stablehlo.subtract", &.{ exp, one_tensor.value }, &.{exp.getType()}, .{});
-    const pow_op = try builder.createAndAttach("stablehlo.power", &.{ base, exp_minus_1.getResult(0) }, &.{result_type}, .{});
+    // Use y/base instead of base^(exp-1) to avoid NaNs for negative bases when exp-1
+    // is not a compile-time constant (some backends lower pow(x, y) via exp(y*log(x))).
+    //
+    // d(base^exp)/d(base) = grad_out * exp * (base^exp / base)  (for base != 0)
+    // We define base^exp / base as 0 when base==0 (avoids 0/0 -> NaN; correct for exp=2).
+    const y_op = try builder.createAndAttach("stablehlo.power", &.{ base, exp }, &.{result_type}, .{});
+    const y = y_op.getResult(0);
 
-    const exp_times_pow_broadcast = try ops.broadcastOperands(builder, exp, pow_op.getResult(0));
+    const y_div_base_broadcast = try ops.broadcastOperands(builder, y, base);
+    defer builder.allocator.free(y_div_base_broadcast.shape);
+
+    const zero_tensor = try ops.constant(builder, 0.0, y_div_base_broadcast.shape, result_elem_type);
+    const zero = zero_tensor.value;
+
+    const compare_type = result_elem_type.getStableHLOCompareType();
+    const base_is_zero_op = hlo.compare(builder.ctx, y_div_base_broadcast.rhs, zero, .EQ, compare_type, builder.loc);
+    builder.insertion_block.appendOwnedOperation(base_is_zero_op);
+    const base_is_zero = base_is_zero_op.getResult(0);
+
+    const y_div_base_type = y_div_base_broadcast.lhs.getType();
+    const y_div_base_op = try builder.createAndAttach(
+        "stablehlo.divide",
+        &.{ y_div_base_broadcast.lhs, y_div_base_broadcast.rhs },
+        &.{y_div_base_type},
+        .{},
+    );
+
+    const safe_y_div_base_op = try builder.createAndAttach(
+        "stablehlo.select",
+        &.{ base_is_zero, zero, y_div_base_op.getResult(0) },
+        &.{y_div_base_type},
+        .{},
+    );
+
+    const exp_times_pow_broadcast = try ops.broadcastOperands(builder, exp, safe_y_div_base_op.getResult(0));
     defer builder.allocator.free(exp_times_pow_broadcast.shape);
     const exp_times_pow_type = exp_times_pow_broadcast.lhs.getType();
     const exp_times_pow = try builder.createAndAttach(
@@ -640,29 +660,21 @@ pub fn reduceMaxVJP(
     const grad_out = adjoints[0];
     const input = primals[0];
 
-    // DEBUG: Print operation info
-    std.debug.print("\n=== DEBUG reduceMaxVJP ===\n", .{});
-    std.debug.print("Operation name: {s}\n", .{original_op.getName()});
-
     // 1. Extract Dimensions
     const dimensions_ref = c.stringRefFromString("dimensions");
     const dimensions_attr = c.operationGetAttributeByName(original_op.handle, dimensions_ref);
-    std.debug.print("dimensions_attr ptr: {}\n", .{@intFromPtr(dimensions_attr.ptr)});
     if (@intFromPtr(dimensions_attr.ptr) == 0) return error.MissingDimensionsAttribute;
 
     // Check if it's a DenseI64Array
-    const is_dense_i64_array = c.attributeIsADenseI64Array(dimensions_attr);
-    std.debug.print("DEBUG reduceMaxVJP: Op {s}, is_dense_i64_array: {}\n", .{ original_op.getName(), is_dense_i64_array });
+    _ = c.attributeIsADenseI64Array(dimensions_attr);
 
     const num_dims = c.mlirDenseArrayGetNumElements(dimensions_attr);
-    std.debug.print("DEBUG reduceMaxVJP: Op {s}, Num Dims: {}\n", .{ original_op.getName(), num_dims });
     var reduce_dims = try builder.allocator.alloc(i64, @intCast(num_dims));
     defer builder.allocator.free(reduce_dims);
 
     for (0..@intCast(num_dims)) |i| {
         reduce_dims[i] = c.denseI64ArrayGetElement(dimensions_attr, @intCast(i));
     }
-    std.debug.print("DEBUG reduceMaxVJP: Extracted reduce_dims: {any}\n", .{reduce_dims});
 
     // 2. Recompute Max (Raw Reduce)
     const input_tensor = try builder.newTensor(input);
@@ -768,8 +780,6 @@ pub fn tryVectorIndexLinearization(
     if (slice_volume != 1 or index_vector_dim >= @as(i64, @intCast(indices_rank)) or indices_type.getDimension(@intCast(index_vector_dim)) <= 1) {
         return null;
     }
-
-    std.debug.print("DEBUG gatherVJP: Detected Scalar Gather with Vector Indices. Using Linearization.\n", .{});
 
     // 1. Linearize Indices
     const map_size = c.stablehloGatherDimensionNumbersGetStartIndexMapSize(dim_numbers_attr);
@@ -1083,12 +1093,8 @@ pub fn gatherVJP(
 
     // Fall back to OneHot + MatMul approach
     const vocab_size = operand_type.getDimension(0);
-    std.debug.print("DEBUG gatherVJP: vocab_size={}, operand_rank={}, indices_rank={}, grad_out_rank={}\n", .{
-        vocab_size, operand_type.getRank(), indices_type.getRank(), grad_out_type.getRank()
-    });
 
     // Create one-hot: [Batch, Seq] -> [Batch, Seq, Vocab]
-    std.debug.print("DEBUG gatherVJP: About to create one-hot tensor...\n", .{});
     const one_hot = try ops.oneHot(
         builder,
         try builder.newTensor(indices_i64),
@@ -1096,7 +1102,6 @@ pub fn gatherVJP(
         1.0, 0.0, -1,
         grad_out_type.getElementType()
     );
-    std.debug.print("DEBUG gatherVJP: One-hot created, rank={}\n", .{one_hot.shape.rank()});
 
     // Get one-hot shape - this determines N (number of index lookups)
     const one_hot_type = one_hot.value.getType().as(mlir.RankedTensorType) orelse return error.InvalidTensorType;
@@ -1109,8 +1114,6 @@ pub fn gatherVJP(
         n_dims *= one_hot_shape[i];
     }
     const vocab_dim = one_hot_shape[one_hot_shape.len - 1];
-
-    std.debug.print("DEBUG gatherVJP: One-hot shape: {any}, n_dims={}\n", .{one_hot_shape, n_dims});
 
     // Get embed_dim from grad_out shape (already extracted at top)
     const embed_dim = grad_out_shape[grad_out_shape.len - 1];
@@ -1132,8 +1135,6 @@ pub fn gatherVJP(
     }
     const expected_elements = n_dims * embed_dim;
 
-    std.debug.print("DEBUG gatherVJP: grad_out has {} elements, need {} for [N={}, Embed={}]\n", .{grad_out_elements, expected_elements, n_dims, embed_dim});
-
     // If grad_out has fewer elements than expected, broadcast/reshape appropriately
     const grad_out_flat: mlir.Value = if (grad_out_elements == expected_elements) blk: {
         // Can directly reshape
@@ -1153,8 +1154,6 @@ pub fn gatherVJP(
             grad_n *= grad_out_shape[i];
         }
 
-        std.debug.print("DEBUG gatherVJP: Broadcasting grad_out from [{}, {}] to [{}, {}]\n", .{grad_n, embed_dim, n_dims, embed_dim});
-
         // Broadcast to match n_dims
         const broadcast_shape = [_]i64{ n_dims, embed_dim };
 
@@ -1171,8 +1170,6 @@ pub fn gatherVJP(
         builder.insertion_block.appendOwnedOperation(broadcast_op);
         break :blk2 broadcast_op.getResult(0);
     };
-
-    std.debug.print("DEBUG gatherVJP: Flattened shapes - one_hot: [{}, {}], grad_out: [{}, {}]\n", .{n_dims, vocab_dim, n_dims, embed_dim});
 
     // Now do dot_general: [N, Vocab]^T @ [N, Embed] = [Vocab, Embed]
     const dot_dims = hlo.DotDimensionNumbersAttribute{
@@ -1287,8 +1284,6 @@ pub fn sliceVJP(
         builder.insertion_block.appendOwnedOperation(pad_op);
 
         try result.append(pad_op.getResult(0));
-
-        std.debug.print("✓ sliceVJP: Created gradient flow using pad operation\n", .{});
     }
 
     return result.toOwnedSlice();
@@ -1503,8 +1498,6 @@ pub fn broadcastInDimVJP(
         }
 
         try result.append(grad_input_tensor.value);
-
-        std.debug.print("✓ broadcastInDimVJP: Created gradient flow for broadcast_in_dim operation\n", .{});
     }
 
     return result.toOwnedSlice();

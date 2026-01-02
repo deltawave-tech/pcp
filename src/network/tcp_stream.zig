@@ -26,7 +26,11 @@ pub const TcpStreamManager = struct {
         
         const json_data = json_buffer.items;
         
-        std.log.debug("Worker is about to send JSON payload: {s}", .{json_data});
+        if (json_data.len <= 2048) {
+            std.log.debug("Sending JSON payload: {s}", .{json_data});
+        } else {
+            std.log.debug("Sending JSON payload ({} bytes)", .{json_data.len});
+        }
         
         const data_length: u32 = @intCast(json_data.len);
         

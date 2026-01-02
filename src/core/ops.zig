@@ -145,8 +145,6 @@ pub const MLIRBuilder = struct {
             attributes: []const struct { []const u8, mlir.Attribute } = &.{},
         },
     ) !mlir.Operation {
-        std.debug.print("DEBUG: createAndAttach entering for {s}\n", .{op_name});
-
         // Pass self.allocator to Operation.create
         const op = try mlir.Operation.create(self.allocator, self.ctx, op_name, .{
             .operands = operands,
@@ -154,8 +152,6 @@ pub const MLIRBuilder = struct {
             .attributes = options.attributes,
             .location = self.loc,
         });
-
-        std.debug.print("DEBUG: createAndAttach operation created: 0x{x}\n", .{@intFromPtr(op.handle.ptr)});
 
         // DEBUG: Verification disabled to isolate if verifier triggers the invalid pointer crash
         // if (!op.verify()) {
@@ -166,7 +162,6 @@ pub const MLIRBuilder = struct {
         // std.debug.print("DEBUG: createAndAttach verify passed\n", .{});
 
         self.insertion_block.appendOwnedOperation(op);
-        std.debug.print("DEBUG: createAndAttach appended operation\n", .{});
 
         return op;
     }
@@ -947,9 +942,6 @@ pub fn broadcastOperands(builder: *MLIRBuilder, lhs: mlir.Value, rhs: mlir.Value
                           else if (lhs_dim == 1) rhs_dim
                           else if (rhs_dim == 1) lhs_dim
                           else {
-            std.debug.print("ERROR: Incompatible shapes for broadcast!\n", .{});
-            std.debug.print("  lhs_shape: {any}, rhs_shape: {any}\n", .{lhs_shape, rhs_shape});
-            std.debug.print("  Conflict at dimension {}: lhs_dim={}, rhs_dim={}\n", .{i, lhs_dim, rhs_dim});
             builder.allocator.free(result_shape);
             return error.IncompatibleShapesForBroadcast;
         };
@@ -966,23 +958,16 @@ pub fn broadcastOperands(builder: *MLIRBuilder, lhs: mlir.Value, rhs: mlir.Value
     const types_match = lhs_elem_type.isEqual(rhs_elem_type);
 
     if (!types_match) {
-        std.debug.print("DEBUG broadcastOperands: Element types differ, converting lhs\n", .{});
-        std.debug.print("  lhs_shape: {any}, rhs_shape: {any}, result_shape: {any}\n", .{lhs_shape, rhs_shape, result_shape});
         // Convert lhs to rhs's element type (keeping lhs's original shape)
         const ctx = mlir.Context{ .handle = c.mlirTypeGetContext(lhs.getType().handle) };
         const lhs_converted_type = mlir.Type.rankedTensorType(ctx, lhs_shape, rhs_elem_type);
-        std.debug.print("  Creating convert [broadcastOperands]: input_shape={any} output_shape={any}\n", .{lhs_shape, lhs_shape});
         const convert_op = try builder.createAndAttach("stablehlo.convert", &.{lhs}, &.{lhs_converted_type}, .{});
         lhs_converted = convert_op.getResult(0);
-        std.debug.print("  Convert created successfully, now broadcasting\n", .{});
     }
 
     // Broadcast operands to the common shape
-    std.debug.print("DEBUG broadcastOperands: Broadcasting lhs to {any}\n", .{result_shape});
     const broadcasted_lhs = try broadcastToShape(builder, lhs_converted, result_shape);
-    std.debug.print("DEBUG broadcastOperands: Broadcasting rhs to {any}\n", .{result_shape});
     const broadcasted_rhs = try broadcastToShape(builder, rhs_converted, result_shape);
-    std.debug.print("DEBUG broadcastOperands: Done\n", .{});
 
     return .{ .lhs = broadcasted_lhs, .rhs = broadcasted_rhs, .shape = result_shape };
 }

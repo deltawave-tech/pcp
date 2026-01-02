@@ -16,6 +16,7 @@ const ops = @import("core/ops.zig");
 const mlir = @import("mlir/wrapper.zig");
 const autodiff = @import("autodiff/engine.zig");
 const dashboard = @import("ui/dashboard.zig");
+const monitoring = @import("ui/monitoring.zig");
 const adam_mlir = @import("optimizers/adam_mlir.zig");
 const graph_builder = @import("compiler/graph_builder.zig");
 const model_introspection = @import("mlir/model_introspection.zig");
@@ -82,6 +83,7 @@ const Args = struct {
     device_id: usize,
     scale: usize,
     should_resume: bool,
+    no_dashboard: bool,
     child_args: std.ArrayList([]const u8),
 
     const Mode = enum {
@@ -109,6 +111,7 @@ const Args = struct {
                 .device_id = 0,
                 .scale = 1,
                 .should_resume = false,
+                .no_dashboard = false,
                 .child_args = child_args_list,
             };
         }
@@ -127,6 +130,7 @@ const Args = struct {
         var device_id: usize = 0;
         var scale: usize = 1;
         var should_resume: bool = false;
+        var no_dashboard: bool = false;
 
         var i: usize = 1;
         while (i < args.len) {
@@ -220,6 +224,8 @@ const Args = struct {
                 }
             } else if (std.mem.eql(u8, args[i], "--resume")) {
                 should_resume = true;
+            } else if (std.mem.eql(u8, args[i], "--no-dashboard")) {
+                no_dashboard = true;
             } else if (std.mem.eql(u8, args[i], "--supervise")) {
                 supervise = true;
                 i += 1;
@@ -246,6 +252,7 @@ const Args = struct {
             .device_id = device_id,
             .scale = scale,
             .should_resume = should_resume,
+            .no_dashboard = no_dashboard,
             .child_args = child_args_list,
         };
     }
@@ -265,6 +272,7 @@ const Args = struct {
         print("  --model <path>       Path to MLIR model file (Shepherd only, overrides config)\n", .{});
         print("  --export-training-artifacts <dir>  Export training MLIR/VMFB + metadata and exit\n", .{});
         print("  --resume             Resume from previous training state\n", .{});
+        print("  --no-dashboard       Disable the TUI dashboard (useful for non-interactive runs)\n", .{});
         print("  --backend <type>     Backend to use: cpu, cuda, metal, vulkan, rocm (default: auto)\n", .{});
         print("  --target <arch>      GPU target architecture (e.g., gfx942 for MI300X, sm_80 for A100)\n", .{});
         print("  --device-id <id>     GPU device ID to use (default: 0, for multi-GPU nodes)\n", .{});
@@ -592,12 +600,17 @@ fn runShepherd(allocator: Allocator, args: Args) !void {
     listen_thread.detach();
 
     // Start the TUI dashboard in its own thread
-    const dashboard_thread = try std.Thread.spawn(.{}, dashboard.runDashboard, .{});
-    defer dashboard_thread.join();
+    var dashboard_thread: ?std.Thread = null;
+    const want_dashboard = !args.no_dashboard and std.io.getStdOut().isTty() and std.io.getStdErr().isTty();
+    if (want_dashboard) {
+        dashboard_thread = try std.Thread.spawn(.{}, dashboard.runDashboard, .{});
+    }
+    defer if (dashboard_thread) |t| t.join();
 
     // Wait for workers and start training
     print("Waiting for workers to connect...\n", .{});
     shepherd_controller.startTraining(args.workers) catch |err| {
+        monitoring.setStatus(.error_state);
         print("💣 Training failed with error: {}\n", .{err});
         return err;
     };

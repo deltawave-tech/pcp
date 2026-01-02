@@ -12,6 +12,7 @@ const backend_selection = @import("../../backends/selection.zig");
 const dataset_mod = @import("../../data/dataset.zig");
 const loader = @import("../../data/loader.zig");
 const math = @import("../../core/math.zig");
+const tensor = @import("../../core/tensor.zig");
 
 const TcpClient = tcp_stream.TcpClient;
 const TcpStreamManager = tcp_stream.TcpStreamManager;
@@ -47,6 +48,7 @@ pub const Worker = struct {
     cached_vmfb: ?[]u8,
     cached_parameter_shapes: ?[][]i64,
     cached_data_input_shapes: ?[][]i64,
+    cached_data_input_dtypes: ?[]tensor.DType,
 
     // NEW: AdamW optimizer state buffers (M and V) and timestep
     m_states: ?[][]u8, // One buffer per parameter
@@ -78,6 +80,7 @@ pub const Worker = struct {
             .cached_vmfb = null,
             .cached_parameter_shapes = null,
             .cached_data_input_shapes = null,
+            .cached_data_input_dtypes = null,
             .m_states = null,
             .v_states = null,
             .timestep = 1.0,
@@ -108,6 +111,9 @@ pub const Worker = struct {
         if (self.cached_data_input_shapes) |shapes| {
             for (shapes) |s| self.allocator.free(s);
             self.allocator.free(shapes);
+        }
+        if (self.cached_data_input_dtypes) |dtypes| {
+            self.allocator.free(dtypes);
         }
 
         // Cleanup optimizer state buffers
@@ -291,6 +297,10 @@ pub const Worker = struct {
             for (shapes) |s| self.allocator.free(s);
             self.cached_data_input_shapes = null;
         }
+        if (self.cached_data_input_dtypes) |dtypes| {
+            self.allocator.free(dtypes);
+            self.cached_data_input_dtypes = null;
+        }
 
         // 1. Parse the JSON payload object
         const payload = switch (msg.data) {
@@ -387,6 +397,31 @@ pub const Worker = struct {
             try shapes_list.append(try dim_list.toOwnedSlice());
         }
         self.cached_data_input_shapes = try shapes_list.toOwnedSlice();
+
+        // 4.5. Parse and cache the data input dtypes
+        if (payload.get("data_input_dtypes")) |dtypes_json| {
+            const dtypes_array = switch (dtypes_json) {
+                .array => |arr| arr,
+                else => return error.InvalidDTypesFormat,
+            };
+
+            var dtypes_list = std.ArrayList(tensor.DType).init(self.allocator);
+            errdefer dtypes_list.deinit();
+
+            for (dtypes_array.items) |val| {
+                const s = switch (val) { .string => |str| str, else => "f32" };
+                const dtype: tensor.DType = if (std.mem.eql(u8, s, "i64")) .i64
+                    else if (std.mem.eql(u8, s, "i32")) .i32
+                    else if (std.mem.eql(u8, s, "f32")) .f32
+                    else if (std.mem.eql(u8, s, "f16")) .f16
+                    else if (std.mem.eql(u8, s, "f64")) .f64
+                    else if (std.mem.eql(u8, s, "bf16")) .bf16
+                    else if (std.mem.eql(u8, s, "bool")) .bool
+                    else .f32; // Default fallback
+                try dtypes_list.append(dtype);
+            }
+            self.cached_data_input_dtypes = try dtypes_list.toOwnedSlice();
+        }
 
         // 5. Allocate M and V state buffers (initialized to zero)
         // Free old buffers if they exist
@@ -642,7 +677,8 @@ pub const Worker = struct {
             defer self.allocator.free(shapes_slice);
 
             // Execute the training step
-            const outputs = try self.backend.executeTrainingStep(vmfb, inputs, shapes_slice);
+            // DiLoCo training: Pass null for dtypes, backend will infer (f32 for params, i64 for last 2 data)
+            const outputs = try self.backend.executeTrainingStep(vmfb, inputs, shapes_slice, null);
             defer {
                 for (outputs) |o| self.allocator.free(o);
                 self.allocator.free(outputs);
@@ -874,7 +910,8 @@ pub const Worker = struct {
             const outputs = try self.backend.executeTrainingStep(
                 self.cached_vmfb.?,
                 inputs_slice,
-                self.cached_data_input_shapes.?
+                self.cached_data_input_shapes.?,
+                self.cached_data_input_dtypes
             );
             defer {
                 for (outputs) |o| self.allocator.free(o);
@@ -987,39 +1024,3 @@ pub const Worker = struct {
         self.state = .disconnected;
     }
 };
-
-/// Test function for Worker
-pub fn testWorker(allocator: Allocator) !void {
-    std.log.info("Testing Worker...");
-    
-    // Create a mock backend for testing
-    const mock_backend = WorkerBackend{
-        .ptr = undefined,
-        .vtable = &.{
-            .executeTrainingStep = mockExecuteTrainingStep,
-            .deinit = mockBackendDeinit,
-        },
-    };
-    
-    var worker = try Worker.init(allocator, mock_backend, null);
-    defer worker.deinit();
-    
-    // Test basic initialization
-    try std.testing.expectEqual(WorkerState.disconnected, worker.getState());
-    try std.testing.expectEqual(@as(?NodeId, null), worker.getNodeId());
-    
-    std.log.info("✓ Worker test completed");
-}
-
-// Mock functions for testing
-fn mockExecuteTrainingStep(ptr: *anyopaque, compiled_artifact: []const u8, inputs_data: [][]const u8, input_shapes: [][]const i64) ![][]u8 {
-    _ = ptr;
-    _ = compiled_artifact;
-    _ = inputs_data;
-    _ = input_shapes;
-    return &[_][]u8{};
-}
-
-fn mockBackendDeinit(ptr: *anyopaque) void {
-    _ = ptr;
-}

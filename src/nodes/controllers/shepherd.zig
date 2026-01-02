@@ -13,6 +13,7 @@ const monitoring = @import("../../ui/monitoring.zig");
 const backend_selection = @import("../../backends/selection.zig");
 const data_manager = @import("data_manager.zig");
 const mlir_ctx = @import("../../mlir/context.zig");
+const tensor = @import("../../core/tensor.zig");
 
 const TcpServer = tcp_stream.TcpServer;
 const TcpStreamManager = tcp_stream.TcpStreamManager;
@@ -359,6 +360,12 @@ pub const Shepherd = struct {
             } else if (std.mem.eql(u8, msg.msg_type, MessageType.INNER_LOOP_COMPLETE)) {
                 self.handleInnerLoopComplete(worker_id, msg) catch |err| {
                     std.log.err("CRITICAL: Failed to queue results from worker {}: {s}", .{ worker_id, @errorName(err) });
+                    return err;
+                };
+            } else if (std.mem.eql(u8, msg.msg_type, MessageType.ROLLOUT_COMPLETE)) {
+                // Queue rollout completion for RLShepherd to collect
+                self.handleInnerLoopComplete(worker_id, msg) catch |err| {
+                    std.log.err("CRITICAL: Failed to queue rollout result from worker {}: {s}", .{ worker_id, @errorName(err) });
                     return err;
                 };
             } else {
@@ -724,6 +731,7 @@ pub const Shepherd = struct {
         vmfb_path: []const u8,
         parameter_shapes: [][]i64,
         data_input_shapes: [][]i64,
+        data_input_dtypes: []tensor.DType,
     ) !void {
         std.log.info("Distributing VMFB path to workers: {s}", .{vmfb_path});
 
@@ -736,7 +744,7 @@ pub const Shepherd = struct {
             // Only initialize if not already initialized
             if (worker.status == .Connected) {
                 std.log.info("Initializing worker {}...", .{worker.node_id});
-                try self.sendInitializeMessageWithPath(worker.node_id, vmfb_path, parameter_shapes, data_input_shapes);
+                try self.sendInitializeMessageWithPath(worker.node_id, vmfb_path, parameter_shapes, data_input_shapes, data_input_dtypes);
                 self.setWorkerStatus(worker.node_id, .GraphInitialized);
             }
         }
@@ -745,7 +753,7 @@ pub const Shepherd = struct {
     }
 
     /// Helper to send initialization message with VMFB file path (for local filesystem loading)
-    fn sendInitializeMessageWithPath(self: *Self, node_id: NodeId, vmfb_path: []const u8, p_shapes: [][]i64, d_shapes: [][]i64) !void {
+    fn sendInitializeMessageWithPath(self: *Self, node_id: NodeId, vmfb_path: []const u8, p_shapes: [][]i64, d_shapes: [][]i64, d_dtypes: []tensor.DType) !void {
         // Build JSON shapes
         var param_shape_array = std.json.Array.init(self.allocator);
         defer param_shape_array.deinit();
@@ -763,12 +771,29 @@ pub const Shepherd = struct {
             try data_shape_array.append(std.json.Value{ .array = dim_array });
         }
 
+        // Serialize DTypes to string array
+        var dtype_array = std.json.Array.init(self.allocator);
+        defer dtype_array.deinit();
+        for (d_dtypes) |dtype| {
+            const type_str = switch (dtype) {
+                .f32 => "f32",
+                .f64 => "f64",
+                .f16 => "f16",
+                .bf16 => "bf16",
+                .i32 => "i32",
+                .i64 => "i64",
+                .bool => "bool",
+            };
+            try dtype_array.append(std.json.Value{ .string = type_str });
+        }
+
         // Build Payload with path instead of bytes
         var payload = std.json.ObjectMap.init(self.allocator);
         defer payload.deinit();
         try payload.put("vmfb_path", std.json.Value{ .string = vmfb_path });
         try payload.put("parameter_shapes", std.json.Value{ .array = param_shape_array });
         try payload.put("data_input_shapes", std.json.Value{ .array = data_shape_array });
+        try payload.put("data_input_dtypes", std.json.Value{ .array = dtype_array });
 
         try self.sendToWorker(node_id, MessageType.INITIALIZE_GRAPH, .{ .object = payload });
     }

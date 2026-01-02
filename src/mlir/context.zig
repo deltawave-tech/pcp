@@ -232,7 +232,7 @@ pub const MLIRContext = struct {
             return error.IREECompilationFailed;
         }
 
-        const vmfb_binary = try std.fs.cwd().readFileAlloc(allocator, temp_vmfb_path, 50 * 1024 * 1024); // 50MB limit
+        const vmfb_binary = try std.fs.cwd().readFileAlloc(allocator, temp_vmfb_path, 2 * 1024 * 1024 * 1024); // 2GB limit
 
         // Cleanup temp files
         std.fs.deleteFileAbsolute(temp_mlir_path) catch {};

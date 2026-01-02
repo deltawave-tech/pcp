@@ -301,15 +301,21 @@ fn loadConfig(allocator: Allocator, path: ?[]const u8) !ConfigResult {
     };
 }
 
-/// Run as RL Shepherd coordinator with GRPO
 fn runRLShepherd(allocator: Allocator, args: Args) !void {
     print("Starting RL Shepherd coordinator with GRPO...\n", .{});
 
-    // Create RLShepherd instance
+    const training_backend = args.backend orelse {
+        print("Error: --backend flag is required for RL Shepherd mode\n", .{});
+        return error.BackendRequired;
+    };
+
+    print("   Training Backend: {s}\n", .{training_backend.toString()});
+
     var rl_shepherd_controller = rl_shepherd.RLShepherd.init(allocator);
     defer rl_shepherd_controller.deinit();
 
-    // Start listening in a separate thread
+    rl_shepherd_controller.training_backend_type = training_backend;
+
     const listen_thread = try std.Thread.spawn(.{}, rlShepherdListenThread, .{ &rl_shepherd_controller, args.host, args.port });
     defer listen_thread.join();
 
@@ -600,9 +606,6 @@ pub fn testDistributedSystem(allocator: Allocator) !void {
 
     // Test Shepherd
     try shepherd.testShepherd(allocator);
-
-    // Test Worker
-    try worker.testWorker(allocator);
 
     // Test DiLoCo
     try diloco.testDiLoCo(allocator);

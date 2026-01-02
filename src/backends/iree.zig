@@ -296,24 +296,29 @@ pub const IreeBackend = struct {
         };
     }
 
-    fn executeTrainingStepInterface(ptr: *anyopaque, artifact: []const u8, data: [][]const u8, shapes: [][]const i64) anyerror![][]u8 {
+    fn executeTrainingStepInterface(ptr: *anyopaque, artifact: []const u8, data: [][]const u8, shapes: [][]const i64, provided_dtypes: ?[]const DType) anyerror![][]u8 {
         const self: *Self = @ptrCast(@alignCast(ptr));
 
-        // Assign dtypes for the new AdamW worker graph signature:
+        // If explicit dtypes are provided (e.g. for RL/Generation), use them.
+        if (provided_dtypes) |dtypes| {
+            return self.execute(artifact, "main", data, shapes, dtypes);
+        }
+
+        // Fallback logic for DiLoCo/AdamW legacy training if dtypes is null:
         // [Params (N x f32), M_states (N x f32), V_states (N x f32), Timestep (1 x f32), Data (2 x i64)]
-        var dtypes = try self.allocator.alloc(DType, data.len);
-        defer self.allocator.free(dtypes);
+        var inferred_dtypes = try self.allocator.alloc(DType, data.len);
+        defer self.allocator.free(inferred_dtypes);
 
         // All inputs except last 2 are f32 (params, M states, V states, timestep)
         for (0..data.len) |i| {
             if (i >= data.len - 2) {
-                dtypes[i] = .i64; // Last 2 are i64 data inputs
+                inferred_dtypes[i] = .i64; // Last 2 are i64 data inputs
             } else {
-                dtypes[i] = .f32; // Everything else is f32
+                inferred_dtypes[i] = .f32; // Everything else is f32
             }
         }
 
-        return self.execute(artifact, "main", data, shapes, dtypes);
+        return self.execute(artifact, "main", data, shapes, inferred_dtypes);
     }
 
     fn getBackendTypeInterface(ptr: *anyopaque) backend_selection.Backend {

@@ -3,6 +3,7 @@ const Allocator = std.mem.Allocator;
 const ArrayList = std.ArrayList;
 const TrainingAlgorithm = @import("training_algorithm.zig").TrainingAlgorithm;
 const TrainingStatus = @import("training_algorithm.zig").TrainingStatus;
+const backend_selection = @import("../backends/selection.zig");
 
 // Forward declaration - RLShepherd will be defined in src/nodes/controllers/rl_shepherd.zig
 pub const RLShepherd = @import("../nodes/controllers/rl_shepherd.zig").RLShepherd;
@@ -93,9 +94,27 @@ pub const GRPO = struct {
             return error.NoPromptsLoaded;
         }
 
-        // 2. Initialize Training Backend (Shepherd-local)
         if (self.controller.training_backend == null) {
-            try self.controller.initTrainingBackend("models/qwen_grpo_training.vmfb");
+            const backend_type = self.controller.training_backend_type orelse backend_selection.Backend.cuda;
+
+            try self.controller.initTrainingBackend(
+                "models/qwen_grpo_training.mlir",
+                backend_type,
+            );
+
+            // Load initial weights after initializing backend
+            if (self.controller.parameter_shapes) |shapes| {
+                std.log.info("Loading initial weights from checkpoints/initial_weights/qwen_flat.bin...", .{});
+                try self.controller.loadWeightsFromFile("checkpoints/initial_weights/qwen_flat.bin", shapes);
+                std.log.info("✓ Loaded initial weights successfully", .{});
+
+                // Initialize optimizer velocity buffers
+                try self.controller.optimizer.initParameters(shapes);
+                std.log.info("✓ Optimizer initialized for {} parameters", .{shapes.len});
+            } else {
+                std.log.err("Failed to load weights: parameter shapes not initialized", .{});
+                return error.ParameterShapesNotInitialized;
+            }
         }
 
         // 3. Initialize Generation Backend (Distributed to Workers)

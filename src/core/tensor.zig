@@ -31,7 +31,9 @@ pub const DType = enum {
         const ctx = mlir_type.getContext();
 
         if (mlir_type.isInteger()) {
-            return .i32;
+            // Try to get bit width from C API
+            const bit_width = c.mlirIntegerTypeGetWidth(mlir_type.handle);
+            return if (bit_width == 64) .i64 else .i32;
         } else if (mlir_type.isBF16(ctx)) {
             return .bf16;
         } else if (mlir_type.isF64(ctx)) {

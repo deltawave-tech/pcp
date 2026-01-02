@@ -15,6 +15,7 @@ You typically want **both** of these available when running the Python tests:
 - **Nix dev shell**: provides IREE tools (`iree-compile`, `iree-run-module`) + compatible runtime libs.
 - **Python venv**: provides `torch` and `torch-mlir` (`pip install -r requirements.txt`).
 - **pcp binary**: the parity tests call `pcp --export-training-artifacts`, so build `./result/bin/pcp` (or `./zig-out/bin/pcp`) first.
+  - The Python helpers prefer `./zig-out/bin/pcp` if it exists. Override with `PCP_BIN=/path/to/pcp`.
 
 Recommended way to run a test from `pcp/`:
 
@@ -111,6 +112,26 @@ nix develop -c ./venv/bin/python test/nanochat/test_pcp_gradients_parity.py
 nix develop -c ./venv/bin/python test/nanochat/test_pcp_training_step_parity.py
 ```
 
+---
+
+### `test/nanochat/test_pcp_diloco_outer_step_parity.py`
+
+**Goal:** validate a full DiLoCo **outer round** (multi-worker, H inner steps, delta averaging, Nesterov update) without involving the dataset pipeline.
+
+**What it checks:**
+- Simulates `K` workers and `H` inner steps using the **PCP training VMFB** (`main`).
+- Uses deterministic synthetic `(idx, targets)` batches per `(worker, step)` so runs are reproducible.
+- Computes `delta_i = master - worker_final` per worker, then `delta_avg = mean(delta_i)`.
+- Applies host-side Nesterov update exactly like `src/optimizers/nesterov.zig:64`.
+- Compares master params (and Nesterov velocity buffers) against a PyTorch reference implementation of the same inner-step math.
+
+**How to run:**
+```bash
+nix develop -c ./venv/bin/python test/nanochat/test_pcp_diloco_outer_step_parity.py
+```
+
+**What a pass looks like:** per-tensor max diffs + `OK: DiLoCo outer-step parity matches (multi-worker synthetic).`
+
 ## PCP Run (Shepherd)
 
 Example command:
@@ -131,6 +152,24 @@ To actually run training, you also need a worker process. For a single-machine C
 ```bash
 ./result/bin/pcp --worker --host 127.0.0.1 --port 18080 --backend cpu
 ```
+
+## PCP System Smoke Test (Shepherd + Worker)
+
+### `test/nanochat/test_pcp_shepherd_worker_smoke.py`
+
+**Goal:** exercise the real PCP networking/runtime loop end-to-end.
+
+**What it checks:**
+- Launches a local shepherd and a local worker (CPU backend).
+- Runs a tiny config (1 outer step, 1 inner step).
+- Asserts: shepherd exits successfully, logs contain no `NaN`, and a checkpoint file is written.
+
+**How to run:**
+```bash
+nix develop -c ./venv/bin/python test/nanochat/test_pcp_shepherd_worker_smoke.py
+```
+
+**What a pass looks like:** `OK: shepherd+worker smoke run completed (finite loss, checkpoint written).`
 
 On a multi-GPU node, use the node manager (spawns supervised workers):
 

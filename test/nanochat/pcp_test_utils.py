@@ -1,4 +1,5 @@
 import ast
+import os
 import shutil
 import struct
 import subprocess
@@ -30,9 +31,16 @@ _NPY_DESCR_TO_DTYPE = {
 
 
 def find_pcp_binary() -> str:
+    override = os.environ.get("PCP_BIN")
+    if override:
+        path = Path(override)
+        if path.exists():
+            return str(path)
+        raise SystemExit(f"PCP_BIN is set but does not exist: {override}")
+
     candidates = [
-        PCP_ROOT / "result" / "bin" / "pcp",
         PCP_ROOT / "zig-out" / "bin" / "pcp",
+        PCP_ROOT / "result" / "bin" / "pcp",
     ]
     for candidate in candidates:
         if candidate.exists():

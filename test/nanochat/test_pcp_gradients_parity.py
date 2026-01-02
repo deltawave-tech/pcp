@@ -21,12 +21,12 @@ TEST_DIR = Path(__file__).resolve().parent
 if str(TEST_DIR) not in sys.path:
     sys.path.insert(0, str(TEST_DIR))
 
-from nanochat.gpt import GPT, GPTConfig
 from pcp_test_utils import (
     export_training_artifacts,
     run_generate_nanochat,
     run_iree_function,
 )
+from nanochat.gpt import GPT, GPTConfig
 
 
 def assert_close(actual, expected, label, atol=1e-4, rtol=1e-4):

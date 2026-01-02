@@ -400,7 +400,7 @@ fn exportTrainingArtifacts(allocator: Allocator, args: Args) !void {
 
     const training_mlir_path = try std.fs.path.join(allocator, &[_][]const u8{ out_dir, "training.mlir" });
     defer allocator.free(training_mlir_path);
-    try std.fs.cwd().writeFile(training_mlir_path, training_mlir);
+    try std.fs.cwd().writeFile(.{ .sub_path = training_mlir_path, .data = training_mlir });
 
     var compile_ctx = try mlir_ctx.MLIRContext.init(allocator);
     defer compile_ctx.deinit();
@@ -415,7 +415,7 @@ fn exportTrainingArtifacts(allocator: Allocator, args: Args) !void {
 
     const vmfb_path = try std.fs.path.join(allocator, &[_][]const u8{ out_dir, "training.vmfb" });
     defer allocator.free(vmfb_path);
-    try std.fs.cwd().writeFile(vmfb_path, vmfb);
+    try std.fs.cwd().writeFile(.{ .sub_path = vmfb_path, .data = vmfb });
 
     const metadata_path = try std.fs.path.join(allocator, &[_][]const u8{ out_dir, "metadata.json" });
     defer allocator.free(metadata_path);
@@ -466,7 +466,7 @@ fn exportTrainingArtifacts(allocator: Allocator, args: Args) !void {
     try root.put("grad_function", std.json.Value{ .string = "model_forward_pass_grad" });
     try root.put("timestep_start", std.json.Value{ .float = 1.0 });
 
-    var writer = metadata_file.writer();
+    const writer = metadata_file.writer();
     try std.json.stringify(std.json.Value{ .object = root }, .{ .whitespace = .indent_2 }, writer);
 
     std.log.info("Export complete: {s}", .{out_dir});
@@ -524,8 +524,7 @@ fn runShepherd(allocator: Allocator, args: Args) !void {
     print("   Port: {}\n", .{args.port});
     print("   Waiting for {} workers\n", .{args.workers});
 
-    // Determine backend based on platform (A100 = Linux = CUDA)
-    const backend = backend_selection.Backend.selectDefault();
+    const backend = args.backend orelse backend_selection.Backend.selectDefault();
     print("   Backend: {s}\n", .{backend.toString()});
 
     // Initialize system

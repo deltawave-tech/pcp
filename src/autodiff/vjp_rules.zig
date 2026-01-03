@@ -19,10 +19,10 @@ pub const VJPFn = *const fn(
 
 /// Check if an mlir.Value comes from a constant operation at compile time
 fn isValueFromConstantOp(value: mlir.Value) bool {
-    // In a full implementation, this would check if the defining op is stablehlo.constant
-    // For now, we'll assume all values are non-constant to be conservative
-    _ = value;
-    return false;
+    if (!c.mlirValueIsAOpResult(value.handle)) return false;
+    const owner = mlir.Operation{ .handle = c.mlirOpResultGetOwner(value.handle) };
+    const name = owner.getName();
+    return std.mem.eql(u8, name, "stablehlo.constant") or std.mem.eql(u8, name, "arith.constant");
 }
 
 /// VJP rule for addition: both inputs get the same gradient
@@ -263,11 +263,36 @@ pub fn powerVJP(
     var result = std.ArrayList(mlir.Value).init(builder.allocator);
     defer result.deinit();
 
-    const one_tensor = try ops.constant(builder, 1.0, result_shape, result_elem_type);
-    const exp_minus_1 = try builder.createAndAttach("stablehlo.subtract", &.{ exp, one_tensor.value }, &.{exp.getType()}, .{});
-    const pow_op = try builder.createAndAttach("stablehlo.power", &.{ base, exp_minus_1.getResult(0) }, &.{result_type}, .{});
+    const y_op = try builder.createAndAttach("stablehlo.power", &.{ base, exp }, &.{result_type}, .{});
+    const y = y_op.getResult(0);
 
-    const exp_times_pow_broadcast = try ops.broadcastOperands(builder, exp, pow_op.getResult(0));
+    const y_div_base_broadcast = try ops.broadcastOperands(builder, y, base);
+    defer builder.allocator.free(y_div_base_broadcast.shape);
+
+    const zero_tensor = try ops.constant(builder, 0.0, y_div_base_broadcast.shape, result_elem_type);
+    const zero = zero_tensor.value;
+
+    const compare_type = result_elem_type.getStableHLOCompareType();
+    const base_is_zero_op = hlo.compare(builder.ctx, y_div_base_broadcast.rhs, zero, .EQ, compare_type, builder.loc);
+    builder.insertion_block.appendOwnedOperation(base_is_zero_op);
+    const base_is_zero = base_is_zero_op.getResult(0);
+
+    const y_div_base_type = y_div_base_broadcast.lhs.getType();
+    const y_div_base_op = try builder.createAndAttach(
+        "stablehlo.divide",
+        &.{ y_div_base_broadcast.lhs, y_div_base_broadcast.rhs },
+        &.{y_div_base_type},
+        .{},
+    );
+
+    const safe_y_div_base_op = try builder.createAndAttach(
+        "stablehlo.select",
+        &.{ base_is_zero, zero, y_div_base_op.getResult(0) },
+        &.{y_div_base_type},
+        .{},
+    );
+
+    const exp_times_pow_broadcast = try ops.broadcastOperands(builder, exp, safe_y_div_base_op.getResult(0));
     defer builder.allocator.free(exp_times_pow_broadcast.shape);
     const exp_times_pow_type = exp_times_pow_broadcast.lhs.getType();
     const exp_times_pow = try builder.createAndAttach(

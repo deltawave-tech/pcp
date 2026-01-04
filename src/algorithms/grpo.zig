@@ -10,10 +10,12 @@ pub const RLShepherd = @import("../nodes/controllers/rl_shepherd.zig").RLShepher
 pub const RolloutData = @import("../nodes/controllers/rl_shepherd.zig").RolloutData;
 
 pub const GRPOConfig = struct {
-    num_iterations: usize = 10,
-    group_size: usize = 4, // Number of generations per prompt
-    learning_rate: f32 = 1e-6,
-    beta: f32 = 0.1, // KL penalty coefficient
+    num_iterations: usize,
+    group_size: usize,
+    learning_rate: f32,
+    beta: f32,
+    prompt_file: []const u8,
+    num_prompts: usize,
 };
 
 pub const GRPO = struct {
@@ -86,7 +88,7 @@ pub const GRPO = struct {
 
         // 1. Load Prompts
         if (self.prompts.items.len == 0) {
-            try self.loadPrompts("data/rl_prompts.bin");
+            try self.loadPrompts(self.config.prompt_file);
         }
 
         if (self.prompts.items.len == 0) {
@@ -154,7 +156,8 @@ pub const GRPO = struct {
             std.log.info("=== GRPO Iteration {}/{} ===", .{ iter + 1, self.config.num_iterations });
 
             // A. Use Loaded Prompts
-            const prompts = self.prompts.items;
+            const max_prompts = @min(self.config.num_prompts, self.prompts.items.len);
+            const prompts = self.prompts.items[0..max_prompts];
 
             // B. Request Rollouts
             // We need 'group_size' completions per prompt
@@ -250,9 +253,7 @@ pub const GRPO = struct {
             std.log.info("=== Iteration {} Summary ===", .{iter + 1});
             std.log.info("  Rewards: mean={d:.3}, std={d:.3}, min={d:.3}, max={d:.3}", .{ reward_mean, reward_std, reward_min, reward_max });
 
-            // E. Train Step (Backprop + Update)
-            // This runs on the Shepherd using the Training Graph
-            try self.controller.trainStep(rollouts, rewards);
+            try self.controller.trainStep(rollouts, rewards, self.config.group_size);
 
             // F. Broadcast Updated Weights to Workers
             try self.controller.broadcastNewWeights();

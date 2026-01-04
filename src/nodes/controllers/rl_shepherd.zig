@@ -393,12 +393,8 @@ pub const RLShepherd = struct {
         return results;
     }
 
-    /// Execute a GRPO training step (debug-hardened)
-    pub fn trainStep(self: *Self, rollouts: ArrayList(RolloutData), rewards: ArrayList(f32)) !void {
+    pub fn trainStep(self: *Self, rollouts: ArrayList(RolloutData), rewards: ArrayList(f32), group_size: usize) !void {
         std.debug.print(">>> trainStep START. Rollouts: {}\n", .{rollouts.items.len});
-
-        // 1. Compute Advantages (Group Normalized)
-        const group_size = 4;
         var advantages = try self.base.allocator.alloc(f32, rewards.items.len);
         defer self.base.allocator.free(advantages);
 
@@ -479,47 +475,17 @@ pub const RLShepherd = struct {
                 }
             }
 
-            // Add Buffer Inputs (causal_mask and inv_freq)
-            // 1. Causal mask: upper triangular with -1e4, shape (1, 1, 512, 512)
-            const causal_mask_size = 1 * 1 * seq_len * seq_len;
-            const causal_mask_bytes = try self.base.allocator.alloc(u8, causal_mask_size * 4);
-            defer self.base.allocator.free(causal_mask_bytes);
-            const causal_mask_f32 = std.mem.bytesAsSlice(f32, causal_mask_bytes);
-            for (0..seq_len) |row| {
-                for (0..seq_len) |col| {
-                    causal_mask_f32[row * seq_len + col] = if (col > row) -1e4 else 0.0;
-                }
-            }
-            try inputs_list.append(causal_mask_bytes);
-            try shapes_list.append(&[_]i64{ 1, 1, seq_len, seq_len });
-            try dtypes_list.append(.f32);
-
-            // 2. inv_freq: RoPE frequencies, shape (32,) for head_dim=64
-            const head_dim: usize = 64;
-            const inv_freq_len = head_dim / 2;
-            const inv_freq_bytes = try self.base.allocator.alloc(u8, inv_freq_len * 4);
-            defer self.base.allocator.free(inv_freq_bytes);
-            const inv_freq_f32 = std.mem.bytesAsSlice(f32, inv_freq_bytes);
-            const rope_base: f32 = 10000.0;
-            for (0..inv_freq_len) |idx| {
-                const exp = @as(f32, @floatFromInt(2 * idx)) / @as(f32, @floatFromInt(head_dim));
-                inv_freq_f32[idx] = 1.0 / std.math.pow(f32, rope_base, exp);
-            }
-            try inputs_list.append(inv_freq_bytes);
-            try shapes_list.append(&[_]i64{inv_freq_len});
-            try dtypes_list.append(.f32);
-
-            // Add Data Inputs
+            const gs: i64 = @intCast(group_size);
             try inputs_list.append(input_ids_bytes);
-            try shapes_list.append(&[_]i64{ group_size, seq_len });
+            try shapes_list.append(&[_]i64{ gs, seq_len });
             try dtypes_list.append(.i64);
 
             try inputs_list.append(mask_bytes);
-            try shapes_list.append(&[_]i64{ group_size, seq_len });
+            try shapes_list.append(&[_]i64{ gs, seq_len });
             try dtypes_list.append(.f32);
 
             try inputs_list.append(adv_bytes);
-            try shapes_list.append(&[_]i64{group_size});
+            try shapes_list.append(&[_]i64{gs});
             try dtypes_list.append(.f32);
 
             // Execute backward pass

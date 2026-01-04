@@ -386,7 +386,7 @@ pub const Shepherd = struct {
     
     /// Handle inner loop completion from worker
     fn handleInnerLoopComplete(self: *Self, worker_id: NodeId, msg: MessageEnvelope) !void {
-        std.log.info("Worker {} sent INNER_LOOP_COMPLETE result", .{worker_id});
+        std.log.info("Worker {} sent {s} result", .{ worker_id, msg.msg_type });
 
         // Clone the message to own the data (msg contains pointers to temporary buffers)
         const msg_clone = try msg.clone(self.allocator);
@@ -640,8 +640,15 @@ pub const Shepherd = struct {
             std.time.sleep(50 * std.time.ns_per_ms);
         }
 
+        std.log.info("Collection loop exited, acquiring mutex...", .{});
         self.result_queue_mutex.lock();
         defer self.result_queue_mutex.unlock();
+
+        // Debug: log what's in the queue
+        std.log.info("collectFromWorkers: looking for '{s}', queue has {} items", .{ expected_msg_type, self.result_queue.items.len });
+        for (self.result_queue.items, 0..) |dbg_msg, dbg_i| {
+            std.log.info("  queue[{}]: msg_type='{s}'", .{ dbg_i, dbg_msg.msg_type });
+        }
 
         var responses = ArrayList(MessageEnvelope).init(self.allocator);
 

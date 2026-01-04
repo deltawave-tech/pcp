@@ -25,6 +25,15 @@ const DiLoCo = diloco.DiLoCo;
 const DiLoCoConfig = diloco.DiLoCoConfig;
 const MLIRBuilder = ops.MLIRBuilder;
 
+const GRPOJsonConfig = struct {
+    num_iterations: usize,
+    group_size: usize,
+    learning_rate: f32,
+    beta: f32,
+    prompt_file: []const u8,
+    num_prompts: usize,
+};
+
 /// JSON Config File Structure
 const ExperimentConfig = struct {
     model_path: []const u8 = "src/models/nanogpt_forward.mlir",
@@ -35,6 +44,8 @@ const ExperimentConfig = struct {
     outer_loop_steps: usize = 100,
     nesterov_momentum: f32 = 0.9,
     max_epochs: usize = 10,
+
+    grpo_config: ?GRPOJsonConfig = null,
 
     // WandB configuration
     wandb_project: []const u8 = "pcp-distributed",
@@ -311,6 +322,15 @@ fn runRLShepherd(allocator: Allocator, args: Args) !void {
 
     print("   Training Backend: {s}\n", .{training_backend.toString()});
 
+    var config_result = try loadConfig(allocator, args.config_path);
+    defer config_result.deinit();
+    const exp_config = config_result.config;
+
+    const json_grpo = exp_config.grpo_config orelse {
+        print("Error: grpo_config is required in config file for RL mode\n", .{});
+        return error.GRPOConfigRequired;
+    };
+
     var rl_shepherd_controller = rl_shepherd.RLShepherd.init(allocator);
     defer rl_shepherd_controller.deinit();
 
@@ -319,21 +339,20 @@ fn runRLShepherd(allocator: Allocator, args: Args) !void {
     const listen_thread = try std.Thread.spawn(.{}, rlShepherdListenThread, .{ &rl_shepherd_controller, args.host, args.port });
     defer listen_thread.join();
 
-    // Give the listen thread time to start
     std.time.sleep(500 * std.time.ns_per_ms);
 
-    // Create GRPO algorithm
     const grpo_config = grpo.GRPOConfig{
-        .num_iterations = 10,
-        .group_size = 4,
-        .learning_rate = 1e-6,
-        .beta = 0.1,
+        .num_iterations = json_grpo.num_iterations,
+        .group_size = json_grpo.group_size,
+        .learning_rate = json_grpo.learning_rate,
+        .beta = json_grpo.beta,
+        .prompt_file = json_grpo.prompt_file,
+        .num_prompts = json_grpo.num_prompts,
     };
 
     var grpo_algo = grpo.GRPO.init(allocator, &rl_shepherd_controller, grpo_config);
     var training_algo = grpo_algo.asTrainingAlgorithm();
 
-    // Run GRPO training loop
     print("Starting GRPO training...\n", .{});
     try training_algo.run();
 

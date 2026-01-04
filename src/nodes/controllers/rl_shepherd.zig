@@ -534,25 +534,62 @@ pub const RLShepherd = struct {
             defer self.base.allocator.free(gradients);
 
             // Update Weights
-            std.debug.print(">>> IREE Execute returned {} gradients. Applying...\n", .{gradients.len});
+            std.log.info("IREE backward pass returned {} gradients", .{gradients.len});
 
             if (self.master_parameters) |params| {
                 if (gradients.len != params.len) {
-                    std.debug.print("CRITICAL: Gradient count mismatch! Params: {}, Grads: {}\n", .{ params.len, gradients.len });
+                    std.log.err("CRITICAL: Gradient count mismatch! Params: {}, Grads: {}", .{ params.len, gradients.len });
                     return error.GradientCountMismatch;
                 }
 
-                for (params, 0..) |_, param_idx| {
-                    if (param_idx % 20 == 0) {
-                        std.debug.print(">>> Updating param {}/{}\n", .{ param_idx, params.len });
-                    }
+                // Compute gradient statistics
+                var total_grad_norm: f64 = 0.0;
+                var total_grad_elements: usize = 0;
+                var max_grad: f32 = 0.0;
+                var nan_count: usize = 0;
+                var inf_count: usize = 0;
 
+                for (gradients) |grad_bytes_raw| {
+                    var grad_slice_stats: []const f32 = undefined;
+                    if (@intFromPtr(grad_bytes_raw.ptr) % 4 != 0) {
+                        const aligned = try self.base.allocator.alloc(u8, grad_bytes_raw.len);
+                        defer self.base.allocator.free(aligned);
+                        @memcpy(aligned, grad_bytes_raw);
+                        grad_slice_stats = @as([]const f32, @alignCast(std.mem.bytesAsSlice(f32, aligned)));
+                    } else {
+                        grad_slice_stats = @as([]const f32, @alignCast(std.mem.bytesAsSlice(f32, grad_bytes_raw)));
+                    }
+                    for (grad_slice_stats) |g| {
+                        if (std.math.isNan(g)) {
+                            nan_count += 1;
+                        } else if (std.math.isInf(g)) {
+                            inf_count += 1;
+                        } else {
+                            total_grad_norm += @as(f64, g) * @as(f64, g);
+                            if (@abs(g) > max_grad) max_grad = @abs(g);
+                        }
+                        total_grad_elements += 1;
+                    }
+                }
+                total_grad_norm = std.math.sqrt(total_grad_norm);
+
+                std.log.info("=== Gradient Statistics ===", .{});
+                std.log.info("  L2 Norm: {d:.6}", .{total_grad_norm});
+                std.log.info("  Max |grad|: {d:.6}", .{max_grad});
+                std.log.info("  Elements: {}", .{total_grad_elements});
+                if (nan_count > 0 or inf_count > 0) {
+                    std.log.warn("  NaN count: {}, Inf count: {}", .{ nan_count, inf_count });
+                }
+
+                // Apply gradients
+                var params_updated: usize = 0;
+                for (params, 0..) |_, param_idx| {
                     const param_bytes = params[param_idx];
                     const grad_bytes_raw = gradients[param_idx];
 
                     // Check alignment of param_bytes
                     if (@intFromPtr(param_bytes.ptr) % 4 != 0) {
-                        std.debug.print("CRITICAL: Param {} unaligned!\n", .{param_idx});
+                        std.log.err("CRITICAL: Param {} unaligned!", .{param_idx});
                         return error.MisalignedParameter;
                     }
                     const param_ptr = @constCast(param_bytes.ptr);
@@ -573,6 +610,7 @@ pub const RLShepherd = struct {
 
                     // Update weights
                     try self.optimizer.update(param_idx, param_slice, grad_slice);
+                    params_updated += 1;
 
                     // Clean up
                     if (aligned_grad_buffer) |buf| {
@@ -580,17 +618,18 @@ pub const RLShepherd = struct {
                     }
                     self.base.allocator.free(grad_bytes_raw);
                 }
+                std.log.info("  Parameters updated: {}/{}", .{ params_updated, params.len });
             }
         }
 
-        std.debug.print(">>> GRPO Step Complete. Weights Updated.\n", .{});
+        std.log.info("=== Training Step Complete ===", .{});
     }
 
     /// Broadcast updated weights to all workers
+    /// Weights are sent directly - no prepending needed since MLIR no longer has dead inv_freq input
     pub fn broadcastNewWeights(self: *Self) !void {
         std.log.info("Broadcasting updated weights to workers...", .{});
 
-        // Get the updated weight buffer
         const weight_data = self.weight_buffer orelse return error.NoWeightsLoaded;
 
         // Encode to Base64 for JSON transport
@@ -643,9 +682,9 @@ pub const RLShepherd = struct {
             }
         } else |_| {}
 
-        // 3. Fallback to Lite Introspection (Source Scan)
+        // 3. Fallback to Standard Introspection (Source Scan)
         if (!metadata_loaded) {
-            std.log.info("Cache miss. Reading MLIR source for Lite Introspection...", .{});
+            std.log.info("Cache miss. Reading MLIR source for introspection...", .{});
 
             // Read source (3.7GB)
             const mlir_source = try std.fs.cwd().readFileAlloc(
@@ -655,16 +694,23 @@ pub const RLShepherd = struct {
             );
             defer self.base.allocator.free(mlir_source);
 
-            std.log.info("Source loaded ({} bytes). Running Lite Inspector (Text Scan)...", .{mlir_source.len});
+            std.log.info("Source loaded ({} bytes). Running Standard Inspector...", .{mlir_source.len});
 
-            // Use the NEW Generation-specific Lite Inspector
-            // This avoids parsing the module to count inputs, assuming 0 params (frozen weights)
-            var meta_result = try model_introspection.ModelInspector.inspectLiteGeneration(
+            // Use standard inspector that separates params from data inputs
+            // Qwen 0.5B has 24 layers: data inputs = Token(1) + Pos(1) + KV(2*24) = 50
+            const num_data_inputs = 50;
+
+            var meta_result = try model_introspection.ModelInspector.inspectLite(
                 self.base.allocator,
                 mlir_source,
+                num_data_inputs,
             );
 
-            std.log.info("Introspection complete. Saving cache to {s}...", .{meta_path});
+            std.log.info("Introspection complete. Found {} params, {} data inputs.", .{
+                meta_result.parameter_shapes.len,
+                meta_result.data_input_shapes.len,
+            });
+            std.log.info("Saving cache to {s}...", .{meta_path});
             try meta_result.saveToFile(meta_path);
 
             self.gen_data_shapes = meta_result.data_input_shapes;
@@ -672,7 +718,8 @@ pub const RLShepherd = struct {
             self.gen_param_shapes = meta_result.parameter_shapes;
         }
 
-        std.log.info("✓ Generation Backend Ready: {} inputs found.", .{self.gen_data_shapes.?.len});
+        const num_params = if (self.gen_param_shapes) |ps| ps.len else 0;
+        std.log.info("✓ Generation Backend Ready: {} params, {} data inputs.", .{ num_params, self.gen_data_shapes.?.len });
     }
 
     /// Distribute the generation graph to workers

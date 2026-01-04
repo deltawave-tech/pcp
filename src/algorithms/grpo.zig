@@ -125,11 +125,27 @@ pub const GRPO = struct {
             );
         }
 
-        // 4. Ensure Workers are Ready
+        // 4. Wait for at least 1 worker to connect before initializing
+        std.log.info("Waiting for workers to connect...", .{});
+        const required_workers: usize = 1;
+        while (true) {
+            const current_count = self.controller.base.getWorkerCount();
+            if (current_count >= required_workers) {
+                std.log.info("✓ {} workers connected", .{current_count});
+                break;
+            }
+            std.time.sleep(100 * std.time.ns_per_ms); // 100ms polling
+        }
+
+        // 5. Ensure Workers are Ready - send VMFB and shapes
         std.log.info("Initializing Workers with Generation Model...", .{});
         try self.controller.prepareWorkersForGeneration("models/qwen_rl_generation.vmfb");
 
-        // Give workers a moment to load the VMFB and allocate the KV cache
+        // 5. Broadcast Initial Weights to Workers (CRITICAL for generation)
+        std.log.info("Broadcasting initial weights to workers...", .{});
+        try self.controller.broadcastNewWeights();
+
+        // Give workers a moment to load the VMFB, weights, and allocate the KV cache
         std.time.sleep(2 * std.time.ns_per_s);
         std.log.info("Workers initialized. Starting training loop...", .{});
 
@@ -162,7 +178,7 @@ pub const GRPO = struct {
             // Qwen 2.5 EOS token ID
             const eos_id: i64 = 151643;
 
-            for (rollouts.items) |r| {
+            for (rollouts.items, 0..) |r, rollout_idx| {
                 var score: f32 = 0.0;
 
                 // 1. Length Scoring
@@ -206,8 +222,33 @@ pub const GRPO = struct {
 
                 try rewards.append(score);
 
-                std.log.info("Rollout reward: {d:.2} (len={}, eos={}, diversity={d:.2})", .{ score, len, has_eos, diversity });
+                // Log detailed rollout info
+                std.log.info("--- Rollout {} ---", .{rollout_idx + 1});
+                std.log.info("  Prompt tokens ({}): {any}", .{ r.prompt.len, r.prompt[0..@min(r.prompt.len, 20)] });
+                std.log.info("  Completion tokens ({}): first20={any}", .{ len, r.completion[0..@min(len, 20)] });
+                if (len > 20) {
+                    std.log.info("  Completion tokens (cont): last20={any}", .{r.completion[@max(len, 20) - 20 .. len]});
+                }
+                std.log.info("  Reward: {d:.3} (len={}, eos={}, diversity={d:.2})", .{ score, len, has_eos, diversity });
             }
+
+            // Iteration summary stats
+            var reward_sum: f32 = 0.0;
+            var reward_min: f32 = std.math.floatMax(f32);
+            var reward_max: f32 = -std.math.floatMax(f32);
+            for (rewards.items) |r| {
+                reward_sum += r;
+                if (r < reward_min) reward_min = r;
+                if (r > reward_max) reward_max = r;
+            }
+            const reward_mean = reward_sum / @as(f32, @floatFromInt(rewards.items.len));
+            var reward_var: f32 = 0.0;
+            for (rewards.items) |r| {
+                reward_var += (r - reward_mean) * (r - reward_mean);
+            }
+            const reward_std = std.math.sqrt(reward_var / @as(f32, @floatFromInt(rewards.items.len)));
+            std.log.info("=== Iteration {} Summary ===", .{iter + 1});
+            std.log.info("  Rewards: mean={d:.3}, std={d:.3}, min={d:.3}, max={d:.3}", .{ reward_mean, reward_std, reward_min, reward_max });
 
             // E. Train Step (Backprop + Update)
             // This runs on the Shepherd using the Training Graph

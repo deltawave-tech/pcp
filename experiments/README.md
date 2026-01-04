@@ -7,6 +7,7 @@ This directory contains experiment configurations for distributed training with 
 - [NanoGPT Small](#nanogpt-small)
 - [NanoGPT Medium](#nanogpt-medium)
 - [NanoGPT Large](#nanogpt-large)
+- [Qwen RL Test](#qwen-rl-test)
 
 ## NanoGPT Small
 
@@ -127,6 +128,138 @@ After setup, the file will be available at `data/enwik8.txt`, matching the `data
 ## NanoGPT Large
 
 TODO
+
+## Qwen RL Test
+
+### Overview
+
+GRPO (Group Relative Policy Optimization) reinforcement learning with Qwen 2.5 0.5B Instruct. This experiment demonstrates distributed RL training using an RL Shepherd controller and CUDA workers for parallel rollout generation.
+
+### Model Specifications
+
+- **Base Model**: Qwen/Qwen2.5-0.5B-Instruct (HuggingFace)
+- **Parameters**: ~494M (1.88 GB in fp32)
+- **Context Length**: 1024 tokens
+- **KV Heads**: 2 (GQA)
+- **Layers**: 24
+- **Hidden Dim**: 896
+- **Vocabulary**: 151,936 tokens
+
+### Architecture
+
+```
+┌─────────────────┐
+│   RL Shepherd   │  Coordinator: loads weights, dispatches prompts,
+│                 │  collects rollouts, computes GRPO updates
+└────────┬────────┘
+         │ TCP (weights, prompts, completions)
+    ┌────┴────┐
+    ▼         ▼
+┌───────┐ ┌───────┐
+│Worker │ │Worker │  CUDA workers: run generation VMFB,
+│  0    │ │  1    │  return token completions
+└───────┘ └───────┘
+```
+
+### Files
+
+| File | Description |
+|------|-------------|
+| `experiments/qwen_rl_test.json` | Experiment configuration |
+| `models/qwen_rl_generation.mlir` | Generation model (stateless RoPE, KV cache I/O) |
+| `models/qwen_rl_generation.vmfb` | Compiled IREE module for CUDA (~520 MB) |
+| `models/qwen_grpo_training.vmfb` | Training backward pass for GRPO updates |
+| `checkpoints/initial_weights/qwen_flat.bin` | Flattened HuggingFace weights (1.88 GB) |
+| `data/rl_prompts.bin` | Binary-encoded prompt token IDs |
+
+### Export Scripts
+
+**Generation Model** (`tools/export_qwen_generation.py`):
+- Exports Qwen with functional parameters (weights as inputs)
+- Implements stateless RoPE (no captured buffers)
+- KV cache passed in/out for autoregressive generation
+- Outputs: MLIR → compile with `iree-compile` to VMFB
+
+**Training Model** (`tools/export_qwen_grpo_training.py`):
+- Exports gradient computation for GRPO policy updates
+- Uses `torch.func.grad` for automatic differentiation
+
+**Weights** (`tools/export_weights_only.py`):
+- Extracts `model.named_parameters()` to flat binary
+- Order must match MLIR function signature exactly
+
+**Prompts** (`tools/prepare_rl_dataset.py`):
+- Tokenizes text prompts to binary format
+- Format: `[num_prompts:u32] [len:u32 tokens:u64[]]*`
+
+### Prompt Dataset
+
+The test uses simple prompts in `data/rl_prompts.bin`:
+
+```
+2+2=
+The capital of France is
+Write a python function to add two numbers.
+Is fire hot? Answer yes or no.
+Solve 3 * 4 + 2.
+```
+
+### Experiment Configuration
+
+```json
+{
+    "model_path": "models/qwen_rl_generation.mlir",
+    "training_model_path": "models/qwen_grpo_training.vmfb",
+    "weights_path": "checkpoints/initial_weights/qwen_flat.bin",
+    "tokenizer": "qwen",
+    "grpo_config": {
+        "num_iterations": 10,
+        "group_size": 4,
+        "learning_rate": 1e-6,
+        "beta": 0.1
+    },
+    "rollout_config": {
+        "max_tokens": 128,
+        "temperature": 0.7
+    }
+}
+```
+
+### Running the Experiment
+
+```bash
+# 1. Export models (if not already done)
+python tools/export_qwen_generation.py
+python tools/export_qwen_grpo_training.py
+
+# 2. Compile to VMFB
+iree-compile models/qwen_rl_generation.mlir \
+    --iree-hal-target-backends=cuda \
+    -o models/qwen_rl_generation.vmfb
+
+# 3. Export weights
+python tools/export_weights_only.py
+
+# 4. Prepare prompts
+python tools/prepare_rl_dataset.py
+
+# 5. Run (uses run_qwen_rl_test.sh convenience script)
+./run_qwen_rl_test.sh
+```
+
+The test script starts an RL Shepherd and one CUDA worker. The shepherd:
+1. Loads weights and broadcasts to workers
+2. Sends prompts for rollout generation
+3. Collects completions and computes rewards
+4. Applies GRPO gradient updates
+5. Broadcasts updated weights for next iteration
+
+### Key Implementation Details
+
+- **Stateless RoPE**: Position embeddings computed from `position_ids` input, not module buffers
+- **KV Cache**: Shape `[batch, kv_heads, seq_len, head_dim]` passed as function I/O
+- **Weight Injection**: All 290 parameters passed as function inputs for gradient flow
+- **Causal Mask**: Computed inside the model from position IDs
 
 ## Configuration Reference
 

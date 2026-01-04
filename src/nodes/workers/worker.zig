@@ -818,7 +818,7 @@ pub const Worker = struct {
 
     /// Handle a Rollout Request (RL Generation)
     fn handleStartRollout(self: *Self, msg: MessageEnvelope) !void {
-        self.state = .training; // Reuse status or add .generating
+        self.state = .training;
 
         // 1. Parse Payload
         const payload = switch (msg.data) {
@@ -827,7 +827,6 @@ pub const Worker = struct {
         };
 
         // Get Prompt (Input IDs)
-        // Assumes payload["prompt"] is array of integers
         const prompt_json = payload.get("prompt") orelse return error.MissingPrompt;
         var prompt_list = std.ArrayList(i64).init(self.allocator);
         defer prompt_list.deinit();
@@ -841,16 +840,13 @@ pub const Worker = struct {
             else => return error.InvalidPromptFormat,
         }
 
-        const max_new_tokens = 128; // Configurable limit
+        const max_new_tokens = 128;
         var generated_tokens = std.ArrayList(i64).init(self.allocator);
         defer generated_tokens.deinit();
 
         // 2. Allocate KV Cache if not ready
-        // Qwen has N layers. Our export script put KV arguments AFTER token and pos.
-        // Input Signature: [Token (1,1), Pos (1,1), K_0, V_0, K_1, V_1 ...]
-        // We need to look at cached_data_input_shapes to know KV sizes.
         if (self.kv_cache == null) {
-            // Skip first 2 shapes (Token, Pos)
+            // Skip first 2 shapes (Token, Pos) -> [K_0, V_0, K_1, V_1 ...]
             const kv_shapes = self.cached_data_input_shapes.?[2..];
             const kv_buffers = try self.allocator.alloc([]u8, kv_shapes.len);
 
@@ -863,55 +859,105 @@ pub const Worker = struct {
             self.kv_cache = kv_buffers;
         }
 
-        // 3. Generation Loop
+        // 3. Build Combined Shapes & DTypes (Params + Data) for IREE
+        const param_shapes = self.cached_parameter_shapes orelse return error.ParameterShapesNotInitialized;
+        const data_shapes = self.cached_data_input_shapes orelse return error.DataShapesNotInitialized;
+
+        // Combine shapes: params first, then data
+        var all_shapes = try self.allocator.alloc([]i64, param_shapes.len + data_shapes.len);
+        defer self.allocator.free(all_shapes);
+        for (param_shapes, 0..) |s, i| all_shapes[i] = s;
+        for (data_shapes, 0..) |s, i| all_shapes[param_shapes.len + i] = s;
+
+        // Build dtypes: params (f32), token (i64), pos (i64), KV caches (f32)
+        var all_dtypes = try self.allocator.alloc(tensor.DType, param_shapes.len + data_shapes.len);
+        defer self.allocator.free(all_dtypes);
+        for (0..param_shapes.len) |i| all_dtypes[i] = .f32;  // Parameters
+        all_dtypes[param_shapes.len] = .i64;  // Token
+        all_dtypes[param_shapes.len + 1] = .i64;  // Position
+        for (param_shapes.len + 2..all_dtypes.len) |i| all_dtypes[i] = .f32;  // KV caches
+
+        // 4. Generation Loop
         var current_pos: i64 = 0;
-
-        // Prefill + Decode logic combined
-        // Ideally prefill is one step, but for simplicity we loop the prompt too
-        // (slower but safer for v1).
-
         const total_len = prompt_list.items.len + max_new_tokens;
 
         while (current_pos < total_len) {
-            // Determine input token
+            // --- FIX: Logic for Input Selection ---
             var input_token: i64 = 0;
+
             if (current_pos < prompt_list.items.len) {
+                // Phase 1: Prefill (Reading Prompt)
                 input_token = prompt_list.items[@intCast(current_pos)];
             } else {
+                // Phase 2: Decoding (Generating)
+                // With the sampling fix below, generated_tokens will NOT be empty here
                 if (generated_tokens.items.len > 0) {
                     input_token = generated_tokens.items[generated_tokens.items.len - 1];
+                } else {
+                    // This should theoretically not happen with the fix,
+                    // but if it does, log it to debug
+                    std.log.warn("Worker {}: Generating with empty history at pos {}", .{ self.node_id.?, current_pos });
                 }
             }
 
-            // Prepare Inputs
+            // Prepare Inputs (Weights + Token + Position + KV Cache)
             var input_list = std.ArrayList([]const u8).init(self.allocator);
             defer input_list.deinit();
 
-            // 1. Token
+            // --- 1. Inject Updated Weights (Parameters) ---
+            std.log.info("DEBUG_INJECT: current_pos={} has_blob={} has_shapes={}", .{
+                current_pos,
+                self.weight_blob != null,
+                self.cached_parameter_shapes != null,
+            });
+            if (self.weight_blob) |blob| {
+                if (self.cached_parameter_shapes) |shapes| {
+                    var offset: usize = 0;
+                    for (shapes, 0..) |shape, param_idx| {
+                        var size: usize = 4; // f32
+                        for (shape) |dim| size *= @intCast(dim);
+
+                        // Slice the blob for this parameter
+                        const param_slice = blob[offset .. offset + size];
+                        try input_list.append(param_slice);
+
+                        // Debug: log first 2 params on first iteration
+                        if (current_pos == 0 and param_idx < 2) {
+                            std.log.info("WEIGHT_DEBUG: param {} size {} first_byte {}", .{
+                                param_idx,
+                                size,
+                                param_slice[0],
+                            });
+                        }
+
+                        offset += size;
+                    }
+                }
+            } else {
+                std.log.err("Worker {}: No weights loaded for generation!", .{self.node_id.?});
+                return error.WeightsNotInitialized;
+            }
+
+            // --- 2. Data Inputs (Token, Pos, KV) ---
             const token_i64 = [_]i64{input_token};
             try input_list.append(std.mem.sliceAsBytes(&token_i64));
 
-            // 2. Position
             const pos_i64 = [_]i64{current_pos};
             try input_list.append(std.mem.sliceAsBytes(&pos_i64));
 
-            // 3. KV Cache
             for (self.kv_cache.?) |buf| {
                 try input_list.append(buf);
             }
 
-            // Prepare Shapes
-            // We use the cached shapes exactly
-
-            // Execute
+            // Execute VMFB
             const inputs_slice = try input_list.toOwnedSlice();
             defer self.allocator.free(inputs_slice);
 
             const outputs = try self.backend.executeTrainingStep(
                 self.cached_vmfb.?,
                 inputs_slice,
-                self.cached_data_input_shapes.?,
-                self.cached_data_input_dtypes
+                all_shapes,
+                all_dtypes,
             );
             defer {
                 for (outputs) |o| self.allocator.free(o);
@@ -919,46 +965,64 @@ pub const Worker = struct {
             }
 
             // Process Outputs
-            // Output 0: Logits [1, 1, Vocab]
-            // Output 1..N: New K/V slices
-
             const logits_raw = outputs[0];
-            const logits_f32_unaligned = std.mem.bytesAsSlice(f32, logits_raw);
-            const logits_f32: []const f32 = @alignCast(logits_f32_unaligned);
+            const logits_f32 = @as([]const f32, @alignCast(std.mem.bytesAsSlice(f32, logits_raw)));
 
-            // Sample if generating new tokens
-            if (current_pos >= prompt_list.items.len) {
+            // --- FIX: Logic for Sampling ---
+            // We must sample when we process the LAST token of the prompt.
+            // The output of the last prompt token is the prediction for the first generated token.
+            const is_last_prompt_token = (current_pos == prompt_list.items.len - 1);
+            const is_generating = (current_pos >= prompt_list.items.len);
+
+            if ((is_last_prompt_token and prompt_list.items.len > 0) or is_generating) {
                 const next_token = self.sampler.sample(logits_f32, 0.7); // Temp 0.7
                 try generated_tokens.append(next_token);
-                // Check EOS (Qwen 151643)
+
+                // Check EOS (Qwen 151643) or limit
                 if (next_token == 151643) break;
+                if (generated_tokens.items.len >= max_new_tokens) break;
             }
 
-            // Update KV Cache (Host Side Update)
-            // Outputs 1..end are the updates.
-            // We copy them into self.kv_cache at the correct offset.
-            // Note: This manual copy is the "In-Out" pattern bottleneck,
-            // but necessary without `util.global` in MLIR.
+            // Update KV Cache (In-place Host Side Update)
+            // Cache shape: [batch=1, heads=NUM_KV_HEADS, seq_len=MAX_SEQ_LEN, head_dim=HEAD_DIM]
+            // Update shape: [batch=1, heads=NUM_KV_HEADS, seq_len=1, head_dim=HEAD_DIM]
+            // Memory layout is head-major (row-major in C order), so we need to scatter
+            // each head's update data to the correct position within that head's slice.
+            const NUM_KV_HEADS: usize = 2; // Qwen 0.5B config
+            const HEAD_DIM: usize = 64;
+            const MAX_SEQ_LEN: usize = 1024;
+            const bytes_per_head_slot: usize = HEAD_DIM * 4; // 256 bytes per position per head
+            const head_stride: usize = MAX_SEQ_LEN * bytes_per_head_slot; // 262144 bytes per head
+
             const updates = outputs[1..];
             for (updates, 0..) |update_bytes, i| {
                 const cache_buffer = self.kv_cache.?[i];
 
-                // Calculate offset in bytes: current_pos * head_dim * n_heads * 4
-                // We know the update is [1, heads, 1, dim], cache is [1, heads, max_seq, dim]
-                // This stride math depends on memory layout (Row Major).
-                // Simplified: We assume flattened 1D for memory copy.
+                // Scatter each head's data to the correct position in the cache
+                for (0..NUM_KV_HEADS) |head| {
+                    const src_offset = head * bytes_per_head_slot;
+                    const dst_offset = head * head_stride + @as(usize, @intCast(current_pos)) * bytes_per_head_slot;
 
-                const update_len = update_bytes.len;
-                const cache_stride = update_len; // Since update is 1 time step slice
-                const offset_bytes = @as(usize, @intCast(current_pos)) * cache_stride;
-
-                if (offset_bytes + update_len <= cache_buffer.len) {
-                    @memcpy(cache_buffer[offset_bytes .. offset_bytes + update_len], update_bytes);
+                    if (dst_offset + bytes_per_head_slot <= cache_buffer.len and
+                        src_offset + bytes_per_head_slot <= update_bytes.len)
+                    {
+                        @memcpy(
+                            cache_buffer[dst_offset .. dst_offset + bytes_per_head_slot],
+                            update_bytes[src_offset .. src_offset + bytes_per_head_slot],
+                        );
+                    }
                 }
             }
 
             current_pos += 1;
         }
+
+        // Log generated tokens for debugging
+        std.log.info("Worker {d}: Generated {d} tokens: {any}", .{
+            self.node_id.?,
+            generated_tokens.items.len,
+            generated_tokens.items,
+        });
 
         // 4. Send Results Back
         var result_payload = std.json.ObjectMap.init(self.allocator);
@@ -971,8 +1035,10 @@ pub const Worker = struct {
         try result_payload.put("completion", .{ .array = tokens_array });
 
         const response = message.MessageEnvelope{
-            .recipient_node = 0, .recipient_service = "shepherd",
-            .sender_node = self.node_id.?, .sender_service = "worker",
+            .recipient_node = 0,
+            .recipient_service = "shepherd",
+            .sender_node = self.node_id.?,
+            .sender_service = "worker",
             .msg_type = MessageType.ROLLOUT_COMPLETE,
             .msg_id = msg.msg_id + 1,
             .data = .{ .object = result_payload },

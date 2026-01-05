@@ -606,7 +606,7 @@ pub const Shepherd = struct {
     pub fn collectFromWorkers(self: *Self, expected_msg_type: []const u8, expected_count: usize) !ArrayList(MessageEnvelope) {
         std.log.info("Collecting results (expecting {})...", .{expected_count});
 
-        const max_wait_seconds: i64 = 180; // 3 minutes - enough for workers to complete training, short enough to detect disconnections
+        const max_wait_seconds: i64 = 1200; // 20 minutes - increased to accommodate long RL generation times (180s+ per worker)
         const start_time = std.time.timestamp();
 
         var loops: usize = 0;

@@ -337,6 +337,9 @@ fn runRLShepherd(allocator: Allocator, args: Args) !void {
     rl_shepherd_controller.training_backend_type = training_backend;
 
     const listen_thread = try std.Thread.spawn(.{}, rlShepherdListenThread, .{ &rl_shepherd_controller, args.host, args.port });
+    // Ensure shepherd stops so listen thread can exit, preventing deadlock on error
+    // Note: Zig executes defers in reverse order, so stop() runs before join()
+    defer rl_shepherd_controller.base.stop();
     defer listen_thread.join();
 
     std.time.sleep(500 * std.time.ns_per_ms);

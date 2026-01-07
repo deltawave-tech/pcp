@@ -1431,9 +1431,26 @@ pub fn broadcastInDimVJP(
         const grad_out_tensor = try builder.newTensor(grad_out);
 
         // Create a reduce_sum op to get the gradient of the input
+        // Use keepdims=true to preserve the shape, then reshape if needed
         var grad_input_tensor: tensor.Tensor(void) = undefined;
         if (dims_to_reduce.items.len > 0) {
-            grad_input_tensor = try ops.reduceSum(builder, grad_out_tensor, dims_to_reduce.items, false);
+            // Use keepdims=true to preserve dimension count
+            grad_input_tensor = try ops.reduceSum(builder, grad_out_tensor, dims_to_reduce.items, true);
+
+            // After reduction with keepdims=true, we have the right rank but may need to verify shape
+            // The reduced dimensions will be size 1, which matches the original input shape
+            // However, if shapes still don't match exactly, reshape to the original input type
+            const grad_result_type = grad_input_tensor.value.getType();
+            const input_as_type = mlir.Type{ .handle = input_type.handle };
+            if (!grad_result_type.isEqual(input_as_type)) {
+                const reshape_op = try builder.createAndAttach(
+                    "stablehlo.reshape",
+                    &.{grad_input_tensor.value},
+                    &.{input_as_type},
+                    .{},
+                );
+                grad_input_tensor = try builder.newTensor(reshape_op.getResult(0));
+            }
         } else {
             // If no dimensions to reduce, the gradient passes through unchanged
             grad_input_tensor = grad_out_tensor;

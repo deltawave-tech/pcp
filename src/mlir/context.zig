@@ -273,7 +273,8 @@ pub fn serializeMLIRModule(allocator: Allocator, module: mlir.Module) ![]u8 {
             // Debug: std.debug.print("MLIR serialization callback: appending {} bytes (total so far: {})\n", .{ data.len, context.buffer.items.len });
 
             // Add bounds checking to prevent buffer overflow
-            if (data.len > 100 * 1024 * 1024) { // 100MB sanity check
+            // Large backward pass models with many gradients can exceed 1GB of MLIR text
+            if (data.len > 2 * 1024 * 1024 * 1024) { // 2GB sanity check
                 std.debug.print("ERROR: MLIR serialization data chunk too large: {} bytes\n", .{data.len});
                 context.error_flag.* = true;
                 return;

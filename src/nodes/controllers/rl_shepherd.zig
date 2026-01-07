@@ -10,6 +10,9 @@ const mlir_ctx = @import("../../mlir/context.zig");
 const model_introspection = @import("../../mlir/model_introspection.zig");
 const Nesterov = @import("../../optimizers/nesterov.zig").Nesterov;
 const tensor = @import("../../core/tensor.zig");
+const GraphBuilder = @import("../../compiler/graph_builder.zig").GraphBuilder;
+const ops = @import("../../core/ops.zig");
+const mlir = @import("../../mlir/wrapper.zig");
 
 pub const RolloutData = struct {
     prompt: []const i64,
@@ -27,8 +30,11 @@ pub const RLShepherd = struct {
 
     // Weight management
     weight_buffer: ?[]align(4096) u8, // Raw weight file buffer (page-aligned for mmap)
-    master_parameters: ?[][]const u8, // Sliced parameter tensors
-    parameter_shapes: ?[][]const i64, // Shapes for each parameter
+    master_parameters: ?[][]const u8, // Sliced parameter tensors (trainable only)
+    parameter_shapes: ?[][]const i64, // Shapes for each trainable parameter
+    buffer_shapes: ?[][]const i64, // Shapes for non-trainable buffers (e.g., rope constants)
+    num_trainable_params: usize, // Number of trainable parameters
+    num_buffers: usize, // Number of non-trainable buffers
     weights_mmapped: bool, // Track if weights are mmapped for correct cleanup
 
     // Training Execution
@@ -51,6 +57,9 @@ pub const RLShepherd = struct {
             .weight_buffer = null,
             .master_parameters = null,
             .parameter_shapes = null,
+            .buffer_shapes = null,
+            .num_trainable_params = 0,
+            .num_buffers = 0,
             .weights_mmapped = false,
             .training_backend = null,
             .training_vmfb = null,
@@ -69,6 +78,12 @@ pub const RLShepherd = struct {
             self.base.allocator.free(params);
         }
         if (self.parameter_shapes) |shapes| {
+            for (shapes) |shape| {
+                self.base.allocator.free(shape);
+            }
+            self.base.allocator.free(shapes);
+        }
+        if (self.buffer_shapes) |shapes| {
             for (shapes) |shape| {
                 self.base.allocator.free(shape);
             }
@@ -216,62 +231,78 @@ pub const RLShepherd = struct {
         std.log.info("✓ Successfully mapped {} parameter tensors ({} MB total).", .{ self.master_parameters.?.len, file_size / 1024 / 1024 });
     }
 
-    pub fn initTrainingBackend(self: *Self, model_path: []const u8, backend: backend_selection.Backend) !void {
-        std.log.info("Initializing Training Backend from {s} using {s}...", .{ model_path, backend.toString() });
+    /// Initialize the training backend using Runtime Compilation with AutoDiff.
+    /// This builds the backward pass from the forward MLIR using the Zig AutoDiff engine.
+    ///
+    /// @param model_path: Path to the forward pass MLIR file
+    /// @param backend: Target backend (e.g., hip, cuda, llvm-cpu)
+    /// @param num_buffers: Number of non-trainable buffers (e.g., rope_inv_freq, causal_mask)
+    /// @param num_data_inputs: Number of data inputs (e.g., input_ids, mask, advantages)
+    pub fn initTrainingBackend(
+        self: *Self,
+        model_path: []const u8,
+        backend: backend_selection.Backend,
+        num_buffers: usize,
+        num_data_inputs: usize,
+    ) !void {
+        std.log.info("Initializing RL Training Backend from {s} using {s}...", .{ model_path, backend.toString() });
+        std.log.info("  num_buffers={}, num_data_inputs={}", .{ num_buffers, num_data_inputs });
 
-        // 1. Initialize Backend
+        // 1. Initialize Backend Runtime
         self.training_backend = try IreeBackend.init(self.base.allocator, backend, 0);
         self.training_backend_type = backend;
+        self.num_buffers = num_buffers;
 
-        // 2. Metadata Cache Handling
-        const meta_path = try std.fmt.allocPrint(self.base.allocator, "{s}.meta.json", .{model_path});
-        defer self.base.allocator.free(meta_path);
+        // 2. Load Forward Pass MLIR Source
+        std.log.info("Reading Forward Pass MLIR from {s}...", .{model_path});
+        const forward_mlir = try std.fs.cwd().readFileAlloc(self.base.allocator, model_path, 2 * 1024 * 1024 * 1024);
+        defer self.base.allocator.free(forward_mlir);
+        std.log.info("  Loaded {} bytes of MLIR source", .{forward_mlir.len});
 
-        var metadata_loaded = false;
-        if (std.fs.cwd().access(meta_path, .{})) |_| {
-            if (model_introspection.ModelMetadata.loadFromFile(self.base.allocator, meta_path)) |meta| {
-                self.parameter_shapes = meta.parameter_shapes;
-                for (meta.data_input_shapes) |s| self.base.allocator.free(s);
-                self.base.allocator.free(meta.data_input_shapes);
-                self.base.allocator.free(meta.data_input_dtypes);
-                metadata_loaded = true;
-                std.log.info("✓ Loaded metadata from cache.", .{});
-            } else |_| {}
-        } else |_| {}
-
-        // 3. Fallback Introspection
-        if (!metadata_loaded) {
-            std.log.info("Cache miss. Introspecting...", .{});
-            const mlir_source = try std.fs.cwd().readFileAlloc(self.base.allocator, model_path, 2 * 1024 * 1024 * 1024);
-            defer self.base.allocator.free(mlir_source);
-
-            // 5 non-parameter inputs: causal_mask buffer, inv_freq buffer, input_ids, mask, advantages
-            const num_data_inputs = 5;
-            var meta_result = model_introspection.ModelInspector.inspectLite(
+        // 3. Introspect the forward pass to get shapes
+        std.log.info("Introspecting model to extract parameter shapes...", .{});
+        const meta_result = model_introspection.ModelInspector.inspectLite(
+            self.base.allocator,
+            forward_mlir,
+            num_buffers + num_data_inputs, // Total non-trainable inputs
+        ) catch |err| blk: {
+            std.log.warn("Lite introspection failed ({}), falling back to Full MLIR parsing...", .{err});
+            var ctx = try mlir_ctx.MLIRContext.init(self.base.allocator);
+            defer ctx.deinit();
+            break :blk try model_introspection.ModelInspector.inspect(
                 self.base.allocator,
-                mlir_source,
-                num_data_inputs,
-            ) catch |err| blk: {
-                std.log.warn("Lite introspection failed ({}), falling back to Full MLIR parsing...", .{err});
-                var ctx = try mlir_ctx.MLIRContext.init(self.base.allocator);
-                defer ctx.deinit();
-                break :blk try model_introspection.ModelInspector.inspect(
-                    self.base.allocator,
-                    ctx.getContext(),
-                    mlir_source,
-                    num_data_inputs,
-                );
-            };
+                ctx.getContext(),
+                forward_mlir,
+                num_buffers + num_data_inputs,
+            );
+        };
 
-            self.parameter_shapes = meta_result.parameter_shapes;
-            meta_result.saveToFile(meta_path) catch {};
+        // parameter_shapes now contains [Params...] (excluding buffers and data)
+        self.parameter_shapes = meta_result.parameter_shapes;
+        self.num_trainable_params = meta_result.parameter_shapes.len;
 
-            for (meta_result.data_input_shapes) |s| self.base.allocator.free(s);
-            self.base.allocator.free(meta_result.data_input_shapes);
-            self.base.allocator.free(meta_result.data_input_dtypes);
+        std.log.info("  Found {} trainable parameters", .{self.num_trainable_params});
+
+        // Extract buffer shapes from the beginning of data_input_shapes
+        // data_input_shapes contains [Buffers..., Data...]
+        if (num_buffers > 0 and meta_result.data_input_shapes.len >= num_buffers) {
+            self.buffer_shapes = try self.base.allocator.alloc([]const i64, num_buffers);
+            for (0..num_buffers) |i| {
+                // Copy the shape from data_input_shapes
+                const src_shape = meta_result.data_input_shapes[i];
+                const shape_copy = try self.base.allocator.alloc(i64, src_shape.len);
+                @memcpy(shape_copy, src_shape);
+                self.buffer_shapes.?[i] = shape_copy;
+            }
+            std.log.info("  Found {} buffer shapes", .{num_buffers});
         }
 
-        // 4. Backend-Specific VMFB Caching
+        // Clean up data input metadata (including buffer shapes which we've copied)
+        for (meta_result.data_input_shapes) |s| self.base.allocator.free(s);
+        self.base.allocator.free(meta_result.data_input_shapes);
+        self.base.allocator.free(meta_result.data_input_dtypes);
+
+        // 4. Check for cached VMFB (backward pass)
         const base_name = if (std.mem.endsWith(u8, model_path, ".mlir"))
             model_path[0 .. model_path.len - 5]
         else
@@ -279,7 +310,7 @@ pub const RLShepherd = struct {
 
         const vmfb_cache_path = try std.fmt.allocPrint(
             self.base.allocator,
-            "{s}.{s}.vmfb",
+            "{s}.grpo_backward.{s}.vmfb",
             .{ base_name, backend.toString() },
         );
         defer self.base.allocator.free(vmfb_cache_path);
@@ -287,7 +318,7 @@ pub const RLShepherd = struct {
         var vmfb_loaded = false;
 
         if (std.fs.cwd().access(vmfb_cache_path, .{})) |_| {
-            std.log.info("Found cached VMFB: {s}", .{vmfb_cache_path});
+            std.log.info("Found cached backward pass VMFB: {s}", .{vmfb_cache_path});
             const vmfb_bytes = try std.fs.cwd().readFileAlloc(self.base.allocator, vmfb_cache_path, 2 * 1024 * 1024 * 1024);
             self.training_vmfb = vmfb_bytes;
             vmfb_loaded = true;
@@ -295,29 +326,62 @@ pub const RLShepherd = struct {
         } else |_| {}
 
         if (!vmfb_loaded) {
-            std.log.warn("Compiling MLIR for {s}... (This runs once)", .{backend.toIreeCompilationTarget()});
+            // 5. Build the backward pass using GraphBuilder + AutoDiff
+            std.log.info("Building GRPO Backward Pass via AutoDiff...", .{});
 
-            const mlir_source = try std.fs.cwd().readFileAlloc(self.base.allocator, model_path, 2 * 1024 * 1024 * 1024);
-            defer self.base.allocator.free(mlir_source);
+            var build_ctx = try mlir_ctx.MLIRContext.init(self.base.allocator);
+            defer build_ctx.deinit();
 
-            var ctx = try mlir_ctx.MLIRContext.init(self.base.allocator);
-            defer ctx.deinit();
+            var builder = try ops.MLIRBuilder.init(self.base.allocator, build_ctx.getContext());
+            defer builder.deinit();
 
-            const vmfb = try ctx.compileToVMFB(
+            // Build the gradient computation graph
+            // The forward pass has signature: (Params..., Buffers..., Data...) -> Loss
+            // The backward pass will have: (Params..., Buffers..., Data...) -> (Grads_Params...)
+            const backward_mlir_source = try GraphBuilder.buildGrpoBackwardPass(
                 self.base.allocator,
-                mlir_source,
+                &builder,
+                forward_mlir,
+                self.num_trainable_params,
+                num_buffers,
+            );
+            defer self.base.allocator.free(backward_mlir_source);
+
+            std.log.info("✓ GRPO Backward Pass built ({} bytes MLIR)", .{backward_mlir_source.len});
+
+            // Optionally save the backward MLIR for debugging
+            const backward_mlir_path = try std.fmt.allocPrint(
+                self.base.allocator,
+                "{s}.grpo_backward.mlir",
+                .{base_name},
+            );
+            defer self.base.allocator.free(backward_mlir_path);
+            std.fs.cwd().writeFile(.{ .sub_path = backward_mlir_path, .data = backward_mlir_source }) catch |err| {
+                std.log.warn("Failed to save backward MLIR for debugging: {}", .{err});
+            };
+
+            // 6. Compile the backward pass to VMFB
+            std.log.info("Compiling GRPO Backward Pass to VMFB for {s}...", .{backend.toIreeCompilationTarget()});
+
+            var compile_ctx = try mlir_ctx.MLIRContext.init(self.base.allocator);
+            defer compile_ctx.deinit();
+
+            const vmfb = try compile_ctx.compileToVMFB(
+                self.base.allocator,
+                backward_mlir_source,
                 backend.toIreeCompilationTarget(),
-                null,
+                null, // target_arch - let IREE choose default
             );
             self.training_vmfb = vmfb;
 
+            // Cache the compiled VMFB
             std.log.info("Saving compiled VMFB to {s}...", .{vmfb_cache_path});
             std.fs.cwd().writeFile(.{ .sub_path = vmfb_cache_path, .data = vmfb }) catch |err| {
                 std.log.warn("Failed to save VMFB cache: {}", .{err});
             };
         }
 
-        std.log.info("✓ Training Backend Ready.", .{});
+        std.log.info("✓ RL Training Backend Initialized via AutoDiff. VMFB Size: {} bytes", .{self.training_vmfb.?.len});
     }
 
     /// Send a rollout request to a worker
@@ -475,6 +539,37 @@ pub const RLShepherd = struct {
                 }
             }
 
+            // Add Buffers (non-trainable inputs like RoPE constants, causal masks)
+            // These are generated/filled with appropriate values based on their shapes
+            var buffer_allocations = ArrayList([]u8).init(self.base.allocator);
+            defer {
+                for (buffer_allocations.items) |buf| self.base.allocator.free(buf);
+                buffer_allocations.deinit();
+            }
+
+            if (self.buffer_shapes) |buf_shapes| {
+                for (buf_shapes) |shape| {
+                    // Calculate buffer size: product(dims) * 4 bytes (f32)
+                    var num_elements: usize = 1;
+                    for (shape) |dim| num_elements *= @intCast(dim);
+                    const byte_size = num_elements * 4;
+
+                    // Allocate and fill with zeros (actual values depend on model)
+                    // For RoPE: inv_freq values
+                    // For causal_mask: attention mask pattern
+                    // TODO: Generate proper buffer values based on model config
+                    const buf = try self.base.allocator.alloc(u8, byte_size);
+                    @memset(buf, 0);
+                    try buffer_allocations.append(buf);
+
+                    try inputs_list.append(buf);
+                    try shapes_list.append(shape);
+                    try dtypes_list.append(.f32);
+                }
+                std.debug.print(">>> Added {} buffer inputs\n", .{buf_shapes.len});
+            }
+
+            // Add Data Inputs
             const gs: i64 = @intCast(group_size);
             try inputs_list.append(input_ids_bytes);
             try shapes_list.append(&[_]i64{ gs, seq_len });

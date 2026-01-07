@@ -97,11 +97,18 @@ pub const GRPO = struct {
         }
 
         if (self.controller.training_backend == null) {
-            const backend_type = self.controller.training_backend_type orelse backend_selection.Backend.cuda;
+            const backend_type = self.controller.training_backend_type orelse {
+                std.log.err("training_backend_type not set! Use --backend flag.", .{});
+                return error.BackendNotSet;
+            };
 
+            // Qwen model: no buffers (causal_mask and RoPE are constants in the MLIR)
+            // Data inputs: input_ids, mask, advantages (3 data inputs)
             try self.controller.initTrainingBackend(
                 "models/qwen_grpo_training.mlir",
                 backend_type,
+                0, // num_buffers (none - all constants are baked in)
+                3, // num_data_inputs
             );
 
             // Load initial weights after initializing backend

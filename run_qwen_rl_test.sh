@@ -65,6 +65,7 @@ echo "Starting RL Shepherd with debug output to /tmp/rl_shepherd_debug.log"
 $EXE --shepherd \
      --rl \
      --no-dashboard \
+     --terminate \
      --backend cuda \
      --config "$CONFIG_FILE" \
      --host 0.0.0.0 \

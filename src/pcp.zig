@@ -91,6 +91,7 @@ const Args = struct {
     should_resume: bool,
     rl_mode: bool,
     no_dashboard: bool,
+    terminate: bool,
     child_args: std.ArrayList([]const u8),
 
     const Mode = enum {
@@ -119,6 +120,7 @@ const Args = struct {
                 .should_resume = false,
                 .rl_mode = false,
                 .no_dashboard = false,
+                .terminate = false,
                 .child_args = child_args_list,
             };
         }
@@ -138,6 +140,7 @@ const Args = struct {
         var should_resume: bool = false;
         var rl_mode: bool = false;
         var no_dashboard: bool = false;
+        var terminate: bool = false;
 
         var i: usize = 1;
         while (i < args.len) {
@@ -230,6 +233,8 @@ const Args = struct {
                 rl_mode = true;
             } else if (std.mem.eql(u8, args[i], "--no-dashboard")) {
                 no_dashboard = true;
+            } else if (std.mem.eql(u8, args[i], "--terminate")) {
+                terminate = true;
             } else if (std.mem.eql(u8, args[i], "--supervise")) {
                 supervise = true;
                 i += 1;
@@ -257,6 +262,7 @@ const Args = struct {
             .should_resume = should_resume,
             .rl_mode = rl_mode,
             .no_dashboard = no_dashboard,
+            .terminate = terminate,
             .child_args = child_args_list,
         };
     }
@@ -277,6 +283,7 @@ const Args = struct {
         print("  --resume             Resume from previous training state\n", .{});
         print("  --rl                 Enable RL mode with GRPO algorithm (Shepherd only)\n", .{});
         print("  --no-dashboard       Disable TUI dashboard for clean log output (Shepherd only)\n", .{});
+        print("  --terminate          Auto-terminate shepherd when training completes\n", .{});
         print("  --backend <type>     Backend to use: cpu, cuda, metal, vulkan, rocm (default: auto)\n", .{});
         print("  --target <arch>      GPU target architecture (e.g., gfx942 for MI300X, sm_80 for A100)\n", .{});
         print("  --device-id <id>     GPU device ID to use (default: 0, for multi-GPU nodes)\n", .{});
@@ -367,6 +374,11 @@ fn runRLShepherd(allocator: Allocator, args: Args) !void {
     try training_algo.run();
 
     print("GRPO training completed!\n", .{});
+
+    if (args.terminate) {
+        print("--terminate flag set, exiting...\n", .{});
+        std.process.exit(0);
+    }
 }
 
 /// RL Shepherd listening thread
@@ -514,6 +526,11 @@ fn runShepherd(allocator: Allocator, args: Args) !void {
     };
 
     print("🌑 Training completed successfully!\n", .{});
+
+    if (args.terminate) {
+        print("--terminate flag set, exiting...\n", .{});
+        std.process.exit(0);
+    }
 }
 
 /// Shepherd listening thread

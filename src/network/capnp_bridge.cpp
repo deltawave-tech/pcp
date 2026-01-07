@@ -13,10 +13,11 @@ struct CapnpMessageBuilder {
 struct CapnpMessageReader {
     // We use a kj::Array to own the memory for the reader
     kj::Array<capnp::word> buffer;
+    capnp::ReaderOptions options;
     capnp::FlatArrayMessageReader reader;
 
-    CapnpMessageReader(kj::Array<capnp::word> buf)
-        : buffer(kj::mv(buf)), reader(buffer) {}
+    CapnpMessageReader(kj::Array<capnp::word> buf, capnp::ReaderOptions opts)
+        : buffer(kj::mv(buf)), options(opts), reader(buffer, options) {}
 };
 
 // --- WorkerPayload ---
@@ -86,7 +87,12 @@ CapnpMessageReader* new_message_reader(const uint8_t* data, size_t size) {
     // Copy data into a kj::Array so the reader can own it.
     auto buf = kj::heapArray<capnp::word>((size + 7) / 8);
     memcpy(buf.asBytes().begin(), data, size);
-    return new CapnpMessageReader(kj::mv(buf));
+
+    // Default Cap'n Proto traversal limits are too small for our large parameter
+    // payloads (tens of MB). Set traversal limit proportional to message size.
+    capnp::ReaderOptions options;
+    options.traversalLimitInWords = buf.size() * 2;
+    return new CapnpMessageReader(kj::mv(buf), options);
 }
 
 int get_worker_payload_params(CapnpMessageReader* reader, const uint8_t** data, size_t* size) {

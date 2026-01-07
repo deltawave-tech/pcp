@@ -1,0 +1,18 @@
+{
+  "model_path": "models/nanochat_smoke_2048.mlir",
+  "data_path": "data/fineweb_edu_2shards_1m.u16",
+  "tokenizer": "u16",
+  "chunk_manifest_path": "data/fineweb_edu_2shards_1m.json",
+  "chunk_shuffle": false,
+  "seed": 1,
+  "learning_rate": 0.0006,
+  "tau": 2,
+  "outer_loop_steps": 3,
+  "nesterov_momentum": 0.9,
+  "max_epochs": 10,
+  "wandb_project": "pcp-distributed",
+  "wandb_entity": null,
+  "wandb_run_name": "nanochat-u16-smoke-2048",
+  "wandb_api_key": null
+}
+

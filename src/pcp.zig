@@ -8,6 +8,7 @@ const Allocator = std.mem.Allocator;
 
 // Import our distributed training components
 const shepherd = @import("nodes/controllers/shepherd.zig");
+const data_manager = @import("nodes/controllers/data_manager.zig");
 const worker = @import("nodes/workers/worker.zig");
 const diloco = @import("algorithms/diloco.zig");
 const training_algorithm = @import("algorithms/training_algorithm.zig");
@@ -34,6 +35,10 @@ const ExperimentConfig = struct {
     model_path: []const u8 = "src/models/nanogpt_forward.mlir",
     data_path: []const u8 = "data/tiny_shakespeare.txt",
     tokenizer: []const u8 = "char",
+    chunk_manifest_path: ?[]const u8 = null,
+    chunk_shuffle: bool = true,
+    seed: u64 = 0,
+    chunk_size_bytes: usize = 100 * 1024,
     learning_rate: f32 = 0.001,
     tau: usize = 10,
     outer_loop_steps: usize = 100,
@@ -480,6 +485,41 @@ fn exportTrainingArtifacts(allocator: Allocator, args: Args) !void {
     std.log.info("Export complete: {s}", .{out_dir});
 }
 
+fn loadChunkSpecsFromManifest(allocator: Allocator, manifest_path: []const u8, total_size: usize) ![]data_manager.ChunkSpec {
+    const Manifest = struct {
+        shards: []Shard,
+        const Shard = struct {
+            shard_index: ?usize = null,
+            start_offset_bytes: ?usize = null,
+            byte_offset: ?usize = null,
+            bytes_written: ?usize = null,
+            byte_length: ?usize = null,
+        };
+    };
+
+    const manifest_bytes = try std.fs.cwd().readFileAlloc(allocator, manifest_path, 50 * 1024 * 1024);
+    defer allocator.free(manifest_bytes);
+
+    const parsed = try std.json.parseFromSlice(Manifest, allocator, manifest_bytes, .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+
+    if (parsed.value.shards.len == 0) return error.EmptyManifest;
+
+    const specs = try allocator.alloc(data_manager.ChunkSpec, parsed.value.shards.len);
+    errdefer allocator.free(specs);
+
+    for (parsed.value.shards, 0..) |shard, i| {
+        const id = shard.shard_index orelse i;
+        const offset = shard.start_offset_bytes orelse shard.byte_offset orelse return error.InvalidManifest;
+        const length = shard.bytes_written orelse shard.byte_length orelse return error.InvalidManifest;
+        if (length == 0) return error.InvalidManifest;
+        if (offset + length > total_size) return error.InvalidManifest;
+        specs[i] = .{ .id = id, .offset = offset, .length = length };
+    }
+
+    return specs;
+}
+
 /// Run as Shepherd coordinator
 fn runShepherd(allocator: Allocator, args: Args) !void {
     const LATEST_RUN_FILE = ".pcp_latest_run";
@@ -558,9 +598,19 @@ fn runShepherd(allocator: Allocator, args: Args) !void {
     defer file.close();
     const stat = try file.stat();
     const total_size = stat.size;
-    const chunk_size = 100 * 1024; // 100KB chunks
-    try shepherd_controller.initDataManager(total_size, chunk_size, exp_config.max_epochs);
-    print("🌙 DataManager initialized: {} total size, {} byte chunks, {} max epochs\n", .{ total_size, chunk_size, exp_config.max_epochs });
+    const seed = if (exp_config.seed != 0) exp_config.seed else @as(u64, @intCast(std.time.timestamp()));
+
+    if (exp_config.chunk_manifest_path) |manifest_path| {
+        const chunk_specs = try loadChunkSpecsFromManifest(allocator, manifest_path, total_size);
+        defer allocator.free(chunk_specs);
+
+        try shepherd_controller.initDataManagerFromChunkSpecs(total_size, chunk_specs, exp_config.max_epochs, exp_config.chunk_shuffle, seed);
+        print("🌙 DataManager initialized: {} total size, {} manifest chunks, {} max epochs\n", .{ total_size, chunk_specs.len, exp_config.max_epochs });
+    } else {
+        const chunk_size = exp_config.chunk_size_bytes;
+        try shepherd_controller.initDataManagerFixed(total_size, chunk_size, exp_config.max_epochs, exp_config.chunk_shuffle, seed);
+        print("🌙 DataManager initialized: {} total size, {} byte chunks, {} max epochs\n", .{ total_size, chunk_size, exp_config.max_epochs });
+    }
 
     // 3. Populate DiLoCo Config with experiment configuration
     var diloco_config = DiLoCoConfig.default();

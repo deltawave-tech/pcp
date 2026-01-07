@@ -456,6 +456,16 @@ pub const Worker = struct {
                 @intCast(self.node_id.?),
             );
             self.dataset = byte_ds.asDataset();
+        } else if (std.mem.eql(u8, tokenizer_type, "u16")) {
+            std.log.info("Worker {}: Using U16TokenDataset (Configured)", .{self.node_id.?});
+            const u16_ds = try loader.U16TokenDataset.initChunk(
+                self.allocator,
+                data_path,
+                @intCast(offset),
+                @intCast(length),
+                @intCast(self.node_id.?),
+            );
+            self.dataset = u16_ds.asDataset();
         } else if (std.mem.eql(u8, tokenizer_type, "char")) {
             std.log.info("Worker {}: Using CharTokenizer (Configured)", .{self.node_id.?});
             const char_ds = try loader.TextDataset.initChunk(

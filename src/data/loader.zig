@@ -398,3 +398,92 @@ pub const ByteTextDataset = struct {
         return DatasetBatch{ .inputs = x_bytes, .targets = y_bytes, .allocator = self.allocator };
     }
 };
+
+/// U16TokenDataset implements Dataset interface for pre-tokenized u16 streams.
+/// The on-disk format is a flat little-endian `u16[]` token array (nanochat IDs).
+pub const U16TokenDataset = struct {
+    allocator: Allocator,
+    tokens: []u16, // The specific chunk of tokens for this worker
+    prng: std.Random.DefaultPrng,
+
+    const Self = @This();
+
+    pub fn initChunk(allocator: Allocator, path: []const u8, offset: usize, length: usize, seed: u64) !*Self {
+        if (offset % 2 != 0) return error.UnalignedOffset;
+        if (length % 2 != 0) return error.UnalignedLength;
+
+        const file = try std.fs.cwd().openFile(path, .{});
+        defer file.close();
+
+        const stat = try file.stat();
+        if (offset >= stat.size) return error.OffsetOutOfBounds;
+
+        const actual_len = @min(length, stat.size - offset);
+        if (actual_len % 2 != 0) return error.UnalignedLength;
+        const token_count = actual_len / 2;
+
+        const chunk_tokens = try allocator.alloc(u16, token_count);
+        errdefer allocator.free(chunk_tokens);
+
+        try file.seekTo(offset);
+        const bytes = std.mem.sliceAsBytes(chunk_tokens);
+        _ = try file.readAll(bytes);
+
+        // Convert from little-endian on big-endian hosts.
+        if (@import("builtin").target.cpu.arch.endian() == .big) {
+            for (chunk_tokens) |*t| t.* = @byteSwap(t.*);
+        }
+
+        const self = try allocator.create(Self);
+        self.* = Self{
+            .allocator = allocator,
+            .tokens = chunk_tokens,
+            .prng = std.Random.DefaultPrng.init(seed),
+        };
+        return self;
+    }
+
+    pub fn asDataset(self: *Self) Dataset {
+        return Dataset{
+            .ptr = self,
+            .vtable = &.{ .getBatch = getBatchImpl, .deinit = deinitImpl },
+        };
+    }
+
+    fn deinitImpl(ptr: *anyopaque) void {
+        const self: *Self = @ptrCast(@alignCast(ptr));
+        self.allocator.free(self.tokens);
+        self.allocator.destroy(self);
+    }
+
+    fn getBatchImpl(ptr: *anyopaque, batch_size: usize, block_size: usize) anyerror!DatasetBatch {
+        const self: *Self = @ptrCast(@alignCast(ptr));
+
+        const size_bytes = batch_size * block_size * 8;
+        const x_bytes = try self.allocator.alloc(u8, size_bytes);
+        errdefer self.allocator.free(x_bytes);
+        const y_bytes = try self.allocator.alloc(u8, size_bytes);
+        errdefer self.allocator.free(y_bytes);
+
+        const x_flat = std.mem.bytesAsSlice(u64, x_bytes);
+        const y_flat = std.mem.bytesAsSlice(u64, y_bytes);
+
+        const random = self.prng.random();
+
+        for (0..batch_size) |i| {
+            if (self.tokens.len <= block_size + 1) return error.ChunkTooSmall;
+            const start = random.uintAtMost(usize, self.tokens.len - block_size - 1);
+
+            const src_x = self.tokens[start..start + block_size];
+            const src_y = self.tokens[start + 1..start + block_size + 1];
+
+            const dest_x = x_flat[i * block_size..(i + 1) * block_size];
+            const dest_y = y_flat[i * block_size..(i + 1) * block_size];
+
+            for (src_x, 0..) |tok, k| dest_x[k] = @intCast(tok);
+            for (src_y, 0..) |tok, k| dest_y[k] = @intCast(tok);
+        }
+
+        return DatasetBatch{ .inputs = x_bytes, .targets = y_bytes, .allocator = self.allocator };
+    }
+};

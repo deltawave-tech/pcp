@@ -487,10 +487,16 @@ pub const Shepherd = struct {
     }
 
     /// Initialize the data manager for chunk-based data partitioning
-    pub fn initDataManager(self: *Self, total_size: usize, chunk_size: usize, max_epochs: usize) !void {
+    pub fn initDataManagerFixed(self: *Self, total_size: usize, chunk_size: usize, max_epochs: usize, shuffle_chunks: bool, seed: u64) !void {
         if (self.data_manager != null) return; // Already initialized
-        self.data_manager = try data_manager.DataManager.init(self.allocator, total_size, chunk_size, max_epochs);
-        std.log.info("DataManager initialized: {} total size, {} chunk size, {} max epochs", .{ total_size, chunk_size, max_epochs });
+        self.data_manager = try data_manager.DataManager.initFixed(self.allocator, total_size, chunk_size, max_epochs, shuffle_chunks, seed);
+        std.log.info("DataManager initialized (fixed chunks): {} total size, {} chunk size, {} max epochs", .{ total_size, chunk_size, max_epochs });
+    }
+
+    pub fn initDataManagerFromChunkSpecs(self: *Self, total_size: usize, chunk_specs: []const data_manager.ChunkSpec, max_epochs: usize, shuffle_chunks: bool, seed: u64) !void {
+        if (self.data_manager != null) return; // Already initialized
+        self.data_manager = try data_manager.DataManager.initFromChunkSpecs(self.allocator, total_size, chunk_specs, max_epochs, shuffle_chunks, seed);
+        std.log.info("DataManager initialized (manifest chunks): {} total size, {} chunks, {} max epochs", .{ total_size, chunk_specs.len, max_epochs });
     }
 
     /// Start training once we have enough workers
@@ -580,6 +586,11 @@ pub const Shepherd = struct {
         for (self.worker_pool.items) |worker| {
             try snapshot.append(worker);
         }
+        std.sort.heap(WorkerConnection, snapshot.items, {}, struct {
+            fn lessThan(_: void, a: WorkerConnection, b: WorkerConnection) bool {
+                return a.node_id < b.node_id;
+            }
+        }.lessThan);
         return snapshot;
     }
 

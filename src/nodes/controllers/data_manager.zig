@@ -14,10 +14,17 @@ pub const DataChunk = struct {
     timestamp: i64,
 };
 
+pub const ChunkSpec = struct {
+    id: usize,
+    offset: usize,
+    length: usize,
+};
+
 pub const DataManager = struct {
     allocator: Allocator,
     chunks: std.ArrayList(DataChunk),
     total_size: usize,
+    shuffle_chunks: bool,
 
     // Epoch tracking
     current_epoch: usize,
@@ -26,6 +33,17 @@ pub const DataManager = struct {
     rng: std.Random.DefaultPrng,
 
     pub fn init(allocator: Allocator, total_size: usize, chunk_size: usize, max_epochs: usize) !DataManager {
+        return initFixed(allocator, total_size, chunk_size, max_epochs, true, @intCast(std.time.timestamp()));
+    }
+
+    pub fn initFixed(
+        allocator: Allocator,
+        total_size: usize,
+        chunk_size: usize,
+        max_epochs: usize,
+        shuffle_chunks: bool,
+        seed: u64,
+    ) !DataManager {
         var chunks = std.ArrayList(DataChunk).init(allocator);
         var offset: usize = 0;
         var id: usize = 0;
@@ -48,10 +66,46 @@ pub const DataManager = struct {
             .allocator = allocator,
             .chunks = chunks,
             .total_size = total_size,
+            .shuffle_chunks = shuffle_chunks,
             .current_epoch = 1,
             .max_epochs = max_epochs,
             .completed_chunks_count = 0,
-            .rng = std.Random.DefaultPrng.init(@intCast(std.time.timestamp())),
+            .rng = std.Random.DefaultPrng.init(seed),
+        };
+    }
+
+    pub fn initFromChunkSpecs(
+        allocator: Allocator,
+        total_size: usize,
+        chunk_specs: []const ChunkSpec,
+        max_epochs: usize,
+        shuffle_chunks: bool,
+        seed: u64,
+    ) !DataManager {
+        var chunks = std.ArrayList(DataChunk).init(allocator);
+        errdefer chunks.deinit();
+        try chunks.ensureTotalCapacity(chunk_specs.len);
+
+        for (chunk_specs) |spec| {
+            try chunks.append(.{
+                .id = spec.id,
+                .offset = spec.offset,
+                .length = spec.length,
+                .state = .Unassigned,
+                .assigned_worker = null,
+                .timestamp = 0,
+            });
+        }
+
+        return DataManager{
+            .allocator = allocator,
+            .chunks = chunks,
+            .total_size = total_size,
+            .shuffle_chunks = shuffle_chunks,
+            .current_epoch = 1,
+            .max_epochs = max_epochs,
+            .completed_chunks_count = 0,
+            .rng = std.Random.DefaultPrng.init(seed),
         };
     }
 
@@ -61,6 +115,7 @@ pub const DataManager = struct {
 
     /// Helper to shuffle chunks for better statistical properties across epochs
     fn shuffleChunks(self: *DataManager) void {
+        if (!self.shuffle_chunks) return;
         const random = self.rng.random();
         random.shuffle(DataChunk, self.chunks.items);
     }

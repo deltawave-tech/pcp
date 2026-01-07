@@ -90,6 +90,7 @@ const Args = struct {
     scale: usize,
     should_resume: bool,
     rl_mode: bool,
+    no_dashboard: bool,
     child_args: std.ArrayList([]const u8),
 
     const Mode = enum {
@@ -117,6 +118,7 @@ const Args = struct {
                 .scale = 1,
                 .should_resume = false,
                 .rl_mode = false,
+                .no_dashboard = false,
                 .child_args = child_args_list,
             };
         }
@@ -135,6 +137,7 @@ const Args = struct {
         var scale: usize = 1;
         var should_resume: bool = false;
         var rl_mode: bool = false;
+        var no_dashboard: bool = false;
 
         var i: usize = 1;
         while (i < args.len) {
@@ -225,6 +228,8 @@ const Args = struct {
                 should_resume = true;
             } else if (std.mem.eql(u8, args[i], "--rl")) {
                 rl_mode = true;
+            } else if (std.mem.eql(u8, args[i], "--no-dashboard")) {
+                no_dashboard = true;
             } else if (std.mem.eql(u8, args[i], "--supervise")) {
                 supervise = true;
                 i += 1;
@@ -251,6 +256,7 @@ const Args = struct {
             .scale = scale,
             .should_resume = should_resume,
             .rl_mode = rl_mode,
+            .no_dashboard = no_dashboard,
             .child_args = child_args_list,
         };
     }
@@ -270,6 +276,7 @@ const Args = struct {
         print("  --model <path>       Path to MLIR model file (Shepherd only, overrides config)\n", .{});
         print("  --resume             Resume from previous training state\n", .{});
         print("  --rl                 Enable RL mode with GRPO algorithm (Shepherd only)\n", .{});
+        print("  --no-dashboard       Disable TUI dashboard for clean log output (Shepherd only)\n", .{});
         print("  --backend <type>     Backend to use: cpu, cuda, metal, vulkan, rocm (default: auto)\n", .{});
         print("  --target <arch>      GPU target architecture (e.g., gfx942 for MI300X, sm_80 for A100)\n", .{});
         print("  --device-id <id>     GPU device ID to use (default: 0, for multi-GPU nodes)\n", .{});
@@ -492,9 +499,12 @@ fn runShepherd(allocator: Allocator, args: Args) !void {
     const listen_thread = try std.Thread.spawn(.{}, shepherdListenThread, .{ shepherd_controller, args.host, args.port });
     listen_thread.detach();
 
-    // Start the TUI dashboard in its own thread
-    const dashboard_thread = try std.Thread.spawn(.{}, dashboard.runDashboard, .{});
-    defer dashboard_thread.join();
+    // Start the TUI dashboard in its own thread (unless --no-dashboard)
+    var dashboard_thread: ?std.Thread = null;
+    if (!args.no_dashboard) {
+        dashboard_thread = try std.Thread.spawn(.{}, dashboard.runDashboard, .{});
+    }
+    defer if (dashboard_thread) |t| t.join();
 
     // Wait for workers and start training
     print("Waiting for workers to connect...\n", .{});

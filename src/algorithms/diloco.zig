@@ -49,6 +49,7 @@ pub const DiLoCoConfig = struct {
     model_mlir_path: []const u8,
     data_path: []const u8,
     tokenizer_type: []const u8,
+    sampling_type: []const u8,
 
     wandb_project: []const u8,
     wandb_entity: ?[]const u8,
@@ -68,6 +69,7 @@ pub const DiLoCoConfig = struct {
             .model_mlir_path = "src/models/nanogpt_forward.mlir",
             .data_path = "data/tiny_shakespeare.txt",
             .tokenizer_type = "char",
+            .sampling_type = "random",
             .wandb_project = "pcp-distributed",
             .wandb_entity = null,
             .wandb_run_name = null,
@@ -561,6 +563,7 @@ pub const DiLoCo = struct {
             try payload_map.put("data_path", std.json.Value{ .string = self.config.data_path });
             try payload_map.put("tau", std.json.Value{ .integer = @intCast(self.config.tau) });
             try payload_map.put("tokenizer", std.json.Value{ .string = self.config.tokenizer_type });
+            try payload_map.put("sampling", std.json.Value{ .string = self.config.sampling_type });
 
             const json_payload = std.json.Value{ .object = payload_map };
 

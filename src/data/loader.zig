@@ -487,3 +487,106 @@ pub const U16TokenDataset = struct {
         return DatasetBatch{ .inputs = x_bytes, .targets = y_bytes, .allocator = self.allocator };
     }
 };
+
+/// U16TokenDatasetFifo implements nanochat-style FIFO consumption over a token stream.
+///
+/// Each `getBatch(B, T)` call consumes exactly `B*T + 1` tokens from the stream:
+/// - inputs are the first `B*T` tokens reshaped into `[B, T]`
+/// - targets are the next-token shift over the same contiguous window (also `[B, T]`)
+///
+/// This matches nanochat's:
+///   needed = B*T + 1
+///   inputs = scratch[:-1].view(B,T)
+///   targets = scratch[1:].view(B,T)
+pub const U16TokenDatasetFifo = struct {
+    allocator: Allocator,
+    tokens: []u16, // The specific chunk of tokens for this worker
+    cursor: usize,
+
+    const Self = @This();
+
+    pub fn initChunk(allocator: Allocator, path: []const u8, offset: usize, length: usize, seed: u64) !*Self {
+        _ = seed; // FIFO mode is deterministic; seed is unused.
+        if (offset % 2 != 0) return error.UnalignedOffset;
+        if (length % 2 != 0) return error.UnalignedLength;
+
+        const file = try std.fs.cwd().openFile(path, .{});
+        defer file.close();
+
+        const stat = try file.stat();
+        if (offset >= stat.size) return error.OffsetOutOfBounds;
+
+        const actual_len = @min(length, stat.size - offset);
+        if (actual_len % 2 != 0) return error.UnalignedLength;
+        const token_count = actual_len / 2;
+
+        const chunk_tokens = try allocator.alloc(u16, token_count);
+        errdefer allocator.free(chunk_tokens);
+
+        try file.seekTo(offset);
+        const bytes = std.mem.sliceAsBytes(chunk_tokens);
+        _ = try file.readAll(bytes);
+
+        // Convert from little-endian on big-endian hosts.
+        if (@import("builtin").target.cpu.arch.endian() == .big) {
+            for (chunk_tokens) |*t| t.* = @byteSwap(t.*);
+        }
+
+        const self = try allocator.create(Self);
+        self.* = Self{
+            .allocator = allocator,
+            .tokens = chunk_tokens,
+            .cursor = 0,
+        };
+        return self;
+    }
+
+    pub fn asDataset(self: *Self) Dataset {
+        return Dataset{
+            .ptr = self,
+            .vtable = &.{ .getBatch = getBatchImpl, .deinit = deinitImpl },
+        };
+    }
+
+    fn deinitImpl(ptr: *anyopaque) void {
+        const self: *Self = @ptrCast(@alignCast(ptr));
+        self.allocator.free(self.tokens);
+        self.allocator.destroy(self);
+    }
+
+    fn getBatchImpl(ptr: *anyopaque, batch_size: usize, block_size: usize) anyerror!DatasetBatch {
+        const self: *Self = @ptrCast(@alignCast(ptr));
+
+        const needed_tokens = batch_size * block_size + 1;
+        if (self.tokens.len < needed_tokens) return error.ChunkTooSmall;
+        if (self.cursor + needed_tokens > self.tokens.len) return error.ChunkExhausted;
+
+        const window = self.tokens[self.cursor .. self.cursor + needed_tokens];
+        self.cursor += needed_tokens;
+
+        const size_bytes = batch_size * block_size * 8;
+        const x_bytes = try self.allocator.alloc(u8, size_bytes);
+        errdefer self.allocator.free(x_bytes);
+        const y_bytes = try self.allocator.alloc(u8, size_bytes);
+        errdefer self.allocator.free(y_bytes);
+
+        const x_flat = std.mem.bytesAsSlice(u64, x_bytes);
+        const y_flat = std.mem.bytesAsSlice(u64, y_bytes);
+
+        // Interpret the contiguous window as a flattened stream of length B*T (+1 for the shift),
+        // then reshape into [B, T] exactly like nanochat.
+        for (0..batch_size) |i| {
+            const base = i * block_size;
+            const src_x = window[base .. base + block_size];
+            const src_y = window[base + 1 .. base + block_size + 1];
+
+            const dest_x = x_flat[i * block_size .. (i + 1) * block_size];
+            const dest_y = y_flat[i * block_size .. (i + 1) * block_size];
+
+            for (src_x, 0..) |tok, k| dest_x[k] = @intCast(tok);
+            for (src_y, 0..) |tok, k| dest_y[k] = @intCast(tok);
+        }
+
+        return DatasetBatch{ .inputs = x_bytes, .targets = y_bytes, .allocator = self.allocator };
+    }
+};

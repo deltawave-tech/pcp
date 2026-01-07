@@ -35,9 +35,11 @@ const ExperimentConfig = struct {
     model_path: []const u8 = "src/models/nanogpt_forward.mlir",
     data_path: []const u8 = "data/tiny_shakespeare.txt",
     tokenizer: []const u8 = "char",
+    sampling: []const u8 = "random", // "random" (default) or "fifo" (cursor-based)
     chunk_manifest_path: ?[]const u8 = null,
     chunk_shuffle: bool = true,
     seed: u64 = 0,
+    chunk_size_mode: []const u8 = "fixed_bytes", // "fixed_bytes" (default) or "diloco_slices"
     chunk_size_bytes: usize = 100 * 1024,
     learning_rate: f32 = 0.001,
     tau: usize = 10,
@@ -99,6 +101,7 @@ const Args = struct {
 
     pub fn parse(allocator: Allocator, args: [][:0]u8) !Args {
         var child_args_list = std.ArrayList([]const u8).init(allocator);
+        errdefer child_args_list.deinit();
 
         if (args.len < 2) {
             return Args{
@@ -301,6 +304,7 @@ fn loadConfig(allocator: Allocator, path: ?[]const u8) !ConfigResult {
     if (path) |p| {
         std.log.info("Loading config from: {s}", .{p});
         const data = try std.fs.cwd().readFileAlloc(allocator, p, 1024 * 1024);
+        errdefer allocator.free(data);
         // Don't free data - the parsed strings point into it!
         const parsed = try std.json.parseFromSlice(ExperimentConfig, allocator, data, .{ .ignore_unknown_fields = true });
         // Keep both the parsed struct and raw JSON data alive so strings remain valid
@@ -332,6 +336,7 @@ fn exportTrainingArtifacts(allocator: Allocator, args: Args) !void {
     diloco_config.model_mlir_path = exp_config.model_path;
     diloco_config.data_path = exp_config.data_path;
     diloco_config.tokenizer_type = exp_config.tokenizer;
+    diloco_config.sampling_type = exp_config.sampling;
     diloco_config.tau = exp_config.tau;
     diloco_config.base_config.learning_rate = exp_config.learning_rate;
     diloco_config.base_config.outer_loop_steps = exp_config.outer_loop_steps;
@@ -436,17 +441,41 @@ fn exportTrainingArtifacts(allocator: Allocator, args: Args) !void {
     defer metadata_file.close();
 
     var param_shape_array = std.json.Array.init(allocator);
-    defer param_shape_array.deinit();
+    defer {
+        for (param_shape_array.items) |item| {
+            switch (item) {
+                .array => |arr| {
+                    var arr_mut = arr;
+                    arr_mut.deinit();
+                },
+                else => {},
+            }
+        }
+        param_shape_array.deinit();
+    }
     for (parameter_shapes) |shape| {
         var dim_array = std.json.Array.init(allocator);
+        errdefer dim_array.deinit();
         for (shape) |dim| try dim_array.append(std.json.Value{ .integer = dim });
         try param_shape_array.append(std.json.Value{ .array = dim_array });
     }
 
     var data_shape_array = std.json.Array.init(allocator);
-    defer data_shape_array.deinit();
+    defer {
+        for (data_shape_array.items) |item| {
+            switch (item) {
+                .array => |arr| {
+                    var arr_mut = arr;
+                    arr_mut.deinit();
+                },
+                else => {},
+            }
+        }
+        data_shape_array.deinit();
+    }
     for (data_input_shapes) |shape| {
         var dim_array = std.json.Array.init(allocator);
+        errdefer dim_array.deinit();
         for (shape) |dim| try dim_array.append(std.json.Value{ .integer = dim });
         try data_shape_array.append(std.json.Value{ .array = dim_array });
     }
@@ -518,6 +547,46 @@ fn loadChunkSpecsFromManifest(allocator: Allocator, manifest_path: []const u8, t
     }
 
     return specs;
+}
+
+const BatchAndBlockSize = struct {
+    batch_size: usize,
+    block_size: usize,
+};
+
+fn inspectModelBatchAndBlockSize(allocator: Allocator, ctx: mlir.Context, model_path: []const u8) !BatchAndBlockSize {
+    const raw_mlir = try std.fs.cwd().readFileAlloc(allocator, model_path, 50 * 1024 * 1024);
+    defer allocator.free(raw_mlir);
+
+    const sanitized_mlir = try sanitizer.ModelSanitizer.applyStabilityPatches(allocator, raw_mlir);
+    defer allocator.free(sanitized_mlir);
+
+    var metadata = try model_introspection.ModelInspector.inspect(
+        allocator,
+        ctx,
+        sanitized_mlir,
+        2, // num_data_inputs (input_ids, targets)
+    );
+    defer metadata.deinit();
+
+    if (metadata.data_input_shapes.len == 0) return error.NotEnoughInputsInModel;
+    const shape0 = metadata.data_input_shapes[0];
+    if (shape0.len != 2) return error.UnsupportedDataInputShape;
+
+    const batch_dim = shape0[0];
+    const block_dim = shape0[1];
+    if (batch_dim <= 0 or block_dim <= 0) return error.InvalidDataInputShape;
+
+    const batch_size: usize = @intCast(batch_dim);
+    const block_size: usize = @intCast(block_dim);
+
+    // Ensure all data inputs agree (e.g., input_ids and targets are both [B,T]).
+    for (metadata.data_input_shapes[1..]) |shape| {
+        if (shape.len != shape0.len) return error.UnsupportedDataInputShape;
+        if (shape[0] != batch_dim or shape[1] != block_dim) return error.MismatchedDataInputShapes;
+    }
+
+    return .{ .batch_size = batch_size, .block_size = block_size };
 }
 
 /// Run as Shepherd coordinator
@@ -597,10 +666,89 @@ fn runShepherd(allocator: Allocator, args: Args) !void {
     const file = try std.fs.cwd().openFile(exp_config.data_path, .{});
     defer file.close();
     const stat = try file.stat();
-    const total_size = stat.size;
+    const total_size: usize = @intCast(stat.size);
     const seed = if (exp_config.seed != 0) exp_config.seed else @as(u64, @intCast(std.time.timestamp()));
 
-    if (exp_config.chunk_manifest_path) |manifest_path| {
+    if (std.mem.eql(u8, exp_config.sampling, "fifo") and !std.mem.eql(u8, exp_config.chunk_size_mode, "diloco_slices")) {
+        std.log.warn(
+            "sampling=\"fifo\" is designed to be used with chunk_size_mode=\"diloco_slices\" (or a manifest that already splits into tau*(B*T+1) token slices); otherwise tokens may be skipped within each chunk.",
+            .{},
+        );
+    }
+
+    if (std.mem.eql(u8, exp_config.chunk_size_mode, "diloco_slices")) {
+        if (exp_config.chunk_manifest_path != null) {
+            print("Error: chunk_manifest_path is not supported with chunk_size_mode=\"diloco_slices\".\n", .{});
+            return error.InvalidConfig;
+        }
+        if (!std.mem.eql(u8, exp_config.tokenizer, "u16")) {
+            print("Error: chunk_size_mode=\"diloco_slices\" requires tokenizer=\"u16\".\n", .{});
+            return error.InvalidConfig;
+        }
+        if (!std.mem.eql(u8, exp_config.sampling, "fifo")) {
+            print("Error: chunk_size_mode=\"diloco_slices\" requires sampling=\"fifo\".\n", .{});
+            return error.InvalidConfig;
+        }
+
+        // Auto-split the token stream into fixed slices sized to exactly the per-worker inner-loop
+        // consumption for one outer round (nanochat-style FIFO): slice_tokens = tau * (B*T + 1).
+        const batch_block = try inspectModelBatchAndBlockSize(allocator, mlir_builder.ctx, exp_config.model_path);
+        const B_u64: u64 = @intCast(batch_block.batch_size);
+        const T_u64: u64 = @intCast(batch_block.block_size);
+        const tau_u64: u64 = @intCast(exp_config.tau);
+
+        const bt_mul = @mulWithOverflow(B_u64, T_u64);
+        if (bt_mul[1] != 0) return error.InvalidConfig;
+        const bt = bt_mul[0];
+
+        const needed_add = @addWithOverflow(bt, 1);
+        if (needed_add[1] != 0) return error.InvalidConfig;
+        const needed_tokens_per_step = needed_add[0];
+
+        const slice_mul = @mulWithOverflow(tau_u64, needed_tokens_per_step);
+        if (slice_mul[1] != 0) return error.InvalidConfig;
+        const slice_tokens = slice_mul[0];
+
+        const bytes_mul = @mulWithOverflow(slice_tokens, 2); // u16 = 2 bytes/token
+        if (bytes_mul[1] != 0) return error.InvalidConfig;
+        const slice_bytes_u64 = bytes_mul[0];
+
+        if (slice_bytes_u64 == 0 or slice_bytes_u64 > std.math.maxInt(usize)) {
+            print("Error: computed slice_bytes is invalid: {}\n", .{slice_bytes_u64});
+            return error.InvalidConfig;
+        }
+        const slice_bytes: usize = @intCast(slice_bytes_u64);
+
+        if (total_size < slice_bytes) {
+            print("Error: dataset too small ({}) for one slice ({} bytes). Reduce B/T/tau or use a larger dataset.\n", .{ total_size, slice_bytes });
+            return error.DatasetTooSmall;
+        }
+
+        const full_chunks_u64: u64 = @intCast(@as(u64, total_size) / slice_bytes_u64);
+        if (full_chunks_u64 == 0) return error.DatasetTooSmall;
+        if (full_chunks_u64 > std.math.maxInt(usize)) return error.DatasetTooLarge;
+        const full_chunks: usize = @intCast(full_chunks_u64);
+
+        const remainder: usize = @intCast(@as(u64, total_size) % slice_bytes_u64);
+
+        const chunk_specs = try allocator.alloc(data_manager.ChunkSpec, full_chunks);
+        defer allocator.free(chunk_specs);
+        for (0..full_chunks) |i| {
+            chunk_specs[i] = .{
+                .id = i,
+                .offset = i * slice_bytes,
+                .length = slice_bytes,
+            };
+        }
+
+        try shepherd_controller.initDataManagerFromChunkSpecs(total_size, chunk_specs, exp_config.max_epochs, exp_config.chunk_shuffle, seed);
+        print("🌙 DataManager initialized: {} total size, {} slice chunks ({} bytes each), remainder {} bytes\n", .{
+            total_size,
+            full_chunks,
+            slice_bytes,
+            remainder,
+        });
+    } else if (exp_config.chunk_manifest_path) |manifest_path| {
         const chunk_specs = try loadChunkSpecsFromManifest(allocator, manifest_path, total_size);
         defer allocator.free(chunk_specs);
 
@@ -617,6 +765,7 @@ fn runShepherd(allocator: Allocator, args: Args) !void {
     diloco_config.model_mlir_path = exp_config.model_path;
     diloco_config.data_path = exp_config.data_path;
     diloco_config.tokenizer_type = exp_config.tokenizer;
+    diloco_config.sampling_type = exp_config.sampling;
     diloco_config.tau = exp_config.tau;
     diloco_config.base_config.learning_rate = exp_config.learning_rate;
     diloco_config.base_config.outer_loop_steps = exp_config.outer_loop_steps;
@@ -743,7 +892,8 @@ pub fn main() !void {
         }
     }
 
-    const args = try Args.parse(allocator, process_args);
+    var args = try Args.parse(allocator, process_args);
+    defer args.child_args.deinit();
 
     print("🪐 PCP Distributed Training System\n", .{});
     print("=====================================\n", .{});

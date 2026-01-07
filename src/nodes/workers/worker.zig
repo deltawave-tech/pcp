@@ -128,6 +128,7 @@ pub const Worker = struct {
 
         // Create a JSON object for the payload
         var payload_map = std.json.ObjectMap.init(self.allocator);
+        defer payload_map.deinit();
         try payload_map.put("backend", std.json.Value{ .string = my_backend.toString() });
 
         // Add target architecture if specified
@@ -436,6 +437,13 @@ pub const Worker = struct {
             }
         else
             "char";
+        const sampling_type = if (payload.get("sampling")) |sampling_val|
+            switch (sampling_val) {
+                .string => |s| s,
+                else => "random",
+            }
+        else
+            "random";
 
         self.current_chunk_id = @intCast(chunk_id);
 
@@ -447,6 +455,7 @@ pub const Worker = struct {
         }
 
         if (std.mem.eql(u8, tokenizer_type, "byte")) {
+            if (!std.mem.eql(u8, sampling_type, "random")) return error.UnsupportedSamplingMode;
             std.log.info("Worker {}: Using ByteTokenizer (Configured)", .{self.node_id.?});
             const byte_ds = try loader.ByteTextDataset.initChunk(
                 self.allocator,
@@ -457,16 +466,31 @@ pub const Worker = struct {
             );
             self.dataset = byte_ds.asDataset();
         } else if (std.mem.eql(u8, tokenizer_type, "u16")) {
-            std.log.info("Worker {}: Using U16TokenDataset (Configured)", .{self.node_id.?});
-            const u16_ds = try loader.U16TokenDataset.initChunk(
-                self.allocator,
-                data_path,
-                @intCast(offset),
-                @intCast(length),
-                @intCast(self.node_id.?),
-            );
-            self.dataset = u16_ds.asDataset();
+            if (std.mem.eql(u8, sampling_type, "fifo")) {
+                std.log.info("Worker {}: Using U16TokenDatasetFifo (Configured)", .{self.node_id.?});
+                const u16_ds = try loader.U16TokenDatasetFifo.initChunk(
+                    self.allocator,
+                    data_path,
+                    @intCast(offset),
+                    @intCast(length),
+                    @intCast(self.node_id.?),
+                );
+                self.dataset = u16_ds.asDataset();
+            } else if (std.mem.eql(u8, sampling_type, "random")) {
+                std.log.info("Worker {}: Using U16TokenDataset (Configured)", .{self.node_id.?});
+                const u16_ds = try loader.U16TokenDataset.initChunk(
+                    self.allocator,
+                    data_path,
+                    @intCast(offset),
+                    @intCast(length),
+                    @intCast(self.node_id.?),
+                );
+                self.dataset = u16_ds.asDataset();
+            } else {
+                return error.UnsupportedSamplingMode;
+            }
         } else if (std.mem.eql(u8, tokenizer_type, "char")) {
+            if (!std.mem.eql(u8, sampling_type, "random")) return error.UnsupportedSamplingMode;
             std.log.info("Worker {}: Using CharTokenizer (Configured)", .{self.node_id.?});
             const char_ds = try loader.TextDataset.initChunk(
                 self.allocator,

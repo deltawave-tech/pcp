@@ -205,28 +205,74 @@ pub const Shepherd = struct {
 
     /// Handle a new worker connection
     fn handleWorkerConnection(self: *Self, stream: net.Stream, worker_address: net.Address) !void {
-        // Wait for JoinRequest from worker or Supervisor handshake
-        const join_msg_result = TcpStreamManager.receive(stream, self.allocator) catch |err| {
-            std.log.err("Failed to receive join message: {}", .{err});
-            stream.close();
-            return;
-        };
-        defer join_msg_result.parsed.deinit();
-        defer self.allocator.free(join_msg_result.buffer);
+        // Wait for JoinRequest from worker or Supervisor handshake.
+        //
+        // IMPORTANT: Don't `defer`-hold the parsed JSON + backing buffer across the entire
+        // worker lifetime (handleWorkerMessages can run indefinitely). Instead, extract
+        // what we need and let the parsed message be freed immediately.
+        var is_supervisor_handshake = false;
+        var supervisor_id: i64 = 0;
+        var join_msg_id: u8 = 0;
 
-        const join_msg = join_msg_result.parsed.value;
+        var worker_backend: Backend = .cpu;
+        var owned_target_arch: ?[]const u8 = null;
+        errdefer if (owned_target_arch) |s| self.allocator.free(s);
+        var worker_supervisor_id: ?i64 = null;
+
+        {
+            const join_msg_result = TcpStreamManager.receive(stream, self.allocator) catch |err| {
+                std.log.err("Failed to receive join message: {}", .{err});
+                stream.close();
+                return;
+            };
+            defer join_msg_result.parsed.deinit();
+            defer self.allocator.free(join_msg_result.buffer);
+
+            const join_msg = join_msg_result.parsed.value;
+            join_msg_id = join_msg.msg_id;
+
+            if (std.mem.eql(u8, join_msg.msg_type, MessageType.SUPERVISOR_HANDSHAKE)) {
+                is_supervisor_handshake = true;
+                supervisor_id = join_msg.data.object.get("supervisor_id").?.integer;
+            } else if (std.mem.eql(u8, join_msg.msg_type, MessageType.JOIN_REQUEST)) {
+                const data_obj = join_msg.data.object;
+                const backend_str = data_obj.get("backend").?.string;
+
+                worker_backend = if (std.mem.eql(u8, backend_str, "cuda")) backend_selection.Backend.cuda
+                    else if (std.mem.eql(u8, backend_str, "rocm")) backend_selection.Backend.rocm
+                    else if (std.mem.eql(u8, backend_str, "metal")) backend_selection.Backend.metal
+                    else .cpu; // Default to cpu
+
+                // Parse and duplicate target architecture string to own it
+                if (data_obj.get("target_arch")) |target_val| {
+                    switch (target_val) {
+                        .string => |s| {
+                            owned_target_arch = try self.allocator.dupe(u8, s);
+                        },
+                        else => {},
+                    }
+                }
+
+                // Supervisor Pattern: link worker -> supervisor (if provided)
+                if (data_obj.get("supervisor_id")) |sid_val| {
+                    worker_supervisor_id = sid_val.integer;
+                }
+            } else {
+                std.log.err("Expected JoinRequest or SupervisorHandshake, got: {s}", .{join_msg.msg_type});
+                stream.close();
+                return;
+            }
+        }
 
         // Handle Supervisor Handshake
-        if (std.mem.eql(u8, join_msg.msg_type, MessageType.SUPERVISOR_HANDSHAKE)) {
-            const sid = join_msg.data.object.get("supervisor_id").?.integer;
-
+        if (is_supervisor_handshake) {
             self.worker_pool_mutex.lock();
             // If this supervisor was already connected (zombie connection), the put will overwrite it.
             // This is correct behavior for a reconnecting supervisor.
-            try self.supervisors.put(sid, stream);
+            try self.supervisors.put(supervisor_id, stream);
             self.worker_pool_mutex.unlock();
 
-            std.log.info("Supervisor {} re-registered control plane.", .{sid});
+            std.log.info("Supervisor {} re-registered control plane.", .{supervisor_id});
 
             // IMPORTANT: Keep this connection alive to detect supervisor disconnects.
             // We loop reading to detect when the connection drops.
@@ -239,40 +285,14 @@ pub const Shepherd = struct {
 
             // Cleanup on disconnect
             self.worker_pool_mutex.lock();
-            _ = self.supervisors.remove(sid);
+            _ = self.supervisors.remove(supervisor_id);
             self.worker_pool_mutex.unlock();
-            return;
-        }
-
-        // Validate it's a JoinRequest
-        if (!std.mem.eql(u8, join_msg.msg_type, MessageType.JOIN_REQUEST)) {
-            std.log.err("Expected JoinRequest or SupervisorHandshake, got: {s}", .{join_msg.msg_type});
             stream.close();
             return;
         }
+
         // For workers, we'll handle the stream lifecycle normally
         defer stream.close();
-
-        // NEW: Parse the backend from the join request's data payload
-        const data_obj = join_msg.data.object;
-        const backend_str = data_obj.get("backend").?.string;
-
-        const worker_backend = if (std.mem.eql(u8, backend_str, "cuda")) backend_selection.Backend.cuda
-            else if (std.mem.eql(u8, backend_str, "rocm")) backend_selection.Backend.rocm
-            else if (std.mem.eql(u8, backend_str, "metal")) backend_selection.Backend.metal
-            else .cpu; // Default to cpu
-
-        // Parse and duplicate target architecture string to own it
-        var owned_target_arch: ?[]const u8 = null;
-        if (data_obj.get("target_arch")) |target_val| {
-            switch (target_val) {
-                .string => |s| {
-                    owned_target_arch = try self.allocator.dupe(u8, s);
-                },
-                else => {},
-            }
-        }
-        errdefer if (owned_target_arch) |s| self.allocator.free(s);
 
         std.log.info("Worker connecting with backend: {s}", .{worker_backend.toString()});
         if (owned_target_arch) |target| {
@@ -291,10 +311,11 @@ pub const Shepherd = struct {
             std.log.err("Failed to append worker {}: {}", .{ assigned_node_id, err });
             return;
         };
+        // Ownership transferred to worker_pool.
+        owned_target_arch = null;
 
         // Link worker to supervisor if supervisor_id is present
-        if (data_obj.get("supervisor_id")) |sid_val| {
-            const sid = sid_val.integer;
+        if (worker_supervisor_id) |sid| {
             self.worker_map.put(assigned_node_id, sid) catch |err| {
                 std.log.err("Failed to map worker {} to supervisor {}: {}", .{ assigned_node_id, sid, err });
             };
@@ -310,23 +331,16 @@ pub const Shepherd = struct {
         std.log.info("Worker {} connected", .{assigned_node_id});
         
         // Send JoinAccept response
-        const empty_obj = std.json.Value{ .object = std.json.ObjectMap.init(self.allocator) };
         const join_accept = tcp_stream.createMessage(
             0, // coordinator node_id
             "shepherd", // coordinator service
             assigned_node_id, // worker node_id
             "worker", // worker service
             MessageType.JOIN_ACCEPT,
-            join_msg.msg_id + 1,
-            empty_obj,
+            join_msg_id + 1,
+            .null,
         );
-        
-        const json_buffer = join_accept.asJsonString(self.allocator) catch |err| {
-            std.log.err("Failed to serialize JOIN_ACCEPT: {}", .{err});
-            return;
-        };
-        defer json_buffer.deinit();
-        
+
         TcpStreamManager.send(stream, join_accept, self.allocator) catch |err| {
             std.log.err("Failed to send join accept: {}", .{err});
             return;
@@ -496,7 +510,7 @@ pub const Shepherd = struct {
     pub fn initDataManagerFromChunkSpecs(self: *Self, total_size: usize, chunk_specs: []const data_manager.ChunkSpec, max_epochs: usize, shuffle_chunks: bool, seed: u64) !void {
         if (self.data_manager != null) return; // Already initialized
         self.data_manager = try data_manager.DataManager.initFromChunkSpecs(self.allocator, total_size, chunk_specs, max_epochs, shuffle_chunks, seed);
-        std.log.info("DataManager initialized (manifest chunks): {} total size, {} chunks, {} max epochs", .{ total_size, chunk_specs.len, max_epochs });
+        std.log.info("DataManager initialized (chunk specs): {} total size, {} chunks, {} max epochs", .{ total_size, chunk_specs.len, max_epochs });
     }
 
     /// Start training once we have enough workers
@@ -738,17 +752,41 @@ pub const Shepherd = struct {
 
         // Build JSON shapes
         var param_shape_array = std.json.Array.init(self.allocator);
-        defer param_shape_array.deinit();
+        defer {
+            for (param_shape_array.items) |item| {
+                switch (item) {
+                    .array => |arr| {
+                        var arr_mut = arr;
+                        arr_mut.deinit();
+                    },
+                    else => {},
+                }
+            }
+            param_shape_array.deinit();
+        }
         for (p_shapes) |shape| {
             var dim_array = std.json.Array.init(self.allocator);
+            errdefer dim_array.deinit();
             for (shape) |dim| try dim_array.append(std.json.Value{ .integer = dim });
             try param_shape_array.append(std.json.Value{ .array = dim_array });
         }
 
         var data_shape_array = std.json.Array.init(self.allocator);
-        defer data_shape_array.deinit();
+        defer {
+            for (data_shape_array.items) |item| {
+                switch (item) {
+                    .array => |arr| {
+                        var arr_mut = arr;
+                        arr_mut.deinit();
+                    },
+                    else => {},
+                }
+            }
+            data_shape_array.deinit();
+        }
         for (d_shapes) |shape| {
             var dim_array = std.json.Array.init(self.allocator);
+            errdefer dim_array.deinit();
             for (shape) |dim| try dim_array.append(std.json.Value{ .integer = dim });
             try data_shape_array.append(std.json.Value{ .array = dim_array });
         }

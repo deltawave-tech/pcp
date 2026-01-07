@@ -866,7 +866,7 @@ pub fn tryVectorIndexLinearization(
         }
     }
 
-    // 2. OneHot & MatMul
+    // 2. Use scatter instead of OneHot + MatMul (avoids massive intermediate tensor)
     // Flatten linear indices to [N]
     var n_elements: i64 = 1;
     for (linear_index_shape) |d| n_elements *= d;
@@ -875,41 +875,44 @@ pub fn tryVectorIndexLinearization(
     const flat_reshape_op = try hlo.reshape(builder.allocator, builder.ctx, linear_indices.?, &flat_indices_shape, builder.loc);
     builder.insertion_block.appendOwnedOperation(flat_reshape_op);
 
-    const one_hot_flat = try ops.oneHot(
-        builder,
-        try builder.newTensor(flat_reshape_op.getResult(0)),
-        total_elements,
-        1.0, 0.0, -1,
-        grad_out_type.getElementType()
-    );
+    // Add trailing dimension for scatter: [N] -> [N, 1]
+    const scatter_indices_shape = [_]i64{ n_elements, 1 };
+    const scatter_indices_reshape_op = try hlo.reshape(builder.allocator, builder.ctx, flat_reshape_op.getResult(0), &scatter_indices_shape, builder.loc);
+    builder.insertion_block.appendOwnedOperation(scatter_indices_reshape_op);
 
-    // Flatten GradOut to [N, 1]
-    const grad_flat_shape = [_]i64{n_elements, 1};
+    // Flatten GradOut to [N] (scalar values to scatter)
+    const grad_flat_shape = [_]i64{n_elements};
     const grad_flat_op = try hlo.reshape(builder.allocator, builder.ctx, grad_out, &grad_flat_shape, builder.loc);
     builder.insertion_block.appendOwnedOperation(grad_flat_op);
 
-    // MatMul: [N, Total]^T @ [N, 1] -> [Total, 1] (Contract dim 0 of LHS with dim 0 of RHS)
-    // OneHot is [N, Total]. Contract N.
-    const dot_dims = hlo.DotDimensionNumbersAttribute{
-        .lhs_batching_dimensions = &.{},
-        .rhs_batching_dimensions = &.{},
-        .lhs_contracting_dimensions = &.{0},
-        .rhs_contracting_dimensions = &.{0},
+    // Create zero accumulator with shape [total_elements] (flat operand)
+    const accum_dtype = tensor.DType.fromMlirType(grad_out_type.getElementType());
+    const flat_operand_shape = [_]i64{total_elements};
+    const accum_tensor = try tensor.Tensor(void).zeros(builder, &flat_operand_shape, accum_dtype);
+
+    // Configure scatter: scatter [N] values into [total_elements] at linear indices
+    const scatter_dim_nums = hlo.ScatterDimensionNumbersAttribute{
+        .update_window_dims = &.{}, // No window dims - scattering scalars
+        .inserted_window_dims = &.{0}, // Inserting into dim 0
+        .scatter_dims_to_operand_dims = &.{0}, // Index maps to dim 0
+        .index_vector_dim = 1, // Last dim of [N, 1] indices
     };
 
-    const grad_table_op = try hlo.dot_general(
-        builder.allocator,
-        builder.ctx,
-        one_hot_flat.value,
-        grad_flat_op.getResult(0),
-        .{ .dot_dimension_numbers = dot_dims }
+    const grad_flat_tensor = try builder.newTensor(grad_flat_op.getResult(0));
+    const scatter_indices_tensor = try builder.newTensor(scatter_indices_reshape_op.getResult(0));
+
+    const scattered = try ops.scatter(
+        builder,
+        accum_tensor,
+        scatter_indices_tensor,
+        grad_flat_tensor,
+        scatter_dim_nums,
     );
-    builder.insertion_block.appendOwnedOperation(grad_table_op);
 
     // Reshape to Operand Shape
     const operand_shape = try operand_type.getShape(builder.allocator);
     defer builder.allocator.free(operand_shape);
-    const final_op = try hlo.reshape(builder.allocator, builder.ctx, grad_table_op.getResult(0), operand_shape, builder.loc);
+    const final_op = try hlo.reshape(builder.allocator, builder.ctx, scattered.value, operand_shape, builder.loc);
     builder.insertion_block.appendOwnedOperation(final_op);
 
     return final_op.getResult(0);
@@ -1149,118 +1152,71 @@ pub fn gatherVJP(
         return result.toOwnedSlice();
     }
 
-    // Fall back to OneHot + MatMul approach
-    const vocab_size = operand_type.getDimension(0);
-    std.debug.print("DEBUG gatherVJP: vocab_size={}, operand_rank={}, indices_rank={}, grad_out_rank={}\n", .{
-        vocab_size, operand_type.getRank(), indices_type.getRank(), grad_out_type.getRank()
-    });
+    // Use stablehlo.scatter to accumulate gradients (avoids massive oneHot tensor)
+    // This is the semantic inverse of gather - scatter grad_out back to embedding positions
+    std.debug.print("DEBUG gatherVJP: Using stablehlo.scatter strategy\n", .{});
 
-    // Create one-hot: [Batch, Seq] -> [Batch, Seq, Vocab]
-    std.debug.print("DEBUG gatherVJP: About to create one-hot tensor...\n", .{});
-    const one_hot = try ops.oneHot(
+    // 1. Create zero accumulator tensor with same shape as operand [Vocab, Embed]
+    const operand_shape = try operand_type.getShape(builder.allocator);
+    defer builder.allocator.free(operand_shape);
+
+    // Get dtype from grad_out (should match operand's element type for gradients)
+    const accum_dtype = tensor.DType.fromMlirType(grad_out_type.getElementType());
+
+    // Create zero tensor [Vocab, Embed]
+    const accum_tensor = try tensor.Tensor(void).zeros(builder, operand_shape, accum_dtype);
+
+    // 2. Get indices shape and reshape indices to add trailing dim: [Batch, Seq] -> [Batch, Seq, 1]
+    // StableHLO scatter expects the last dimension of scatter_indices to be the index vector
+    const indices_shape = try indices_type.getShape(builder.allocator);
+    defer builder.allocator.free(indices_shape);
+
+    var indices_expanded_shape = try builder.allocator.alloc(i64, indices_shape.len + 1);
+    defer builder.allocator.free(indices_expanded_shape);
+    @memcpy(indices_expanded_shape[0..indices_shape.len], indices_shape);
+    indices_expanded_shape[indices_shape.len] = 1;
+
+    const indices_expanded_type = mlir.Type.rankedTensorType(
+        builder.ctx,
+        indices_expanded_shape,
+        mlir.Type.i64Type(builder.ctx),
+    );
+    const indices_expanded_op = try builder.createAndAttach("stablehlo.reshape", &.{indices_i64}, &.{indices_expanded_type}, .{});
+    const indices_expanded = try builder.newTensor(indices_expanded_op.getResult(0));
+
+    // 3. Configure Scatter Dimension Numbers
+    // operand: [Vocab, Embed]
+    // scatter_indices: [Batch, Seq, 1] - last dim is the index vector (size 1, indexing into Vocab)
+    // updates (grad_out): [Batch, Seq, Embed]
+    //
+    // We want to scatter updates into operand[indices[b,s], :] += grad_out[b,s,:]
+    const scatter_dim_nums = hlo.ScatterDimensionNumbersAttribute{
+        // Dimensions in 'updates' that are window dimensions (copied directly, not scattered)
+        // Embed dimension (last dim of updates) is preserved
+        .update_window_dims = &.{@as(i64, @intCast(grad_out_shape.len - 1))},
+
+        // Dimensions in 'operand' that are inserted (scattered into)
+        // Vocab dimension (dim 0) is the scattered dimension
+        .inserted_window_dims = &.{0},
+
+        // Mapping from index vector elements to operand dimensions
+        // Index[..., 0] -> operand dim 0 (Vocab)
+        .scatter_dims_to_operand_dims = &.{0},
+
+        // The dimension in scatter_indices that contains the index vector
+        .index_vector_dim = @intCast(indices_shape.len), // Last dim (the new dim we added)
+    };
+
+    // 4. Execute scatter: zeros[indices] += grad_out
+    const grad_operand = try ops.scatter(
         builder,
-        try builder.newTensor(indices_i64),
-        vocab_size,
-        1.0, 0.0, -1,
-        grad_out_type.getElementType()
-    );
-    std.debug.print("DEBUG gatherVJP: One-hot created, rank={}\n", .{one_hot.shape.rank()});
-
-    // Get one-hot shape - this determines N (number of index lookups)
-    const one_hot_type = one_hot.value.getType().as(mlir.RankedTensorType) orelse return error.InvalidTensorType;
-    const one_hot_shape = try one_hot_type.getShape(builder.allocator);
-    defer builder.allocator.free(one_hot_shape);
-
-    // Flatten one-hot to [N, Vocab] where N is product of all dims except last (vocab dim)
-    var n_dims: i64 = 1;
-    for (0..(one_hot_shape.len - 1)) |i| {
-        n_dims *= one_hot_shape[i];
-    }
-    const vocab_dim = one_hot_shape[one_hot_shape.len - 1];
-
-    std.debug.print("DEBUG gatherVJP: One-hot shape: {any}, n_dims={}\n", .{one_hot_shape, n_dims});
-
-    // Get embed_dim from grad_out shape (already extracted at top)
-    const embed_dim = grad_out_shape[grad_out_shape.len - 1];
-
-    // Flatten one_hot to [N, Vocab]
-    const one_hot_flat_shape = [_]i64{ n_dims, vocab_dim };
-    const one_hot_flat_type = mlir.Type.rankedTensorType(
-        builder.ctx,
-        &one_hot_flat_shape,
-        one_hot_type.getElementType()
-    );
-    const one_hot_flat_op = try builder.createAndAttach("stablehlo.reshape", &.{one_hot.value}, &.{one_hot_flat_type}, .{});
-    const one_hot_flat = one_hot_flat_op.getResult(0);
-
-    // Calculate total elements in grad_out
-    var grad_out_elements: i64 = 1;
-    for (grad_out_shape) |dim| {
-        grad_out_elements *= dim;
-    }
-    const expected_elements = n_dims * embed_dim;
-
-    std.debug.print("DEBUG gatherVJP: grad_out has {} elements, need {} for [N={}, Embed={}]\n", .{grad_out_elements, expected_elements, n_dims, embed_dim});
-
-    // If grad_out has fewer elements than expected, broadcast/reshape appropriately
-    const grad_out_flat: mlir.Value = if (grad_out_elements == expected_elements) blk: {
-        // Can directly reshape
-        const grad_out_flat_shape = [_]i64{ n_dims, embed_dim };
-        const grad_out_flat_type = mlir.Type.rankedTensorType(
-            builder.ctx,
-            &grad_out_flat_shape,
-            grad_out_type.getElementType()
-        );
-        const grad_out_flat_op = try builder.createAndAttach("stablehlo.reshape", &.{grad_out}, &.{grad_out_flat_type}, .{});
-        break :blk grad_out_flat_op.getResult(0);
-    } else blk2: {
-        // Need to broadcast grad_out to match n_dims
-        // First reshape grad_out to flatten all but last dim
-        var grad_n: i64 = 1;
-        for (0..(grad_out_shape.len - 1)) |i| {
-            grad_n *= grad_out_shape[i];
-        }
-
-        std.debug.print("DEBUG gatherVJP: Broadcasting grad_out from [{}, {}] to [{}, {}]\n", .{grad_n, embed_dim, n_dims, embed_dim});
-
-        // Broadcast to match n_dims
-        const broadcast_shape = [_]i64{ n_dims, embed_dim };
-
-        // Calculate broadcast dimensions
-        const broadcast_dims = [_]i64{0, 1}; // Broadcast along first two dimensions
-        const broadcast_op = try hlo.broadcast_in_dim(
-            builder.allocator,
-            builder.ctx,
-            grad_out,
-            &broadcast_shape,
-            &broadcast_dims,
-            builder.loc
-        );
-        builder.insertion_block.appendOwnedOperation(broadcast_op);
-        break :blk2 broadcast_op.getResult(0);
-    };
-
-    std.debug.print("DEBUG gatherVJP: Flattened shapes - one_hot: [{}, {}], grad_out: [{}, {}]\n", .{n_dims, vocab_dim, n_dims, embed_dim});
-
-    // Now do dot_general: [N, Vocab]^T @ [N, Embed] = [Vocab, Embed]
-    const dot_dims = hlo.DotDimensionNumbersAttribute{
-        .lhs_batching_dimensions = &.{},
-        .rhs_batching_dimensions = &.{},
-        .lhs_contracting_dimensions = &.{0}, // Contract on N dimension
-        .rhs_contracting_dimensions = &.{0}, // Contract on N dimension
-    };
-
-    // Grad_table = OneHot^T @ Grad_out
-    const grad_table_op = try hlo.dot_general(
-        builder.allocator,
-        builder.ctx,
-        one_hot_flat,
-        grad_out_flat,
-        .{ .dot_dimension_numbers = dot_dims }
+        accum_tensor,
+        indices_expanded,
+        try builder.newTensor(grad_out),
+        scatter_dim_nums,
     );
 
-    builder.insertion_block.appendOwnedOperation(grad_table_op);
-    try result.append(grad_table_op.getResult(0));
+    try result.append(grad_operand.value);
 
     return result.toOwnedSlice();
 }

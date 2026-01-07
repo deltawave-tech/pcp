@@ -183,9 +183,9 @@ GRPO (Group Relative Policy Optimization) reinforcement learning with Qwen 2.5 0
 - KV cache passed in/out for autoregressive generation
 - Outputs: MLIR → compile with `iree-compile` to VMFB
 
-**Training Model** (`tools/export_qwen_grpo_training_stateless.py`):
-- Exports gradient computation for GRPO policy updates
-- Uses `torch.func.grad` for automatic differentiation
+**Training Model** (`tools/export_qwen_forward.py`):
+- Exports forward pass (loss computation) for GRPO training
+- PCP's autodiff engine computes gradients from this forward pass
 - Stateless RoPE (matches generation model, no buffer inputs)
 
 **Weights** (`tools/export_weights_only.py`):
@@ -264,7 +264,7 @@ The GRPO algorithm:
 ```bash
 # 1. Export models (if not already done)
 python tools/export_qwen_generation.py
-python tools/export_qwen_grpo_training.py
+python tools/export_qwen_forward.py
 
 # 2. Compile to VMFB
 iree-compile models/qwen_rl_generation.mlir \

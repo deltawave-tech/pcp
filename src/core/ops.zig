@@ -869,7 +869,29 @@ pub fn gather(
 ) !Tensor {
     // Use the corrected StableHLO dialect wrapper
     const operation = hlo.gather(builder.ctx, operand.value, start_indices.value, dimension_numbers, slice_sizes, builder.loc);
-    
+
+    return try builder.createAndAppendOp(operation);
+}
+
+/// Scatter operation for gradient accumulation (inverse of gather)
+/// This scatters updates into operand at positions specified by scatter_indices
+pub fn scatter(
+    builder: *MLIRBuilder,
+    operand: Tensor,
+    scatter_indices: Tensor,
+    updates: Tensor,
+    dimension_numbers: hlo.ScatterDimensionNumbersAttribute,
+) !Tensor {
+    const operation = try hlo.scatter(
+        builder.allocator,
+        builder.ctx,
+        operand.value,
+        scatter_indices.value,
+        updates.value,
+        dimension_numbers,
+        builder.loc,
+    );
+
     return try builder.createAndAppendOp(operation);
 }
 

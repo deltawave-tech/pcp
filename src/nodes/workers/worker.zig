@@ -13,6 +13,7 @@ const dataset_mod = @import("../../data/dataset.zig");
 const loader = @import("../../data/loader.zig");
 const math = @import("../../core/math.zig");
 const tensor = @import("../../core/tensor.zig");
+const IreeBackend = @import("../../backends/iree.zig").IreeBackend;
 
 const TcpClient = tcp_stream.TcpClient;
 const TcpStreamManager = tcp_stream.TcpStreamManager;
@@ -63,9 +64,14 @@ pub const Worker = struct {
     supervisor_id: ?i64,
 
     // RL / Generation State
-    kv_cache: ?[][]u8,        // Persistent KV Cache buffers on Host (to be sent to device)
+    kv_cache: ?[][]u8,        // Persistent KV Cache buffers on Host (legacy, to be sent to device)
     sampler: math.Sampler,    // Token sampler
     weight_blob: ?[]u8,       // Flat weight buffer for RL generation (updated by Shepherd)
+
+    // Device Residency: Persistent GPU buffers to avoid PCIe transfers
+    device_weights: ?[]IreeBackend.DeviceBuffer,  // Weights on GPU (updated once per UPDATE_WEIGHTS)
+    device_kv_cache: ?[]IreeBackend.DeviceBuffer, // KV cache on GPU (pointer-swapped each step)
+    device_weights_dirty: bool,                    // True if weight_blob was updated, needs re-upload
 
     const Self = @This();
 
@@ -90,6 +96,9 @@ pub const Worker = struct {
             .kv_cache = null,
             .sampler = math.Sampler.init(@intCast(std.time.timestamp())),
             .weight_blob = null,
+            .device_weights = null,
+            .device_kv_cache = null,
+            .device_weights_dirty = false,
         };
     }
     
@@ -135,6 +144,16 @@ pub const Worker = struct {
         // Cleanup weight blob
         if (self.weight_blob) |blob| {
             self.allocator.free(blob);
+        }
+
+        // Cleanup device-resident buffers
+        if (self.device_weights) |weights| {
+            for (weights) |buf| buf.release();
+            self.allocator.free(weights);
+        }
+        if (self.device_kv_cache) |cache| {
+            for (cache) |buf| buf.release();
+            self.allocator.free(cache);
         }
 
         self.client.deinit();
@@ -813,10 +832,14 @@ pub const Worker = struct {
 
         _ = try std.base64.standard.Decoder.decode(self.weight_blob.?, b64_weights);
 
+        // Mark device weights as dirty so they get re-uploaded on next rollout
+        self.device_weights_dirty = true;
+
         std.log.info("Worker {}: Weights updated ({} bytes)", .{ self.node_id.?, decoded_len });
     }
 
-    /// Handle a Rollout Request (RL Generation)
+    /// Handle a Rollout Request (RL Generation) with Device Residency for Weights
+    /// Weights stay on GPU VRAM (~2GB saved), KV Cache uses host-side accumulation (~25MB/step)
     fn handleStartRollout(self: *Self, msg: MessageEnvelope) !void {
         self.state = .training;
 
@@ -844,161 +867,162 @@ pub const Worker = struct {
         var generated_tokens = std.ArrayList(i64).init(self.allocator);
         defer generated_tokens.deinit();
 
-        // 2. Allocate KV Cache if not ready
-        if (self.kv_cache == null) {
-            // Skip first 2 shapes (Token, Pos) -> [K_0, V_0, K_1, V_1 ...]
-            const kv_shapes = self.cached_data_input_shapes.?[2..];
-            const kv_buffers = try self.allocator.alloc([]u8, kv_shapes.len);
+        // Cast backend to IreeBackend to access device residency methods
+        const iree_impl: *IreeBackend = @ptrCast(@alignCast(self.backend.ptr));
 
-            for (kv_shapes, 0..) |shape, i| {
-                var size: usize = 4; // f32
-                for (shape) |dim| size *= @intCast(dim);
-                kv_buffers[i] = try self.allocator.alloc(u8, size);
-                @memset(kv_buffers[i], 0); // Zero init
-            }
-            self.kv_cache = kv_buffers;
-        }
-
-        // 3. Build Combined Shapes & DTypes (Params + Data) for IREE
         const param_shapes = self.cached_parameter_shapes orelse return error.ParameterShapesNotInitialized;
         const data_shapes = self.cached_data_input_shapes orelse return error.DataShapesNotInitialized;
 
-        // Combine shapes: params first, then data
-        var all_shapes = try self.allocator.alloc([]i64, param_shapes.len + data_shapes.len);
-        defer self.allocator.free(all_shapes);
-        for (param_shapes, 0..) |s, i| all_shapes[i] = s;
-        for (data_shapes, 0..) |s, i| all_shapes[param_shapes.len + i] = s;
-
-        // Build dtypes: params (f32), token (i64), pos (i64), KV caches (f32)
-        var all_dtypes = try self.allocator.alloc(tensor.DType, param_shapes.len + data_shapes.len);
-        defer self.allocator.free(all_dtypes);
-        for (0..param_shapes.len) |i| all_dtypes[i] = .f32;  // Parameters
-        all_dtypes[param_shapes.len] = .i64;  // Token
-        all_dtypes[param_shapes.len + 1] = .i64;  // Position
-        for (param_shapes.len + 2..all_dtypes.len) |i| all_dtypes[i] = .f32;  // KV caches
-
-        // 4. Generation Loop
-        var current_pos: i64 = 0;
-        const total_len = prompt_list.items.len + max_new_tokens;
-
-        while (current_pos < total_len) {
-            // --- FIX: Logic for Input Selection ---
-            var input_token: i64 = 0;
-
-            if (current_pos < prompt_list.items.len) {
-                // Phase 1: Prefill (Reading Prompt)
-                input_token = prompt_list.items[@intCast(current_pos)];
-            } else {
-                // Phase 2: Decoding (Generating)
-                // With the sampling fix below, generated_tokens will NOT be empty here
-                if (generated_tokens.items.len > 0) {
-                    input_token = generated_tokens.items[generated_tokens.items.len - 1];
-                } else {
-                    // This should theoretically not happen with the fix,
-                    // but if it does, log it to debug
-                    std.log.warn("Worker {}: Generating with empty history at pos {}", .{ self.node_id.?, current_pos });
-                }
-            }
-
-            // Prepare Inputs (Weights + Token + Position + KV Cache)
-            var input_list = std.ArrayList([]const u8).init(self.allocator);
-            defer input_list.deinit();
-
-            // --- 1. Inject Updated Weights (Parameters) ---
-            std.log.info("DEBUG_INJECT: current_pos={} has_blob={} has_shapes={}", .{
-                current_pos,
-                self.weight_blob != null,
-                self.cached_parameter_shapes != null,
-            });
-            if (self.weight_blob) |blob| {
-                if (self.cached_parameter_shapes) |shapes| {
-                    var offset: usize = 0;
-                    for (shapes, 0..) |shape, param_idx| {
-                        var size: usize = 4; // f32
-                        for (shape) |dim| size *= @intCast(dim);
-
-                        // Slice the blob for this parameter
-                        const param_slice = blob[offset .. offset + size];
-                        try input_list.append(param_slice);
-
-                        // Debug: log first 2 params on first iteration
-                        if (current_pos == 0 and param_idx < 2) {
-                            std.log.info("WEIGHT_DEBUG: param {} size {} first_byte {}", .{
-                                param_idx,
-                                size,
-                                param_slice[0],
-                            });
-                        }
-
-                        offset += size;
-                    }
-                }
-            } else {
+        // 2. UPLOAD WEIGHTS TO VRAM (Once per UPDATE_WEIGHTS, not every token!)
+        if (self.device_weights == null or self.device_weights_dirty) {
+            if (self.weight_blob == null) {
                 std.log.err("Worker {}: No weights loaded for generation!", .{self.node_id.?});
                 return error.WeightsNotInitialized;
             }
 
-            // --- 2. Data Inputs (Token, Pos, KV) ---
-            const token_i64 = [_]i64{input_token};
-            try input_list.append(std.mem.sliceAsBytes(&token_i64));
+            std.log.info("Worker {}: Moving Weights to VRAM (one-time cost)...", .{self.node_id.?});
 
-            const pos_i64 = [_]i64{current_pos};
-            try input_list.append(std.mem.sliceAsBytes(&pos_i64));
-
-            for (self.kv_cache.?) |buf| {
-                try input_list.append(buf);
+            // Release old device weights if they exist
+            if (self.device_weights) |old_weights| {
+                for (old_weights) |buf| buf.release();
+                self.allocator.free(old_weights);
             }
 
-            // Execute VMFB
-            const inputs_slice = try input_list.toOwnedSlice();
-            defer self.allocator.free(inputs_slice);
+            var dev_weights = std.ArrayList(IreeBackend.DeviceBuffer).init(self.allocator);
+            errdefer {
+                for (dev_weights.items) |buf| buf.release();
+                dev_weights.deinit();
+            }
 
-            const outputs = try self.backend.executeTrainingStep(
+            var offset: usize = 0;
+            for (param_shapes) |shape| {
+                var size: usize = 4; // f32
+                for (shape) |dim| size *= @intCast(dim);
+
+                const slice = self.weight_blob.?[offset .. offset + size];
+                const dev_buf = try iree_impl.moveToDevice(slice, shape, .f32);
+                try dev_weights.append(dev_buf);
+
+                offset += size;
+            }
+
+            self.device_weights = try dev_weights.toOwnedSlice();
+            self.device_weights_dirty = false;
+            std.log.info("Worker {}: Weights uploaded ({} parameters, {} bytes total)", .{
+                self.node_id.?,
+                param_shapes.len,
+                offset,
+            });
+        }
+
+        // 3. INITIALIZE KV CACHE ON HOST (model outputs single-position slices, we accumulate)
+        if (self.kv_cache) |old_cache| {
+            for (old_cache) |buf| self.allocator.free(buf);
+            self.allocator.free(old_cache);
+        }
+
+        const kv_shapes = data_shapes[2..];
+        const kv_buffers = try self.allocator.alloc([]u8, kv_shapes.len);
+        for (kv_shapes, 0..) |shape, i| {
+            var size: usize = 4; // f32
+            for (shape) |dim| size *= @intCast(dim);
+            kv_buffers[i] = try self.allocator.alloc(u8, size);
+            @memset(kv_buffers[i], 0);
+        }
+        self.kv_cache = kv_buffers;
+
+        // 4. GENERATION LOOP
+        var current_pos: i64 = 0;
+        const total_len = prompt_list.items.len + max_new_tokens;
+
+        while (current_pos < total_len) {
+            // Select input token
+            var input_token: i64 = 0;
+            if (current_pos < prompt_list.items.len) {
+                input_token = prompt_list.items[@intCast(current_pos)];
+            } else {
+                if (generated_tokens.items.len > 0) {
+                    input_token = generated_tokens.items[generated_tokens.items.len - 1];
+                }
+            }
+
+            // Build Input List of DeviceBuffers
+            var inputs = std.ArrayList(IreeBackend.DeviceBuffer).init(self.allocator);
+            defer inputs.deinit();
+
+            // A. Weights (Already on Device - just add refs, no transfer!)
+            for (self.device_weights.?) |w| {
+                w.retain();
+                try inputs.append(w);
+            }
+
+            // B. Token & Position (16 bytes total)
+            const token_bytes = std.mem.asBytes(&input_token);
+            const dev_token = try iree_impl.moveToDevice(token_bytes, data_shapes[0], .i64);
+            try inputs.append(dev_token);
+
+            const pos_bytes = std.mem.asBytes(&current_pos);
+            const dev_pos = try iree_impl.moveToDevice(pos_bytes, data_shapes[1], .i64);
+            try inputs.append(dev_pos);
+
+            // C. KV Cache (Upload from host - ~25MB per step)
+            for (self.kv_cache.?, kv_shapes) |kv_buf, shape| {
+                const dev_kv = try iree_impl.moveToDevice(kv_buf, shape, .f32);
+                try inputs.append(dev_kv);
+            }
+
+            // EXECUTE (Weights stay on device - saves ~2GB transfer!)
+            const outputs = try iree_impl.executeWithDeviceBuffers(
                 self.cached_vmfb.?,
-                inputs_slice,
-                all_shapes,
-                all_dtypes,
+                "main",
+                inputs.items,
             );
-            defer {
-                for (outputs) |o| self.allocator.free(o);
-                self.allocator.free(outputs);
-            }
+            defer self.allocator.free(outputs);
 
-            // Process Outputs
-            const logits_raw = outputs[0];
-            const logits_f32 = @as([]const f32, @alignCast(std.mem.bytesAsSlice(f32, logits_raw)));
+            // Release input refs
+            for (inputs.items) |buf| buf.release();
 
-            // --- FIX: Logic for Sampling ---
-            // We must sample when we process the LAST token of the prompt.
-            // The output of the last prompt token is the prediction for the first generated token.
+            // PROCESS OUTPUTS: [Logits, KV_0, KV_1, ...]
+
+            // 1. Download Logits (~600KB)
+            const logits_bytes = try iree_impl.readToHost(outputs[0]);
+            defer self.allocator.free(logits_bytes);
+            outputs[0].release();
+
+            const logits_f32 = @as([]const f32, @alignCast(std.mem.bytesAsSlice(f32, logits_bytes)));
+
+            // 2. Sample Logic
             const is_last_prompt_token = (current_pos == prompt_list.items.len - 1);
             const is_generating = (current_pos >= prompt_list.items.len);
 
             if ((is_last_prompt_token and prompt_list.items.len > 0) or is_generating) {
-                const next_token = self.sampler.sample(logits_f32, 0.7); // Temp 0.7
+                const next_token = self.sampler.sample(logits_f32, 0.7);
                 try generated_tokens.append(next_token);
 
-                // Check EOS (Qwen 151643) or limit
-                if (next_token == 151643) break;
-                if (generated_tokens.items.len >= max_new_tokens) break;
+                if (next_token == 151643) {
+                    for (outputs[1..]) |buf| buf.release();
+                    break;
+                }
+                if (generated_tokens.items.len >= max_new_tokens) {
+                    for (outputs[1..]) |buf| buf.release();
+                    break;
+                }
             }
 
-            // Update KV Cache (In-place Host Side Update)
-            // Cache shape: [batch=1, heads=NUM_KV_HEADS, seq_len=MAX_SEQ_LEN, head_dim=HEAD_DIM]
-            // Update shape: [batch=1, heads=NUM_KV_HEADS, seq_len=1, head_dim=HEAD_DIM]
-            // Memory layout is head-major (row-major in C order), so we need to scatter
-            // each head's update data to the correct position within that head's slice.
-            const NUM_KV_HEADS: usize = 2; // Qwen 0.5B config
+            // 3. Update KV Cache on Host (scatter single-position outputs into full cache)
+            const NUM_KV_HEADS: usize = 2;
             const HEAD_DIM: usize = 64;
             const MAX_SEQ_LEN: usize = 1024;
-            const bytes_per_head_slot: usize = HEAD_DIM * 4; // 256 bytes per position per head
-            const head_stride: usize = MAX_SEQ_LEN * bytes_per_head_slot; // 262144 bytes per head
+            const bytes_per_head_slot: usize = HEAD_DIM * 4;
+            const head_stride: usize = MAX_SEQ_LEN * bytes_per_head_slot;
 
-            const updates = outputs[1..];
-            for (updates, 0..) |update_bytes, i| {
+            for (outputs[1..], 0..) |output_buf, i| {
+                const update_bytes = try iree_impl.readToHost(output_buf);
+                defer self.allocator.free(update_bytes);
+                output_buf.release();
+
                 const cache_buffer = self.kv_cache.?[i];
 
-                // Scatter each head's data to the correct position in the cache
                 for (0..NUM_KV_HEADS) |head| {
                     const src_offset = head * bytes_per_head_slot;
                     const dst_offset = head * head_stride + @as(usize, @intCast(current_pos)) * bytes_per_head_slot;
@@ -1017,14 +1041,13 @@ pub const Worker = struct {
             current_pos += 1;
         }
 
-        // Log generated tokens for debugging
         std.log.info("Worker {d}: Generated {d} tokens: {any}", .{
             self.node_id.?,
             generated_tokens.items.len,
             generated_tokens.items,
         });
 
-        // 4. Send Results Back
+        // 5. Send Results Back
         var result_payload = std.json.ObjectMap.init(self.allocator);
         defer result_payload.deinit();
 

@@ -60,6 +60,26 @@ pub const IreeBackend = struct {
 
     const Self = @This();
 
+    /// A handle to a buffer resident on the device memory (VRAM)
+    /// Uses IREE reference counting for lifetime management
+    pub const DeviceBuffer = struct {
+        handle: *c.iree_hal_buffer_view_t,
+
+        pub fn retain(self: DeviceBuffer) void {
+            c.iree_hal_buffer_view_retain(self.handle);
+        }
+
+        pub fn release(self: DeviceBuffer) void {
+            c.iree_hal_buffer_view_release(self.handle);
+        }
+
+        /// Get the byte length of this buffer
+        pub fn byteLength(self: DeviceBuffer) usize {
+            const buf_ptr = c.iree_hal_buffer_view_buffer(self.handle);
+            return @intCast(c.iree_hal_buffer_byte_length(buf_ptr));
+        }
+    };
+
     // Helper to map DType to IREE element type
     fn getIreeType(dtype: DType) c.iree_hal_element_type_t {
         return switch (dtype) {
@@ -149,20 +169,63 @@ pub const IreeBackend = struct {
         self.allocator.destroy(self);
     }
 
-    /// Execute a function. Reuses the session if the vmfb_bytes pointer matches the previously loaded one.
-    pub fn execute(
-        self: *Self,
-        vmfb_bytes: []const u8,
-        function_name: []const u8,
-        inputs_data: [][]const u8,
-        input_shapes: [][]const i64,
-        input_dtypes: ?[]const DType
-    ) ![][]u8 {
-        // 1. Check if we need to load/reload the module
-        // We use pointer equality for speed, assuming the Worker caches the artifact buffer.
+    // ========================================================================
+    // Device Residency API - Keep tensors on GPU to avoid PCIe transfers
+    // ========================================================================
+
+    /// Allocate a buffer on the device and copy host data into it immediately.
+    /// The returned DeviceBuffer is owned by the caller and must be released.
+    pub fn moveToDevice(self: *Self, data: []const u8, shape: []const i64, dtype: DType) !DeviceBuffer {
+        // 1. Create Shape
+        var iree_shape = try self.allocator.alloc(c.iree_hal_dim_t, shape.len);
+        defer self.allocator.free(iree_shape);
+        for (shape, 0..) |dim, k| iree_shape[k] = @intCast(dim);
+
+        const element_type = getIreeType(dtype);
+
+        // 2. Allocate and Copy (Host -> Device) using DEVICE_LOCAL memory (VRAM)
+        var buffer_view: ?*c.iree_hal_buffer_view_t = null;
+
+        try ireeCheck(c.iree_hal_buffer_view_allocate_buffer_copy(
+            self.device.?,
+            c.iree_hal_device_allocator(self.device.?),
+            @intCast(shape.len),
+            iree_shape.ptr,
+            element_type,
+            c.IREE_HAL_ENCODING_TYPE_DENSE_ROW_MAJOR,
+            .{
+                .type = c.IREE_HAL_MEMORY_TYPE_DEVICE_LOCAL,
+                .access = c.IREE_HAL_MEMORY_ACCESS_ALL,
+                .usage = c.IREE_HAL_BUFFER_USAGE_DEFAULT,
+            },
+            .{ .data = data.ptr, .data_length = data.len },
+            @ptrCast(&buffer_view),
+        ));
+
+        return DeviceBuffer{ .handle = buffer_view.? };
+    }
+
+    /// Allocate a zero-filled buffer directly on the device.
+    /// The returned DeviceBuffer is owned by the caller and must be released.
+    pub fn allocateZerosDevice(self: *Self, shape: []const i64, dtype: DType) !DeviceBuffer {
+        // Calculate byte size for zero initialization
+        var byte_size: usize = dtype.sizeInBytes();
+        for (shape) |d| byte_size *= @intCast(d);
+
+        // Allocate zeros on host (temporary)
+        const zeros = try self.allocator.alloc(u8, byte_size);
+        defer self.allocator.free(zeros);
+        @memset(zeros, 0);
+
+        return self.moveToDevice(zeros, shape, dtype);
+    }
+
+    /// Ensure session is loaded for a given VMFB.
+    /// This is a helper used by both execute() and executeWithDeviceBuffers().
+    fn ensureSessionLoaded(self: *Self, vmfb_bytes: []const u8) !void {
         const need_load = self.session == null or
-                          self.loaded_vmfb_ptr != vmfb_bytes.ptr or
-                          self.loaded_vmfb_len != vmfb_bytes.len;
+            self.loaded_vmfb_ptr != vmfb_bytes.ptr or
+            self.loaded_vmfb_len != vmfb_bytes.len;
 
         if (need_load) {
             // Teardown old session if it exists
@@ -196,6 +259,92 @@ pub const IreeBackend = struct {
             self.loaded_vmfb_ptr = vmfb_bytes.ptr;
             self.loaded_vmfb_len = vmfb_bytes.len;
         }
+    }
+
+    /// Execute using pre-allocated DeviceBuffers.
+    /// Returns a list of DeviceBuffers (caller owns them and must release each).
+    /// This avoids Host<->Device transfers for inputs that are already on device.
+    pub fn executeWithDeviceBuffers(
+        self: *Self,
+        vmfb_bytes: []const u8,
+        function_name: []const u8,
+        inputs: []const DeviceBuffer,
+    ) ![]DeviceBuffer {
+        // 1. Ensure session is loaded
+        try self.ensureSessionLoaded(vmfb_bytes);
+
+        // 2. Initialize call
+        var call: c.iree_runtime_call_t = undefined;
+
+        const full_fn_name = try std.fmt.allocPrint(self.allocator, "module.{s}", .{function_name});
+        defer self.allocator.free(full_fn_name);
+
+        const fn_name_view = c.iree_string_view_t{ .data = full_fn_name.ptr, .size = full_fn_name.len };
+        try ireeCheck(c.iree_runtime_call_initialize_by_name(self.session.?, fn_name_view, &call));
+        defer c.iree_runtime_call_deinitialize(&call);
+
+        // 3. Push Inputs (Cheap pointer push - no H2D copy!)
+        for (inputs) |buf| {
+            try ireeCheck(c.iree_runtime_call_inputs_push_back_buffer_view(&call, buf.handle));
+        }
+
+        // 4. Invoke (GPU Compute)
+        try ireeCheck(c.iree_runtime_call_invoke(&call, 0));
+
+        // 5. Collect Outputs as DeviceBuffers (No D2H copy yet!)
+        var outputs_list = std.ArrayList(DeviceBuffer).init(self.allocator);
+        errdefer {
+            for (outputs_list.items) |buf| buf.release();
+            outputs_list.deinit();
+        }
+
+        const outputs = c.iree_runtime_call_outputs(&call);
+        const output_count = c.iree_vm_list_size(outputs);
+        var i: c.iree_host_size_t = 0;
+
+        while (i < output_count) : (i += 1) {
+            var output_view: ?*c.iree_hal_buffer_view_t = null;
+            // Pop retains the buffer view, so we own it now
+            try ireeCheck(c.iree_runtime_call_outputs_pop_front_buffer_view(&call, @ptrCast(&output_view)));
+            try outputs_list.append(DeviceBuffer{ .handle = output_view.? });
+        }
+
+        return outputs_list.toOwnedSlice();
+    }
+
+    /// Read a DeviceBuffer back to Host memory.
+    /// Caller owns the returned slice and must free it.
+    pub fn readToHost(self: *Self, device_buf: DeviceBuffer) ![]u8 {
+        const buf_ptr = c.iree_hal_buffer_view_buffer(device_buf.handle);
+        const length = c.iree_hal_buffer_byte_length(buf_ptr);
+
+        const host_data = try self.allocator.alloc(u8, @intCast(length));
+        errdefer self.allocator.free(host_data);
+
+        try ireeCheck(c.iree_hal_device_transfer_d2h(
+            self.device.?,
+            buf_ptr,
+            0,
+            host_data.ptr,
+            @intCast(length),
+            c.IREE_HAL_TRANSFER_BUFFER_FLAG_DEFAULT,
+            c.iree_infinite_timeout(),
+        ));
+
+        return host_data;
+    }
+
+    /// Execute a function. Reuses the session if the vmfb_bytes pointer matches the previously loaded one.
+    pub fn execute(
+        self: *Self,
+        vmfb_bytes: []const u8,
+        function_name: []const u8,
+        inputs_data: [][]const u8,
+        input_shapes: [][]const i64,
+        input_dtypes: ?[]const DType,
+    ) ![][]u8 {
+        // 1. Ensure session is loaded
+        try self.ensureSessionLoaded(vmfb_bytes);
 
         // 2. Initialize call
         var call: c.iree_runtime_call_t = undefined;

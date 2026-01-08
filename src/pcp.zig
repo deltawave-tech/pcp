@@ -32,6 +32,11 @@ const GRPOJsonConfig = struct {
     beta: f32,
     prompt_file: []const u8,
     num_prompts: usize,
+    weights_path: []const u8,
+    generation_vmfb_path: []const u8,
+    generation_mlir_path: []const u8,
+    training_mlir_path: []const u8,
+    num_gen_data_inputs: usize,
 };
 
 /// JSON Config File Structure
@@ -365,6 +370,11 @@ fn runRLShepherd(allocator: Allocator, args: Args) !void {
         .beta = json_grpo.beta,
         .prompt_file = json_grpo.prompt_file,
         .num_prompts = json_grpo.num_prompts,
+        .weights_path = json_grpo.weights_path,
+        .generation_vmfb_path = json_grpo.generation_vmfb_path,
+        .generation_mlir_path = json_grpo.generation_mlir_path,
+        .training_mlir_path = json_grpo.training_mlir_path,
+        .num_gen_data_inputs = json_grpo.num_gen_data_inputs,
     };
 
     var grpo_algo = grpo.GRPO.init(allocator, &rl_shepherd_controller, grpo_config);

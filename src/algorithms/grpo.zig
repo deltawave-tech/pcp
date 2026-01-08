@@ -16,6 +16,13 @@ pub const GRPOConfig = struct {
     beta: f32,
     prompt_file: []const u8,
     num_prompts: usize,
+    // Model paths
+    weights_path: []const u8,
+    generation_vmfb_path: []const u8,
+    generation_mlir_path: []const u8,
+    training_mlir_path: []const u8,
+    // Generation model config
+    num_gen_data_inputs: usize, // Token(1) + Pos(1) + KV(2*num_layers)
 };
 
 pub const GRPO = struct {
@@ -105,7 +112,7 @@ pub const GRPO = struct {
             // Qwen model: no buffers (causal_mask and RoPE are constants in the MLIR)
             // Data inputs: input_ids, mask, advantages (3 data inputs)
             try self.controller.initTrainingBackend(
-                "models/qwen_grpo_training.mlir",
+                self.config.training_mlir_path,
                 backend_type,
                 0, // num_buffers (none - all constants are baked in)
                 3, // num_data_inputs
@@ -113,8 +120,8 @@ pub const GRPO = struct {
 
             // Load initial weights after initializing backend
             if (self.controller.parameter_shapes) |shapes| {
-                std.log.info("Loading initial weights from checkpoints/initial_weights/qwen_flat.bin...", .{});
-                try self.controller.loadWeightsFromFile("checkpoints/initial_weights/qwen_flat.bin", shapes);
+                std.log.info("Loading initial weights from {s}...", .{self.config.weights_path});
+                try self.controller.loadWeightsFromFile(self.config.weights_path, shapes);
                 std.log.info("✓ Loaded initial weights successfully", .{});
 
                 // Initialize optimizer velocity buffers
@@ -129,8 +136,9 @@ pub const GRPO = struct {
         // 3. Initialize Generation Backend (Distributed to Workers)
         if (self.controller.generation_vmfb == null) {
             try self.controller.initGenerationBackend(
-                "models/qwen_rl_generation.vmfb",
-                "models/qwen_rl_generation.mlir",
+                self.config.generation_vmfb_path,
+                self.config.generation_mlir_path,
+                self.config.num_gen_data_inputs,
             );
         }
 
@@ -146,13 +154,15 @@ pub const GRPO = struct {
             std.time.sleep(100 * std.time.ns_per_ms); // 100ms polling
         }
 
-        // 5. Ensure Workers are Ready - send VMFB and shapes
+        // 5. Ensure Workers are Ready - send VMFB path and weights path for local loading
         std.log.info("Initializing Workers with Generation Model...", .{});
-        try self.controller.prepareWorkersForGeneration("models/qwen_rl_generation.vmfb");
+        try self.controller.prepareWorkersForGeneration(
+            self.config.generation_vmfb_path,
+            self.config.weights_path, // Workers load weights locally (avoids 31GB network transfer)
+        );
 
-        // 5. Broadcast Initial Weights to Workers (CRITICAL for generation)
-        std.log.info("Broadcasting initial weights to workers...", .{});
-        try self.controller.broadcastNewWeights();
+        // Workers load weights locally from disk - no initial broadcast needed!
+        // This is critical for large models (8B+) where weights exceed TCP limits
 
         // Give workers a moment to load the VMFB, weights, and allocate the KV cache
         std.time.sleep(2 * std.time.ns_per_s);

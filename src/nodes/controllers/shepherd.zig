@@ -759,6 +759,83 @@ pub const Shepherd = struct {
         std.log.info("✓ All workers initialized with VMFB path", .{});
     }
 
+    /// Initialize workers with VMFB path AND weights path for local loading
+    /// This is the preferred method for RL training where weights can be large (>2GB)
+    pub fn initializeWorkersWithVMFBAndWeights(
+        self: *Self,
+        vmfb_path: []const u8,
+        weights_path: []const u8,
+        parameter_shapes: [][]i64,
+        data_input_shapes: [][]i64,
+        data_input_dtypes: []tensor.DType,
+    ) !void {
+        std.log.info("Distributing VMFB path to workers: {s}", .{vmfb_path});
+        std.log.info("Workers will load weights locally from: {s}", .{weights_path});
+
+        self.worker_pool_mutex.lock();
+        const workers = try self.allocator.dupe(WorkerConnection, self.worker_pool.items);
+        self.worker_pool_mutex.unlock();
+        defer self.allocator.free(workers);
+
+        for (workers) |worker| {
+            // Only initialize if not already initialized
+            if (worker.status == .Connected) {
+                std.log.info("Initializing worker {}...", .{worker.node_id});
+                try self.sendInitializeMessageWithPathAndWeights(worker.node_id, vmfb_path, weights_path, parameter_shapes, data_input_shapes, data_input_dtypes);
+                self.setWorkerStatus(worker.node_id, .GraphInitialized);
+            }
+        }
+
+        std.log.info("✓ All workers initialized with VMFB + weights paths", .{});
+    }
+
+    /// Helper to send initialization message with VMFB and weights file paths
+    fn sendInitializeMessageWithPathAndWeights(self: *Self, node_id: NodeId, vmfb_path: []const u8, weights_path: []const u8, p_shapes: [][]i64, d_shapes: [][]i64, d_dtypes: []tensor.DType) !void {
+        // Build JSON shapes
+        var param_shape_array = std.json.Array.init(self.allocator);
+        defer param_shape_array.deinit();
+        for (p_shapes) |shape| {
+            var dim_array = std.json.Array.init(self.allocator);
+            for (shape) |dim| try dim_array.append(std.json.Value{ .integer = dim });
+            try param_shape_array.append(std.json.Value{ .array = dim_array });
+        }
+
+        var data_shape_array = std.json.Array.init(self.allocator);
+        defer data_shape_array.deinit();
+        for (d_shapes) |shape| {
+            var dim_array = std.json.Array.init(self.allocator);
+            for (shape) |dim| try dim_array.append(std.json.Value{ .integer = dim });
+            try data_shape_array.append(std.json.Value{ .array = dim_array });
+        }
+
+        // Serialize DTypes to string array
+        var dtype_array = std.json.Array.init(self.allocator);
+        defer dtype_array.deinit();
+        for (d_dtypes) |dtype| {
+            const type_str = switch (dtype) {
+                .f32 => "f32",
+                .f64 => "f64",
+                .f16 => "f16",
+                .bf16 => "bf16",
+                .i32 => "i32",
+                .i64 => "i64",
+                .bool => "bool",
+            };
+            try dtype_array.append(std.json.Value{ .string = type_str });
+        }
+
+        // Build Payload with paths instead of bytes
+        var payload = std.json.ObjectMap.init(self.allocator);
+        defer payload.deinit();
+        try payload.put("vmfb_path", std.json.Value{ .string = vmfb_path });
+        try payload.put("weights_path", std.json.Value{ .string = weights_path });
+        try payload.put("parameter_shapes", std.json.Value{ .array = param_shape_array });
+        try payload.put("data_input_shapes", std.json.Value{ .array = data_shape_array });
+        try payload.put("data_input_dtypes", std.json.Value{ .array = dtype_array });
+
+        try self.sendToWorker(node_id, MessageType.INITIALIZE_GRAPH, .{ .object = payload });
+    }
+
     /// Helper to send initialization message with VMFB file path (for local filesystem loading)
     fn sendInitializeMessageWithPath(self: *Self, node_id: NodeId, vmfb_path: []const u8, p_shapes: [][]i64, d_shapes: [][]i64, d_dtypes: []tensor.DType) !void {
         // Build JSON shapes

@@ -442,48 +442,88 @@ pub const Worker = struct {
             self.cached_data_input_dtypes = try dtypes_list.toOwnedSlice();
         }
 
-        // 5. Allocate M and V state buffers (initialized to zero)
-        // Free old buffers if they exist
-        if (self.m_states) |states| {
-            for (states) |s| self.allocator.free(s);
-            self.allocator.free(states);
-        }
-        if (self.v_states) |states| {
-            for (states) |s| self.allocator.free(s);
-            self.allocator.free(states);
-        }
+        // 5. Load weights from local path if provided (for RL generation workers)
+        var is_generation_only = false;
+        if (payload.get("weights_path")) |weights_path_val| {
+            const weights_path = switch (weights_path_val) {
+                .string => |s| s,
+                else => return error.InvalidWeightsPathFormat,
+            };
+            std.log.info("Loading initial weights from local path: {s}", .{weights_path});
 
-        const num_params = self.cached_parameter_shapes.?.len;
-        const m_buffers = try self.allocator.alloc([]u8, num_params);
-        errdefer {
-            for (m_buffers) |buf| self.allocator.free(buf);
-            self.allocator.free(m_buffers);
-        }
-        const v_buffers = try self.allocator.alloc([]u8, num_params);
-        errdefer {
-            for (v_buffers) |buf| self.allocator.free(buf);
-            self.allocator.free(v_buffers);
-        }
-
-        // Allocate and zero-initialize each state buffer
-        for (self.cached_parameter_shapes.?, 0..) |shape, i| {
-            var size: usize = @sizeOf(f32); // f32 for all parameters
-            for (shape) |dim| {
-                size *= @intCast(dim);
+            if (self.weight_blob) |old_blob| {
+                self.allocator.free(old_blob);
             }
 
-            m_buffers[i] = try self.allocator.alloc(u8, size);
-            @memset(m_buffers[i], 0);
+            const file = try std.fs.cwd().openFile(weights_path, .{ .mode = .read_only });
+            defer file.close();
 
-            v_buffers[i] = try self.allocator.alloc(u8, size);
-            @memset(v_buffers[i], 0);
+            const stat = try file.stat();
+            const size = stat.size;
+
+            self.weight_blob = try self.allocator.alloc(u8, size);
+            errdefer {
+                self.allocator.free(self.weight_blob.?);
+                self.weight_blob = null;
+            }
+
+            const bytes_read = try file.readAll(self.weight_blob.?);
+            if (bytes_read != size) {
+                return error.IncompleteWeightsRead;
+            }
+
+            self.device_weights_dirty = true;
+            is_generation_only = true;
+
+            std.log.info("✓ Loaded initial weights locally ({} MB)", .{size / (1024 * 1024)});
         }
 
-        self.m_states = m_buffers;
-        self.v_states = v_buffers;
-        self.timestep = 1.0; // Reset timestep
+        // 6. Allocate M and V state buffers (skip for generation-only workers)
+        if (!is_generation_only) {
+            if (self.m_states) |states| {
+                for (states) |s| self.allocator.free(s);
+                self.allocator.free(states);
+            }
+            if (self.v_states) |states| {
+                for (states) |s| self.allocator.free(s);
+                self.allocator.free(states);
+            }
 
-        std.log.info("Worker {} cached VMFB, {} parameter shapes, {} data input shapes, and allocated optimizer state buffers.", .{ self.node_id.?, self.cached_parameter_shapes.?.len, self.cached_data_input_shapes.?.len });
+            const num_params = self.cached_parameter_shapes.?.len;
+            const m_buffers = try self.allocator.alloc([]u8, num_params);
+            errdefer {
+                for (m_buffers) |buf| self.allocator.free(buf);
+                self.allocator.free(m_buffers);
+            }
+            const v_buffers = try self.allocator.alloc([]u8, num_params);
+            errdefer {
+                for (v_buffers) |buf| self.allocator.free(buf);
+                self.allocator.free(v_buffers);
+            }
+
+            for (self.cached_parameter_shapes.?, 0..) |shape, i| {
+                var size: usize = @sizeOf(f32);
+                for (shape) |dim| {
+                    size *= @intCast(dim);
+                }
+
+                m_buffers[i] = try self.allocator.alloc(u8, size);
+                @memset(m_buffers[i], 0);
+
+                v_buffers[i] = try self.allocator.alloc(u8, size);
+                @memset(v_buffers[i], 0);
+            }
+
+            self.m_states = m_buffers;
+            self.v_states = v_buffers;
+            self.timestep = 1.0;
+        }
+
+        if (is_generation_only) {
+            std.log.info("Worker {} cached VMFB, {} parameter shapes, {} data input shapes (generation-only).", .{ self.node_id.?, self.cached_parameter_shapes.?.len, self.cached_data_input_shapes.?.len });
+        } else {
+            std.log.info("Worker {} cached VMFB, {} parameter shapes, {} data input shapes, and allocated optimizer state buffers.", .{ self.node_id.?, self.cached_parameter_shapes.?.len, self.cached_data_input_shapes.?.len });
+        }
     }
     
     /// Handle StartInnerLoop command from Shepherd using Cap'n Proto

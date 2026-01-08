@@ -711,11 +711,11 @@ pub const RLShepherd = struct {
     }
 
     /// Initialize the generation backend for workers
-    pub fn initGenerationBackend(self: *Self, vmfb_path: []const u8, mlir_path: []const u8) !void {
+    /// num_data_inputs = Token(1) + Pos(1) + KV(2*num_layers)
+    pub fn initGenerationBackend(self: *Self, vmfb_path: []const u8, mlir_path: []const u8, num_data_inputs: usize) !void {
         std.log.info("Initializing Generation Backend...", .{});
 
         // 1. Read VMFB
-        // Use 10GB limit as defined before
         self.generation_vmfb = try std.fs.cwd().readFileAlloc(
             self.base.allocator,
             vmfb_path,
@@ -735,7 +735,7 @@ pub const RLShepherd = struct {
             if (model_introspection.ModelMetadata.loadFromFile(self.base.allocator, meta_path)) |meta| {
                 self.gen_data_shapes = meta.data_input_shapes;
                 self.gen_data_dtypes = meta.data_input_dtypes;
-                self.gen_param_shapes = meta.parameter_shapes; // Should be empty
+                self.gen_param_shapes = meta.parameter_shapes;
                 metadata_loaded = true;
                 std.log.info("✓ Loaded generation metadata from cache: {} data inputs (instant!)", .{meta.data_input_shapes.len});
             } else |err| {
@@ -747,7 +747,6 @@ pub const RLShepherd = struct {
         if (!metadata_loaded) {
             std.log.info("Cache miss. Reading MLIR source for introspection...", .{});
 
-            // Read source (3.7GB)
             const mlir_source = try std.fs.cwd().readFileAlloc(
                 self.base.allocator,
                 mlir_path,
@@ -756,10 +755,6 @@ pub const RLShepherd = struct {
             defer self.base.allocator.free(mlir_source);
 
             std.log.info("Source loaded ({} bytes). Running Standard Inspector...", .{mlir_source.len});
-
-            // Use standard inspector that separates params from data inputs
-            // Qwen 0.5B has 24 layers: data inputs = Token(1) + Pos(1) + KV(2*24) = 50
-            const num_data_inputs = 50;
 
             var meta_result = try model_introspection.ModelInspector.inspectLite(
                 self.base.allocator,
@@ -784,33 +779,30 @@ pub const RLShepherd = struct {
     }
 
     /// Distribute the generation graph to workers
-    pub fn prepareWorkersForGeneration(self: *Self, vmfb_path: []const u8) !void {
+    /// Workers load weights locally from weights_path instead of receiving over network
+    pub fn prepareWorkersForGeneration(self: *Self, vmfb_path: []const u8, weights_path: []const u8) !void {
         if (self.gen_data_shapes == null or self.gen_data_dtypes == null) {
             return error.GenerationBackendNotInitialized;
         }
 
         std.log.info("Preparing workers for RL generation...", .{});
+        std.log.info("  VMFB: {s}", .{vmfb_path});
+        std.log.info("  Weights: {s} (local load)", .{weights_path});
 
-        // Use parameter shapes (should be empty for generation graph with frozen weights)
-        const param_shapes = self.gen_param_shapes orelse {
-            // Allocate empty mutable slice if needed
+        // Use parameter shapes from generation model
+        const param_shapes = self.gen_param_shapes orelse blk: {
             const empty = try self.base.allocator.alloc([]i64, 0);
-            defer self.base.allocator.free(empty);
-            return try self.base.initializeWorkersWithVMFB(
-                vmfb_path,
-                empty,
-                self.gen_data_shapes.?,
-                self.gen_data_dtypes.?,
-            );
+            break :blk empty;
         };
 
-        try self.base.initializeWorkersWithVMFB(
+        try self.base.initializeWorkersWithVMFBAndWeights(
             vmfb_path,
+            weights_path,
             param_shapes,
             self.gen_data_shapes.?,
             self.gen_data_dtypes.?,
         );
 
-        std.log.info("✓ Workers ready for generation", .{});
+        std.log.info("✓ Workers ready for generation (weights loaded locally)", .{});
     }
 };

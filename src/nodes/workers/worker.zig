@@ -913,6 +913,12 @@ pub const Worker = struct {
         const param_shapes = self.cached_parameter_shapes orelse return error.ParameterShapesNotInitialized;
         const data_shapes = self.cached_data_input_shapes orelse return error.DataShapesNotInitialized;
 
+        // 1.5 PRE-LOAD SESSION (JIT compile CUDA kernels while GPU memory is free)
+        if (self.cached_vmfb) |vmfb| {
+            std.log.info("Worker {}: Pre-loading session (JIT compiling kernels)...", .{self.node_id.?});
+            try iree_impl.loadSession(vmfb);
+        }
+
         // 2. UPLOAD WEIGHTS TO VRAM (Once per UPDATE_WEIGHTS, not every token!)
         if (self.device_weights == null or self.device_weights_dirty) {
             if (self.weight_blob == null) {
@@ -956,6 +962,7 @@ pub const Worker = struct {
         }
 
         // 3. INITIALIZE KV CACHE ON HOST (model outputs single-position slices, we accumulate)
+        std.log.info("Worker {}: Initializing KV cache on host ({} buffers)...", .{ self.node_id.?, data_shapes.len - 2 });
         if (self.kv_cache) |old_cache| {
             for (old_cache) |buf| self.allocator.free(buf);
             self.allocator.free(old_cache);
@@ -970,12 +977,17 @@ pub const Worker = struct {
             @memset(kv_buffers[i], 0);
         }
         self.kv_cache = kv_buffers;
+        std.log.info("Worker {}: KV cache initialized on host", .{self.node_id.?});
 
         // 4. GENERATION LOOP
         var current_pos: i64 = 0;
         const total_len = prompt_list.items.len + max_new_tokens;
 
+        std.log.info("Worker {}: Starting generation loop (total_len={})...", .{ self.node_id.?, total_len });
+
         while (current_pos < total_len) {
+            if (current_pos == 0) std.log.info("Worker {}: Generation step 0 - building inputs...", .{self.node_id.?});
+
             // Select input token
             var input_token: i64 = 0;
             if (current_pos < prompt_list.items.len) {
@@ -995,6 +1007,7 @@ pub const Worker = struct {
                 w.retain();
                 try inputs.append(w);
             }
+            if (current_pos == 0) std.log.info("Worker {}: Added {} weight refs", .{ self.node_id.?, self.device_weights.?.len });
 
             // B. Token & Position (16 bytes total)
             const token_bytes = std.mem.asBytes(&input_token);
@@ -1004,12 +1017,14 @@ pub const Worker = struct {
             const pos_bytes = std.mem.asBytes(&current_pos);
             const dev_pos = try iree_impl.moveToDevice(pos_bytes, data_shapes[1], .i64);
             try inputs.append(dev_pos);
+            if (current_pos == 0) std.log.info("Worker {}: Uploaded token+pos to device", .{self.node_id.?});
 
             // C. KV Cache (Upload from host - ~25MB per step)
             for (self.kv_cache.?, kv_shapes) |kv_buf, shape| {
                 const dev_kv = try iree_impl.moveToDevice(kv_buf, shape, .f32);
                 try inputs.append(dev_kv);
             }
+            if (current_pos == 0) std.log.info("Worker {}: Uploaded {} KV cache buffers, executing...", .{ self.node_id.?, kv_shapes.len });
 
             // EXECUTE (Weights stay on device - saves ~2GB transfer!)
             const outputs = try iree_impl.executeWithDeviceBuffers(
@@ -1018,6 +1033,7 @@ pub const Worker = struct {
                 inputs.items,
             );
             defer self.allocator.free(outputs);
+            if (current_pos == 0) std.log.info("Worker {}: First execute complete!", .{self.node_id.?});
 
             // Release input refs
             for (inputs.items) |buf| buf.release();

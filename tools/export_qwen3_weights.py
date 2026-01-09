@@ -31,7 +31,7 @@ def get_expected_bytes_from_meta(meta_path: str):
 def main():
     expected_bytes, shape_sizes = get_expected_bytes_from_meta(META_FILE)
 
-    print(f"Loading {MODEL_ID} weights...")
+    print(f"Loading {MODEL_ID} weights in float32...")
     config = AutoConfig.from_pretrained(MODEL_ID, trust_remote_code=True)
     model = AutoModelForCausalLM.from_pretrained(
         MODEL_ID,
@@ -48,9 +48,9 @@ def main():
 
     total_param_bytes = 0
     for name, param in params:
-        total_param_bytes += param.numel() * 4
+        total_param_bytes += param.numel() * 4  # f32
 
-    print(f"Total parameter size: {total_param_bytes / 1024**3:.2f} GB")
+    print(f"Total parameter size: {total_param_bytes / 1024**3:.2f} GB (f32)")
 
     if expected_bytes is not None:
         print(f"Verifying against meta.json: Expected {expected_bytes}, Actual {total_param_bytes}")
@@ -63,7 +63,6 @@ def main():
     print(f"Writing weights to {output_path}...")
     with open(output_path, "wb") as f:
         for name, param in params:
-            # Detach and cast to ensure float32 flat bytes
             data = param.detach().cpu().float().numpy().tobytes()
             f.write(data)
 

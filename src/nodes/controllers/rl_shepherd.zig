@@ -196,7 +196,7 @@ pub const RLShepherd = struct {
             const byte_size = num_elements * 4;
 
             if (offset + byte_size > file_size) {
-                std.log.err("❌ Weight file too small at parameter {}: offset={} byte_size={} file_size={}", .{ i, offset, byte_size, file_size });
+                std.log.err("Weight file too small at parameter {}: offset={} byte_size={} file_size={}", .{ i, offset, byte_size, file_size });
                 return error.WeightFileTooSmall;
             }
 

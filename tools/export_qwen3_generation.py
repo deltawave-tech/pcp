@@ -68,9 +68,9 @@ class StaticCacheShim:
 
 # --- 2. Stateless RoPE Implementation ---
 def stateless_rope(position_ids):
-    inv_freq = torch.tensor(INV_FREQ_LIST, device=position_ids.device, dtype=torch.float32)
+    inv_freq = torch.tensor(INV_FREQ_LIST, device=position_ids.device, dtype=DTYPE)
     inv_freq_expanded = inv_freq.view(1, -1)
-    position_ids_expanded = position_ids.float().view(BATCH_SIZE, -1, 1)
+    position_ids_expanded = position_ids.to(dtype=DTYPE).view(BATCH_SIZE, -1, 1)
     freqs = position_ids_expanded * inv_freq_expanded
     emb = torch.cat((freqs, freqs), dim=-1)
     cos = emb.cos().view(BATCH_SIZE, 1, -1, HEAD_DIM).to(dtype=DTYPE)

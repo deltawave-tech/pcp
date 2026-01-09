@@ -220,9 +220,9 @@ pub const IreeBackend = struct {
         return self.moveToDevice(zeros, shape, dtype);
     }
 
-    /// Ensure session is loaded for a given VMFB.
-    /// This is a helper used by both execute() and executeWithDeviceBuffers().
-    fn ensureSessionLoaded(self: *Self, vmfb_bytes: []const u8) !void {
+    /// Pre-load session and JIT compile CUDA kernels.
+    /// Call this BEFORE uploading weights to ensure compilation has scratch memory.
+    pub fn loadSession(self: *Self, vmfb_bytes: []const u8) !void {
         const need_load = self.session == null or
             self.loaded_vmfb_ptr != vmfb_bytes.ptr or
             self.loaded_vmfb_len != vmfb_bytes.len;
@@ -234,7 +234,7 @@ pub const IreeBackend = struct {
                 c.iree_runtime_session_release(s);
                 self.session = null;
             } else {
-                std.log.info("IreeBackend: Initializing session...", .{});
+                std.log.info("IreeBackend: Pre-loading session (JIT compiling kernels)...", .{});
             }
 
             // Create fresh session
@@ -258,6 +258,7 @@ pub const IreeBackend = struct {
             // Update tracking
             self.loaded_vmfb_ptr = vmfb_bytes.ptr;
             self.loaded_vmfb_len = vmfb_bytes.len;
+            std.log.info("IreeBackend: JIT compilation complete.", .{});
         }
     }
 
@@ -271,7 +272,7 @@ pub const IreeBackend = struct {
         inputs: []const DeviceBuffer,
     ) ![]DeviceBuffer {
         // 1. Ensure session is loaded
-        try self.ensureSessionLoaded(vmfb_bytes);
+        try self.loadSession(vmfb_bytes);
 
         // 2. Initialize call
         var call: c.iree_runtime_call_t = undefined;
@@ -344,7 +345,7 @@ pub const IreeBackend = struct {
         input_dtypes: ?[]const DType,
     ) ![][]u8 {
         // 1. Ensure session is loaded
-        try self.ensureSessionLoaded(vmfb_bytes);
+        try self.loadSession(vmfb_bytes);
 
         // 2. Initialize call
         var call: c.iree_runtime_call_t = undefined;

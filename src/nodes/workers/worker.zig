@@ -807,7 +807,7 @@ pub const Worker = struct {
                 0,
                 "shepherd",
                 MessageType.INNER_LOOP_COMPLETE,
-                msg.msg_id + 1,
+                msg.msg_id +% 1,
                 std.json.Value{ .object = response_payload },
             );
 
@@ -869,7 +869,7 @@ pub const Worker = struct {
             0,
             "shepherd",
             MessageType.INNER_LOOP_COMPLETE,
-            msg.msg_id + 1,
+            msg.msg_id +% 1,
             std.json.Value{ .object = response_payload },
         );
 

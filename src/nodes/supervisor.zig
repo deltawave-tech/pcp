@@ -32,7 +32,21 @@ pub const Supervisor = struct {
     pub fn init(allocator: std.mem.Allocator, host: []const u8, port: u16, child_cmd_args: []const []const u8) !Self {
         // Use a high-entropy-ish seed to avoid supervisor_id collisions when spawning many supervisors
         // within the same second (e.g. multi-GPU NodeManager startup).
-        const seed = @as(u64, @truncate(@as(u128, @bitCast(std.time.nanoTimestamp())))) ^ @as(u64, @intCast(std.process.getPid()));
+        const tid: u64 = if (@hasDecl(std.Thread, "getCurrentId"))
+            @as(u64, @intCast(std.Thread.getCurrentId()))
+        else
+            0;
+        const pid: u64 = if (@hasDecl(std.process, "getPid"))
+            @as(u64, @intCast(std.process.getPid()))
+        else if (@hasDecl(std.posix, "getpid"))
+            @as(u64, @intCast(std.posix.getpid()))
+        else
+            0;
+
+        const seed =
+            @as(u64, @truncate(@as(u128, @bitCast(std.time.nanoTimestamp())))) ^
+            (pid << 1) ^
+            (tid << 33);
         var prng = std.Random.DefaultPrng.init(seed);
         const my_id = prng.random().int(i64);
 

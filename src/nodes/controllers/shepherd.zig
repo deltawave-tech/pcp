@@ -337,7 +337,7 @@ pub const Shepherd = struct {
             assigned_node_id, // worker node_id
             "worker", // worker service
             MessageType.JOIN_ACCEPT,
-            join_msg_id + 1,
+            join_msg_id +% 1,
             .null,
         );
 

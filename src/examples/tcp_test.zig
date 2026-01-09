@@ -38,7 +38,7 @@ fn testServerHandler(stream: net.Stream, allocator: std.mem.Allocator) !void {
         received_msg.sender_node, // original sender becomes recipient
         received_msg.sender_service, // original sender service becomes recipient
         "test_response",
-        received_msg.msg_id + 1,
+        received_msg.msg_id +% 1,
         std.json.Value{ .string = "Server response" },
     );
     
@@ -71,7 +71,7 @@ fn testClientFunction(allocator: std.mem.Allocator, host: []const u8, port: u16)
     
     // Validate response
     try testing.expectEqualStrings("test_response", response.msg_type);
-    try testing.expectEqual(test_msg.msg_id + 1, response.msg_id);
+    try testing.expectEqual(test_msg.msg_id +% 1, response.msg_id);
     try testing.expectEqual(test_msg.sender_node, response.recipient_node);
     try testing.expectEqualStrings(test_msg.sender_service, response.recipient_service);
 }

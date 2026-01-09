@@ -17,6 +17,11 @@
         pkgs = import nixpkgs {
           inherit system overlays;
           config.allowUnfree = true;
+          # A couple of packages need this on darwin.
+          config.allowUnsupportedSystem =
+            (system == "aarch64-darwin" || system == "x86_64-darwin");
+          config.allowBroken =
+            (system == "aarch64-darwin" || system == "x86_64-darwin");
         };
         lib = pkgs.lib;
         # zig is LLVM based. In order to ensure ABI compatibility, we have base our builds on

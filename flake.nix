@@ -72,28 +72,36 @@
           version = "main";
           src = ./.;
           nativeBuildInputs = [
-            pkgs.makeWrapper
-            llvmPkg.libllvm.dev
-            mlirPkg.dev
-            pkgs.zig_0_13
-            pkgs.pkg-config
-            llvmPkg.lld
-            llvmPkg.clang-tools
             llvmPkg.bintools
+            llvmPkg.clang-tools
             llvmPkg.libcxx.dev
+            llvmPkg.libllvm.dev
+            llvmPkg.lld
+            mlirPkg.dev
+            pkgs.makeWrapper
+            pkgs.pkg-config
+            pkgs.zig_0_13
             pkgs.zig_0_13.hook
           ] ++ lib.optionals pkgs.stdenv.isDarwin [ pkgs.apple-sdk_15 ];
           buildInputs = [
-            llvmPkg.libcxx
             llvmPkg.clang-tools
+            llvmPkg.libcxx
             llvmPkg.libllvm
             mlirPkg
-            pkgs.capnproto
-            packages.iree-sdk.src
             packages.iree-sdk.build
+            packages.iree-sdk.src
+            pkgs.capnproto
           ];
-          propagatedBuildInputs =
-            [ pkgs.cudaPackages.cuda_cudart pkgs.glibc packages.iree-sdk pkgs.numactl pkgs.elfutils pkgs.zlib pkgs.zstd pkgs.libdrm ];
+          propagatedBuildInputs = [
+            packages.iree-sdk
+            pkgs.cudaPackages.cuda_cudart
+            pkgs.elfutils
+            pkgs.glibc
+            pkgs.libdrm
+            pkgs.numactl
+            pkgs.zlib
+            pkgs.zstd
+          ];
           dontConfigure = true;
           doCheck = false;
           zigBuildFlags = [ "--verbose" "--color" "off" ];
@@ -112,18 +120,20 @@
             patchelf --add-needed libdrm_amdgpu.so.1 $out/bin/pcp
 
             # Generate the Nix-side RPATH automatically from inputs
-            NIX_RPATH="${lib.makeLibraryPath [
-              pkgs.numactl
-              pkgs.elfutils
-              pkgs.zlib
-              pkgs.zstd
-              pkgs.libdrm
-              pkgs.capnproto
-              pkgs.cudaPackages.cuda_cudart
-              pkgs.glibc
-              pkgs.stdenv.cc.cc.lib
-              packages.iree-sdk
-            ]}"
+            NIX_RPATH="${
+              lib.makeLibraryPath [
+                packages.iree-sdk
+                pkgs.capnproto
+                pkgs.cudaPackages.cuda_cudart
+                pkgs.elfutils
+                pkgs.glibc
+                pkgs.libdrm
+                pkgs.numactl
+                pkgs.stdenv.cc.cc.lib
+                pkgs.zlib
+                pkgs.zstd
+              ]
+            }"
 
             # Append System paths for driver fallbacks (PTX JIT, ROCm, etc.)
             SYSTEM_RPATH="/usr/lib/x86_64-linux-gnu:/usr/lib64:/usr/lib:/opt/amdgpu/lib/x86_64-linux-gnu:/opt/amdgpu/lib:/run/opengl-driver/lib:/opt/rocm/lib:/opt/rocm/hip/lib"

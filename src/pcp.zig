@@ -10,6 +10,8 @@ const Allocator = std.mem.Allocator;
 const shepherd = @import("nodes/controllers/shepherd.zig");
 const worker = @import("nodes/workers/worker.zig");
 const diloco = @import("algorithms/diloco.zig");
+const grpo = @import("algorithms/grpo.zig");
+const rl_shepherd = @import("nodes/controllers/rl_shepherd.zig");
 const training_algorithm = @import("algorithms/training_algorithm.zig");
 const backend_selection = @import("backends/selection.zig");
 const ops = @import("core/ops.zig");
@@ -23,6 +25,20 @@ const DiLoCo = diloco.DiLoCo;
 const DiLoCoConfig = diloco.DiLoCoConfig;
 const MLIRBuilder = ops.MLIRBuilder;
 
+const GRPOJsonConfig = struct {
+    num_iterations: usize,
+    group_size: usize,
+    learning_rate: f32,
+    beta: f32,
+    prompt_file: []const u8,
+    num_prompts: usize,
+    weights_path: []const u8,
+    generation_vmfb_path: []const u8,
+    generation_mlir_path: []const u8,
+    training_mlir_path: []const u8,
+    num_gen_data_inputs: usize,
+};
+
 /// JSON Config File Structure
 const ExperimentConfig = struct {
     model_path: []const u8 = "src/models/nanogpt_forward.mlir",
@@ -33,6 +49,8 @@ const ExperimentConfig = struct {
     outer_loop_steps: usize = 100,
     nesterov_momentum: f32 = 0.9,
     max_epochs: usize = 10,
+
+    grpo_config: ?GRPOJsonConfig = null,
 
     // WandB configuration
     wandb_project: []const u8 = "pcp-distributed",
@@ -76,6 +94,9 @@ const Args = struct {
     device_id: usize,
     scale: usize,
     should_resume: bool,
+    rl_mode: bool,
+    no_dashboard: bool,
+    terminate: bool,
     child_args: std.ArrayList([]const u8),
 
     const Mode = enum {
@@ -102,6 +123,9 @@ const Args = struct {
                 .device_id = 0,
                 .scale = 1,
                 .should_resume = false,
+                .rl_mode = false,
+                .no_dashboard = false,
+                .terminate = false,
                 .child_args = child_args_list,
             };
         }
@@ -119,6 +143,9 @@ const Args = struct {
         var device_id: usize = 0;
         var scale: usize = 1;
         var should_resume: bool = false;
+        var rl_mode: bool = false;
+        var no_dashboard: bool = false;
+        var terminate: bool = false;
 
         var i: usize = 1;
         while (i < args.len) {
@@ -207,6 +234,12 @@ const Args = struct {
                 }
             } else if (std.mem.eql(u8, args[i], "--resume")) {
                 should_resume = true;
+            } else if (std.mem.eql(u8, args[i], "--rl")) {
+                rl_mode = true;
+            } else if (std.mem.eql(u8, args[i], "--no-dashboard")) {
+                no_dashboard = true;
+            } else if (std.mem.eql(u8, args[i], "--terminate")) {
+                terminate = true;
             } else if (std.mem.eql(u8, args[i], "--supervise")) {
                 supervise = true;
                 i += 1;
@@ -232,6 +265,9 @@ const Args = struct {
             .device_id = device_id,
             .scale = scale,
             .should_resume = should_resume,
+            .rl_mode = rl_mode,
+            .no_dashboard = no_dashboard,
+            .terminate = terminate,
             .child_args = child_args_list,
         };
     }
@@ -250,6 +286,9 @@ const Args = struct {
         print("  --workers <count>    Number of workers to wait for (default: 2)\n", .{});
         print("  --model <path>       Path to MLIR model file (Shepherd only, overrides config)\n", .{});
         print("  --resume             Resume from previous training state\n", .{});
+        print("  --rl                 Enable RL mode with GRPO algorithm (Shepherd only)\n", .{});
+        print("  --no-dashboard       Disable TUI dashboard for clean log output (Shepherd only)\n", .{});
+        print("  --terminate          Auto-terminate shepherd when training completes\n", .{});
         print("  --backend <type>     Backend to use: cpu, cuda, metal, vulkan, rocm (default: auto)\n", .{});
         print("  --target <arch>      GPU target architecture (e.g., gfx942 for MI300X, sm_80 for A100)\n", .{});
         print("  --device-id <id>     GPU device ID to use (default: 0, for multi-GPU nodes)\n", .{});
@@ -292,8 +331,78 @@ fn loadConfig(allocator: Allocator, path: ?[]const u8) !ConfigResult {
     };
 }
 
+fn runRLShepherd(allocator: Allocator, args: Args) !void {
+    print("Starting RL Shepherd coordinator with GRPO...\n", .{});
+
+    const training_backend = args.backend orelse {
+        print("Error: --backend flag is required for RL Shepherd mode\n", .{});
+        return error.BackendRequired;
+    };
+
+    print("   Training Backend: {s}\n", .{training_backend.toString()});
+
+    var config_result = try loadConfig(allocator, args.config_path);
+    defer config_result.deinit();
+    const exp_config = config_result.config;
+
+    const json_grpo = exp_config.grpo_config orelse {
+        print("Error: grpo_config is required in config file for RL mode\n", .{});
+        return error.GRPOConfigRequired;
+    };
+
+    var rl_shepherd_controller = rl_shepherd.RLShepherd.init(allocator);
+    defer rl_shepherd_controller.deinit();
+
+    rl_shepherd_controller.training_backend_type = training_backend;
+
+    const listen_thread = try std.Thread.spawn(.{}, rlShepherdListenThread, .{ &rl_shepherd_controller, args.host, args.port });
+    // Ensure shepherd stops so listen thread can exit, preventing deadlock on error
+    // Note: Zig executes defers in reverse order, so stop() runs before join()
+    defer rl_shepherd_controller.base.stop();
+    defer listen_thread.join();
+
+    std.time.sleep(500 * std.time.ns_per_ms);
+
+    const grpo_config = grpo.GRPOConfig{
+        .num_iterations = json_grpo.num_iterations,
+        .group_size = json_grpo.group_size,
+        .learning_rate = json_grpo.learning_rate,
+        .beta = json_grpo.beta,
+        .prompt_file = json_grpo.prompt_file,
+        .num_prompts = json_grpo.num_prompts,
+        .weights_path = json_grpo.weights_path,
+        .generation_vmfb_path = json_grpo.generation_vmfb_path,
+        .generation_mlir_path = json_grpo.generation_mlir_path,
+        .training_mlir_path = json_grpo.training_mlir_path,
+        .num_gen_data_inputs = json_grpo.num_gen_data_inputs,
+    };
+
+    var grpo_algo = grpo.GRPO.init(allocator, &rl_shepherd_controller, grpo_config);
+    var training_algo = grpo_algo.asTrainingAlgorithm();
+
+    print("Starting GRPO training...\n", .{});
+    try training_algo.run();
+
+    print("GRPO training completed!\n", .{});
+
+    if (args.terminate) {
+        print("--terminate flag set, exiting...\n", .{});
+        std.process.exit(0);
+    }
+}
+
+/// RL Shepherd listening thread
+fn rlShepherdListenThread(rl_shepherd_controller: *rl_shepherd.RLShepherd, host: []const u8, port: u16) !void {
+    try rl_shepherd_controller.listen(host, port);
+}
+
 /// Run as Shepherd coordinator
 fn runShepherd(allocator: Allocator, args: Args) !void {
+    // Check if RL mode is enabled
+    if (args.rl_mode) {
+        return runRLShepherd(allocator, args);
+    }
+
     const LATEST_RUN_FILE = ".pcp_latest_run";
     var run_id_buf: [64]u8 = undefined;
     var run_id: []const u8 = undefined;
@@ -412,9 +521,12 @@ fn runShepherd(allocator: Allocator, args: Args) !void {
     const listen_thread = try std.Thread.spawn(.{}, shepherdListenThread, .{ shepherd_controller, args.host, args.port });
     listen_thread.detach();
 
-    // Start the TUI dashboard in its own thread
-    const dashboard_thread = try std.Thread.spawn(.{}, dashboard.runDashboard, .{});
-    defer dashboard_thread.join();
+    // Start the TUI dashboard in its own thread (unless --no-dashboard)
+    var dashboard_thread: ?std.Thread = null;
+    if (!args.no_dashboard) {
+        dashboard_thread = try std.Thread.spawn(.{}, dashboard.runDashboard, .{});
+    }
+    defer if (dashboard_thread) |t| t.join();
 
     // Wait for workers and start training
     print("Waiting for workers to connect...\n", .{});
@@ -424,6 +536,11 @@ fn runShepherd(allocator: Allocator, args: Args) !void {
     };
 
     print("🌑 Training completed successfully!\n", .{});
+
+    if (args.terminate) {
+        print("--terminate flag set, exiting...\n", .{});
+        std.process.exit(0);
+    }
 }
 
 /// Shepherd listening thread
@@ -548,9 +665,6 @@ pub fn testDistributedSystem(allocator: Allocator) !void {
 
     // Test Shepherd
     try shepherd.testShepherd(allocator);
-
-    // Test Worker
-    try worker.testWorker(allocator);
 
     // Test DiLoCo
     try diloco.testDiLoCo(allocator);

@@ -46,7 +46,9 @@ pub const GraphBuilder = struct {
 
         // === PHASE 3: AUTODIFF ===
         std.debug.print("GraphBuilder: Running Autodiff...\n", .{});
-        _ = try autodiff.buildGradientGraph(allocator, builder, cloned_forward_fn);
+        const gradient_clip_min = @as(f64, @floatCast(optimizer.conf.gradient_clip_min));
+        const gradient_clip_max = @as(f64, @floatCast(optimizer.conf.gradient_clip_max));
+        _ = try autodiff.buildGradientGraph(allocator, builder, cloned_forward_fn, gradient_clip_min, gradient_clip_max);
         const grad_fn_name = "model_forward_pass_grad";
 
         // === PHASE 4: BUILD ORCHESTRATOR 'main' ===
@@ -174,6 +176,145 @@ pub const GraphBuilder = struct {
             return error.ModuleVerificationFailed;
         }
 
+        return mlir_ctx.serializeMLIRModule(allocator, builder.module);
+    }
+
+    /// Builds a gradient-computation graph for GRPO/RL.
+    /// Input: Forward pass MLIR (Params..., Buffers..., Data...) -> Loss
+    /// Output: Backward pass MLIR (Params..., Buffers..., Data...) -> (Grads_Params...)
+    ///
+    /// Unlike buildTrainingGraph (which includes the optimizer in MLIR), this one only
+    /// calculates gradients. The optimizer step happens on the Shepherd CPU for GRPO/RL.
+    ///
+    /// @param allocator: Memory allocator
+    /// @param builder: MLIRBuilder with initialized context and module
+    /// @param forward_mlir_source: MLIR source text of the forward pass
+    /// @param num_params: Number of trainable parameters (gradients returned for these)
+    /// @param num_buffers: Number of non-trainable buffers (e.g., rope constants, masks)
+    /// @return Serialized MLIR module bytes for the backward pass
+    pub fn buildGrpoBackwardPass(
+        allocator: Allocator,
+        builder: *MLIRBuilder,
+        forward_mlir_source: []const u8,
+        num_params: usize,
+        num_buffers: usize,
+    ) ![]u8 {
+        const c_api = @import("../mlir/c.zig").c;
+
+        std.debug.print("Compiling GRPO Backward Pass via GraphBuilder...\n", .{});
+        std.debug.print("  num_params={}, num_buffers={}\n", .{ num_params, num_buffers });
+
+        // === PHASE 1: LOAD AND PARSE FORWARD PASS ===
+        const temp_module = try mlir.Module.parse(builder.ctx, forward_mlir_source);
+        defer temp_module.deinit();
+
+        // Find "main" in the temp module
+        const forward_fn_to_clone = try temp_module.findFunction("main");
+
+        // === PHASE 2: CLONE INTO MAIN MODULE ===
+        const cloned_forward_fn = mlir.Operation{ .handle = c_api.operationClone(forward_fn_to_clone.handle) };
+
+        // Rename to avoid conflict with the new 'main' we will create
+        const new_fn_name = "qwen_forward";
+        const new_name_attr = mlir.Attribute.stringAttr(builder.ctx, new_fn_name);
+        const sym_name_ref = c_api.stringRefFromString("sym_name");
+        c_api.operationSetAttributeByName(cloned_forward_fn.handle, sym_name_ref, new_name_attr.handle);
+
+        builder.module_body.appendOwnedOperation(cloned_forward_fn);
+
+        // === PHASE 3: AUTODIFF ===
+        std.debug.print("GraphBuilder: Running AutoDiff on Qwen forward pass...\n", .{});
+        // GRPO gradients can be large, use reasonable clipping bounds
+        const gradient_clip_min: f64 = -100.0;
+        const gradient_clip_max: f64 = 100.0;
+        _ = try autodiff.buildGradientGraph(allocator, builder, cloned_forward_fn, gradient_clip_min, gradient_clip_max);
+        const grad_fn_name = "qwen_forward_grad";
+
+        // === PHASE 4: BUILD ORCHESTRATOR 'main' ===
+        std.debug.print("GraphBuilder: Structuring 'main' for GRPO gradient computation...\n", .{});
+
+        const forward_fn_type = cloned_forward_fn.getType().as(mlir.FunctionType) orelse return error.NotAFunctionType;
+        const total_inputs = forward_fn_type.getNumInputs();
+
+        // Validate input counts
+        const num_data_inputs = total_inputs - num_params - num_buffers;
+        std.debug.print("  total_inputs={}, num_data_inputs={}\n", .{ total_inputs, num_data_inputs });
+
+        // 4.1 Define Input Types - same as forward pass
+        var main_input_types = std.ArrayList(mlir.Type).init(allocator);
+        defer main_input_types.deinit();
+        for (0..total_inputs) |i| {
+            try main_input_types.append(forward_fn_type.getInput(i));
+        }
+
+        // 4.2 Define Output Types - only gradients for trainable parameters
+        var main_output_types = std.ArrayList(mlir.Type).init(allocator);
+        defer main_output_types.deinit();
+        for (0..num_params) |i| {
+            try main_output_types.append(forward_fn_type.getInput(i));
+        }
+
+        const main_func_type = try mlir.Type.functionType(allocator, builder.ctx, main_input_types.items, main_output_types.items);
+
+        // 4.3 Create main function
+        const main_result = try builder.createFunction("main", main_func_type);
+        builder.setInsertionBlock(main_result.entry_block);
+
+        // 4.4 Get arguments from main function
+        const main_args = try main_result.entry_block.getArguments(allocator);
+        defer allocator.free(main_args);
+
+        // 4.5 Prepare Call to Gradient Function
+        // Grad function takes: (original inputs..., loss_gradient)
+        var grad_operands = std.ArrayList(mlir.Value).init(allocator);
+        defer grad_operands.deinit();
+
+        // Add all original inputs (Params + Buffers + Data)
+        try grad_operands.appendSlice(main_args);
+
+        // Add incoming gradient of Loss (Scalar 1.0)
+        // The forward pass returns a scalar loss
+        const loss_result_type = forward_fn_type.getResult(0);
+        const loss_ranked_type = loss_result_type.as(mlir.RankedTensorType) orelse return error.LossNotRankedTensor;
+        const loss_elem_type = loss_ranked_type.getElementType();
+        const loss_shape = try loss_ranked_type.getShape(allocator);
+        defer allocator.free(loss_shape);
+
+        const one_tensor = try ops.constant(builder, 1.0, loss_shape, loss_elem_type);
+        try grad_operands.append(one_tensor.value);
+
+        // 4.6 Determine result types for gradient call (one gradient per input)
+        var grad_call_result_types = std.ArrayList(mlir.Type).init(allocator);
+        defer grad_call_result_types.deinit();
+        for (main_args) |arg| {
+            try grad_call_result_types.append(arg.getType());
+        }
+
+        // 4.7 Create the CallOp to gradient function
+        const grad_callee_attr = mlir.Attribute.symbolRefAttr(builder.ctx, grad_fn_name);
+        const grad_call_op = try builder.createAndAttach("func.call", grad_operands.items, grad_call_result_types.items, .{
+            .attributes = &.{.{ "callee", grad_callee_attr }},
+        });
+
+        // 4.8 Return ONLY Parameter Gradients
+        // Discard gradients for Buffers and Data inputs
+        var return_operands = std.ArrayList(mlir.Value).init(allocator);
+        defer return_operands.deinit();
+
+        for (0..num_params) |i| {
+            try return_operands.append(grad_call_op.getResult(i));
+        }
+
+        _ = try builder.createAndAttach("func.return", return_operands.items, &.{}, .{});
+
+        // === PHASE 5: VERIFY AND SERIALIZE ===
+        if (!builder.module.op().verify()) {
+            std.log.err("GRPO backward pass module verification failed!", .{});
+            builder.module.op().dump();
+            return error.ModuleVerificationFailed;
+        }
+
+        std.debug.print("✓ GRPO Backward Pass graph built successfully\n", .{});
         return mlir_ctx.serializeMLIRModule(allocator, builder.module);
     }
 };

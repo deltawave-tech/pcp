@@ -5,8 +5,8 @@ const Dataset = dataset_mod.Dataset;
 const DatasetBatch = dataset_mod.Batch;
 
 pub const Batch = struct {
-    x: []u32,
-    y: []u32,
+    x: []u64,
+    y: []u64,
 };
 
 pub const CharTokenizer = struct {
@@ -14,6 +14,8 @@ pub const CharTokenizer = struct {
     char_to_int: std.AutoHashMap(u8, u32),
     int_to_char: std.AutoHashMap(u32, u8),
     vocab_size: usize,
+
+    const MAX_VOCAB_SIZE = 65;
 
     // Reads a text file and builds the character vocabulary
     pub fn initFromFile(allocator: Allocator, path: []const u8) !CharTokenizer {
@@ -28,20 +30,35 @@ pub const CharTokenizer = struct {
 
         var char_to_int = std.AutoHashMap(u8, u32).init(allocator);
         var int_to_char = std.AutoHashMap(u32, u8).init(allocator);
-        
+
+        var chars = std.ArrayList(u8).init(allocator);
+        defer chars.deinit();
+
         var it = char_set.keyIterator();
-        var i = @as(u32, 0);
         while (it.next()) |char_ptr| {
-            try char_to_int.put(char_ptr.*, i);
-            try int_to_char.put(i, char_ptr.*);
-            i += 1;
+            try chars.append(char_ptr.*);
         }
 
-        return CharTokenizer {
+        std.sort.heap(u8, chars.items, {}, std.sort.asc(u8));
+
+        const vocab_len: usize = @min(chars.items.len, MAX_VOCAB_SIZE);
+        for (chars.items[0..vocab_len], 0..) |ch, idx| {
+            const token: u32 = @intCast(idx);
+            try char_to_int.put(ch, token);
+            try int_to_char.put(token, ch);
+        }
+
+        if (chars.items.len > MAX_VOCAB_SIZE) {
+            for (chars.items[MAX_VOCAB_SIZE..]) |ch| {
+                std.log.warn("Dataset has more characters than model vocab ({}). Ignoring char '{c}'", .{ MAX_VOCAB_SIZE, ch });
+            }
+        }
+
+        return CharTokenizer{
             .allocator = allocator,
             .char_to_int = char_to_int,
             .int_to_char = int_to_char,
-            .vocab_size = char_to_int.count(),
+            .vocab_size = vocab_len,
         };
     }
 
@@ -53,7 +70,11 @@ pub const CharTokenizer = struct {
     pub fn encode(self: *CharTokenizer, text: []const u8) ![]u32 {
         const tokens = try self.allocator.alloc(u32, text.len);
         for (text, 0..) |char, i| {
-            tokens[i] = self.char_to_int.get(char) orelse return error.UnknownCharacter;
+            if (self.char_to_int.get(char)) |token| {
+                tokens[i] = token;
+            } else {
+                tokens[i] = 0;
+            }
         }
         return tokens;
     }
@@ -126,9 +147,9 @@ pub const DataLoader = struct {
     
     // Gets a single random batch of (inputs, targets)
     pub fn getBatch(self: *DataLoader, batch_size: usize, block_size: usize) !Batch {
-        const x = try self.allocator.alloc(u32, batch_size * block_size);
-        const y = try self.allocator.alloc(u32, batch_size * block_size);
-        
+        const x = try self.allocator.alloc(u64, batch_size * block_size);
+        const y = try self.allocator.alloc(u64, batch_size * block_size);
+
         var prng = std.Random.DefaultPrng.init(@intCast(std.time.nanoTimestamp()));
         const random = prng.random();
 
@@ -137,8 +158,11 @@ pub const DataLoader = struct {
             const input_slice = self.tokens[start_index .. start_index + block_size];
             const target_slice = self.tokens[start_index + 1 .. start_index + block_size + 1];
 
-            @memcpy(x[i * block_size .. (i+1) * block_size], input_slice);
-            @memcpy(y[i * block_size .. (i+1) * block_size], target_slice);
+            const x_dest = x[i * block_size .. (i+1) * block_size];
+            const y_dest = y[i * block_size .. (i+1) * block_size];
+
+            for (input_slice, 0..) |token, k| x_dest[k] = @intCast(token);
+            for (target_slice, 0..) |token, k| y_dest[k] = @intCast(token);
         }
 
         return Batch{ .x = x, .y = y };
@@ -172,8 +196,8 @@ pub const ByteDataLoader = struct {
     }
 
     pub fn getBatch(self: *ByteDataLoader, batch_size: usize, block_size: usize) !Batch {
-        const x = try self.allocator.alloc(u32, batch_size * block_size);
-        const y = try self.allocator.alloc(u32, batch_size * block_size);
+        const x = try self.allocator.alloc(u64, batch_size * block_size);
+        const y = try self.allocator.alloc(u64, batch_size * block_size);
 
         var prng = std.Random.DefaultPrng.init(@intCast(std.time.nanoTimestamp()));
         const random = prng.random();
@@ -183,8 +207,11 @@ pub const ByteDataLoader = struct {
             const input_slice = self.tokens[start_index .. start_index + block_size];
             const target_slice = self.tokens[start_index + 1 .. start_index + block_size + 1];
 
-            @memcpy(x[i * block_size .. (i+1) * block_size], input_slice);
-            @memcpy(y[i * block_size .. (i+1) * block_size], target_slice);
+            const x_dest = x[i * block_size .. (i+1) * block_size];
+            const y_dest = y[i * block_size .. (i+1) * block_size];
+
+            for (input_slice, 0..) |token, k| x_dest[k] = @intCast(token);
+            for (target_slice, 0..) |token, k| y_dest[k] = @intCast(token);
         }
 
         return Batch{ .x = x, .y = y };
@@ -249,15 +276,15 @@ pub const TextDataset = struct {
     fn getBatchImpl(ptr: *anyopaque, batch_size: usize, block_size: usize) anyerror!DatasetBatch {
         const self: *Self = @ptrCast(@alignCast(ptr));
 
-        // Allocate IREE-compatible byte buffers (u32 -> 4 bytes)
-        const size_bytes = batch_size * block_size * 4;
+        // Allocate IREE-compatible byte buffers (u64 -> 8 bytes)
+        const size_bytes = batch_size * block_size * 8;
         const x_bytes = try self.allocator.alloc(u8, size_bytes);
         errdefer self.allocator.free(x_bytes);
         const y_bytes = try self.allocator.alloc(u8, size_bytes);
         errdefer self.allocator.free(y_bytes);
 
-        const x_flat = std.mem.bytesAsSlice(u32, x_bytes);
-        const y_flat = std.mem.bytesAsSlice(u32, y_bytes);
+        const x_flat = std.mem.bytesAsSlice(u64, x_bytes);
+        const y_flat = std.mem.bytesAsSlice(u64, y_bytes);
 
         const random = self.prng.random();
 
@@ -266,8 +293,14 @@ pub const TextDataset = struct {
             if (self.tokens.len <= block_size + 1) return error.ChunkTooSmall;
             const start = random.uintAtMost(usize, self.tokens.len - block_size - 1);
 
-            @memcpy(x_flat[i * block_size..(i + 1) * block_size], self.tokens[start..start + block_size]);
-            @memcpy(y_flat[i * block_size..(i + 1) * block_size], self.tokens[start + 1..start + block_size + 1]);
+            const src_x = self.tokens[start..start + block_size];
+            const src_y = self.tokens[start + 1..start + block_size + 1];
+
+            const dest_x = x_flat[i * block_size..(i + 1) * block_size];
+            const dest_y = y_flat[i * block_size..(i + 1) * block_size];
+
+            for (src_x, 0..) |tok, k| dest_x[k] = @intCast(tok);
+            for (src_y, 0..) |tok, k| dest_y[k] = @intCast(tok);
         }
 
         return DatasetBatch{ .inputs = x_bytes, .targets = y_bytes, .allocator = self.allocator };
@@ -333,15 +366,15 @@ pub const ByteTextDataset = struct {
     fn getBatchImpl(ptr: *anyopaque, batch_size: usize, block_size: usize) anyerror!DatasetBatch {
         const self: *Self = @ptrCast(@alignCast(ptr));
 
-        // Allocate IREE-compatible byte buffers (u32 -> 4 bytes)
-        const size_bytes = batch_size * block_size * 4;
+        // Allocate IREE-compatible byte buffers (u64 -> 8 bytes)
+        const size_bytes = batch_size * block_size * 8;
         const x_bytes = try self.allocator.alloc(u8, size_bytes);
         errdefer self.allocator.free(x_bytes);
         const y_bytes = try self.allocator.alloc(u8, size_bytes);
         errdefer self.allocator.free(y_bytes);
 
-        const x_flat = std.mem.bytesAsSlice(u32, x_bytes);
-        const y_flat = std.mem.bytesAsSlice(u32, y_bytes);
+        const x_flat = std.mem.bytesAsSlice(u64, x_bytes);
+        const y_flat = std.mem.bytesAsSlice(u64, y_bytes);
 
         const random = self.prng.random();
 
@@ -350,8 +383,14 @@ pub const ByteTextDataset = struct {
             if (self.tokens.len <= block_size + 1) return error.ChunkTooSmall;
             const start = random.uintAtMost(usize, self.tokens.len - block_size - 1);
 
-            @memcpy(x_flat[i * block_size..(i + 1) * block_size], self.tokens[start..start + block_size]);
-            @memcpy(y_flat[i * block_size..(i + 1) * block_size], self.tokens[start + 1..start + block_size + 1]);
+            const src_x = self.tokens[start..start + block_size];
+            const src_y = self.tokens[start + 1..start + block_size + 1];
+
+            const dest_x = x_flat[i * block_size..(i + 1) * block_size];
+            const dest_y = y_flat[i * block_size..(i + 1) * block_size];
+
+            for (src_x, 0..) |tok, k| dest_x[k] = @intCast(tok);
+            for (src_y, 0..) |tok, k| dest_y[k] = @intCast(tok);
         }
 
         return DatasetBatch{ .inputs = x_bytes, .targets = y_bytes, .allocator = self.allocator };

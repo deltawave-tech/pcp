@@ -50,9 +50,8 @@ pub const MLIRBuilder = struct {
     }
 
     /// Helper to create scalar constant tensors
-    pub fn scalarConstant(self: *Self, value: f32) !Tensor {
-        const element_type = mlir.Type.f32Type(self.ctx);
-        return constant(self, @floatCast(value), &.{}, element_type);
+    pub fn scalarConstant(self: *Self, value: f64, element_type: mlir.Type) !Tensor {
+        return constant(self, value, &.{}, element_type);
     }
 
     /// Temporarily sets the insertion point to a new block.
@@ -381,11 +380,16 @@ pub fn matmul(builder: *MLIRBuilder, a: Tensor, b: Tensor) !Tensor {
     }
     // Case 5: 4D x 4D (multi-batch, e.g., multi-head attention)
     else if (a_rank == 4 and b_rank == 4) {
-        // For multi-head attention: [B, n_head, T, head_dim] x [B, n_head, head_dim, T] -> [B, n_head, T, T]
-        if (a.shape.getDimension(0) != b.shape.getDimension(0) or // Batch size must match
-            a.shape.getDimension(1) != b.shape.getDimension(1) or // Number of heads must match  
-            a.shape.getDimension(3) != b.shape.getDimension(2)) { // Contracting dimension must match
+        const q_heads = a.shape.getDimension(1);
+        const kv_heads = b.shape.getDimension(1);
+
+        if (a.shape.getDimension(0) != b.shape.getDimension(0) or
+            a.shape.getDimension(3) != b.shape.getDimension(2)) {
             return error.IncompatibleShapes;
+        }
+
+        if (q_heads != kv_heads) {
+            if (@rem(q_heads, kv_heads) != 0) return error.InvalidGQAHeadRatio;
         }
     }
     else {
@@ -439,7 +443,7 @@ pub fn matmul(builder: *MLIRBuilder, a: Tensor, b: Tensor) !Tensor {
     }
 
     // Use StableHLO dialect wrapper
-    const operation = hlo.dot_general(builder.ctx, a.value, b.value, .{
+    const operation = try hlo.dot_general(builder.allocator, builder.ctx, a.value, b.value, .{
         .dot_dimension_numbers = dot_dims,
     });
 
@@ -473,7 +477,7 @@ pub fn transpose(builder: *MLIRBuilder, a: Tensor, permutation: []const i64) !Te
     }
 
     // Use StableHLO dialect wrapper
-    const operation = hlo.transpose(builder.ctx, a.value, permutation, builder.loc);
+    const operation = try hlo.transpose(builder.allocator, builder.ctx, a.value, permutation, builder.loc);
 
     // MUST use the helper that appends the operation
     return try builder.createAndAppendOp(operation);
@@ -491,31 +495,20 @@ pub fn reshape(builder: *MLIRBuilder, a: Tensor, new_shape: []const i64) !Tensor
 /// Element-wise maximum operation
 pub fn maximum(builder: *MLIRBuilder, a: Tensor, b: Tensor) !Tensor {
     const b_tensors = try broadcastTensors(builder, a, b);
-    
-    // Use StableHLO dialect wrapper
-    const operation = hlo.maximum(builder.ctx, b_tensors[0].value, b_tensors[1].value, builder.loc);
-
-    // MUST use the helper that appends the operation
+    const operation = try hlo.maximum(builder.allocator, builder.ctx, b_tensors[0].value, b_tensors[1].value, builder.loc);
     return try builder.createAndAppendOp(operation);
 }
 
 /// Element-wise minimum operation
 pub fn minimum(builder: *MLIRBuilder, a: Tensor, b: Tensor) !Tensor {
     const b_tensors = try broadcastTensors(builder, a, b);
-    
-    // Use StableHLO dialect wrapper
-    const operation = hlo.minimum(builder.ctx, b_tensors[0].value, b_tensors[1].value, builder.loc);
-
-    // MUST use the helper that appends the operation
+    const operation = try hlo.minimum(builder.allocator, builder.ctx, b_tensors[0].value, b_tensors[1].value, builder.loc);
     return try builder.createAndAppendOp(operation);
 }
 
 /// Element-wise negation
 pub fn negate(builder: *MLIRBuilder, a: Tensor) !Tensor {
-    // Use StableHLO dialect wrapper
-    const operation = hlo.negate(builder.ctx, a.value, builder.loc);
-
-    // MUST use the helper that appends the operation
+    const operation = try hlo.negate(builder.allocator, builder.ctx, a.value, builder.loc);
     return try builder.createAndAppendOp(operation);
 }
 
@@ -546,9 +539,7 @@ pub fn softmax(builder: *MLIRBuilder, a: Tensor) !Tensor {
 
 /// Element-wise exponential
 pub fn exp(builder: *MLIRBuilder, a: Tensor) !Tensor {
-    // Use StableHLO dialect wrapper
-    const operation = hlo.exponential(builder.ctx, a.value, builder.loc);
-
+    const operation = try hlo.exponential(builder.allocator, builder.ctx, a.value, builder.loc);
     return try builder.createAndAppendOp(operation);
 }
 
@@ -627,17 +618,29 @@ pub fn reduceSum(builder: *MLIRBuilder, a: Tensor, dimensions: []const i64, keep
 
 /// Element-wise reciprocal square root (1/sqrt(x))
 pub fn rsqrt(builder: *MLIRBuilder, a: Tensor) !Tensor {
-    // Use StableHLO dialect wrapper
-    const operation = hlo.rsqrt(builder.ctx, a.value, builder.loc);
-
+    const operation = try hlo.rsqrt(builder.allocator, builder.ctx, a.value, builder.loc);
     return try builder.createAndAppendOp(operation);
 }
 
 /// Slice operation to extract sub-tensors
 pub fn slice(builder: *MLIRBuilder, a: Tensor, start_indices: []const i64, limit_indices: []const i64, strides: []const i64) !Tensor {
-    // Use StableHLO dialect wrapper
-    const operation = hlo.slice(builder.ctx, a.value, start_indices, limit_indices, strides, builder.loc);
+    const operation = try hlo.slice(builder.allocator, builder.ctx, a.value, start_indices, limit_indices, strides, builder.loc);
 
+    return try builder.createAndAppendOp(operation);
+}
+
+/// Dynamic update slice operation
+/// Updates 'operand' with values from 'update' starting at 'start_indices'.
+/// Crucial for ring-buffer KV caches.
+pub fn dynamicUpdateSlice(builder: *MLIRBuilder, operand: Tensor, update: Tensor, start_indices: Tensor) !Tensor {
+    const operation = try hlo.dynamic_update_slice(
+        builder.allocator,
+        builder.ctx,
+        operand.value,
+        update.value,
+        start_indices.value,
+        builder.loc
+    );
     return try builder.createAndAppendOp(operation);
 }
 
@@ -651,9 +654,8 @@ pub fn iota(builder: *MLIRBuilder, shape: []const i64, iota_dimension: i64, elem
 
 /// Compare operation for element-wise comparisons
 pub fn compare(builder: *MLIRBuilder, lhs: Tensor, rhs: Tensor, direction: hlo.CompareDirection) !Tensor {
-    // Determine compare_type based on element type
     const elem_type = lhs.value.getType().as(mlir.RankedTensorType).?.getElementType();
-    const compare_type = if (@intFromPtr(elem_type.handle.ptr) == @intFromPtr(mlir.Type.i32Type(builder.ctx).handle.ptr)) hlo.CompareType.SIGNED else hlo.CompareType.FLOAT; // Adjust as needed
+    const compare_type = elem_type.getStableHLOCompareType();
 
     const operation = hlo.compare(builder.ctx, lhs.value, rhs.value, direction, compare_type, builder.loc);
     return try builder.createAndAppendOp(operation);
@@ -691,17 +693,37 @@ pub fn select(builder: *MLIRBuilder, pred: Tensor, on_true: Tensor, on_false: Te
 
 /// Element-wise tanh operation
 pub fn tanh(builder: *MLIRBuilder, a: Tensor) !Tensor {
-    // Use StableHLO dialect wrapper
-    const operation = hlo.tanh(builder.ctx, a.value, builder.loc);
-
+    const operation = try hlo.tanh(builder.allocator, builder.ctx, a.value, builder.loc);
     return try builder.createAndAppendOp(operation);
+}
+
+/// Sigmoid activation: 1 / (1 + exp(-x))
+pub fn sigmoid(builder: *MLIRBuilder, a: Tensor) !Tensor {
+    const operation = try hlo.logistic(builder.allocator, builder.ctx, a.value, builder.loc);
+    return try builder.createAndAppendOp(operation);
+}
+
+/// SiLU (Swish) activation: x * sigmoid(x)
+pub fn silu(builder: *MLIRBuilder, a: Tensor) !Tensor {
+    const sig = try sigmoid(builder, a);
+    return try multiply(builder, a, sig);
 }
 
 /// Element-wise natural logarithm
 pub fn log(builder: *MLIRBuilder, a: Tensor) !Tensor {
-    // Use StableHLO dialect wrapper
-    const operation = hlo.log(builder.ctx, a.value, builder.loc);
+    const operation = try hlo.log(builder.allocator, builder.ctx, a.value, builder.loc);
+    return try builder.createAndAppendOp(operation);
+}
 
+/// Element-wise sine
+pub fn sin(builder: *MLIRBuilder, a: Tensor) !Tensor {
+    const operation = try hlo.sine(builder.allocator, builder.ctx, a.value, builder.loc);
+    return try builder.createAndAppendOp(operation);
+}
+
+/// Element-wise cosine
+pub fn cos(builder: *MLIRBuilder, a: Tensor) !Tensor {
+    const operation = try hlo.cosine(builder.allocator, builder.ctx, a.value, builder.loc);
     return try builder.createAndAppendOp(operation);
 }
 
@@ -805,18 +827,27 @@ pub fn oneHot(builder: *MLIRBuilder, indices: Tensor, depth: i64, on_value: f64,
 /// Creates a constant tensor from a scalar value, broadcasting to a given shape.
 /// This is now the single source of truth for creating constants.
 pub fn constant(builder: *MLIRBuilder, value: f64, shape: []const i64, element_type: mlir.Type) !Tensor {
-    const tensor_type = mlir.Type.rankedTensorType(builder.ctx, shape, element_type);
+    const f32_type = mlir.Type.f32Type(builder.ctx);
+    const f64_type = mlir.Type.f64Type(builder.ctx);
 
+    if (element_type.isBF16(builder.ctx) or
+        (!element_type.isEqual(f32_type) and
+         !element_type.isEqual(f64_type) and
+         !element_type.isInteger() and
+         !element_type.isIndex()))
+    {
+        const f32_constant = try constant(builder, value, shape, f32_type);
+        return convert(builder, f32_constant, element_type);
+    }
+
+    const tensor_type = mlir.Type.rankedTensorType(builder.ctx, shape, element_type);
     var attr: mlir.Attribute = undefined;
 
     if (element_type.isInteger() or element_type.isIndex()) {
-        // Handle Integer/Index types
         const i_val: i64 = @intFromFloat(value);
         const element_attr = mlir.Attribute.integerAttr(builder.ctx, i_val, element_type);
         attr = mlir.Attribute.denseElementsAttrSplat(tensor_type, element_attr);
     } else {
-        // Handle Float types
-        // Use the specific FloatSplat for floats to ensure correct bit representation
         attr = mlir.Attribute.denseElementsAttrFloatSplat(tensor_type, value);
     }
 
@@ -838,7 +869,29 @@ pub fn gather(
 ) !Tensor {
     // Use the corrected StableHLO dialect wrapper
     const operation = hlo.gather(builder.ctx, operand.value, start_indices.value, dimension_numbers, slice_sizes, builder.loc);
-    
+
+    return try builder.createAndAppendOp(operation);
+}
+
+/// Scatter operation for gradient accumulation (inverse of gather)
+/// This scatters updates into operand at positions specified by scatter_indices
+pub fn scatter(
+    builder: *MLIRBuilder,
+    operand: Tensor,
+    scatter_indices: Tensor,
+    updates: Tensor,
+    dimension_numbers: hlo.ScatterDimensionNumbersAttribute,
+) !Tensor {
+    const operation = try hlo.scatter(
+        builder.allocator,
+        builder.ctx,
+        operand.value,
+        scatter_indices.value,
+        updates.value,
+        dimension_numbers,
+        builder.loc,
+    );
+
     return try builder.createAndAppendOp(operation);
 }
 

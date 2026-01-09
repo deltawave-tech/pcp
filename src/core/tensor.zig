@@ -8,6 +8,7 @@ const Allocator = std.mem.Allocator;
 /// Supported data types for tensors (maps to MLIR types)
 pub const DType = enum {
     f16,
+    bf16,
     f32,
     f64,
     i32,
@@ -18,21 +19,38 @@ pub const DType = enum {
         return switch (self) {
             .f32 => mlir.Type.f32Type(ctx),
             .f64 => mlir.Type.f64Type(ctx),
-            // TODO: Add other types as we implement them in MLIR wrappers
+            .bf16 => mlir.Type.bf16Type(ctx),
+            .i32 => mlir.Type.i32Type(ctx),
+            .i64 => mlir.Type.i64Type(ctx),
             else => @panic("DType not yet implemented in MLIR wrappers"),
         };
     }
 
     /// Convert from MLIR type to DType
     pub fn fromMlirType(mlir_type: mlir.Type) DType {
-        // Simple implementation - could be enhanced with proper type introspection
-        _ = mlir_type;
-        return .f32; // For now, assume f32 - TODO: Add proper type detection
+        const ctx = mlir_type.getContext();
+
+        if (mlir_type.isInteger()) {
+            // Try to get bit width from C API
+            const bit_width = c.mlirIntegerTypeGetWidth(mlir_type.handle);
+            return if (bit_width == 64) .i64 else .i32;
+        } else if (mlir_type.isBF16(ctx)) {
+            return .bf16;
+        } else if (mlir_type.isF64(ctx)) {
+            return .f64;
+        } else if (mlir_type.isF32(ctx)) {
+            return .f32;
+        } else if (mlir_type.isIndex()) {
+            return .i64;
+        }
+
+        return .f32;
     }
 
     pub fn sizeInBytes(self: DType) usize {
         return switch (self) {
             .f16 => 2,
+            .bf16 => 2,
             .f32 => 4,
             .f64 => 8,
             .i32 => 4,
@@ -263,6 +281,11 @@ pub fn Tensor(comptime T: type) type {
         pub fn relu(self: Self) !Self {
             const ops_mod = @import("ops.zig");
             return try ops_mod.relu(self.builder, self);
+        }
+
+        pub fn dynamicUpdate(self: Self, update: Self, start_indices: Self) !Self {
+            const ops_mod = @import("ops.zig");
+            return try ops_mod.dynamicUpdateSlice(self.builder, self, update, start_indices);
         }
 
         /// Create a generic Tensor from a raw byte slice and shape.

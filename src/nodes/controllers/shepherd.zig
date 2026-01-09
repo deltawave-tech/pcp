@@ -13,6 +13,7 @@ const monitoring = @import("../../ui/monitoring.zig");
 const backend_selection = @import("../../backends/selection.zig");
 const data_manager = @import("data_manager.zig");
 const mlir_ctx = @import("../../mlir/context.zig");
+const tensor = @import("../../core/tensor.zig");
 
 const TcpServer = tcp_stream.TcpServer;
 const TcpStreamManager = tcp_stream.TcpStreamManager;
@@ -361,6 +362,12 @@ pub const Shepherd = struct {
                     std.log.err("CRITICAL: Failed to queue results from worker {}: {s}", .{ worker_id, @errorName(err) });
                     return err;
                 };
+            } else if (std.mem.eql(u8, msg.msg_type, MessageType.ROLLOUT_COMPLETE)) {
+                // Queue rollout completion for RLShepherd to collect
+                self.handleInnerLoopComplete(worker_id, msg) catch |err| {
+                    std.log.err("CRITICAL: Failed to queue rollout result from worker {}: {s}", .{ worker_id, @errorName(err) });
+                    return err;
+                };
             } else {
                 std.log.warn("Unknown message type from worker {}: {s}", .{ worker_id, msg.msg_type });
             }
@@ -379,7 +386,7 @@ pub const Shepherd = struct {
     
     /// Handle inner loop completion from worker
     fn handleInnerLoopComplete(self: *Self, worker_id: NodeId, msg: MessageEnvelope) !void {
-        std.log.info("Worker {} sent INNER_LOOP_COMPLETE result", .{worker_id});
+        std.log.info("Worker {} sent {s} result", .{ worker_id, msg.msg_type });
 
         // Clone the message to own the data (msg contains pointers to temporary buffers)
         const msg_clone = try msg.clone(self.allocator);
@@ -599,7 +606,7 @@ pub const Shepherd = struct {
     pub fn collectFromWorkers(self: *Self, expected_msg_type: []const u8, expected_count: usize) !ArrayList(MessageEnvelope) {
         std.log.info("Collecting results (expecting {})...", .{expected_count});
 
-        const max_wait_seconds: i64 = 180; // 3 minutes - enough for workers to complete training, short enough to detect disconnections
+        const max_wait_seconds: i64 = 1200; // 20 minutes - increased to accommodate long RL generation times (180s+ per worker)
         const start_time = std.time.timestamp();
 
         var loops: usize = 0;
@@ -633,8 +640,15 @@ pub const Shepherd = struct {
             std.time.sleep(50 * std.time.ns_per_ms);
         }
 
+        std.log.info("Collection loop exited, acquiring mutex...", .{});
         self.result_queue_mutex.lock();
         defer self.result_queue_mutex.unlock();
+
+        // Debug: log what's in the queue
+        std.log.info("collectFromWorkers: looking for '{s}', queue has {} items", .{ expected_msg_type, self.result_queue.items.len });
+        for (self.result_queue.items, 0..) |dbg_msg, dbg_i| {
+            std.log.info("  queue[{}]: msg_type='{s}'", .{ dbg_i, dbg_msg.msg_type });
+        }
 
         var responses = ArrayList(MessageEnvelope).init(self.allocator);
 
@@ -715,6 +729,157 @@ pub const Shepherd = struct {
                 self.setWorkerStatus(worker.node_id, .GraphInitialized);
             }
         }
+    }
+
+    /// Directly initializes workers with a pre-compiled VMFB path and known shapes
+    /// Workers will load the VMFB from their local filesystem
+    pub fn initializeWorkersWithVMFB(
+        self: *Self,
+        vmfb_path: []const u8,
+        parameter_shapes: [][]i64,
+        data_input_shapes: [][]i64,
+        data_input_dtypes: []tensor.DType,
+    ) !void {
+        std.log.info("Distributing VMFB path to workers: {s}", .{vmfb_path});
+
+        self.worker_pool_mutex.lock();
+        const workers = try self.allocator.dupe(WorkerConnection, self.worker_pool.items);
+        self.worker_pool_mutex.unlock();
+        defer self.allocator.free(workers);
+
+        for (workers) |worker| {
+            // Only initialize if not already initialized
+            if (worker.status == .Connected) {
+                std.log.info("Initializing worker {}...", .{worker.node_id});
+                try self.sendInitializeMessageWithPath(worker.node_id, vmfb_path, parameter_shapes, data_input_shapes, data_input_dtypes);
+                self.setWorkerStatus(worker.node_id, .GraphInitialized);
+            }
+        }
+
+        std.log.info("✓ All workers initialized with VMFB path", .{});
+    }
+
+    /// Initialize workers with VMFB path AND weights path for local loading
+    /// This is the preferred method for RL training where weights can be large (>2GB)
+    pub fn initializeWorkersWithVMFBAndWeights(
+        self: *Self,
+        vmfb_path: []const u8,
+        weights_path: []const u8,
+        parameter_shapes: [][]i64,
+        data_input_shapes: [][]i64,
+        data_input_dtypes: []tensor.DType,
+    ) !void {
+        std.log.info("Distributing VMFB path to workers: {s}", .{vmfb_path});
+        std.log.info("Workers will load weights locally from: {s}", .{weights_path});
+
+        self.worker_pool_mutex.lock();
+        const workers = try self.allocator.dupe(WorkerConnection, self.worker_pool.items);
+        self.worker_pool_mutex.unlock();
+        defer self.allocator.free(workers);
+
+        for (workers) |worker| {
+            // Only initialize if not already initialized
+            if (worker.status == .Connected) {
+                std.log.info("Initializing worker {}...", .{worker.node_id});
+                try self.sendInitializeMessageWithPathAndWeights(worker.node_id, vmfb_path, weights_path, parameter_shapes, data_input_shapes, data_input_dtypes);
+                self.setWorkerStatus(worker.node_id, .GraphInitialized);
+            }
+        }
+
+        std.log.info("✓ All workers initialized with VMFB + weights paths", .{});
+    }
+
+    /// Helper to send initialization message with VMFB and weights file paths
+    fn sendInitializeMessageWithPathAndWeights(self: *Self, node_id: NodeId, vmfb_path: []const u8, weights_path: []const u8, p_shapes: [][]i64, d_shapes: [][]i64, d_dtypes: []tensor.DType) !void {
+        // Build JSON shapes
+        var param_shape_array = std.json.Array.init(self.allocator);
+        defer param_shape_array.deinit();
+        for (p_shapes) |shape| {
+            var dim_array = std.json.Array.init(self.allocator);
+            for (shape) |dim| try dim_array.append(std.json.Value{ .integer = dim });
+            try param_shape_array.append(std.json.Value{ .array = dim_array });
+        }
+
+        var data_shape_array = std.json.Array.init(self.allocator);
+        defer data_shape_array.deinit();
+        for (d_shapes) |shape| {
+            var dim_array = std.json.Array.init(self.allocator);
+            for (shape) |dim| try dim_array.append(std.json.Value{ .integer = dim });
+            try data_shape_array.append(std.json.Value{ .array = dim_array });
+        }
+
+        // Serialize DTypes to string array
+        var dtype_array = std.json.Array.init(self.allocator);
+        defer dtype_array.deinit();
+        for (d_dtypes) |dtype| {
+            const type_str = switch (dtype) {
+                .f32 => "f32",
+                .f64 => "f64",
+                .f16 => "f16",
+                .bf16 => "bf16",
+                .i32 => "i32",
+                .i64 => "i64",
+                .bool => "bool",
+            };
+            try dtype_array.append(std.json.Value{ .string = type_str });
+        }
+
+        // Build Payload with paths instead of bytes
+        var payload = std.json.ObjectMap.init(self.allocator);
+        defer payload.deinit();
+        try payload.put("vmfb_path", std.json.Value{ .string = vmfb_path });
+        try payload.put("weights_path", std.json.Value{ .string = weights_path });
+        try payload.put("parameter_shapes", std.json.Value{ .array = param_shape_array });
+        try payload.put("data_input_shapes", std.json.Value{ .array = data_shape_array });
+        try payload.put("data_input_dtypes", std.json.Value{ .array = dtype_array });
+
+        try self.sendToWorker(node_id, MessageType.INITIALIZE_GRAPH, .{ .object = payload });
+    }
+
+    /// Helper to send initialization message with VMFB file path (for local filesystem loading)
+    fn sendInitializeMessageWithPath(self: *Self, node_id: NodeId, vmfb_path: []const u8, p_shapes: [][]i64, d_shapes: [][]i64, d_dtypes: []tensor.DType) !void {
+        // Build JSON shapes
+        var param_shape_array = std.json.Array.init(self.allocator);
+        defer param_shape_array.deinit();
+        for (p_shapes) |shape| {
+            var dim_array = std.json.Array.init(self.allocator);
+            for (shape) |dim| try dim_array.append(std.json.Value{ .integer = dim });
+            try param_shape_array.append(std.json.Value{ .array = dim_array });
+        }
+
+        var data_shape_array = std.json.Array.init(self.allocator);
+        defer data_shape_array.deinit();
+        for (d_shapes) |shape| {
+            var dim_array = std.json.Array.init(self.allocator);
+            for (shape) |dim| try dim_array.append(std.json.Value{ .integer = dim });
+            try data_shape_array.append(std.json.Value{ .array = dim_array });
+        }
+
+        // Serialize DTypes to string array
+        var dtype_array = std.json.Array.init(self.allocator);
+        defer dtype_array.deinit();
+        for (d_dtypes) |dtype| {
+            const type_str = switch (dtype) {
+                .f32 => "f32",
+                .f64 => "f64",
+                .f16 => "f16",
+                .bf16 => "bf16",
+                .i32 => "i32",
+                .i64 => "i64",
+                .bool => "bool",
+            };
+            try dtype_array.append(std.json.Value{ .string = type_str });
+        }
+
+        // Build Payload with path instead of bytes
+        var payload = std.json.ObjectMap.init(self.allocator);
+        defer payload.deinit();
+        try payload.put("vmfb_path", std.json.Value{ .string = vmfb_path });
+        try payload.put("parameter_shapes", std.json.Value{ .array = param_shape_array });
+        try payload.put("data_input_shapes", std.json.Value{ .array = data_shape_array });
+        try payload.put("data_input_dtypes", std.json.Value{ .array = dtype_array });
+
+        try self.sendToWorker(node_id, MessageType.INITIALIZE_GRAPH, .{ .object = payload });
     }
 
     /// Helper to construct and send the initialization JSON payload

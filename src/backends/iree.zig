@@ -54,7 +54,31 @@ pub const IreeBackend = struct {
     session: ?*c.iree_runtime_session_t,
     backend: backend_selection.Backend,
 
+    // Cache tracking to detect if we need to reload the module
+    loaded_vmfb_ptr: ?[*]const u8 = null,
+    loaded_vmfb_len: usize = 0,
+
     const Self = @This();
+
+    /// A handle to a buffer resident on the device memory (VRAM)
+    /// Uses IREE reference counting for lifetime management
+    pub const DeviceBuffer = struct {
+        handle: *c.iree_hal_buffer_view_t,
+
+        pub fn retain(self: DeviceBuffer) void {
+            c.iree_hal_buffer_view_retain(self.handle);
+        }
+
+        pub fn release(self: DeviceBuffer) void {
+            c.iree_hal_buffer_view_release(self.handle);
+        }
+
+        /// Get the byte length of this buffer
+        pub fn byteLength(self: DeviceBuffer) usize {
+            const buf_ptr = c.iree_hal_buffer_view_buffer(self.handle);
+            return @intCast(c.iree_hal_buffer_byte_length(buf_ptr));
+        }
+    };
 
     // Helper to map DType to IREE element type
     fn getIreeType(dtype: DType) c.iree_hal_element_type_t {
@@ -62,9 +86,10 @@ pub const IreeBackend = struct {
             .f32 => c.IREE_HAL_ELEMENT_TYPE_FLOAT_32,
             .f64 => c.IREE_HAL_ELEMENT_TYPE_FLOAT_64,
             .f16 => c.IREE_HAL_ELEMENT_TYPE_FLOAT_16,
+            .bf16 => c.IREE_HAL_ELEMENT_TYPE_BFLOAT_16,
             .i32 => c.IREE_HAL_ELEMENT_TYPE_SINT_32,
             .i64 => c.IREE_HAL_ELEMENT_TYPE_SINT_64,
-            .bool => c.IREE_HAL_ELEMENT_TYPE_BOOL_8, // IREE treats i1 as 8-bit bool
+            .bool => c.IREE_HAL_ELEMENT_TYPE_BOOL_8,
         };
     }
 
@@ -74,6 +99,9 @@ pub const IreeBackend = struct {
 
         self.allocator = allocator;
         self.backend = backend;
+        self.session = null; // Session created on first execute
+        self.loaded_vmfb_ptr = null;
+        self.loaded_vmfb_len = 0;
 
         // 1. Create Instance with driver registry
         var instance_options: c.iree_runtime_instance_options_t = undefined;
@@ -131,17 +159,6 @@ pub const IreeBackend = struct {
             ));
         }
 
-        // 3. Create the runtime session
-        var session_options: c.iree_runtime_session_options_t = undefined;
-        c.iree_runtime_session_options_initialize(&session_options);
-        try ireeCheck(c.iree_runtime_session_create_with_device(
-            self.instance.?,
-            &session_options,
-            self.device.?,
-            c.iree_runtime_instance_host_allocator(self.instance.?),
-            &self.session,
-        ));
-
         return self;
     }
 
@@ -152,36 +169,185 @@ pub const IreeBackend = struct {
         self.allocator.destroy(self);
     }
 
-    /// Execute a training step with a pre-compiled VMFB artifact.
+    // ========================================================================
+    // Device Residency API - Keep tensors on GPU to avoid PCIe transfers
+    // ========================================================================
+
+    /// Allocate a buffer on the device and copy host data into it immediately.
+    /// The returned DeviceBuffer is owned by the caller and must be released.
+    pub fn moveToDevice(self: *Self, data: []const u8, shape: []const i64, dtype: DType) !DeviceBuffer {
+        // 1. Create Shape
+        var iree_shape = try self.allocator.alloc(c.iree_hal_dim_t, shape.len);
+        defer self.allocator.free(iree_shape);
+        for (shape, 0..) |dim, k| iree_shape[k] = @intCast(dim);
+
+        const element_type = getIreeType(dtype);
+
+        // 2. Allocate and Copy (Host -> Device) using DEVICE_LOCAL memory (VRAM)
+        var buffer_view: ?*c.iree_hal_buffer_view_t = null;
+
+        try ireeCheck(c.iree_hal_buffer_view_allocate_buffer_copy(
+            self.device.?,
+            c.iree_hal_device_allocator(self.device.?),
+            @intCast(shape.len),
+            iree_shape.ptr,
+            element_type,
+            c.IREE_HAL_ENCODING_TYPE_DENSE_ROW_MAJOR,
+            .{
+                .type = c.IREE_HAL_MEMORY_TYPE_DEVICE_LOCAL,
+                .access = c.IREE_HAL_MEMORY_ACCESS_ALL,
+                .usage = c.IREE_HAL_BUFFER_USAGE_DEFAULT,
+            },
+            .{ .data = data.ptr, .data_length = data.len },
+            @ptrCast(&buffer_view),
+        ));
+
+        return DeviceBuffer{ .handle = buffer_view.? };
+    }
+
+    /// Allocate a zero-filled buffer directly on the device.
+    /// The returned DeviceBuffer is owned by the caller and must be released.
+    pub fn allocateZerosDevice(self: *Self, shape: []const i64, dtype: DType) !DeviceBuffer {
+        // Calculate byte size for zero initialization
+        var byte_size: usize = dtype.sizeInBytes();
+        for (shape) |d| byte_size *= @intCast(d);
+
+        // Allocate zeros on host (temporary)
+        const zeros = try self.allocator.alloc(u8, byte_size);
+        defer self.allocator.free(zeros);
+        @memset(zeros, 0);
+
+        return self.moveToDevice(zeros, shape, dtype);
+    }
+
+    /// Pre-load session and JIT compile CUDA kernels.
+    /// Call this BEFORE uploading weights to ensure compilation has scratch memory.
+    pub fn loadSession(self: *Self, vmfb_bytes: []const u8) !void {
+        const need_load = self.session == null or
+            self.loaded_vmfb_ptr != vmfb_bytes.ptr or
+            self.loaded_vmfb_len != vmfb_bytes.len;
+
+        if (need_load) {
+            // Teardown old session if it exists
+            if (self.session) |s| {
+                std.log.info("IreeBackend: Artifact changed, reloading session...", .{});
+                c.iree_runtime_session_release(s);
+                self.session = null;
+            } else {
+                std.log.info("IreeBackend: Pre-loading session (JIT compiling kernels)...", .{});
+            }
+
+            // Create fresh session
+            var session_options: c.iree_runtime_session_options_t = undefined;
+            c.iree_runtime_session_options_initialize(&session_options);
+            try ireeCheck(c.iree_runtime_session_create_with_device(
+                self.instance.?,
+                &session_options,
+                self.device.?,
+                c.iree_runtime_instance_host_allocator(self.instance.?),
+                &self.session,
+            ));
+
+            // Load the bytecode module
+            try ireeCheck(c.iree_runtime_session_append_bytecode_module_from_memory(
+                self.session.?,
+                .{ .data = vmfb_bytes.ptr, .data_length = vmfb_bytes.len },
+                c.iree_allocator_null(),
+            ));
+
+            // Update tracking
+            self.loaded_vmfb_ptr = vmfb_bytes.ptr;
+            self.loaded_vmfb_len = vmfb_bytes.len;
+            std.log.info("IreeBackend: JIT compilation complete.", .{});
+        }
+    }
+
+    /// Execute using pre-allocated DeviceBuffers.
+    /// Returns a list of DeviceBuffers (caller owns them and must release each).
+    /// This avoids Host<->Device transfers for inputs that are already on device.
+    pub fn executeWithDeviceBuffers(
+        self: *Self,
+        vmfb_bytes: []const u8,
+        function_name: []const u8,
+        inputs: []const DeviceBuffer,
+    ) ![]DeviceBuffer {
+        // 1. Ensure session is loaded
+        try self.loadSession(vmfb_bytes);
+
+        // 2. Initialize call
+        var call: c.iree_runtime_call_t = undefined;
+
+        const full_fn_name = try std.fmt.allocPrint(self.allocator, "module.{s}", .{function_name});
+        defer self.allocator.free(full_fn_name);
+
+        const fn_name_view = c.iree_string_view_t{ .data = full_fn_name.ptr, .size = full_fn_name.len };
+        try ireeCheck(c.iree_runtime_call_initialize_by_name(self.session.?, fn_name_view, &call));
+        defer c.iree_runtime_call_deinitialize(&call);
+
+        // 3. Push Inputs (Cheap pointer push - no H2D copy!)
+        for (inputs) |buf| {
+            try ireeCheck(c.iree_runtime_call_inputs_push_back_buffer_view(&call, buf.handle));
+        }
+
+        // 4. Invoke (GPU Compute)
+        try ireeCheck(c.iree_runtime_call_invoke(&call, 0));
+
+        // 5. Collect Outputs as DeviceBuffers (No D2H copy yet!)
+        var outputs_list = std.ArrayList(DeviceBuffer).init(self.allocator);
+        errdefer {
+            for (outputs_list.items) |buf| buf.release();
+            outputs_list.deinit();
+        }
+
+        const outputs = c.iree_runtime_call_outputs(&call);
+        const output_count = c.iree_vm_list_size(outputs);
+        var i: c.iree_host_size_t = 0;
+
+        while (i < output_count) : (i += 1) {
+            var output_view: ?*c.iree_hal_buffer_view_t = null;
+            // Pop retains the buffer view, so we own it now
+            try ireeCheck(c.iree_runtime_call_outputs_pop_front_buffer_view(&call, @ptrCast(&output_view)));
+            try outputs_list.append(DeviceBuffer{ .handle = output_view.? });
+        }
+
+        return outputs_list.toOwnedSlice();
+    }
+
+    /// Read a DeviceBuffer back to Host memory.
+    /// Caller owns the returned slice and must free it.
+    pub fn readToHost(self: *Self, device_buf: DeviceBuffer) ![]u8 {
+        const buf_ptr = c.iree_hal_buffer_view_buffer(device_buf.handle);
+        const length = c.iree_hal_buffer_byte_length(buf_ptr);
+
+        const host_data = try self.allocator.alloc(u8, @intCast(length));
+        errdefer self.allocator.free(host_data);
+
+        try ireeCheck(c.iree_hal_device_transfer_d2h(
+            self.device.?,
+            buf_ptr,
+            0,
+            host_data.ptr,
+            @intCast(length),
+            c.IREE_HAL_TRANSFER_BUFFER_FLAG_DEFAULT,
+            c.iree_infinite_timeout(),
+        ));
+
+        return host_data;
+    }
+
+    /// Execute a function. Reuses the session if the vmfb_bytes pointer matches the previously loaded one.
     pub fn execute(
         self: *Self,
         vmfb_bytes: []const u8,
         function_name: []const u8,
         inputs_data: [][]const u8,
         input_shapes: [][]const i64,
-        input_dtypes: ?[]const DType
+        input_dtypes: ?[]const DType,
     ) ![][]u8 {
-        // 1. Create a fresh session for this execution to avoid module accumulation
-        var temp_session: ?*c.iree_runtime_session_t = null;
-        var session_options: c.iree_runtime_session_options_t = undefined;
-        c.iree_runtime_session_options_initialize(&session_options);
-        try ireeCheck(c.iree_runtime_session_create_with_device(
-            self.instance.?,
-            &session_options,
-            self.device.?,
-            c.iree_runtime_instance_host_allocator(self.instance.?),
-            &temp_session,
-        ));
-        defer c.iree_runtime_session_release(temp_session.?);
+        // 1. Ensure session is loaded
+        try self.loadSession(vmfb_bytes);
 
-        // 2. Load the .vmfb module into the temporary session
-        try ireeCheck(c.iree_runtime_session_append_bytecode_module_from_memory(
-            temp_session.?,
-            .{ .data = vmfb_bytes.ptr, .data_length = vmfb_bytes.len },
-            c.iree_allocator_null(), // We don't own the flatbuffer data
-        ));
-
-        // 3. Initialize a call to the specified function
+        // 2. Initialize call
         var call: c.iree_runtime_call_t = undefined;
 
         // IREE expects the format "module.<function_name>"
@@ -189,10 +355,10 @@ pub const IreeBackend = struct {
         defer self.allocator.free(full_fn_name);
 
         const fn_name_view = c.iree_string_view_t{ .data = full_fn_name.ptr, .size = full_fn_name.len };
-        try ireeCheck(c.iree_runtime_call_initialize_by_name(temp_session.?, fn_name_view, &call));
+        try ireeCheck(c.iree_runtime_call_initialize_by_name(self.session.?, fn_name_view, &call));
         defer c.iree_runtime_call_deinitialize(&call);
 
-        // 3. Create IREE buffer views from input data using the simpler allocate_buffer_copy API
+        // 3. Prepare Inputs (Host -> Device)
         std.debug.assert(inputs_data.len == input_shapes.len);
 
         for (inputs_data, input_shapes, 0..) |input_slice, shape_slice, i| {
@@ -206,66 +372,61 @@ pub const IreeBackend = struct {
             // Determine element type: Use provided dtype or default to f32
             const element_type = if (input_dtypes) |dtypes| getIreeType(dtypes[i]) else c.IREE_HAL_ELEMENT_TYPE_FLOAT_32;
 
-            // Create buffer view directly from data - much simpler than manual mapping!
+            // Create buffer view directly from data
             var buffer_view: ?*c.iree_hal_buffer_view_t = null;
             try ireeCheck(c.iree_hal_buffer_view_allocate_buffer_copy(
-                c.iree_runtime_session_device(temp_session.?),
-                c.iree_runtime_session_device_allocator(temp_session.?),
+                c.iree_runtime_session_device(self.session.?),
+                c.iree_runtime_session_device_allocator(self.session.?),
                 @intCast(shape_slice.len),
                 iree_shape.ptr,
-                element_type, // Use dynamic type
+                element_type,
                 c.IREE_HAL_ENCODING_TYPE_DENSE_ROW_MAJOR,
                 .{
                     .type = c.IREE_HAL_MEMORY_TYPE_DEVICE_LOCAL,
                     .access = c.IREE_HAL_MEMORY_ACCESS_ALL,
                     .usage = c.IREE_HAL_BUFFER_USAGE_DEFAULT,
-                    .queue_affinity = 0,
-                    .min_alignment = 0,
                 },
                 .{ .data = input_slice.ptr, .data_length = input_slice.len },
                 @ptrCast(&buffer_view),
             ));
             defer c.iree_hal_buffer_view_release(buffer_view.?);
-            
+
             try ireeCheck(c.iree_runtime_call_inputs_push_back_buffer_view(&call, buffer_view.?));
         }
-        
-        // 4. Invoke the function
-        try ireeCheck(c.iree_runtime_call_invoke(&call, 0)); // flags = 0
 
-        // 5. Get the outputs from the call using VM list API
+        // 4. Invoke
+        try ireeCheck(c.iree_runtime_call_invoke(&call, 0));
+
+        // 5. Read Outputs (Device -> Host)
         var outputs_list = std.ArrayList([]u8).init(self.allocator);
         errdefer {
             for (outputs_list.items) |o| self.allocator.free(o);
             outputs_list.deinit();
         }
-        
+
         const outputs = c.iree_runtime_call_outputs(&call);
         const output_count = c.iree_vm_list_size(outputs);
-        std.debug.print("[DEBUG] IREE execution completed. Output count: {}\n", .{output_count});
         var i: c.iree_host_size_t = 0;
+
         while (i < output_count) : (i += 1) {
             var output_buffer_view: ?*c.iree_hal_buffer_view_t = null;
             try ireeCheck(c.iree_runtime_call_outputs_pop_front_buffer_view(&call, @ptrCast(&output_buffer_view)));
             defer c.iree_hal_buffer_view_release(output_buffer_view.?);
 
-            // Get the buffer from the view and copy its data
             const output_buffer = c.iree_hal_buffer_view_buffer(output_buffer_view.?);
             const buffer_byte_length = c.iree_hal_buffer_byte_length(output_buffer);
-            std.debug.print("[DEBUG] Output {}: buffer_byte_length = {} bytes\n", .{i, buffer_byte_length});
-            
-            // Allocate output data and read from buffer
+
             const output_data = try self.allocator.alloc(u8, @intCast(buffer_byte_length));
             try ireeCheck(c.iree_hal_device_transfer_d2h(
-                c.iree_runtime_session_device(temp_session.?),
+                c.iree_runtime_session_device(self.session.?),
                 output_buffer,
-                0, // source_offset
-                output_data.ptr, // target_buffer
+                0,
+                output_data.ptr,
                 @intCast(buffer_byte_length),
                 c.IREE_HAL_TRANSFER_BUFFER_FLAG_DEFAULT,
                 c.iree_infinite_timeout(),
             ));
-            
+
             try outputs_list.append(output_data);
         }
 
@@ -285,24 +446,29 @@ pub const IreeBackend = struct {
         };
     }
 
-    fn executeTrainingStepInterface(ptr: *anyopaque, artifact: []const u8, data: [][]const u8, shapes: [][]const i64) anyerror![][]u8 {
+    fn executeTrainingStepInterface(ptr: *anyopaque, artifact: []const u8, data: [][]const u8, shapes: [][]const i64, provided_dtypes: ?[]const DType) anyerror![][]u8 {
         const self: *Self = @ptrCast(@alignCast(ptr));
 
-        // Assign dtypes for the new AdamW worker graph signature:
+        // If explicit dtypes are provided (e.g. for RL/Generation), use them.
+        if (provided_dtypes) |dtypes| {
+            return self.execute(artifact, "main", data, shapes, dtypes);
+        }
+
+        // Fallback logic for DiLoCo/AdamW legacy training if dtypes is null:
         // [Params (N x f32), M_states (N x f32), V_states (N x f32), Timestep (1 x f32), Data (2 x i64)]
-        var dtypes = try self.allocator.alloc(DType, data.len);
-        defer self.allocator.free(dtypes);
+        var inferred_dtypes = try self.allocator.alloc(DType, data.len);
+        defer self.allocator.free(inferred_dtypes);
 
         // All inputs except last 2 are f32 (params, M states, V states, timestep)
         for (0..data.len) |i| {
             if (i >= data.len - 2) {
-                dtypes[i] = .i64; // Last 2 are i64 data inputs
+                inferred_dtypes[i] = .i64; // Last 2 are i64 data inputs
             } else {
-                dtypes[i] = .f32; // Everything else is f32
+                inferred_dtypes[i] = .f32; // Everything else is f32
             }
         }
 
-        return self.execute(artifact, "main", data, shapes, dtypes);
+        return self.execute(artifact, "main", data, shapes, inferred_dtypes);
     }
 
     fn getBackendTypeInterface(ptr: *anyopaque) backend_selection.Backend {

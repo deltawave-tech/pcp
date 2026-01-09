@@ -11,6 +11,9 @@ const worker_backend = @import("../../backends/worker_backend.zig");
 const backend_selection = @import("../../backends/selection.zig");
 const dataset_mod = @import("../../data/dataset.zig");
 const loader = @import("../../data/loader.zig");
+const math = @import("../../core/math.zig");
+const tensor = @import("../../core/tensor.zig");
+const IreeBackend = @import("../../backends/iree.zig").IreeBackend;
 
 const TcpClient = tcp_stream.TcpClient;
 const TcpStreamManager = tcp_stream.TcpStreamManager;
@@ -46,6 +49,7 @@ pub const Worker = struct {
     cached_vmfb: ?[]u8,
     cached_parameter_shapes: ?[][]i64,
     cached_data_input_shapes: ?[][]i64,
+    cached_data_input_dtypes: ?[]tensor.DType,
 
     // NEW: AdamW optimizer state buffers (M and V) and timestep
     m_states: ?[][]u8, // One buffer per parameter
@@ -58,6 +62,16 @@ pub const Worker = struct {
 
     // Supervisor Pattern: ID of the supervisor managing this worker
     supervisor_id: ?i64,
+
+    // RL / Generation State
+    kv_cache: ?[][]u8,        // Persistent KV Cache buffers on Host (legacy, to be sent to device)
+    sampler: math.Sampler,    // Token sampler
+    weight_blob: ?[]u8,       // Flat weight buffer for RL generation (updated by Shepherd)
+
+    // Device Residency: Persistent GPU buffers to avoid PCIe transfers
+    device_weights: ?[]IreeBackend.DeviceBuffer,  // Weights on GPU (updated once per UPDATE_WEIGHTS)
+    device_kv_cache: ?[]IreeBackend.DeviceBuffer, // KV cache on GPU (pointer-swapped each step)
+    device_weights_dirty: bool,                    // True if weight_blob was updated, needs re-upload
 
     const Self = @This();
 
@@ -72,12 +86,19 @@ pub const Worker = struct {
             .cached_vmfb = null,
             .cached_parameter_shapes = null,
             .cached_data_input_shapes = null,
+            .cached_data_input_dtypes = null,
             .m_states = null,
             .v_states = null,
             .timestep = 1.0,
             .dataset = null,
             .current_chunk_id = null,
             .supervisor_id = supervisor_id,
+            .kv_cache = null,
+            .sampler = math.Sampler.init(@intCast(std.time.timestamp())),
+            .weight_blob = null,
+            .device_weights = null,
+            .device_kv_cache = null,
+            .device_weights_dirty = false,
         };
     }
     
@@ -100,6 +121,9 @@ pub const Worker = struct {
             for (shapes) |s| self.allocator.free(s);
             self.allocator.free(shapes);
         }
+        if (self.cached_data_input_dtypes) |dtypes| {
+            self.allocator.free(dtypes);
+        }
 
         // Cleanup optimizer state buffers
         if (self.m_states) |states| {
@@ -109,6 +133,27 @@ pub const Worker = struct {
         if (self.v_states) |states| {
             for (states) |s| self.allocator.free(s);
             self.allocator.free(states);
+        }
+
+        // Cleanup KV cache buffers
+        if (self.kv_cache) |cache_buffers| {
+            for (cache_buffers) |buf| self.allocator.free(buf);
+            self.allocator.free(cache_buffers);
+        }
+
+        // Cleanup weight blob
+        if (self.weight_blob) |blob| {
+            self.allocator.free(blob);
+        }
+
+        // Cleanup device-resident buffers
+        if (self.device_weights) |weights| {
+            for (weights) |buf| buf.release();
+            self.allocator.free(weights);
+        }
+        if (self.device_kv_cache) |cache| {
+            for (cache) |buf| buf.release();
+            self.allocator.free(cache);
         }
 
         self.client.deinit();
@@ -202,6 +247,10 @@ pub const Worker = struct {
                 try self.handleInitializeGraph(msg);
             } else if (std.mem.eql(u8, msg.msg_type, MessageType.START_INNER_LOOP)) {
                 try self.handleStartInnerLoop(msg);
+            } else if (std.mem.eql(u8, msg.msg_type, MessageType.START_ROLLOUT)) {
+                try self.handleStartRollout(msg);
+            } else if (std.mem.eql(u8, msg.msg_type, MessageType.UPDATE_WEIGHTS)) {
+                try self.handleUpdateWeights(msg);
             } else if (std.mem.eql(u8, msg.msg_type, MessageType.SHUTDOWN)) {
                 self.handleShutdown(msg);
                 break;
@@ -267,24 +316,46 @@ pub const Worker = struct {
             for (shapes) |s| self.allocator.free(s);
             self.cached_data_input_shapes = null;
         }
+        if (self.cached_data_input_dtypes) |dtypes| {
+            self.allocator.free(dtypes);
+            self.cached_data_input_dtypes = null;
+        }
 
         // 1. Parse the JSON payload object
         const payload = switch (msg.data) {
             .object => |obj| obj,
             else => return error.InvalidMessageFormat,
         };
-        
-        // 2. Decode and cache the VMFB
-        const b64_vmfb_val = payload.get("vmfb") orelse return error.MissingVmfbField;
-        const vmfb_string = switch (b64_vmfb_val) {
-            .string => |s| s,
-            else => return error.InvalidVmfbFormat,
-        };
-        
-        const decoded_len = try std.base64.standard.Decoder.calcSizeForSlice(vmfb_string);
-        const vmfb_bytes = try self.allocator.alloc(u8, decoded_len);
-        try std.base64.standard.Decoder.decode(vmfb_bytes, vmfb_string);
-        self.cached_vmfb = vmfb_bytes;
+
+        // 2. Load VMFB (either from path or from base64-encoded bytes)
+        if (payload.get("vmfb_path")) |vmfb_path_val| {
+            // Load from filesystem
+            const vmfb_path = switch (vmfb_path_val) {
+                .string => |s| s,
+                else => return error.InvalidVmfbPathFormat,
+            };
+            std.log.info("Loading VMFB from path: {s}", .{vmfb_path});
+            const vmfb_bytes = try std.fs.cwd().readFileAlloc(
+                self.allocator,
+                vmfb_path,
+                10 * 1024 * 1024 * 1024, // 10GB limit
+            );
+            self.cached_vmfb = vmfb_bytes;
+            std.log.info("✓ Loaded VMFB from disk ({} bytes)", .{vmfb_bytes.len});
+        } else if (payload.get("vmfb")) |b64_vmfb_val| {
+            // Legacy: decode from base64
+            const vmfb_string = switch (b64_vmfb_val) {
+                .string => |s| s,
+                else => return error.InvalidVmfbFormat,
+            };
+            const decoded_len = try std.base64.standard.Decoder.calcSizeForSlice(vmfb_string);
+            const vmfb_bytes = try self.allocator.alloc(u8, decoded_len);
+            try std.base64.standard.Decoder.decode(vmfb_bytes, vmfb_string);
+            self.cached_vmfb = vmfb_bytes;
+            std.log.info("✓ Decoded VMFB from base64 ({} bytes)", .{vmfb_bytes.len});
+        } else {
+            return error.MissingVmfbField;
+        }
 
         // 3. Parse and cache the parameter shapes
         const param_shapes_json = payload.get("parameter_shapes") orelse return error.MissingParameterShapesField;
@@ -346,48 +417,113 @@ pub const Worker = struct {
         }
         self.cached_data_input_shapes = try shapes_list.toOwnedSlice();
 
-        // 5. Allocate M and V state buffers (initialized to zero)
-        // Free old buffers if they exist
-        if (self.m_states) |states| {
-            for (states) |s| self.allocator.free(s);
-            self.allocator.free(states);
-        }
-        if (self.v_states) |states| {
-            for (states) |s| self.allocator.free(s);
-            self.allocator.free(states);
+        // 4.5. Parse and cache the data input dtypes
+        if (payload.get("data_input_dtypes")) |dtypes_json| {
+            const dtypes_array = switch (dtypes_json) {
+                .array => |arr| arr,
+                else => return error.InvalidDTypesFormat,
+            };
+
+            var dtypes_list = std.ArrayList(tensor.DType).init(self.allocator);
+            errdefer dtypes_list.deinit();
+
+            for (dtypes_array.items) |val| {
+                const s = switch (val) { .string => |str| str, else => "f32" };
+                const dtype: tensor.DType = if (std.mem.eql(u8, s, "i64")) .i64
+                    else if (std.mem.eql(u8, s, "i32")) .i32
+                    else if (std.mem.eql(u8, s, "f32")) .f32
+                    else if (std.mem.eql(u8, s, "f16")) .f16
+                    else if (std.mem.eql(u8, s, "f64")) .f64
+                    else if (std.mem.eql(u8, s, "bf16")) .bf16
+                    else if (std.mem.eql(u8, s, "bool")) .bool
+                    else .f32; // Default fallback
+                try dtypes_list.append(dtype);
+            }
+            self.cached_data_input_dtypes = try dtypes_list.toOwnedSlice();
         }
 
-        const num_params = self.cached_parameter_shapes.?.len;
-        const m_buffers = try self.allocator.alloc([]u8, num_params);
-        errdefer {
-            for (m_buffers) |buf| self.allocator.free(buf);
-            self.allocator.free(m_buffers);
-        }
-        const v_buffers = try self.allocator.alloc([]u8, num_params);
-        errdefer {
-            for (v_buffers) |buf| self.allocator.free(buf);
-            self.allocator.free(v_buffers);
-        }
+        // 5. Load weights from local path if provided (for RL generation workers)
+        var is_generation_only = false;
+        if (payload.get("weights_path")) |weights_path_val| {
+            const weights_path = switch (weights_path_val) {
+                .string => |s| s,
+                else => return error.InvalidWeightsPathFormat,
+            };
+            std.log.info("Loading initial weights from local path: {s}", .{weights_path});
 
-        // Allocate and zero-initialize each state buffer
-        for (self.cached_parameter_shapes.?, 0..) |shape, i| {
-            var size: usize = @sizeOf(f32); // f32 for all parameters
-            for (shape) |dim| {
-                size *= @intCast(dim);
+            if (self.weight_blob) |old_blob| {
+                self.allocator.free(old_blob);
             }
 
-            m_buffers[i] = try self.allocator.alloc(u8, size);
-            @memset(m_buffers[i], 0);
+            const file = try std.fs.cwd().openFile(weights_path, .{ .mode = .read_only });
+            defer file.close();
 
-            v_buffers[i] = try self.allocator.alloc(u8, size);
-            @memset(v_buffers[i], 0);
+            const stat = try file.stat();
+            const size = stat.size;
+
+            self.weight_blob = try self.allocator.alloc(u8, size);
+            errdefer {
+                self.allocator.free(self.weight_blob.?);
+                self.weight_blob = null;
+            }
+
+            const bytes_read = try file.readAll(self.weight_blob.?);
+            if (bytes_read != size) {
+                return error.IncompleteWeightsRead;
+            }
+
+            self.device_weights_dirty = true;
+            is_generation_only = true;
+
+            std.log.info("✓ Loaded initial weights locally ({} MB)", .{size / (1024 * 1024)});
         }
 
-        self.m_states = m_buffers;
-        self.v_states = v_buffers;
-        self.timestep = 1.0; // Reset timestep
+        // 6. Allocate M and V state buffers (skip for generation-only workers)
+        if (!is_generation_only) {
+            if (self.m_states) |states| {
+                for (states) |s| self.allocator.free(s);
+                self.allocator.free(states);
+            }
+            if (self.v_states) |states| {
+                for (states) |s| self.allocator.free(s);
+                self.allocator.free(states);
+            }
 
-        std.log.info("Worker {} cached VMFB, {} parameter shapes, {} data input shapes, and allocated optimizer state buffers.", .{ self.node_id.?, self.cached_parameter_shapes.?.len, self.cached_data_input_shapes.?.len });
+            const num_params = self.cached_parameter_shapes.?.len;
+            const m_buffers = try self.allocator.alloc([]u8, num_params);
+            errdefer {
+                for (m_buffers) |buf| self.allocator.free(buf);
+                self.allocator.free(m_buffers);
+            }
+            const v_buffers = try self.allocator.alloc([]u8, num_params);
+            errdefer {
+                for (v_buffers) |buf| self.allocator.free(buf);
+                self.allocator.free(v_buffers);
+            }
+
+            for (self.cached_parameter_shapes.?, 0..) |shape, i| {
+                var size: usize = @sizeOf(f32);
+                for (shape) |dim| {
+                    size *= @intCast(dim);
+                }
+
+                m_buffers[i] = try self.allocator.alloc(u8, size);
+                @memset(m_buffers[i], 0);
+
+                v_buffers[i] = try self.allocator.alloc(u8, size);
+                @memset(v_buffers[i], 0);
+            }
+
+            self.m_states = m_buffers;
+            self.v_states = v_buffers;
+            self.timestep = 1.0;
+        }
+
+        if (is_generation_only) {
+            std.log.info("Worker {} cached VMFB, {} parameter shapes, {} data input shapes (generation-only).", .{ self.node_id.?, self.cached_parameter_shapes.?.len, self.cached_data_input_shapes.?.len });
+        } else {
+            std.log.info("Worker {} cached VMFB, {} parameter shapes, {} data input shapes, and allocated optimizer state buffers.", .{ self.node_id.?, self.cached_parameter_shapes.?.len, self.cached_data_input_shapes.?.len });
+        }
     }
     
     /// Handle StartInnerLoop command from Shepherd using Cap'n Proto
@@ -489,6 +625,26 @@ pub const Worker = struct {
         defer reader.deinit();
         const initial_params_bytes_temp = try reader.getParams();
 
+        // Validate Received Parameters
+        var sum: f64 = 0.0;
+        var non_zero_count: usize = 0;
+        const f32_view = std.mem.bytesAsSlice(f32, initial_params_bytes_temp);
+
+        for (f32_view) |val| {
+            if (val != 0.0) non_zero_count += 1;
+            sum += @abs(val);
+        }
+
+        std.log.warn("🔍 PARAMETER INTEGRITY CHECK:", .{});
+        std.log.warn("   Bytes Received: {}", .{initial_params_bytes_temp.len});
+        std.log.warn("   Non-Zero Elements: {} / {}", .{non_zero_count, f32_view.len});
+        std.log.warn("   Abs Sum: {d:.4}", .{sum});
+
+        if (non_zero_count == 0) {
+            std.log.err("🚨 CRITICAL: Worker received ALL-ZERO parameters! Training will produce NaN.", .{});
+            return error.ReceivedZeroParameters;
+        }
+
         // Save a persistent copy of initial params for delta calculation later
         const initial_params_bytes = try self.allocator.dupe(u8, initial_params_bytes_temp);
         defer self.allocator.free(initial_params_bytes);
@@ -580,7 +736,8 @@ pub const Worker = struct {
             defer self.allocator.free(shapes_slice);
 
             // Execute the training step
-            const outputs = try self.backend.executeTrainingStep(vmfb, inputs, shapes_slice);
+            // DiLoCo training: Pass null for dtypes, backend will infer (f32 for params, i64 for last 2 data)
+            const outputs = try self.backend.executeTrainingStep(vmfb, inputs, shapes_slice, null);
             defer {
                 for (outputs) |o| self.allocator.free(o);
                 self.allocator.free(outputs);
@@ -683,15 +840,293 @@ pub const Worker = struct {
         try self.client.send(response);
         self.state = .connected;
     }
-    
-    
-    
-    
-    
-    
-    
-    
-    
+    /// Handle weight update from Shepherd
+    fn handleUpdateWeights(self: *Self, msg: MessageEnvelope) !void {
+        std.log.info("Worker {}: Receiving weight update...", .{self.node_id.?});
+
+        const payload = switch (msg.data) {
+            .object => |o| o,
+            else => return error.InvalidFormat,
+        };
+
+        const weights_value = payload.get("weights") orelse return error.MissingWeights;
+        const b64_weights = switch (weights_value) {
+            .string => |s| s,
+            else => return error.InvalidWeightsFormat,
+        };
+
+        // Decode Base64
+        const decoded_len = try std.base64.standard.Decoder.calcSizeForSlice(b64_weights);
+
+        // Free old weight blob if exists
+        if (self.weight_blob) |old_blob| {
+            self.allocator.free(old_blob);
+        }
+
+        // Allocate and decode new weights
+        self.weight_blob = try self.allocator.alloc(u8, decoded_len);
+        errdefer {
+            self.allocator.free(self.weight_blob.?);
+            self.weight_blob = null;
+        }
+
+        _ = try std.base64.standard.Decoder.decode(self.weight_blob.?, b64_weights);
+
+        // Mark device weights as dirty so they get re-uploaded on next rollout
+        self.device_weights_dirty = true;
+
+        std.log.info("Worker {}: Weights updated ({} bytes)", .{ self.node_id.?, decoded_len });
+    }
+
+    /// Handle a Rollout Request (RL Generation) with Device Residency for Weights
+    /// Weights stay on GPU VRAM (~2GB saved), KV Cache uses host-side accumulation (~25MB/step)
+    fn handleStartRollout(self: *Self, msg: MessageEnvelope) !void {
+        self.state = .training;
+
+        // 1. Parse Payload
+        const payload = switch (msg.data) {
+            .object => |obj| obj,
+            else => return error.InvalidMessageFormat,
+        };
+
+        // Get Prompt (Input IDs)
+        const prompt_json = payload.get("prompt") orelse return error.MissingPrompt;
+        var prompt_list = std.ArrayList(i64).init(self.allocator);
+        defer prompt_list.deinit();
+
+        switch (prompt_json) {
+            .array => |arr| {
+                for (arr.items) |item| {
+                    try prompt_list.append(item.integer);
+                }
+            },
+            else => return error.InvalidPromptFormat,
+        }
+
+        const max_new_tokens = 128;
+        var generated_tokens = std.ArrayList(i64).init(self.allocator);
+        defer generated_tokens.deinit();
+
+        // Cast backend to IreeBackend to access device residency methods
+        const iree_impl: *IreeBackend = @ptrCast(@alignCast(self.backend.ptr));
+
+        const param_shapes = self.cached_parameter_shapes orelse return error.ParameterShapesNotInitialized;
+        const data_shapes = self.cached_data_input_shapes orelse return error.DataShapesNotInitialized;
+
+        // 1.5 PRE-LOAD SESSION (JIT compile CUDA kernels while GPU memory is free)
+        if (self.cached_vmfb) |vmfb| {
+            std.log.info("Worker {}: Pre-loading session (JIT compiling kernels)...", .{self.node_id.?});
+            try iree_impl.loadSession(vmfb);
+        }
+
+        // 2. UPLOAD WEIGHTS TO VRAM (Once per UPDATE_WEIGHTS, not every token!)
+        if (self.device_weights == null or self.device_weights_dirty) {
+            if (self.weight_blob == null) {
+                std.log.err("Worker {}: No weights loaded for generation!", .{self.node_id.?});
+                return error.WeightsNotInitialized;
+            }
+
+            std.log.info("Worker {}: Moving Weights to VRAM (one-time cost)...", .{self.node_id.?});
+
+            // Release old device weights if they exist
+            if (self.device_weights) |old_weights| {
+                for (old_weights) |buf| buf.release();
+                self.allocator.free(old_weights);
+            }
+
+            var dev_weights = std.ArrayList(IreeBackend.DeviceBuffer).init(self.allocator);
+            errdefer {
+                for (dev_weights.items) |buf| buf.release();
+                dev_weights.deinit();
+            }
+
+            var offset: usize = 0;
+            for (param_shapes) |shape| {
+                var size: usize = 4; // f32
+                for (shape) |dim| size *= @intCast(dim);
+
+                const slice = self.weight_blob.?[offset .. offset + size];
+                const dev_buf = try iree_impl.moveToDevice(slice, shape, .f32);
+                try dev_weights.append(dev_buf);
+
+                offset += size;
+            }
+
+            self.device_weights = try dev_weights.toOwnedSlice();
+            self.device_weights_dirty = false;
+            std.log.info("Worker {}: Weights uploaded ({} parameters, {} bytes total)", .{
+                self.node_id.?,
+                param_shapes.len,
+                offset,
+            });
+        }
+
+        // 3. INITIALIZE KV CACHE ON HOST (model outputs single-position slices, we accumulate)
+        std.log.info("Worker {}: Initializing KV cache on host ({} buffers)...", .{ self.node_id.?, data_shapes.len - 2 });
+        if (self.kv_cache) |old_cache| {
+            for (old_cache) |buf| self.allocator.free(buf);
+            self.allocator.free(old_cache);
+        }
+
+        const kv_shapes = data_shapes[2..];
+        const kv_buffers = try self.allocator.alloc([]u8, kv_shapes.len);
+        for (kv_shapes, 0..) |shape, i| {
+            var size: usize = 4; // f32
+            for (shape) |dim| size *= @intCast(dim);
+            kv_buffers[i] = try self.allocator.alloc(u8, size);
+            @memset(kv_buffers[i], 0);
+        }
+        self.kv_cache = kv_buffers;
+        std.log.info("Worker {}: KV cache initialized on host", .{self.node_id.?});
+
+        // 4. GENERATION LOOP
+        var current_pos: i64 = 0;
+        const total_len = prompt_list.items.len + max_new_tokens;
+
+        std.log.info("Worker {}: Starting generation loop (total_len={})...", .{ self.node_id.?, total_len });
+
+        while (current_pos < total_len) {
+            if (current_pos == 0) std.log.info("Worker {}: Generation step 0 - building inputs...", .{self.node_id.?});
+
+            // Select input token
+            var input_token: i64 = 0;
+            if (current_pos < prompt_list.items.len) {
+                input_token = prompt_list.items[@intCast(current_pos)];
+            } else {
+                if (generated_tokens.items.len > 0) {
+                    input_token = generated_tokens.items[generated_tokens.items.len - 1];
+                }
+            }
+
+            // Build Input List of DeviceBuffers
+            var inputs = std.ArrayList(IreeBackend.DeviceBuffer).init(self.allocator);
+            defer inputs.deinit();
+
+            // A. Weights (Already on Device - just add refs, no transfer!)
+            for (self.device_weights.?) |w| {
+                w.retain();
+                try inputs.append(w);
+            }
+            if (current_pos == 0) std.log.info("Worker {}: Added {} weight refs", .{ self.node_id.?, self.device_weights.?.len });
+
+            // B. Token & Position (16 bytes total)
+            const token_bytes = std.mem.asBytes(&input_token);
+            const dev_token = try iree_impl.moveToDevice(token_bytes, data_shapes[0], .i64);
+            try inputs.append(dev_token);
+
+            const pos_bytes = std.mem.asBytes(&current_pos);
+            const dev_pos = try iree_impl.moveToDevice(pos_bytes, data_shapes[1], .i64);
+            try inputs.append(dev_pos);
+            if (current_pos == 0) std.log.info("Worker {}: Uploaded token+pos to device", .{self.node_id.?});
+
+            // C. KV Cache (Upload from host - ~25MB per step)
+            for (self.kv_cache.?, kv_shapes) |kv_buf, shape| {
+                const dev_kv = try iree_impl.moveToDevice(kv_buf, shape, .f32);
+                try inputs.append(dev_kv);
+            }
+            if (current_pos == 0) std.log.info("Worker {}: Uploaded {} KV cache buffers, executing...", .{ self.node_id.?, kv_shapes.len });
+
+            // EXECUTE (Weights stay on device - saves ~2GB transfer!)
+            const outputs = try iree_impl.executeWithDeviceBuffers(
+                self.cached_vmfb.?,
+                "main",
+                inputs.items,
+            );
+            defer self.allocator.free(outputs);
+            if (current_pos == 0) std.log.info("Worker {}: First execute complete!", .{self.node_id.?});
+
+            // Release input refs
+            for (inputs.items) |buf| buf.release();
+
+            // PROCESS OUTPUTS: [Logits, KV_0, KV_1, ...]
+
+            // 1. Download Logits (~600KB)
+            const logits_bytes = try iree_impl.readToHost(outputs[0]);
+            defer self.allocator.free(logits_bytes);
+            outputs[0].release();
+
+            const logits_f32 = @as([]const f32, @alignCast(std.mem.bytesAsSlice(f32, logits_bytes)));
+
+            // 2. Sample Logic
+            const is_last_prompt_token = (current_pos == prompt_list.items.len - 1);
+            const is_generating = (current_pos >= prompt_list.items.len);
+
+            if ((is_last_prompt_token and prompt_list.items.len > 0) or is_generating) {
+                const next_token = self.sampler.sample(logits_f32, 0.7);
+                try generated_tokens.append(next_token);
+
+                if (next_token == 151643) {
+                    for (outputs[1..]) |buf| buf.release();
+                    break;
+                }
+                if (generated_tokens.items.len >= max_new_tokens) {
+                    for (outputs[1..]) |buf| buf.release();
+                    break;
+                }
+            }
+
+            // 3. Update KV Cache on Host (scatter single-position outputs into full cache)
+            const NUM_KV_HEADS: usize = 2;
+            const HEAD_DIM: usize = 64;
+            const MAX_SEQ_LEN: usize = 1024;
+            const bytes_per_head_slot: usize = HEAD_DIM * 4;
+            const head_stride: usize = MAX_SEQ_LEN * bytes_per_head_slot;
+
+            for (outputs[1..], 0..) |output_buf, i| {
+                const update_bytes = try iree_impl.readToHost(output_buf);
+                defer self.allocator.free(update_bytes);
+                output_buf.release();
+
+                const cache_buffer = self.kv_cache.?[i];
+
+                for (0..NUM_KV_HEADS) |head| {
+                    const src_offset = head * bytes_per_head_slot;
+                    const dst_offset = head * head_stride + @as(usize, @intCast(current_pos)) * bytes_per_head_slot;
+
+                    if (dst_offset + bytes_per_head_slot <= cache_buffer.len and
+                        src_offset + bytes_per_head_slot <= update_bytes.len)
+                    {
+                        @memcpy(
+                            cache_buffer[dst_offset .. dst_offset + bytes_per_head_slot],
+                            update_bytes[src_offset .. src_offset + bytes_per_head_slot],
+                        );
+                    }
+                }
+            }
+
+            current_pos += 1;
+        }
+
+        std.log.info("Worker {d}: Generated {d} tokens: {any}", .{
+            self.node_id.?,
+            generated_tokens.items.len,
+            generated_tokens.items,
+        });
+
+        // 5. Send Results Back
+        var result_payload = std.json.ObjectMap.init(self.allocator);
+        defer result_payload.deinit();
+
+        var tokens_array = std.json.Array.init(self.allocator);
+        defer tokens_array.deinit();
+        for (generated_tokens.items) |t| try tokens_array.append(.{ .integer = t });
+
+        try result_payload.put("completion", .{ .array = tokens_array });
+
+        const response = message.MessageEnvelope{
+            .recipient_node = 0,
+            .recipient_service = "shepherd",
+            .sender_node = self.node_id.?,
+            .sender_service = "worker",
+            .msg_type = MessageType.ROLLOUT_COMPLETE,
+            .msg_id = msg.msg_id + 1,
+            .data = .{ .object = result_payload },
+        };
+
+        try self.client.send(response);
+        self.state = .connected;
+    }
+
     /// Handle Shutdown command from Shepherd
     fn handleShutdown(self: *Self, msg: MessageEnvelope) void {
         _ = msg;
@@ -734,39 +1169,3 @@ pub const Worker = struct {
         self.state = .disconnected;
     }
 };
-
-/// Test function for Worker
-pub fn testWorker(allocator: Allocator) !void {
-    std.log.info("Testing Worker...");
-    
-    // Create a mock backend for testing
-    const mock_backend = WorkerBackend{
-        .ptr = undefined,
-        .vtable = &.{
-            .executeTrainingStep = mockExecuteTrainingStep,
-            .deinit = mockBackendDeinit,
-        },
-    };
-    
-    var worker = try Worker.init(allocator, mock_backend, null);
-    defer worker.deinit();
-    
-    // Test basic initialization
-    try std.testing.expectEqual(WorkerState.disconnected, worker.getState());
-    try std.testing.expectEqual(@as(?NodeId, null), worker.getNodeId());
-    
-    std.log.info("✓ Worker test completed");
-}
-
-// Mock functions for testing
-fn mockExecuteTrainingStep(ptr: *anyopaque, compiled_artifact: []const u8, inputs_data: [][]const u8, input_shapes: [][]const i64) ![][]u8 {
-    _ = ptr;
-    _ = compiled_artifact;
-    _ = inputs_data;
-    _ = input_shapes;
-    return &[_][]u8{};
-}
-
-fn mockBackendDeinit(ptr: *anyopaque) void {
-    _ = ptr;
-}

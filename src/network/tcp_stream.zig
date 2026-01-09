@@ -58,13 +58,14 @@ pub const TcpStreamManager = struct {
         const data_length = std.mem.readInt(u32, &length_bytes, .little);
         
         // Debug: Log raw bytes and parsed length (only for invalid messages)
-        if (data_length > 1024 * 1024 * 1024) {
+        const MAX_MESSAGE_SIZE: u32 = 4000 * 1024 * 1024; // ~4GB for large model VMFBs (u32 limit)
+        if (data_length > MAX_MESSAGE_SIZE) {
             std.log.debug("Invalid length prefix bytes: {} {} {} {} -> parsed as {} bytes", .{
                 length_bytes[0], length_bytes[1], length_bytes[2], length_bytes[3], data_length
             });
         }
 
-        if (data_length > 1024 * 1024 * 1024) {
+        if (data_length > MAX_MESSAGE_SIZE) {
             std.log.err("Message exceeds size limit: {} MB (raw bytes: {} {} {} {})", .{
                 data_length / (1024 * 1024), length_bytes[0], length_bytes[1], length_bytes[2], length_bytes[3]
             });

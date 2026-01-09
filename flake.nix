@@ -130,6 +130,11 @@
 
             patchelf --force-rpath --set-rpath "$NIX_RPATH:$SYSTEM_RPATH" $out/bin/pcp
 
+            # Patch test executables with same RPATH for CUDA/ROCm access
+            if [ -f "$out/bin/isolated_vjp_tests" ]; then
+              patchelf --force-rpath --set-rpath "$NIX_RPATH:$SYSTEM_RPATH" $out/bin/isolated_vjp_tests
+            fi
+
             wrapProgram $out/bin/pcp \
               --suffix PATH : "${packages.iree-sdk}/bin"
           '';

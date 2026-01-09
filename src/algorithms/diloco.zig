@@ -36,6 +36,7 @@ const MLIRBuilder = ops.MLIRBuilder;
 const Tensor = tensor.Tensor(void);
 const Executor = execution.Executor; // NEW: Generic executor interface
 const DataLoader = data_loader.DataLoader;
+const ModelSanitizer = @import("../compiler/sanitizer.zig").ModelSanitizer;
 
 const RECOVERY_FILENAME = "shepherd_state.bin";
 
@@ -56,6 +57,7 @@ pub const DiLoCoConfig = struct {
 
     checkpoint_dir: []const u8,
     resume_training: bool,
+    dtype: tensor.DType = .f32,
 
     pub fn default() DiLoCoConfig {
         return DiLoCoConfig{
@@ -115,7 +117,7 @@ pub const DiLoCo = struct {
 
     // Change the init signature to accept the generic executor (dataset now loaded by workers)
     pub fn init(allocator: Allocator, coordinator: *Shepherd, config: DiLoCoConfig, executor: Executor, mlir_builder: *MLIRBuilder) !Self {
-        const element_type = mlir.Type.f32Type(mlir_builder.ctx);
+        const element_type = config.dtype.toMLIRType(mlir_builder.ctx);
 
         const recovery_path = try std.fs.path.join(allocator, &[_][]const u8{ config.checkpoint_dir, "recovery", RECOVERY_FILENAME });
         defer allocator.free(recovery_path);
@@ -131,8 +133,12 @@ pub const DiLoCo = struct {
             std.log.info("Resume mode: Will attempt to load recovery state from {s}", .{recovery_path});
         }
 
-        std.debug.print("Introspecting model parameters from: {s}\n", .{config.model_mlir_path});
-        const mlir_source = try std.fs.cwd().readFileAlloc(allocator, config.model_mlir_path, 10 * 1024 * 1024);
+        std.debug.print("Loading model from: {s}\n", .{config.model_mlir_path});
+        const raw_mlir = try std.fs.cwd().readFileAlloc(allocator, config.model_mlir_path, 10 * 1024 * 1024);
+        defer allocator.free(raw_mlir);
+
+        std.debug.print("Applying ModelSanitizer patches...\n", .{});
+        const mlir_source = try ModelSanitizer.applyStabilityPatches(allocator, raw_mlir);
         defer allocator.free(mlir_source);
 
         // Introspect using the new ModelInspector
@@ -196,29 +202,15 @@ pub const DiLoCo = struct {
             .optimizer = "Nesterov-AdamW",
         });
 
-        // Create a partial instance to build the worker graph
-        var partial_self = Self{
-            .allocator = allocator,
-            .coordinator = undefined, // Not used during graph building
-            .config = config,
-            .status = .not_started,
-            .metrics = TrainingMetrics.init(),
-            .current_epoch = 0,
-            .mlir_builder = mlir_builder,
-            .adam_optimizer = adam_optimizer,
-            .host_optimizer = host_opt,
-            .element_type = element_type,
-            .master_parameters = null,
-            .parameter_shapes = parameter_shapes,
-            .data_input_shapes = data_input_shapes,
-            .executor = executor,
-            .worker_graph_mlir_source = undefined, // Will be set below
-            .data_loader = undefined, // No longer used - workers load data locally
-            .wandb_logger = logger,
-        };
-
-        // Build the worker graph ONCE during initialization using the safe function builder
-        const graph = try partial_self.buildWorkerTrainingGraph(mlir_builder);
+        // Build the worker graph ONCE during initialization using the sanitized source
+        std.debug.print("Building worker training graph...\n", .{});
+        const graph = try GraphBuilder.buildTrainingGraph(
+            allocator,
+            mlir_builder,
+            mlir_source,
+            adam_optimizer,
+            parameter_shapes.len,
+        );
 
         return Self{
             .allocator = allocator,
@@ -431,9 +423,8 @@ pub const DiLoCo = struct {
                 param.* = rng.random().floatNorm(f32) * scale;
             }
 
-            // Convert to MLIR tensor
             const byte_data = std.mem.sliceAsBytes(param_data);
-            param_tensor.* = try Tensor.fromBytes(self.mlir_builder, byte_data, shape, .f32);
+            param_tensor.* = try Tensor.fromBytes(self.mlir_builder, byte_data, shape, self.config.dtype);
         }
 
         self.master_parameters = param_tensors;
@@ -485,26 +476,6 @@ pub const DiLoCo = struct {
         std.log.info("✓ Checkpoint saved.", .{});
     }
 
-    /// Build the complete worker training graph as MLIR module using loaded .mlir file
-    /// This loads a .mlir file, clones the forward function, and creates the complete training pipeline
-    fn buildWorkerTrainingGraph(self: *Self, builder: *MLIRBuilder) ![]u8 {
-        // Read the source from disk
-        const forward_pass_mlir_source = try std.fs.cwd().readFileAlloc(
-            self.allocator,
-            self.config.model_mlir_path,
-            10 * 1024 * 1024,
-        );
-        defer self.allocator.free(forward_pass_mlir_source);
-
-        // Delegate to the specialized compiler
-        return GraphBuilder.buildTrainingGraph(
-            self.allocator,
-            builder,
-            forward_pass_mlir_source,
-            self.adam_optimizer,
-            self.parameter_shapes.len, // Pass the count we determined during Init
-        );
-    }
 
     /// Broadcast to snapshot participants only
     /// Returns the number of workers that were actually assigned chunks
@@ -524,6 +495,20 @@ pub const DiLoCo = struct {
             defer self.allocator.free(tensor_data);
             try total_param_bytes.appendSlice(tensor_data);
         }
+
+        // Validate Outgoing Parameters
+        const raw_bytes = total_param_bytes.items;
+        const f32_view = std.mem.bytesAsSlice(f32, raw_bytes);
+        var sum: f64 = 0.0;
+        var non_zero_count: usize = 0;
+        for (f32_view) |val| {
+            if (val != 0.0) non_zero_count += 1;
+            sum += @abs(val);
+        }
+        std.log.warn("🔍 SHEPHERD SEND CHECK:", .{});
+        std.log.warn("   Total Bytes: {}", .{raw_bytes.len});
+        std.log.warn("   Non-Zero: {} / {}", .{non_zero_count, f32_view.len});
+        std.log.warn("   Sum: {d:.4}", .{sum});
 
         // Create WorkerPayload with parameters (no batch data - workers load locally)
         const empty_slice: []const u8 = &[_]u8{};

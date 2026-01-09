@@ -1,0 +1,34 @@
+{
+    "model_path": "models/qwen3_8b_rl_generation.mlir",
+    "tokenizer": "qwen",
+    "learning_rate": 1e-5,
+    "nesterov_momentum": 0.9,
+    "grpo_config": {
+        "num_iterations": 1,
+        "group_size": 4,
+        "learning_rate": 1e-6,
+        "beta": 0.1,
+        "prompt_file": "data/rl_prompts.bin",
+        "num_prompts": 1,
+        "weights_path": "checkpoints/initial_weights/qwen3_8b_flat.bin",
+        "generation_vmfb_path": "models/qwen3_8b_rl_generation.vmfb",
+        "generation_mlir_path": "models/qwen3_8b_rl_generation.mlir",
+        "training_mlir_path": "models/qwen3_8b_grpo_training.mlir",
+        "num_gen_data_inputs": 74
+    },
+    "rollout_config": {
+        "max_tokens": 128,
+        "temperature": 0.7,
+        "top_p": 0.9,
+        "batch_size": 4
+    },
+    "prompts": [
+        "What is the capital of France?",
+        "Explain quantum physics in simple terms.",
+        "Write a short poem about nature."
+    ],
+    "wandb_project": "pcp-qwen3-rl",
+    "wandb_entity": null,
+    "wandb_run_name": "qwen3-8b-grpo-test",
+    "wandb_api_key": null
+}

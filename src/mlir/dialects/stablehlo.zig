@@ -83,8 +83,8 @@ pub fn zeroConstant(allocator: std.mem.Allocator, ctx: mlir.Context, shape: []co
 }
 
 /// Creates a stablehlo.maximum operation (used for ReLU)
-pub fn maximum(ctx: mlir.Context, lhs: mlir.Value, rhs: mlir.Value, loc: mlir.Location) mlir.Operation {
-    return mlir.Operation.create(ctx, "stablehlo.maximum", .{
+pub fn maximum(allocator: std.mem.Allocator, ctx: mlir.Context, lhs: mlir.Value, rhs: mlir.Value, loc: mlir.Location) !mlir.Operation {
+    return mlir.Operation.create(allocator, ctx, "stablehlo.maximum", .{
         .operands = &.{ lhs, rhs },
         .results = &.{lhs.getType()},
         .location = loc,
@@ -92,8 +92,8 @@ pub fn maximum(ctx: mlir.Context, lhs: mlir.Value, rhs: mlir.Value, loc: mlir.Lo
 }
 
 /// Creates a stablehlo.minimum operation
-pub fn minimum(ctx: mlir.Context, lhs: mlir.Value, rhs: mlir.Value, loc: mlir.Location) mlir.Operation {
-    return mlir.Operation.create(ctx, "stablehlo.minimum", .{
+pub fn minimum(allocator: std.mem.Allocator, ctx: mlir.Context, lhs: mlir.Value, rhs: mlir.Value, loc: mlir.Location) !mlir.Operation {
+    return mlir.Operation.create(allocator, ctx, "stablehlo.minimum", .{
         .operands = &.{ lhs, rhs },
         .results = &.{lhs.getType()},
         .location = loc,
@@ -101,8 +101,8 @@ pub fn minimum(ctx: mlir.Context, lhs: mlir.Value, rhs: mlir.Value, loc: mlir.Lo
 }
 
 /// Creates a stablehlo.exponential operation
-pub fn exponential(ctx: mlir.Context, operand: mlir.Value, loc: mlir.Location) mlir.Operation {
-    return mlir.Operation.create(ctx, "stablehlo.exponential", .{
+pub fn exponential(allocator: std.mem.Allocator, ctx: mlir.Context, operand: mlir.Value, loc: mlir.Location) !mlir.Operation {
+    return mlir.Operation.create(allocator, ctx, "stablehlo.exponential", .{
         .operands = &.{operand},
         .results = &.{operand.getType()},
         .location = loc,
@@ -147,8 +147,8 @@ pub fn reduce_max(
     // 2. Create the init_value: negative infinity for floats, which is the identity element for max reduction.
     const neg_inf = std.math.inf(f32) * -1.0;
     const scalar_type = mlir.Type.tensor(&.{}, element_type);
-    const neg_inf_attr = mlir.Attribute.denseElementsAttrSplat(scalar_type, @floatCast(neg_inf));
-    const init_constant_op = constant(ctx, .{ .value = neg_inf_attr, .result_type = scalar_type });
+    const neg_inf_attr = mlir.Attribute.denseElementsAttrFloatSplat(scalar_type, @floatCast(neg_inf));
+    const init_constant_op = try constant(allocator, ctx, .{ .value = neg_inf_attr, .result_type = scalar_type });
 
     builder.insertion_block.appendOwnedOperation(init_constant_op);
     const init_value = init_constant_op.getResult(0);
@@ -161,9 +161,9 @@ pub fn reduce_max(
     // 4. Add arguments and the 'maximum' operation to the body
     const lhs_arg = body_block.addArgument(scalar_type, loc);
     const rhs_arg = body_block.addArgument(scalar_type, loc);
-    const max_op = maximum(ctx, lhs_arg, rhs_arg, loc); // Use stablehlo.maximum
+    const max_op = try maximum(allocator, ctx, lhs_arg, rhs_arg, loc); // Use stablehlo.maximum
     c_api.blockAppendOwnedOperation(body_block.handle, max_op.handle);
-    const return_op = mlir.Operation.create(ctx, "stablehlo.return", .{ .operands = &.{max_op.getResult(0)} });
+    const return_op = try mlir.Operation.create(allocator, ctx, "stablehlo.return", .{ .operands = &.{max_op.getResult(0)} });
     c_api.blockAppendOwnedOperation(body_block.handle, return_op.handle);
 
     // 5. Build the final stablehlo.reduce operation using pcpCreateOperation
@@ -401,7 +401,7 @@ pub fn select(allocator: std.mem.Allocator, ctx: mlir.Context, pred: mlir.Value,
 }
 
 /// Creates a stablehlo.transpose operation
-pub fn transpose(ctx: mlir.Context, operand: mlir.Value, permutation: []const i64, loc: mlir.Location) mlir.Operation {
+pub fn transpose(allocator: std.mem.Allocator, ctx: mlir.Context, operand: mlir.Value, permutation: []const i64, loc: mlir.Location) !mlir.Operation {
     const perm_attr = mlir.Attribute.denseI64ArrayAttr(ctx, permutation);
     
     // Calculate result type with transposed dimensions
@@ -415,8 +415,8 @@ pub fn transpose(ctx: mlir.Context, operand: mlir.Value, permutation: []const i6
     }
     
     const result_type = mlir.Type.tensor(result_dims.items, input_type.getElementType());
-    
-    return mlir.Operation.create(ctx, "stablehlo.transpose", .{
+
+    return mlir.Operation.create(allocator, ctx, "stablehlo.transpose", .{
         .operands = &.{operand},
         .results = &.{result_type},
         .attributes = &.{.{ "permutation", perm_attr }},
@@ -570,7 +570,7 @@ pub fn broadcast_in_dim(allocator: std.mem.Allocator, ctx: mlir.Context, operand
 }
 
 /// Creates a stablehlo.concatenate operation
-pub fn concatenate(ctx: mlir.Context, operands: []const mlir.Value, dimension: i64, loc: mlir.Location) mlir.Operation {
+pub fn concatenate(allocator: std.mem.Allocator, ctx: mlir.Context, operands: []const mlir.Value, dimension: i64, loc: mlir.Location) !mlir.Operation {
     // All operands should have the same type except for the concatenation dimension
     const first_type = operands[0].getType().as(mlir.RankedTensorType).?;
     
@@ -593,16 +593,8 @@ pub fn concatenate(ctx: mlir.Context, operands: []const mlir.Value, dimension: i
     
     const result_type = mlir.Type.tensor(result_dims.items, first_type.getElementType());
     const dimension_attr = mlir.Attribute.integerAttr(ctx, dimension, mlir.Type.i64Type(ctx));
-    
-    // Convert []const mlir.Value to [*]*c.c.MlirValue for C API
-    var c_operands = std.ArrayList(*c.c.MlirValue).init(std.heap.page_allocator);
-    defer c_operands.deinit();
-    
-    for (operands) |operand| {
-        c_operands.append(operand.handle) catch @panic("OOM");
-    }
-    
-    return mlir.Operation.create(ctx, "stablehlo.concatenate", .{
+
+    return mlir.Operation.create(allocator, ctx, "stablehlo.concatenate", .{
         .operands = operands,
         .results = &.{result_type},
         .attributes = &.{.{ "dimension", dimension_attr }},
@@ -705,8 +697,8 @@ pub fn onesConstant(ctx: mlir.Context, shape: []const i64, element_type: mlir.Ty
 }
 
 /// Creates a stablehlo.rsqrt operation (reciprocal square root)
-pub fn rsqrt(ctx: mlir.Context, operand: mlir.Value, loc: mlir.Location) mlir.Operation {
-    return mlir.Operation.create(ctx, "stablehlo.rsqrt", .{
+pub fn rsqrt(allocator: std.mem.Allocator, ctx: mlir.Context, operand: mlir.Value, loc: mlir.Location) !mlir.Operation {
+    return mlir.Operation.create(allocator, ctx, "stablehlo.rsqrt", .{
         .operands = &.{operand},
         .results = &.{operand.getType()},
         .location = loc,
@@ -714,8 +706,8 @@ pub fn rsqrt(ctx: mlir.Context, operand: mlir.Value, loc: mlir.Location) mlir.Op
 }
 
 /// Creates a stablehlo.log operation
-pub fn log(ctx: mlir.Context, operand: mlir.Value, loc: mlir.Location) mlir.Operation {
-    return mlir.Operation.create(ctx, "stablehlo.log", .{
+pub fn log(allocator: std.mem.Allocator, ctx: mlir.Context, operand: mlir.Value, loc: mlir.Location) !mlir.Operation {
+    return mlir.Operation.create(allocator, ctx, "stablehlo.log", .{
         .operands = &.{operand},
         .results = &.{operand.getType()},
         .location = loc,
@@ -741,8 +733,35 @@ pub fn power(allocator: std.mem.Allocator, ctx: mlir.Context, lhs: mlir.Value, r
 }
 
 /// Creates a stablehlo.tanh operation
-pub fn tanh(ctx: mlir.Context, operand: mlir.Value, loc: mlir.Location) mlir.Operation {
-    return mlir.Operation.create(ctx, "stablehlo.tanh", .{
+pub fn tanh(allocator: std.mem.Allocator, ctx: mlir.Context, operand: mlir.Value, loc: mlir.Location) !mlir.Operation {
+    return mlir.Operation.create(allocator, ctx, "stablehlo.tanh", .{
+        .operands = &.{operand},
+        .results = &.{operand.getType()},
+        .location = loc,
+    });
+}
+
+/// Creates a stablehlo.logistic operation (Sigmoid: 1 / (1 + exp(-x)))
+pub fn logistic(allocator: std.mem.Allocator, ctx: mlir.Context, operand: mlir.Value, loc: mlir.Location) !mlir.Operation {
+    return mlir.Operation.create(allocator, ctx, "stablehlo.logistic", .{
+        .operands = &.{operand},
+        .results = &.{operand.getType()},
+        .location = loc,
+    });
+}
+
+/// Creates a stablehlo.sine operation
+pub fn sine(allocator: std.mem.Allocator, ctx: mlir.Context, operand: mlir.Value, loc: mlir.Location) !mlir.Operation {
+    return mlir.Operation.create(allocator, ctx, "stablehlo.sine", .{
+        .operands = &.{operand},
+        .results = &.{operand.getType()},
+        .location = loc,
+    });
+}
+
+/// Creates a stablehlo.cosine operation
+pub fn cosine(allocator: std.mem.Allocator, ctx: mlir.Context, operand: mlir.Value, loc: mlir.Location) !mlir.Operation {
+    return mlir.Operation.create(allocator, ctx, "stablehlo.cosine", .{
         .operands = &.{operand},
         .results = &.{operand.getType()},
         .location = loc,
@@ -794,7 +813,7 @@ pub fn iota(allocator: std.mem.Allocator, ctx: mlir.Context, shape: []const i64,
 
 /// Creates a stablehlo.one_hot operation
 /// Creates a chlo.one_hot operation
-pub fn one_hot(ctx: mlir.Context, indices: mlir.Value, depth: i64, on_value: f32, off_value: f32, axis: i64, element_type: mlir.Type, loc: mlir.Location) !mlir.Operation {
+pub fn one_hot(allocator: std.mem.Allocator, ctx: mlir.Context, indices: mlir.Value, depth: i64, on_value: f32, off_value: f32, axis: i64, element_type: mlir.Type, loc: mlir.Location) !mlir.Operation {
     const axis_attr = mlir.Attribute.integerAttr(ctx, axis, mlir.Type.i64Type(ctx));
     const on_value_attr = mlir.Attribute.floatAttr(ctx, @floatCast(on_value), element_type);
     const off_value_attr = mlir.Attribute.floatAttr(ctx, @floatCast(off_value), element_type);
@@ -820,7 +839,7 @@ pub fn one_hot(ctx: mlir.Context, indices: mlir.Value, depth: i64, on_value: f32
     const result_type = mlir.Type.tensor(result_dims.items, element_type);
 
     // CHANGE THE OPERATION NAME HERE
-    const op = mlir.Operation.create(ctx, "chlo.one_hot", .{
+    const op = try mlir.Operation.create(allocator, ctx, "chlo.one_hot", .{
         .operands = &.{indices},
         .results = &.{result_type},
         .attributes = &.{
@@ -849,10 +868,10 @@ pub fn convert(allocator: std.mem.Allocator, ctx: mlir.Context, operand: mlir.Va
 }
 
 /// Creates a stablehlo.softmax operation 
-pub fn softmax(ctx: mlir.Context, operand: mlir.Value, axis: i64, loc: mlir.Location) mlir.Operation {
+pub fn softmax(allocator: std.mem.Allocator, ctx: mlir.Context, operand: mlir.Value, axis: i64, loc: mlir.Location) !mlir.Operation {
     const axis_attr = mlir.Attribute.integerAttr(ctx, axis, mlir.Type.i64Type(ctx));
-    
-    return mlir.Operation.create(ctx, "stablehlo.softmax", .{
+
+    return mlir.Operation.create(allocator, ctx, "stablehlo.softmax", .{
         .operands = &.{operand},
         .results = &.{operand.getType()},
         .attributes = &.{.{ "axis", axis_attr }},
@@ -1155,6 +1174,24 @@ pub fn pad(
             .{ "edge_padding_high", padding_high_attr },
             .{ "interior_padding", interior_padding_attr }
         },
+        .location = loc,
+    });
+}
+
+/// Creates a stablehlo.dynamic_update_slice operation
+/// Used for efficient KV cache updates (inserting new token data into the cache buffer)
+pub fn dynamic_update_slice(
+    allocator: std.mem.Allocator,
+    ctx: mlir.Context,
+    operand: mlir.Value,
+    update: mlir.Value,
+    start_indices: mlir.Value,
+    loc: mlir.Location
+) !mlir.Operation {
+    return mlir.Operation.create(allocator, ctx, "stablehlo.dynamic_update_slice", .{
+        .operands = &.{ operand, update, start_indices },
+        // The result type is always the same as the operand (the cache tensor)
+        .results = &.{operand.getType()},
         .location = loc,
     });
 }

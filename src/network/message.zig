@@ -181,6 +181,11 @@ pub const MessageType = struct {
     // Supervisor Control Protocol
     pub const SUPERVISOR_HANDSHAKE = "SupervisorHandshake"; // Supervisor -> Shepherd (ID: u64)
     pub const RESTART_WORKER = "RestartWorker";           // Shepherd -> Supervisor (Force restart)
+
+    // RL / GRPO Protocol
+    pub const START_ROLLOUT = "StartRollout";       // Shepherd -> Worker: "Generate text for these prompts"
+    pub const ROLLOUT_COMPLETE = "RolloutComplete"; // Worker -> Shepherd: "Here are the token IDs and LogProbs"
+    pub const UPDATE_WEIGHTS = "UpdateWeights";     // Shepherd -> Worker: "Here are the new model weights"
 };
 
 pub const MessageHandler = *const fn (MessageEnvelope) anyerror!void;

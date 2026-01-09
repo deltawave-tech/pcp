@@ -77,6 +77,17 @@ pub const NodeManager = struct {
 
             const build_success = blk: {
                 args.append(self.self_exe_path) catch break :blk false;
+
+                // The Supervisor process itself maintains the control-plane connection to the Shepherd.
+                // Pass host/port *before* `--supervise` so the supervisor connects to the correct endpoint
+                // (otherwise it defaults to 127.0.0.1:8080 and spams ConnectionRefused).
+                args.append("--host") catch break :blk false;
+                args.append(self.host) catch break :blk false;
+
+                args.append("--port") catch break :blk false;
+                const port_str = std.fmt.allocPrint(child_allocator, "{d}", .{self.port}) catch break :blk false;
+                args.append(port_str) catch break :blk false;
+
                 args.append("--supervise") catch break :blk false;
                 args.append("--") catch break :blk false;
                 args.append("--worker") catch break :blk false;
@@ -89,7 +100,6 @@ pub const NodeManager = struct {
                 args.append(self.host) catch break :blk false;
 
                 args.append("--port") catch break :blk false;
-                const port_str = std.fmt.allocPrint(child_allocator, "{d}", .{self.port}) catch break :blk false;
                 args.append(port_str) catch break :blk false;
 
                 args.append("--backend") catch break :blk false;

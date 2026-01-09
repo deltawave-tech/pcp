@@ -505,49 +505,75 @@ pub const Worker = struct {
             return error.UnknownTokenizer;
         }
 
-        // 5. Decode the Base64-encoded Cap'n Proto params
-        const b64_params = switch (payload.get("params") orelse return error.MissingParams) {
-            .string => |s| s,
-            else => return error.InvalidParamsFormat,
-        };
+        // 5. Resolve params transport: inline base64 (small models) vs shared blob files (large models).
+        const params_path = if (payload.get("params_path")) |val|
+            switch (val) {
+                .string => |s| s,
+                else => return error.InvalidParamsFormat,
+            }
+        else
+            null;
+
+        const blob_dir = if (payload.get("blob_dir")) |val|
+            switch (val) {
+                .string => |s| s,
+                else => return error.InvalidMessageFormat,
+            }
+        else
+            null;
 
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
 
-        const capnp_len = try std.base64.standard.Decoder.calcSizeForSlice(b64_params);
-        const capnp_bytes = try arena.allocator().alloc(u8, capnp_len);
-        try std.base64.standard.Decoder.decode(capnp_bytes, b64_params);
+        var initial_params_inline: ?[]const u8 = null;
+        var params_path_for_delta: ?[]const u8 = null;
 
-        // 6. Deserialize params only (no batch data)
-        const reader = try binary_protocol.WorkerPayload.Reader.init(capnp_bytes);
-        defer reader.deinit();
-        const initial_params_bytes_temp = try reader.getParams();
+        if (params_path) |p| {
+            params_path_for_delta = p;
+        } else {
+            const b64_params = switch (payload.get("params") orelse return error.MissingParams) {
+                .string => |s| s,
+                else => return error.InvalidParamsFormat,
+            };
 
-        // Validate Received Parameters
-        var sum: f64 = 0.0;
-        var non_zero_count: usize = 0;
-        const f32_view = std.mem.bytesAsSlice(f32, initial_params_bytes_temp);
+            const capnp_len = try std.base64.standard.Decoder.calcSizeForSlice(b64_params);
+            const capnp_bytes = try arena.allocator().alloc(u8, capnp_len);
+            try std.base64.standard.Decoder.decode(capnp_bytes, b64_params);
 
-        for (f32_view) |val| {
-            if (val != 0.0) non_zero_count += 1;
-            sum += @abs(val);
+            // 6. Deserialize params only (no batch data)
+            const reader = try binary_protocol.WorkerPayload.Reader.init(capnp_bytes);
+            defer reader.deinit();
+            const initial_params_bytes_temp = try reader.getParams();
+            initial_params_inline = initial_params_bytes_temp;
+
+            // Validate received parameters (sample-based for large tensors).
+            const f32_view = std.mem.bytesAsSlice(f32, initial_params_bytes_temp);
+            const max_sample_floats: usize = 1 << 20; // 1,048,576 floats (~4MiB)
+            const sample = @min(f32_view.len, max_sample_floats);
+            var sum: f64 = 0.0;
+            var non_zero_count: usize = 0;
+            for (f32_view[0..sample]) |val| {
+                if (val != 0.0) non_zero_count += 1;
+                sum += @abs(val);
+            }
+
+            std.log.warn("🔍 PARAMETER INTEGRITY CHECK (sample):", .{});
+            std.log.warn("   Bytes Received: {}", .{initial_params_bytes_temp.len});
+            std.log.warn("   Sample Non-Zero Elements: {} / {}", .{non_zero_count, sample});
+            std.log.warn("   Sample Abs Sum: {d:.4}", .{sum});
+
+            if (non_zero_count == 0) {
+                std.log.err("🚨 CRITICAL: Worker received ALL-ZERO parameters! Training will produce NaN.", .{});
+                return error.ReceivedZeroParameters;
+            }
         }
 
-        std.log.warn("🔍 PARAMETER INTEGRITY CHECK:", .{});
-        std.log.warn("   Bytes Received: {}", .{initial_params_bytes_temp.len});
-        std.log.warn("   Non-Zero Elements: {} / {}", .{non_zero_count, f32_view.len});
-        std.log.warn("   Abs Sum: {d:.4}", .{sum});
-
-        if (non_zero_count == 0) {
-            std.log.err("🚨 CRITICAL: Worker received ALL-ZERO parameters! Training will produce NaN.", .{});
-            return error.ReceivedZeroParameters;
+        if (params_path_for_delta != null and blob_dir == null) {
+            std.log.err("Missing blob_dir for params_path transport", .{});
+            return error.InvalidMessageFormat;
         }
 
-        // Save a persistent copy of initial params for delta calculation later
-        const initial_params_bytes = try self.allocator.dupe(u8, initial_params_bytes_temp);
-        defer self.allocator.free(initial_params_bytes);
-
-        std.log.info("Starting inner loop: params={} bytes, chunk={}", .{ initial_params_bytes.len, chunk_id });
+        std.log.info("Starting inner loop: chunk={}", .{chunk_id});
 
         // 7. Persistent optimizer states
         // We do NOT reset m_states, v_states, or timestep.
@@ -558,22 +584,56 @@ pub const Worker = struct {
         if (self.timestep == 0.0) self.timestep = 1.0;
 
         // 8. Copy initial params into working buffers (we'll update these in the loop)
-        var current_params = try self.allocator.alloc([]u8, param_shapes.len);
+        const current_params = try self.allocator.alloc([]u8, param_shapes.len);
         defer {
             for (current_params) |buf| self.allocator.free(buf);
             self.allocator.free(current_params);
         }
 
-        var param_offset: usize = 0;
-        for (param_shapes, 0..) |shape, i| {
-            var size: usize = @sizeOf(f32);
-            for (shape) |dim| size *= @intCast(dim);
+        if (params_path_for_delta) |p| {
+            const file = try std.fs.cwd().openFile(p, .{});
+            defer file.close();
+            const stat = try file.stat();
+            if (stat.size > @as(u64, std.math.maxInt(usize))) return error.ParameterBufferTooSmall;
+            const file_size: usize = @intCast(stat.size);
 
-            if (param_offset + size > initial_params_bytes.len) return error.ParameterBufferTooSmall;
+            if (payload.get("params_bytes")) |pb| {
+                if (pb == .integer and pb.integer > 0) {
+                    const advertised_u64: u64 = @intCast(pb.integer);
+                    if (advertised_u64 <= @as(u64, std.math.maxInt(usize))) {
+                        const advertised: usize = @intCast(advertised_u64);
+                        if (advertised != file_size) {
+                            std.log.warn("Params blob size mismatch: advertised {} bytes, file has {} bytes", .{ advertised, file_size });
+                        }
+                    }
+                }
+            }
 
-            current_params[i] = try self.allocator.alloc(u8, size);
-            @memcpy(current_params[i], initial_params_bytes[param_offset .. param_offset + size]);
-            param_offset += size;
+            var reader = file.reader();
+            var total_read: usize = 0;
+            for (param_shapes, 0..) |shape, i| {
+                var size: usize = @sizeOf(f32);
+                for (shape) |dim| size *= @intCast(dim);
+                current_params[i] = try self.allocator.alloc(u8, size);
+                try reader.readNoEof(current_params[i]);
+                total_read += size;
+            }
+            if (total_read != file_size) {
+                std.log.warn("Params blob read {} bytes but file size is {}", .{ total_read, file_size });
+            }
+        } else {
+            const initial_params_bytes = initial_params_inline orelse return error.MissingParams;
+            var param_offset: usize = 0;
+            for (param_shapes, 0..) |shape, i| {
+                var size: usize = @sizeOf(f32);
+                for (shape) |dim| size *= @intCast(dim);
+
+                if (param_offset + size > initial_params_bytes.len) return error.ParameterBufferTooSmall;
+
+                current_params[i] = try self.allocator.alloc(u8, size);
+                @memcpy(current_params[i], initial_params_bytes[param_offset .. param_offset + size]);
+                param_offset += size;
+            }
         }
 
         // 9. Extract batch_size and block_size from data_shapes
@@ -688,6 +748,74 @@ pub const Worker = struct {
         std.log.info("Worker {} completed {} inner loop steps, final loss: {d:.4}", .{ self.node_id.?, tau, final_loss });
 
         // 11. Calculate Delta = Initial_Params - Final_Params and send it
+        if (params_path_for_delta) |p| {
+            const out_dir = blob_dir orelse return error.InvalidMessageFormat;
+            std.fs.cwd().makePath(out_dir) catch {};
+
+            var name_buf: [128]u8 = undefined;
+            const filename = try std.fmt.bufPrint(&name_buf, "delta_worker{d}_chunk{d}.f32", .{ self.node_id.?, self.current_chunk_id.? });
+            const delta_path = try std.fs.path.join(self.allocator, &[_][]const u8{ out_dir, filename });
+            defer self.allocator.free(delta_path);
+
+            const params_file = try std.fs.cwd().openFile(p, .{});
+            defer params_file.close();
+            var params_reader = params_file.reader();
+
+            const delta_file = try std.fs.cwd().createFile(delta_path, .{ .truncate = true });
+            defer delta_file.close();
+            var delta_writer = delta_file.writer();
+
+            const chunk_floats_max: usize = 1 << 20; // 1,048,576 f32 ~= 4MiB
+            const scratch_f32 = try self.allocator.alloc(f32, chunk_floats_max);
+            defer self.allocator.free(scratch_f32);
+            const scratch_bytes = std.mem.sliceAsBytes(scratch_f32);
+
+            var bytes_written: usize = 0;
+            for (current_params) |final_block_bytes| {
+                const final_f32 = std.mem.bytesAsSlice(f32, final_block_bytes);
+                var offset_elems: usize = 0;
+                while (offset_elems < final_f32.len) {
+                    const remaining_elems = final_f32.len - offset_elems;
+                    const chunk_elems = @min(chunk_floats_max, remaining_elems);
+                    const chunk_bytes_len = chunk_elems * @sizeOf(f32);
+                    const chunk_bytes = scratch_bytes[0..chunk_bytes_len];
+
+                    try params_reader.readNoEof(chunk_bytes);
+
+                    for (scratch_f32[0..chunk_elems], 0..) |*val, j| {
+                        val.* = val.* - final_f32[offset_elems + j];
+                    }
+
+                    try delta_writer.writeAll(chunk_bytes);
+                    bytes_written += chunk_bytes_len;
+                    offset_elems += chunk_elems;
+                }
+            }
+
+            delta_file.sync() catch {};
+
+            var response_payload = std.json.ObjectMap.init(self.allocator);
+            defer response_payload.deinit();
+            try response_payload.put("delta_path", std.json.Value{ .string = delta_path });
+            try response_payload.put("delta_bytes", std.json.Value{ .integer = @intCast(bytes_written) });
+            try response_payload.put("loss", std.json.Value{ .float = @floatCast(final_loss) });
+            try response_payload.put("chunk_id", std.json.Value{ .integer = @intCast(self.current_chunk_id.?) });
+
+            const response = tcp_stream.createMessage(
+                self.node_id.?,
+                "worker",
+                0,
+                "shepherd",
+                MessageType.INNER_LOOP_COMPLETE,
+                msg.msg_id + 1,
+                std.json.Value{ .object = response_payload },
+            );
+
+            try self.client.send(response);
+            self.state = .connected;
+            return;
+        }
+
         var delta_bytes = std.ArrayList(u8).init(self.allocator);
         defer delta_bytes.deinit();
 
@@ -695,6 +823,7 @@ pub const Worker = struct {
         var delta_offset: usize = 0;
         for (current_params) |final_block_bytes| {
             const param_block_size = final_block_bytes.len;
+            const initial_params_bytes = initial_params_inline orelse return error.MissingParams;
             const initial_block_bytes = initial_params_bytes[delta_offset .. delta_offset + param_block_size];
 
             // Cast to f32 for arithmetic

@@ -231,6 +231,19 @@ pub const MLIRContext = struct {
 
         // --- FIXES FOR NanoGPT COMPILATION ---
 
+        // Disable const-eval in the IREE compiler pipeline when requested.
+        //
+        // On some container runtimes the IREE compiler's const-eval runtime
+        // (which uses the local-task driver) fails to initialize its task
+        // executor topology, causing errors like:
+        //   "runtime error in consteval: ... local_task/task_device.c:72: ... must have at least one queue"
+        //
+        // Disabling const-eval keeps compilation correct while avoiding that
+        // runtime dependency.
+        if (std.posix.getenv("PCP_IREE_DISABLE_CONSTEVAL") != null) {
+            try argv.append("--iree-opt-const-eval=false");
+        }
+
         // 1. Enable 64-bit indexing (Required for large models)
         try argv.append("--iree-vm-target-index-bits=64");
         try argv.append("--iree-stream-resource-index-bits=64");

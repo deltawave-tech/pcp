@@ -39,6 +39,57 @@ const DataLoader = data_loader.DataLoader;
 const ModelSanitizer = @import("../compiler/sanitizer.zig").ModelSanitizer;
 
 const RECOVERY_FILENAME = "shepherd_state.bin";
+const DEFAULT_INLINE_BLOB_MAX_BYTES: usize = 512 * 1024 * 1024; // 512MiB
+
+fn resolveInlineBlobMaxBytes() usize {
+    if (std.posix.getenv("PCP_BLOB_INLINE_MAX_BYTES")) |raw_z| {
+        const raw: []const u8 = std.mem.sliceTo(raw_z, 0);
+        if (raw.len > 0) {
+            const parsed = std.fmt.parseInt(usize, raw, 10) catch |err| {
+                std.log.warn(
+                    "Invalid PCP_BLOB_INLINE_MAX_BYTES={s} ({s}); using default {}",
+                    .{ raw, @errorName(err), DEFAULT_INLINE_BLOB_MAX_BYTES },
+                );
+                return DEFAULT_INLINE_BLOB_MAX_BYTES;
+            };
+            if (parsed > 0) return parsed;
+            std.log.warn(
+                "Invalid PCP_BLOB_INLINE_MAX_BYTES={s} (must be > 0); using default {}",
+                .{ raw, DEFAULT_INLINE_BLOB_MAX_BYTES },
+            );
+        }
+    }
+    return DEFAULT_INLINE_BLOB_MAX_BYTES;
+}
+
+fn shouldUseFileBlobs(total_param_bytes: usize) bool {
+    if (std.posix.getenv("PCP_BLOB_TRANSPORT")) |mode_z| {
+        const mode: []const u8 = std.mem.sliceTo(mode_z, 0);
+        if (std.mem.eql(u8, mode, "file")) return true;
+        if (std.mem.eql(u8, mode, "inline")) return false;
+        if (mode.len != 0) {
+            std.log.warn("Unknown PCP_BLOB_TRANSPORT={s}; expected \"file\" or \"inline\"", .{mode});
+        }
+    }
+    return total_param_bytes > resolveInlineBlobMaxBytes();
+}
+
+fn totalParamBytes(parameter_shapes: [][]i64) !usize {
+    var total: usize = 0;
+    for (parameter_shapes) |shape| {
+        var size: usize = @sizeOf(f32);
+        for (shape) |dim| {
+            if (dim <= 0) return error.InvalidParameterShape;
+            const mul = @mulWithOverflow(size, @as(usize, @intCast(dim)));
+            if (mul[1] != 0) return error.ParameterSizeOverflow;
+            size = mul[0];
+        }
+        const add = @addWithOverflow(total, size);
+        if (add[1] != 0) return error.ParameterSizeOverflow;
+        total = add[0];
+    }
+    return total;
+}
 
 /// DiLoCo algorithm configuration
 pub const DiLoCoConfig = struct {
@@ -498,45 +549,62 @@ pub const DiLoCo = struct {
 
         const param_tensors = self.master_parameters.?;
 
-        // Extract and concatenate all parameter tensor data
-        var total_param_bytes = ArrayList(u8).init(self.allocator);
-        defer total_param_bytes.deinit();
+        const total_param_bytes = try totalParamBytes(self.parameter_shapes);
+        const use_file_blobs = shouldUseFileBlobs(total_param_bytes);
 
-        for (param_tensors) |param_tensor| {
-            const tensor_data = try param_tensor.toBytes(self.allocator);
-            defer self.allocator.free(tensor_data);
-            try total_param_bytes.appendSlice(tensor_data);
+        var blob_dir: ?[]const u8 = null;
+        defer if (blob_dir) |p| self.allocator.free(p);
+        var params_path: ?[]const u8 = null;
+        defer if (params_path) |p| self.allocator.free(p);
+
+        var b64_encoded_params: ?[]u8 = null;
+        defer if (b64_encoded_params) |buf| self.allocator.free(buf);
+        var encoded_len: usize = 0;
+
+        if (use_file_blobs) {
+            const dir = try std.fs.path.join(self.allocator, &[_][]const u8{ self.config.checkpoint_dir, "blobs" });
+            blob_dir = dir;
+            std.fs.cwd().makePath(dir) catch {};
+
+            const p = try std.fs.path.join(self.allocator, &[_][]const u8{ dir, "params_f32.bin" });
+            params_path = p;
+
+            const file = try std.fs.cwd().createFile(p, .{ .truncate = true });
+            defer file.close();
+            var writer = file.writer();
+            for (param_tensors) |param_tensor| {
+                const tensor_data = try param_tensor.toBytes(self.allocator);
+                defer self.allocator.free(tensor_data);
+                try writer.writeAll(tensor_data);
+            }
+            file.sync() catch {};
+            std.log.info("Params blob written: {s} ({} bytes)", .{ p, total_param_bytes });
+        } else {
+            // Inline transport: serialize params via Cap'n Proto and Base64 for JSON transport.
+            var total_param_bytes_list = ArrayList(u8).init(self.allocator);
+            defer total_param_bytes_list.deinit();
+            try total_param_bytes_list.ensureTotalCapacity(total_param_bytes);
+
+            for (param_tensors) |param_tensor| {
+                const tensor_data = try param_tensor.toBytes(self.allocator);
+                defer self.allocator.free(tensor_data);
+                try total_param_bytes_list.appendSlice(tensor_data);
+            }
+
+            const empty_slice: []const u8 = &[_]u8{};
+            const worker_payload = binary_protocol.WorkerPayload{
+                .params = total_param_bytes_list.items,
+                .input_ids = empty_slice,
+                .targets = empty_slice,
+            };
+            const capnp_bytes = try worker_payload.serialize(self.allocator);
+            defer self.allocator.free(capnp_bytes);
+
+            const b64_len = std.base64.standard.Encoder.calcSize(capnp_bytes.len);
+            const buf = try self.allocator.alloc(u8, b64_len);
+            b64_encoded_params = buf;
+            encoded_len = std.base64.standard.Encoder.encode(buf, capnp_bytes).len;
         }
-
-        // Validate Outgoing Parameters
-        const raw_bytes = total_param_bytes.items;
-        const f32_view = std.mem.bytesAsSlice(f32, raw_bytes);
-        var sum: f64 = 0.0;
-        var non_zero_count: usize = 0;
-        for (f32_view) |val| {
-            if (val != 0.0) non_zero_count += 1;
-            sum += @abs(val);
-        }
-        std.log.warn("🔍 SHEPHERD SEND CHECK:", .{});
-        std.log.warn("   Total Bytes: {}", .{raw_bytes.len});
-        std.log.warn("   Non-Zero: {} / {}", .{non_zero_count, f32_view.len});
-        std.log.warn("   Sum: {d:.4}", .{sum});
-
-        // Create WorkerPayload with parameters (no batch data - workers load locally)
-        const empty_slice: []const u8 = &[_]u8{};
-        const worker_payload = binary_protocol.WorkerPayload{
-            .params = total_param_bytes.items,
-            .input_ids = empty_slice,
-            .targets = empty_slice,
-        };
-        const capnp_bytes = try worker_payload.serialize(self.allocator);
-        defer self.allocator.free(capnp_bytes);
-
-        // Base64 encode the Cap'n Proto message for JSON transport
-        const b64_len = std.base64.standard.Encoder.calcSize(capnp_bytes.len);
-        const b64_encoded_params = try self.allocator.alloc(u8, b64_len);
-        defer self.allocator.free(b64_encoded_params);
-        const encoded_len = std.base64.standard.Encoder.encode(b64_encoded_params, capnp_bytes).len;
 
         // Send to each worker with their assigned data chunk
         var workers_assigned: usize = 0;
@@ -556,7 +624,13 @@ pub const DiLoCo = struct {
             var payload_map = std.json.ObjectMap.init(self.allocator);
             defer payload_map.deinit();
 
-            try payload_map.put("params", std.json.Value{ .string = b64_encoded_params[0..encoded_len] });
+            if (use_file_blobs) {
+                try payload_map.put("params_path", std.json.Value{ .string = params_path.? });
+                try payload_map.put("params_bytes", std.json.Value{ .integer = @intCast(total_param_bytes) });
+                try payload_map.put("blob_dir", std.json.Value{ .string = blob_dir.? });
+            } else {
+                try payload_map.put("params", std.json.Value{ .string = b64_encoded_params.?[0..encoded_len] });
+            }
             try payload_map.put("offset", std.json.Value{ .integer = @intCast(chunk.?.offset) });
             try payload_map.put("length", std.json.Value{ .integer = @intCast(chunk.?.length) });
             try payload_map.put("chunk_id", std.json.Value{ .integer = @intCast(chunk.?.id) });
@@ -591,13 +665,7 @@ pub const DiLoCo = struct {
         if (self.master_parameters == null) return error.ParametersNotInitialized;
 
         // 1. Initialize Accumulator (Zeroed buffer matching total parameter size)
-        // We calculate total size first
-        var total_param_bytes: usize = 0;
-        for (self.parameter_shapes) |shape| {
-            var elem_count: usize = 1;
-            for (shape) |dim| elem_count *= @intCast(dim);
-            total_param_bytes += elem_count * @sizeOf(f32);
-        }
+        const total_param_bytes = try totalParamBytes(self.parameter_shapes);
 
         const accumulator = try self.allocator.alloc(u8, total_param_bytes);
         defer self.allocator.free(accumulator);
@@ -637,6 +705,68 @@ pub const DiLoCo = struct {
             // Decode Payload
             var arena = std.heap.ArenaAllocator.init(self.allocator);
             defer arena.deinit();
+
+            // Large payload path: worker writes delta to a shared blob file and sends its path.
+            if (response.data == .object) {
+                const obj = response.data.object;
+                if (obj.get("delta_path")) |delta_val| {
+                    const delta_path = switch (delta_val) {
+                        .string => |s| s,
+                        else => return error.InvalidMessageFormat,
+                    };
+                    const loss_val_f32: f32 = blk_loss: {
+                        if (obj.get("loss")) |loss_val| {
+                            break :blk_loss switch (loss_val) {
+                                .float => |f| @floatCast(f),
+                                .integer => |i| @floatFromInt(i),
+                                else => return error.InvalidMessageFormat,
+                            };
+                        }
+                        return error.InvalidMessageFormat;
+                    };
+
+                    const file = try std.fs.cwd().openFile(delta_path, .{});
+                    defer file.close();
+
+                    const stat = try file.stat();
+                    if (stat.size > @as(u64, std.math.maxInt(usize))) return error.DimensionMismatch;
+                    const file_size: usize = @intCast(stat.size);
+                    if (file_size != total_param_bytes) {
+                        std.log.err("Worker delta size mismatch! Expected {}, got {}", .{ total_param_bytes, file_size });
+                        return error.DimensionMismatch;
+                    }
+
+                    const acc_f32: [*]f32 = @ptrCast(@alignCast(accumulator.ptr));
+                    const total_floats: usize = total_param_bytes / @sizeOf(f32);
+
+                    const chunk_floats: usize = 1 << 20; // 1,048,576 f32 ~= 4MiB
+                    const buf_f32 = try arena.allocator().alloc(f32, @min(chunk_floats, total_floats));
+                    const buf_bytes = std.mem.sliceAsBytes(buf_f32);
+
+                    var reader = file.reader();
+                    var offset_bytes: usize = 0;
+                    while (offset_bytes < total_param_bytes) {
+                        const remaining = total_param_bytes - offset_bytes;
+                        const to_read = @min(buf_bytes.len, remaining);
+                        try reader.readNoEof(buf_bytes[0..to_read]);
+
+                        const floats_read: usize = to_read / @sizeOf(f32);
+                        const acc_slice = acc_f32[offset_bytes / @sizeOf(f32) .. offset_bytes / @sizeOf(f32) + floats_read];
+                        for (buf_f32[0..floats_read], 0..) |d, j| {
+                            acc_slice[j] += d;
+                        }
+                        offset_bytes += to_read;
+                    }
+
+                    if (std.posix.getenv("PCP_KEEP_BLOB_FILES") == null) {
+                        std.fs.cwd().deleteFile(delta_path) catch {};
+                    }
+
+                    total_loss += loss_val_f32;
+                    collected_count += 1;
+                    continue;
+                }
+            }
 
             // Extract base64 payload
             const b64_payload = switch (response.data) {

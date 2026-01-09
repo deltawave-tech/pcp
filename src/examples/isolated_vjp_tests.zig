@@ -1130,7 +1130,7 @@ pub fn testRoPEComponentVJP(allocator: Allocator) !void {
     const term4 = try ops.multiply(&builder, x2, cos_t);
     const y2 = try ops.add(&builder, term3, term4);
 
-    const hlo = @import("../mlir/dialects/stablehlo.zig");
+    const hlo = @import("pcp").mlir.dialects.stablehlo;
     const concat_op = try hlo.concatenate(allocator, context, &.{y1.value, y2.value}, 0, builder.loc);
     builder.insertion_block.appendOwnedOperation(concat_op);
 
@@ -1185,7 +1185,7 @@ pub fn testConcatenateVJP(allocator: Allocator) !void {
     const val_a = fwd_result.entry_block.getArgument(0);
     const val_b = fwd_result.entry_block.getArgument(1);
 
-    const hlo = @import("../mlir/dialects/stablehlo.zig");
+    const hlo = @import("pcp").mlir.dialects.stablehlo;
     const concat_op = try hlo.concatenate(allocator, context, &.{val_a, val_b}, 0, builder.loc);
     builder.insertion_block.appendOwnedOperation(concat_op);
 

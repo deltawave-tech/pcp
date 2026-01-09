@@ -624,7 +624,31 @@ pub const Shepherd = struct {
     pub fn collectFromWorkers(self: *Self, expected_msg_type: []const u8, expected_count: usize) !ArrayList(MessageEnvelope) {
         std.log.info("Collecting results (expecting {})...", .{expected_count});
 
-        const max_wait_seconds: i64 = 180; // 3 minutes - enough for workers to complete training, short enough to detect disconnections
+        // Default timeout is intentionally short to surface dead/disconnected workers quickly.
+        // For large `tau` runs, a worker may legitimately take much longer than this to finish
+        // its inner loop; override with:
+        //   export PCP_COLLECT_TIMEOUT_SECONDS=3600
+        const default_wait_seconds: i64 = 180;
+        const max_wait_seconds: i64 = blk: {
+            if (std.posix.getenv("PCP_COLLECT_TIMEOUT_SECONDS")) |raw_z| {
+                const raw: []const u8 = std.mem.sliceTo(raw_z, 0);
+                if (raw.len > 0) {
+                    const parsed = std.fmt.parseInt(i64, raw, 10) catch |err| {
+                        std.log.warn(
+                            "Invalid PCP_COLLECT_TIMEOUT_SECONDS={s} ({s}); using default {}s",
+                            .{ raw, @errorName(err), default_wait_seconds },
+                        );
+                        break :blk default_wait_seconds;
+                    };
+                    if (parsed > 0) break :blk parsed;
+                    std.log.warn(
+                        "Invalid PCP_COLLECT_TIMEOUT_SECONDS={s} (must be > 0); using default {}s",
+                        .{ raw, default_wait_seconds },
+                    );
+                }
+            }
+            break :blk default_wait_seconds;
+        };
         const start_time = std.time.timestamp();
 
         var loops: usize = 0;

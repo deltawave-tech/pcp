@@ -822,8 +822,140 @@ pub fn tryVectorIndexLinearization(
         return null;
     }
 
+    // IMPORTANT: Avoid "linearization via one-hot(total_elements)" for large operands.
+    //
+    // Torch-MLIR often lowers cross-entropy style indexing as:
+    //   operand: [N, V]
+    //   indices: [N, 1, 2] = concat(iota(N), targets(N))  (row,col)
+    //   gather  -> [N, 1]
+    //
+    // A naive "linearize (row,col) -> flat_index; one_hot(depth=N*V)" would create a
+    // one-hot tensor of shape [N, N*V] which is astronomically large for real vocab sizes.
+    //
+    // We instead recognize the common 2D case and build the gradient w.r.t. operand as:
+    //   one_hot(targets, depth=V) * grad_out
+    // yielding shape [N, V] (then reshaped to operand shape).
+    //
+    // This is the minimal dense gradient representation for this gather pattern and
+    // avoids the OOMs seen on real nanochat configs (T=2048, vocab=65536).
+    const index_vec_len = indices_type.getDimension(@intCast(index_vector_dim));
+    if (operand_rank == 2 and index_vec_len == 2) {
+        const map_size = c.stablehloGatherDimensionNumbersGetStartIndexMapSize(dim_numbers_attr);
+        if (map_size == 2 and
+            c.stablehloGatherDimensionNumbersGetStartIndexMapElem(dim_numbers_attr, 0) == 0 and
+            c.stablehloGatherDimensionNumbersGetStartIndexMapElem(dim_numbers_attr, 1) == 1)
+        {
+            const operand_dim0 = operand_type.getDimension(0);
+            const operand_dim1 = operand_type.getDimension(1);
+
+            // Shape of indices after removing the vector dim (outer dims).
+            var outer_shape = try builder.allocator.alloc(i64, indices_rank - 1);
+            defer builder.allocator.free(outer_shape);
+            var dim_idx: usize = 0;
+            for (0..indices_rank) |d| {
+                if (d != @as(usize, @intCast(index_vector_dim))) {
+                    outer_shape[dim_idx] = indices_type.getDimension(d);
+                    dim_idx += 1;
+                }
+            }
+
+            // Heuristic guard: this pattern should be [N, 1] outer dims and match operand dim0.
+            if (outer_shape.len == 2 and outer_shape[0] == operand_dim0 and outer_shape[1] == 1) {
+                if (build_options.pcp_verbose_logs) {
+                    std.debug.print("DEBUG gatherVJP: Detected 2D scalar gather (row,col) with iota rows. Using vocab one-hot gradient.\n", .{});
+                    std.debug.print("DEBUG gatherVJP: operand=[{}, {}], outer=[{}, {}]\n", .{ operand_dim0, operand_dim1, outer_shape[0], outer_shape[1] });
+                }
+
+                // Extract the column component (k=1) from the index vector dim.
+                var start = try builder.allocator.alloc(i64, indices_rank);
+                defer builder.allocator.free(start);
+                var limit = try builder.allocator.alloc(i64, indices_rank);
+                defer builder.allocator.free(limit);
+                var slice_strides = try builder.allocator.alloc(i64, indices_rank);
+                defer builder.allocator.free(slice_strides);
+                for (0..indices_rank) |d| {
+                    start[d] = 0;
+                    limit[d] = indices_type.getDimension(d);
+                    slice_strides[d] = 1;
+                }
+                start[@intCast(index_vector_dim)] = 1;
+                limit[@intCast(index_vector_dim)] = 2;
+
+                const col_slice_op = try hlo.slice(builder.allocator, builder.ctx, indices_i64, start, limit, slice_strides, builder.loc);
+                builder.insertion_block.appendOwnedOperation(col_slice_op);
+
+                const col_reshape_op = try hlo.reshape(builder.allocator, builder.ctx, col_slice_op.getResult(0), outer_shape, builder.loc);
+                builder.insertion_block.appendOwnedOperation(col_reshape_op);
+                const col_indices = col_reshape_op.getResult(0); // [N,1]
+
+                // one_hot(col_indices, depth=V) -> [N, 1, V]
+                const one_hot = try ops.oneHot(
+                    builder,
+                    try builder.newTensor(col_indices),
+                    operand_dim1,
+                    1.0,
+                    0.0,
+                    -1,
+                    grad_out_type.getElementType(),
+                );
+
+                // Reshape grad_out [N,1] -> [N,1,1] then broadcast to [N,1,V].
+                var grad_3_shape = try builder.allocator.alloc(i64, outer_shape.len + 1);
+                defer builder.allocator.free(grad_3_shape);
+                @memcpy(grad_3_shape[0..outer_shape.len], outer_shape);
+                grad_3_shape[outer_shape.len] = 1;
+
+                const grad_3_op = try hlo.reshape(builder.allocator, builder.ctx, grad_out, grad_3_shape, builder.loc);
+                builder.insertion_block.appendOwnedOperation(grad_3_op);
+
+                const one_hot_type = one_hot.value.getType().as(mlir.RankedTensorType) orelse return error.InvalidTensorType;
+                const one_hot_shape = try one_hot_type.getShape(builder.allocator);
+                defer builder.allocator.free(one_hot_shape);
+
+                const grad_broadcast = try ops.broadcastToShape(builder, grad_3_op.getResult(0), one_hot_shape);
+                const mul_op = try hlo.multiply(builder.allocator, builder.ctx, one_hot.value, grad_broadcast, builder.loc);
+                builder.insertion_block.appendOwnedOperation(mul_op);
+
+                // Reshape [N,1,V] -> [N,V] to match operand.
+                const final_shape = [_]i64{ operand_dim0, operand_dim1 };
+                const final_op = try hlo.reshape(builder.allocator, builder.ctx, mul_op.getResult(0), &final_shape, builder.loc);
+                builder.insertion_block.appendOwnedOperation(final_op);
+
+                return final_op.getResult(0);
+            }
+        }
+    }
+
     if (build_options.pcp_verbose_logs) {
-        std.debug.print("DEBUG gatherVJP: Detected Scalar Gather with Vector Indices. Using Linearization.\n", .{});
+        std.debug.print("DEBUG gatherVJP: Detected Scalar Gather with Vector Indices, but no safe specialization found. Falling back.\n", .{});
+    }
+
+    // Safety guard: the legacy linearization path below constructs a one-hot tensor of
+    // shape [N, total_elements]. For real workloads, total_elements can be enormous
+    // (e.g., (B*T)*Vocab), and materializing this one-hot will OOM even on large GPUs.
+    //
+    // We hard-fail before building an obviously-infeasible graph.
+    const max_linear_onehot_elements: u64 = 250_000_000; // ~1GiB if f32
+    var n_elements_u64: u64 = 1;
+    for (0..indices_rank) |d| {
+        if (d == @as(usize, @intCast(index_vector_dim))) continue;
+        const dim_i64 = indices_type.getDimension(d);
+        if (dim_i64 <= 0) return error.InvalidTensorType;
+        const mul = @mulWithOverflow(n_elements_u64, @as(u64, @intCast(dim_i64)));
+        if (mul[1] != 0) return error.GatherVjpWouldOom;
+        n_elements_u64 = mul[0];
+    }
+    if (total_elements <= 0) return error.InvalidTensorType;
+    const total_elements_u64: u64 = @intCast(total_elements);
+    const prod = @mulWithOverflow(n_elements_u64, total_elements_u64);
+    if (prod[1] != 0 or prod[0] > max_linear_onehot_elements) {
+        if (build_options.pcp_verbose_logs) {
+            std.debug.print(
+                "ERROR gatherVJP: Refusing linearized one-hot of size N*Total = {}*{} = {} elements (cap={}).\n",
+                .{ n_elements_u64, total_elements_u64, prod[0], max_linear_onehot_elements },
+            );
+        }
+        return error.GatherVjpWouldOom;
     }
 
     // 1. Linearize Indices
@@ -897,7 +1029,15 @@ pub fn tryVectorIndexLinearization(
         }
     }
 
-    // 2. OneHot & MatMul
+    // 2. OneHot & MatMul (ONLY SAFE FOR SMALL OPERANDS)
+    //
+    // NOTE: This path is extremely memory-intensive when total_elements is large
+    // (e.g., logits indexing with total_elements = (B*T)*Vocab). It is preserved
+    // for small toy models, but real nanochat configs should hit a specialization
+    // above instead.
+    //
+    // If this path still triggers in a real run, reduce B/T/Vocab or implement a
+    // better scatter-based VJP for the remaining gather patterns.
     // Flatten linear indices to [N]
     var n_elements: i64 = 1;
     for (linear_index_shape) |d| n_elements *= d;

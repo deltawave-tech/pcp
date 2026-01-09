@@ -30,7 +30,10 @@ pub const Supervisor = struct {
     /// Initialize supervisor with generic child arguments
     /// child_cmd_args should contain all arguments to pass to the child (e.g., ["--shepherd", "--config", "exp.json"])
     pub fn init(allocator: std.mem.Allocator, host: []const u8, port: u16, child_cmd_args: []const []const u8) !Self {
-        var prng = std.Random.DefaultPrng.init(@intCast(std.time.timestamp()));
+        // Use a high-entropy-ish seed to avoid supervisor_id collisions when spawning many supervisors
+        // within the same second (e.g. multi-GPU NodeManager startup).
+        const seed = @as(u64, @truncate(@as(u128, @bitCast(std.time.nanoTimestamp())))) ^ @as(u64, @intCast(std.process.getPid()));
+        var prng = std.Random.DefaultPrng.init(seed);
         const my_id = prng.random().int(i64);
 
         var args_list = std.ArrayList([]const u8).init(allocator);

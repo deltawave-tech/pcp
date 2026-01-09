@@ -5,13 +5,8 @@
     zig-overlay.url = "github:mitchellh/zig-overlay";
     zls.url = "github:zigtools/zls";
     flake-utils.url = "github:numtide/flake-utils";
-    nix-github-actions = {
-      url = "github:nix-community/nix-github-actions";
-      inputs.nixpkgs.follows = "nixpkgs";
-    };
   };
-  outputs =
-    { self, nixpkgs, zig-overlay, zls, flake-utils, nix-github-actions }@inputs:
+  outputs = { self, nixpkgs, zig-overlay, zls, flake-utils }@inputs:
     flake-utils.lib.eachSystem [
       "x86_64-linux"
       "aarch64-linux"
@@ -268,8 +263,5 @@
           hash = "sha256-jCv8pg3oXFVSfvgcSenwxsC/jkyN+dWTwosSAAFEvCo=";
           stripRoot = false;
         };
-      }) // {
-        githubActions =
-          nix-github-actions.lib.mkGithubMatrix { inherit (self) checks; };
-      };
+      });
 }

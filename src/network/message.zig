@@ -166,7 +166,11 @@ pub const NodeId = u8;
 pub const ServiceId = []const u8;
 
 /// A (possibly random) message id.
-pub const MessageId = u8;
+///
+/// This used to be `u8`, which is prone to runtime panics in ReleaseSafe builds when any
+/// code increments it with checked arithmetic (overflow at 255). The protocol does not rely on
+/// wraparound semantics, so we use a wider type to make long-running distributed jobs robust.
+pub const MessageId = u32;
 
 /// Message types for DiLoCo distributed training
 pub const MessageType = struct {

@@ -562,7 +562,15 @@ pub const DiLoCo = struct {
         var encoded_len: usize = 0;
 
         if (use_file_blobs) {
-            const dir = try std.fs.path.join(self.allocator, &[_][]const u8{ self.config.checkpoint_dir, "blobs" });
+            const dir = blk: {
+                if (std.posix.getenv("PCP_BLOB_DIR")) |raw_z| {
+                    const raw: []const u8 = std.mem.sliceTo(raw_z, 0);
+                    if (raw.len != 0) {
+                        break :blk try self.allocator.dupe(u8, raw);
+                    }
+                }
+                break :blk try std.fs.path.join(self.allocator, &[_][]const u8{ self.config.checkpoint_dir, "blobs" });
+            };
             blob_dir = dir;
             std.fs.cwd().makePath(dir) catch {};
 

@@ -2,7 +2,6 @@
 /// Each Supervisor manages a Worker on a specific GPU device
 /// Process tree: NodeManager (1) → Supervisor (N) → Worker (N)
 /// Resilience: NodeManager monitors Supervisors; Supervisors monitor Workers.
-
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const ArrayList = std.ArrayList;
@@ -127,17 +126,27 @@ pub const NodeManager = struct {
             std.log.info("[GPU {}] Launching Supervisor...", .{device_id});
 
             child.spawn() catch |err| {
-                std.log.err("[GPU {}] Failed to spawn: {}. Retrying in 5s...", .{device_id, err});
+                std.log.err("[GPU {}] Failed to spawn: {}. Retrying in 5s...", .{ device_id, err });
                 std.time.sleep(5 * std.time.ns_per_s);
                 continue;
             };
 
             // 4. Wait (Blocking)
             const term = child.wait() catch |err| blk_wait: {
-                std.log.err("[GPU {}] Error waiting for supervisor: {}", .{device_id, err});
+                std.log.err("[GPU {}] Error waiting for supervisor: {}", .{ device_id, err });
                 _ = child.kill() catch {};
                 break :blk_wait std.process.Child.Term{ .Exited = 255 };
             };
+
+            const clean_exit = switch (term) {
+                .Exited => |code| code == 0,
+                else => false,
+            };
+
+            if (clean_exit) {
+                std.log.info("[GPU {}] Supervisor exited cleanly ({any}). Stopping monitor loop.", .{ device_id, term });
+                break;
+            }
 
             // 5. Handle Exit
             if (self.should_run.load(.acquire)) {

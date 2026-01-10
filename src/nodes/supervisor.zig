@@ -1,7 +1,6 @@
 /// Supervisor - Parent process that manages a child process with automatic restarts
 /// Implements the Supervisor Pattern for fault-tolerant distributed training
 /// Generalized to supervise any child process (Worker or Shepherd)
-
 const std = @import("std");
 const net = std.net;
 const tcp_stream = @import("../network/tcp_stream.zig");
@@ -208,8 +207,23 @@ pub const Supervisor = struct {
     }
 
     fn monitorChild(self: *Self, child: *std.process.Child) !void {
-        _ = child.wait() catch {};
+        const term = child.wait() catch |err| blk: {
+            std.log.err("Child wait failed: {}", .{err});
+            break :blk std.process.Child.Term{ .Exited = 255 };
+        };
         self.child_process = null;
+
+        const clean_exit = switch (term) {
+            .Exited => |code| code == 0,
+            else => false,
+        };
+
+        if (clean_exit) {
+            std.log.info("Child exited cleanly ({any}). Supervisor shutting down.", .{term});
+            self.should_run = false;
+            self.client.disconnect();
+            return;
+        }
 
         if (self.should_run) {
             std.log.warn("Child process died. Restarting in 1s...", .{});

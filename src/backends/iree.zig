@@ -264,15 +264,24 @@ pub const IreeBackend = struct {
             const output_buffer = c.iree_hal_buffer_view_buffer(output_buffer_view.?);
             const buffer_byte_length = c.iree_hal_buffer_byte_length(output_buffer);
             std.debug.print("[DEBUG] Output {}: buffer_byte_length = {} bytes\n", .{i, buffer_byte_length});
+
+            const output_len: usize = std.math.cast(usize, buffer_byte_length) orelse {
+                std.log.err("IREE output {} too large to materialize on host: {} bytes", .{ i, buffer_byte_length });
+                return error.OutputTooLarge;
+            };
             
             // Allocate output data and read from buffer
-            const output_data = try self.allocator.alloc(u8, @intCast(buffer_byte_length));
+            const output_data = try self.allocator.alloc(u8, output_len);
             try ireeCheckCtx(c.iree_hal_device_transfer_d2h(
                 c.iree_runtime_session_device(temp_session.?),
                 output_buffer,
                 0, // source_offset
                 output_data.ptr, // target_buffer
-                @intCast(buffer_byte_length),
+                std.math.cast(c.iree_device_size_t, output_len) orelse {
+                    self.allocator.free(output_data);
+                    std.log.err("IREE output {} length too large for device transfer: {} bytes", .{ i, output_len });
+                    return error.OutputTooLarge;
+                },
                 c.IREE_HAL_TRANSFER_BUFFER_FLAG_DEFAULT,
                 c.iree_infinite_timeout(),
             ), "iree_hal_device_transfer_d2h");

@@ -374,7 +374,10 @@ pub const Worker = struct {
         for (self.cached_parameter_shapes.?, 0..) |shape, i| {
             var size: usize = @sizeOf(f32); // f32 for all parameters
             for (shape) |dim| {
-                size *= @intCast(dim);
+                if (dim <= 0) return error.InvalidParameterShape;
+                const mul = @mulWithOverflow(size, @as(usize, @intCast(dim)));
+                if (mul[1] != 0) return error.ParameterSizeOverflow;
+                size = mul[0];
             }
 
             m_buffers[i] = try self.allocator.alloc(u8, size);
@@ -522,6 +525,17 @@ pub const Worker = struct {
         else
             null;
 
+        // Allow blob dir to be provided out-of-band (e.g. via Modal env) so we can still
+        // fall back to file-based delta transport even if the payload doesn't carry `blob_dir`.
+        const env_blob_dir = blk: {
+            if (std.posix.getenv("PCP_BLOB_DIR")) |raw_z| {
+                const raw: []const u8 = std.mem.sliceTo(raw_z, 0);
+                if (raw.len != 0) break :blk raw;
+            }
+            break :blk null;
+        };
+        const effective_blob_dir: ?[]const u8 = blob_dir orelse env_blob_dir;
+
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
 
@@ -568,7 +582,7 @@ pub const Worker = struct {
             }
         }
 
-        if (params_path_for_delta != null and blob_dir == null) {
+        if (params_path_for_delta != null and effective_blob_dir == null) {
             std.log.err("Missing blob_dir for params_path transport", .{});
             return error.InvalidMessageFormat;
         }
@@ -613,10 +627,17 @@ pub const Worker = struct {
             var total_read: usize = 0;
             for (param_shapes, 0..) |shape, i| {
                 var size: usize = @sizeOf(f32);
-                for (shape) |dim| size *= @intCast(dim);
+                for (shape) |dim| {
+                    if (dim <= 0) return error.InvalidParameterShape;
+                    const mul = @mulWithOverflow(size, @as(usize, @intCast(dim)));
+                    if (mul[1] != 0) return error.ParameterSizeOverflow;
+                    size = mul[0];
+                }
                 current_params[i] = try self.allocator.alloc(u8, size);
                 try reader.readNoEof(current_params[i]);
-                total_read += size;
+                const add = @addWithOverflow(total_read, size);
+                if (add[1] != 0) return error.ParameterSizeOverflow;
+                total_read = add[0];
             }
             if (total_read != file_size) {
                 std.log.warn("Params blob read {} bytes but file size is {}", .{ total_read, file_size });
@@ -626,13 +647,19 @@ pub const Worker = struct {
             var param_offset: usize = 0;
             for (param_shapes, 0..) |shape, i| {
                 var size: usize = @sizeOf(f32);
-                for (shape) |dim| size *= @intCast(dim);
+                for (shape) |dim| {
+                    if (dim <= 0) return error.InvalidParameterShape;
+                    const mul = @mulWithOverflow(size, @as(usize, @intCast(dim)));
+                    if (mul[1] != 0) return error.ParameterSizeOverflow;
+                    size = mul[0];
+                }
 
-                if (param_offset + size > initial_params_bytes.len) return error.ParameterBufferTooSmall;
+                const next_offset = @addWithOverflow(param_offset, size);
+                if (next_offset[1] != 0 or next_offset[0] > initial_params_bytes.len) return error.ParameterBufferTooSmall;
 
                 current_params[i] = try self.allocator.alloc(u8, size);
-                @memcpy(current_params[i], initial_params_bytes[param_offset .. param_offset + size]);
-                param_offset += size;
+                @memcpy(current_params[i], initial_params_bytes[param_offset..next_offset[0]]);
+                param_offset = next_offset[0];
             }
         }
 
@@ -712,17 +739,43 @@ pub const Worker = struct {
 
             // Update current_params with new_params from outputs[0..N]
             for (0..num_params) |i| {
+                if (outputs[i].len != current_params[i].len) {
+                    std.log.err("Param output size mismatch for param {}: expected {} bytes, got {} bytes", .{
+                        i,
+                        current_params[i].len,
+                        outputs[i].len,
+                    });
+                    return error.UnexpectedOutputSize;
+                }
                 @memcpy(current_params[i], outputs[i]);
             }
 
             // Update m_states with new_m from outputs[N..2N]
             for (0..num_params) |i| {
-                @memcpy(m_states[i], outputs[num_params + i]);
+                const out_idx = num_params + i;
+                if (outputs[out_idx].len != m_states[i].len) {
+                    std.log.err("M-state output size mismatch for param {}: expected {} bytes, got {} bytes", .{
+                        i,
+                        m_states[i].len,
+                        outputs[out_idx].len,
+                    });
+                    return error.UnexpectedOutputSize;
+                }
+                @memcpy(m_states[i], outputs[out_idx]);
             }
 
             // Update v_states with new_v from outputs[2N..3N]
             for (0..num_params) |i| {
-                @memcpy(v_states[i], outputs[2 * num_params + i]);
+                const out_idx = 2 * num_params + i;
+                if (outputs[out_idx].len != v_states[i].len) {
+                    std.log.err("V-state output size mismatch for param {}: expected {} bytes, got {} bytes", .{
+                        i,
+                        v_states[i].len,
+                        outputs[out_idx].len,
+                    });
+                    return error.UnexpectedOutputSize;
+                }
+                @memcpy(v_states[i], outputs[out_idx]);
             }
 
             // Extract loss from outputs[3N]
@@ -749,7 +802,8 @@ pub const Worker = struct {
 
         // 11. Calculate Delta = Initial_Params - Final_Params and send it
         if (params_path_for_delta) |p| {
-            const out_dir = blob_dir orelse return error.InvalidMessageFormat;
+            std.log.info("Worker {} computing delta for chunk {}...", .{ self.node_id.?, self.current_chunk_id.? });
+            const out_dir = effective_blob_dir orelse return error.InvalidMessageFormat;
             std.fs.cwd().makePath(out_dir) catch {};
 
             var name_buf: [128]u8 = undefined;
@@ -777,7 +831,9 @@ pub const Worker = struct {
                 while (offset_elems < final_f32.len) {
                     const remaining_elems = final_f32.len - offset_elems;
                     const chunk_elems = @min(chunk_floats_max, remaining_elems);
-                    const chunk_bytes_len = chunk_elems * @sizeOf(f32);
+                    const mul = @mulWithOverflow(chunk_elems, @as(usize, @sizeOf(f32)));
+                    if (mul[1] != 0) return error.DeltaTooLarge;
+                    const chunk_bytes_len = mul[0];
                     const chunk_bytes = scratch_bytes[0..chunk_bytes_len];
 
                     try params_reader.readNoEof(chunk_bytes);
@@ -787,15 +843,30 @@ pub const Worker = struct {
                     }
 
                     try delta_writer.writeAll(chunk_bytes);
-                    bytes_written += chunk_bytes_len;
-                    offset_elems += chunk_elems;
+                    const add_written = @addWithOverflow(bytes_written, chunk_bytes_len);
+                    if (add_written[1] != 0) return error.DeltaTooLarge;
+                    bytes_written = add_written[0];
+
+                    const add_off = @addWithOverflow(offset_elems, chunk_elems);
+                    if (add_off[1] != 0) return error.DeltaTooLarge;
+                    offset_elems = add_off[0];
                 }
             }
 
             delta_file.sync() catch {};
+            std.log.info("Worker {} wrote delta file: {s} ({} bytes)", .{ self.node_id.?, delta_path, bytes_written });
 
             var response_payload = std.json.ObjectMap.init(self.allocator);
             defer response_payload.deinit();
+            const max_json_i64: usize = @intCast(std.math.maxInt(i64));
+            if (bytes_written > max_json_i64) {
+                std.log.err("delta_bytes too large to encode as JSON i64: {}", .{bytes_written});
+                return error.DeltaTooLarge;
+            }
+            if (self.current_chunk_id.? > max_json_i64) {
+                std.log.err("chunk_id too large to encode as JSON i64: {}", .{self.current_chunk_id.?});
+                return error.ChunkIdTooLarge;
+            }
             try response_payload.put("delta_path", std.json.Value{ .string = delta_path });
             try response_payload.put("delta_bytes", std.json.Value{ .integer = @intCast(bytes_written) });
             try response_payload.put("loss", std.json.Value{ .float = @floatCast(final_loss) });
@@ -816,15 +887,40 @@ pub const Worker = struct {
             return;
         }
 
+        // Inline delta transport (Cap'n Proto + Base64 inside JSON).
+        //
+        // IMPORTANT: Cap'n Proto has a hard upper bound on list sizes (u29 words). In practice, this
+        // means we cannot inline multi-hundred-MiB parameter updates reliably. When params/deltas are
+        // large, use file blob transport (see PCP_BLOB_TRANSPORT=file).
+        var total_param_bytes: usize = 0;
+        for (current_params) |buf| {
+            const add = @addWithOverflow(total_param_bytes, buf.len);
+            if (add[1] != 0) return error.DeltaTooLarge;
+            total_param_bytes = add[0];
+        }
+        // 512MiB is the default cutoff for blob transport (and safely below Cap'n Proto's list limit).
+        const inline_max_bytes: usize = 512 * 1024 * 1024;
+        if (total_param_bytes > inline_max_bytes) {
+            std.log.err(
+                "Inline delta too large ({} bytes). Set PCP_BLOB_TRANSPORT=file (and optionally PCP_BLOB_DIR) to use file blobs.",
+                .{total_param_bytes},
+            );
+            return error.DeltaTooLarge;
+        }
+        std.log.info("Worker {} sending inline delta ({} bytes)", .{ self.node_id.?, total_param_bytes });
+
         var delta_bytes = std.ArrayList(u8).init(self.allocator);
         defer delta_bytes.deinit();
+        try delta_bytes.ensureTotalCapacity(total_param_bytes);
 
         // Iterate over parameter blocks to compute delta
         var delta_offset: usize = 0;
         for (current_params) |final_block_bytes| {
             const param_block_size = final_block_bytes.len;
             const initial_params_bytes = initial_params_inline orelse return error.MissingParams;
-            const initial_block_bytes = initial_params_bytes[delta_offset .. delta_offset + param_block_size];
+            const next_offset = @addWithOverflow(delta_offset, param_block_size);
+            if (next_offset[1] != 0 or next_offset[0] > initial_params_bytes.len) return error.ParameterBufferTooSmall;
+            const initial_block_bytes = initial_params_bytes[delta_offset..next_offset[0]];
 
             // Cast to f32 for arithmetic
             const initial_f32 = std.mem.bytesAsSlice(f32, initial_block_bytes);
@@ -838,7 +934,7 @@ pub const Worker = struct {
                 try delta_bytes.appendSlice(delta_val_bytes);
             }
 
-            delta_offset += param_block_size;
+            delta_offset = next_offset[0];
         }
 
         // Send Delta instead of raw params

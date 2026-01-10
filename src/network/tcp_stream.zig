@@ -35,6 +35,10 @@ pub const TcpStreamManager = struct {
             std.log.debug("Sending JSON payload ({} bytes)", .{json_data.len});
         }
         
+        if (json_data.len > std.math.maxInt(u32)) {
+            std.log.err("Message too large for u32 length prefix: {} bytes", .{json_data.len});
+            return error.MessageTooLarge;
+        }
         const data_length: u32 = @intCast(json_data.len);
         
         // Send length prefix first (4 bytes for u32)

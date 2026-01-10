@@ -1,6 +1,46 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
+fn enableCrashTraces(exe: *std.Build.Step.Compile) void {
+    // Ensure Zig can print actionable stack traces (file/line where possible) on panics in
+    // ReleaseSafe builds.
+    //
+    // In practice (e.g. Modal), stripping can remove DWARF sections that Zig's unwinder uses.
+    // We try to keep enough information for unwinding by:
+    // - keeping frame pointers (for simple stack walking),
+    // - forcing unwind tables when supported by this Zig version,
+    // - and disabling Zig-side stripping when supported.
+    // `root_module` has changed types across Zig versions (sometimes a pointer, sometimes a value).
+    // Normalize to the underlying `std.Build.Module` container type for feature detection.
+    const RootModuleT = @TypeOf(exe.root_module);
+    const ti = @typeInfo(RootModuleT);
+    const RootModule = blk: {
+        // Zig has renamed `@typeInfo` tags across releases (`.Pointer` -> `.pointer`).
+        // Detect which one we have and extract the child type if needed.
+        const TypeInfoT = @TypeOf(ti);
+        if (@hasField(TypeInfoT, "Pointer")) {
+            break :blk switch (ti) {
+                .Pointer => |p| p.child,
+                else => RootModuleT,
+            };
+        }
+        break :blk switch (ti) {
+            .pointer => |p| p.child,
+            else => RootModuleT,
+        };
+    };
+
+    if (@hasField(RootModule, "omit_frame_pointer")) {
+        exe.root_module.omit_frame_pointer = false;
+    }
+    if (@hasField(RootModule, "unwind_tables")) {
+        exe.root_module.unwind_tables = true;
+    }
+    if (@hasField(RootModule, "strip")) {
+        exe.root_module.strip = false;
+    }
+}
+
 const test_targets = [_]std.Target.Query{
     .{}, // native
     .{ .cpu_arch = .aarch64, .os_tag = .macos },
@@ -551,6 +591,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    enableCrashTraces(rocm_pipeline_test);
     rocm_pipeline_test.root_module.addImport("pcp", pcp_module);
     rocm_pipeline_test.root_module.addImport("build_options", options_module);
     addIreeDependencies(rocm_pipeline_test, b, iree_config);
@@ -569,6 +610,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    enableCrashTraces(pcp);
     pcp.root_module.addImport("pcp", pcp_module);
     pcp.root_module.addImport("build_options", options_module);
 
@@ -656,6 +698,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    enableCrashTraces(data_pipeline_test);
 
     // Add module dependencies for data pipeline test
     data_pipeline_test.root_module.addImport("pcp", pcp_module);
@@ -678,6 +721,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    enableCrashTraces(isolated_vjp_tests);
 
     // Add module dependencies
     isolated_vjp_tests.root_module.addImport("pcp", pcp_module);
@@ -703,6 +747,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    enableCrashTraces(mlir_optimizer_tests);
 
     // Add module dependencies
     mlir_optimizer_tests.root_module.addImport("pcp", pcp_module);

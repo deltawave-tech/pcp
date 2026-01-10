@@ -71,6 +71,9 @@
           name = "pcp";
           version = "main";
           src = ./.;
+          # Keep debug symbols/unwind info so Zig safety panics (e.g. integer overflow)
+          # produce actionable stack traces in logs (Modal workers are otherwise stripped).
+          dontStrip = true;
           nativeBuildInputs = [
             pkgs.makeWrapper
             llvmPkg.libllvm.dev

@@ -18,6 +18,7 @@ const TcpServer = tcp_stream.TcpServer;
 const TcpStreamManager = tcp_stream.TcpStreamManager;
 const MessageEnvelope = message.MessageEnvelope;
 const MessageType = message.MessageType;
+const MessageId = message.MessageId;
 const NodeId = message.NodeId;
 const Executor = execution.Executor;
 const Backend = backend_selection.Backend;
@@ -212,7 +213,7 @@ pub const Shepherd = struct {
         // what we need and let the parsed message be freed immediately.
         var is_supervisor_handshake = false;
         var supervisor_id: i64 = 0;
-        var join_msg_id: u8 = 0;
+        var join_msg_id: MessageId = 0;
 
         var worker_backend: Backend = .cpu;
         var owned_target_arch: ?[]const u8 = null;
@@ -542,7 +543,7 @@ pub const Shepherd = struct {
     
     /// Broadcast a message to all workers
     pub fn broadcastToWorkers(self: *Self, msg_type: []const u8, data: std.json.Value) !void {
-        var msg_id: u8 = 1;
+        var msg_id: MessageId = 1;
 
         self.worker_pool_mutex.lock();
         defer self.worker_pool_mutex.unlock();

@@ -1,6 +1,5 @@
 /// Main entry point for distributed training
 /// This file handles command-line arguments and launches either Shepherd or Worker
-
 const std = @import("std");
 const print = std.debug.print;
 const ArrayList = std.ArrayList;
@@ -61,7 +60,7 @@ const ExperimentConfig = struct {
 const ConfigResult = struct {
     config: ExperimentConfig,
     parsed: ?std.json.Parsed(ExperimentConfig),
-    json_data: ?[]u8,  // Keep the raw JSON buffer alive
+    json_data: ?[]u8, // Keep the raw JSON buffer alive
     allocator: Allocator,
 
     pub fn deinit(self: *@This()) void {
@@ -176,7 +175,7 @@ const Args = struct {
                     const connect_str = args[i];
                     if (std.mem.indexOf(u8, connect_str, ":")) |colon_idx| {
                         host = connect_str[0..colon_idx];
-                        port = std.fmt.parseInt(u16, connect_str[colon_idx + 1..], 10) catch 8080;
+                        port = std.fmt.parseInt(u16, connect_str[colon_idx + 1 ..], 10) catch 8080;
                     } else {
                         host = connect_str;
                     }
@@ -599,7 +598,7 @@ fn runShepherd(allocator: Allocator, args: Args) !void {
     if (args.should_resume) {
         // Attempt to read the ID of the run we are resuming
         const f = std.fs.cwd().openFile(LATEST_RUN_FILE, .{}) catch |err| {
-            print("Cannot resume: failed to open {s} to retrieve Run ID: {}\n", .{LATEST_RUN_FILE, err});
+            print("Cannot resume: failed to open {s} to retrieve Run ID: {}\n", .{ LATEST_RUN_FILE, err });
             return err;
         };
         defer f.close();
@@ -645,10 +644,7 @@ fn runShepherd(allocator: Allocator, args: Args) !void {
     print("   Backend: {s}\n", .{backend.toString()});
 
     // Initialize system
-    var system = try backend_selection.DistributedTrainingSystem.init(
-        allocator,
-        backend
-    );
+    var system = try backend_selection.DistributedTrainingSystem.init(allocator, backend);
     defer system.deinit();
 
     // Get the shared MLIR context from the executor
@@ -660,6 +656,7 @@ fn runShepherd(allocator: Allocator, args: Args) !void {
 
     // Now use system.shepherd instead of a local variable
     const shepherd_controller = &system.shepherd;
+    defer shepherd_controller.stop();
 
     // 2. Initialize DataManager for chunk-based data partitioning
     print("Initializing DataManager for dataset: {s}...\n", .{exp_config.data_path});

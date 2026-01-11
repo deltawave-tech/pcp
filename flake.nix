@@ -84,7 +84,9 @@
             pkgs.pkg-config
             pkgs.zig_0_13
             pkgs.zig_0_13.hook
-          ] ++ lib.optionals pkgs.stdenv.isDarwin [ pkgs.apple-sdk_15 ];
+          ] ++ lib.optionals pkgs.stdenv.isDarwin [
+            pkgs.apple-sdk_15
+          ];
           buildInputs = [
             llvmPkg.clang-tools
             llvmPkg.libcxx
@@ -93,17 +95,23 @@
             packages.iree-sdk.build
             packages.iree-sdk.src
             pkgs.capnproto
+          ] ++ lib.optionals pkgs.stdenv.isDarwin [
+            pkgs.darwin.apple_sdk.frameworks.Foundation
+            pkgs.darwin.apple_sdk.frameworks.Metal
+            pkgs.darwin.apple_sdk.frameworks.CoreGraphics
           ];
           propagatedBuildInputs = [
             packages.iree-sdk
+            pkgs.zlib
+            pkgs.zstd
+          ] ++ lib.optionals pkgs.stdenv.isLinux [
             pkgs.cudaPackages.cuda_cudart
             pkgs.elfutils
             pkgs.glibc
             pkgs.libdrm
             pkgs.numactl
-            pkgs.zlib
-            pkgs.zstd
           ];
+          env.ZIG_SYSTEM_LINKER_HACK = "1";
           dontConfigure = true;
           doCheck = false;
           zigBuildFlags = [ "--verbose" "--color" "off" ];
@@ -113,7 +121,10 @@
           IREE_SOURCE_DIR = "${packages.iree-sdk.src}";
           IREE_BUILD_DIR = "${packages.iree-sdk.build}";
 
-          postFixup = ''
+          postFixup = if pkgs.stdenv.isDarwin then ''
+            wrapProgram $out/bin/pcp \
+              --suffix PATH : "${packages.iree-sdk}/bin"
+          '' else ''
             patchelf --add-needed libnuma.so.1 $out/bin/pcp
             patchelf --add-needed libelf.so.1 $out/bin/pcp
             patchelf --add-needed libz.so.1 $out/bin/pcp
@@ -121,7 +132,6 @@
             patchelf --add-needed libdrm.so.2 $out/bin/pcp
             patchelf --add-needed libdrm_amdgpu.so.1 $out/bin/pcp
 
-            # Generate the Nix-side RPATH automatically from inputs
             NIX_RPATH="${
               lib.makeLibraryPath [
                 packages.iree-sdk
@@ -137,12 +147,10 @@
               ]
             }"
 
-            # Append System paths for driver fallbacks (PTX JIT, ROCm, etc.)
             SYSTEM_RPATH="/usr/lib/x86_64-linux-gnu:/usr/lib64:/usr/lib:/opt/amdgpu/lib/x86_64-linux-gnu:/opt/amdgpu/lib:/run/opengl-driver/lib:/opt/rocm/lib:/opt/rocm/hip/lib"
 
             patchelf --force-rpath --set-rpath "$NIX_RPATH:$SYSTEM_RPATH" $out/bin/pcp
 
-            # Patch test executables with same RPATH for CUDA/ROCm access
             if [ -f "$out/bin/isolated_vjp_tests" ]; then
               patchelf --force-rpath --set-rpath "$NIX_RPATH:$SYSTEM_RPATH" $out/bin/isolated_vjp_tests
             fi
@@ -180,62 +188,75 @@
             hash = "sha256-O+yp6ysHQJKlgLnoK1esGdRmce6M4nPgFTsxEck0xw0=";
             fetchSubmodules = true;
           };
-          nativeBuildInputs =
-            [ pkgs.cmake pkgs.ninja pkgs.python3 pkgs.bintools pkgs.patchelf ];
-          # Mix together a couple of dependencies needed to build the CUDA layer.  See
-          # 'build_tools/scripts/fetch_cuda_deps.sh'.
-          postUnpack = ''
-            set -e
 
+          nativeBuildInputs = [ pkgs.cmake pkgs.ninja pkgs.python3 pkgs.bintools ]
+            ++ lib.optionals pkgs.stdenv.isLinux [ pkgs.patchelf ]
+            ++ lib.optionals pkgs.stdenv.isDarwin [ pkgs.apple-sdk_15 ];
+
+          postUnpack = lib.optionalString pkgs.stdenv.isLinux ''
+            set -e
             echo "Copying needed cuda artifacts"
-            icd=/build/iree_cuda_deps
+            icd=$NIX_BUILD_TOP/iree_cuda_deps
             mkdir -p $icd
             cp -r ${pkgs.cudaPackages_12_2.cuda_cccl.dev}/include $icd
-            chmod --recursive u+w $icd
+            chmod -R u+w $icd
             cp -r ${pkgs.cudaPackages_12_2.cuda_cudart.dev}/include $icd
-            chmod --recursive u+w $icd
+            chmod -R u+w $icd
             cp -r ${pkgs.cudaPackages_12_2.cuda_nvcc}/include $icd
-            chmod --recursive u+w $icd
-
+            chmod -R u+w $icd
             mkdir -p $icd/nvvm/
             cp -r ${pkgs.cudaPackages_12_2.cuda_nvcc}/nvvm/libdevice/ $icd/nvvm/
             chmod u+w $icd
           '';
+
           propagatedBuildInputs = [ llvmPkg.lld llvmPkg.libllvm ];
-          buildInputs = [ pkgs.gtest ];
+
+          buildInputs = [ pkgs.gtest ] ++ lib.optionals pkgs.stdenv.isDarwin [
+            pkgs.darwin.apple_sdk.frameworks.Foundation
+            pkgs.darwin.apple_sdk.frameworks.Metal
+          ];
+
           cmakeFlags = [
-            # Flags suggested in
-            # https://iree.dev/building-from-source/getting-started/#configuration-settings
             (lib.cmakeFeature "CMAKE_BUILD_TYPE" "RelWithDebInfo")
             (lib.cmakeFeature "CMAKE_AR" "ar")
+            (lib.cmakeBool "IREE_BUILD_TESTS" false)
+            (lib.cmakeBool "IREE_BUILD_SAMPLES" false)
             (lib.cmakeBool "CMAKE_SKIP_INSTALL_RPATH" true)
-
             (lib.cmakeBool "IREE_ENABLE_ASSERTIONS" true)
             (lib.cmakeBool "IREE_ENABLE_SPLIT_DWARF" true)
-            (lib.cmakeBool "IREE_ENABLE_THIN_ARCHIVES" true)
+            (lib.cmakeBool "IREE_ENABLE_THIN_ARCHIVES" pkgs.stdenv.isLinux)
             (lib.cmakeBool "IREE_ENABLE_LLD" true)
-
-            (lib.cmakeFeature "CUDAToolkit_ROOT" "/build/iree_cuda_deps")
+            (lib.cmakeBool "IREE_TARGET_BACKEND_METAL_SPIRV" true)
+            (lib.cmakeBool "IREE_HAL_DRIVER_METAL" pkgs.stdenv.isDarwin)
+            (lib.cmakeBool "IREE_HAL_DRIVER_VULKAN" true)
+            "-B" "build"
+          ] ++ lib.optionals pkgs.stdenv.isLinux [
+            (lib.cmakeBool "IREE_TARGET_BACKEND_ROCM" true)
+            (lib.cmakeBool "IREE_HAL_DRIVER_HIP" true)
+            (lib.cmakeBool "IREE_HAL_DRIVER_CUDA" true)
+            (lib.cmakeBool "IREE_TARGET_BACKEND_CUDA" true)
+            (lib.cmakeFeature "CUDAToolkit_ROOT" "../iree_cuda_deps")
             (lib.cmakeFeature "IREE_TARGET_BACKEND_ROCM_DEVICE_BC_PATH"
               "${packages.iree-amdgpu-device-libs}")
-            (lib.cmakeBool "IREE_HAL_DRIVER_CUDA" true)
-            (lib.cmakeBool "IREE_HAL_DRIVER_HIP" true)
-            (lib.cmakeBool "IREE_HAL_DRIVER_VULKAN" true)
-            (lib.cmakeBool "IREE_TARGET_BACKEND_CUDA" true)
-            (lib.cmakeBool "IREE_TARGET_BACKEND_ROCM" true)
-            "-B"
-            "/build/build"
           ];
-          ninjaFlags = [ "-C" "/build/build" ];
 
-          IREE_CUDA_DEPS_DIR = "/build/iree_cuda_deps";
+          ninjaFlags = [ "-C" "build" ];
+
           preConfigure = ''
-            mkdir /build/build
+            mkdir -p build
+          '' + lib.optionalString pkgs.stdenv.isDarwin ''
+            export NIX_CFLAGS_COMPILE="$NIX_CFLAGS_COMPILE \
+              -DMTLLanguageVersion3_0=196608 \
+              -DMTLGPUFamilyApple8=1008 \
+              -DMTLGPUFamilyMetal3=5001"
           '';
 
           outputs = [ "out" "build" ];
+
           postInstall = ''
             mkdir -p $build
+            cp -r build/* $build/
+          '' + lib.optionalString pkgs.stdenv.isLinux ''
             to_patch=(
               iree-compile
               iree-link
@@ -246,16 +267,13 @@
               iree-run-mlir
               test-iree-compiler-api-test-binary
             )
-
             for f in ''${to_patch[@]}; do
-              patchelf --remove-rpath /build/build/tools/$f
+              if [ -f "$build/tools/$f" ]; then
+                patchelf --remove-rpath $build/tools/$f
+              fi
             done
-            cp -r /build/build/* $build/
           '';
 
-          # Prevent the `_multioutDevs` routine to perform any action. -- It tries to move
-          # `$build/lib/cmake` to `$out/lib/cmake` which produces a collision due to the already
-          # present `IREE` directory.
           moveToDev = false;
           meta = {
             description = "IREE SDK built from source";

@@ -357,6 +357,8 @@ fn addIreeDependencies(target: *std.Build.Step.Compile, b: *std.Build, iree_conf
     // Platform-specific GPU drivers
     if (target.root_module.resolved_target.?.result.os.tag == .macos) {
         // Metal driver for macOS (M3)
+        target.addLibraryPath(.{ .cwd_relative = b.fmt("{s}/runtime/src/iree/hal/drivers/metal", .{build_dir}) });
+        target.addLibraryPath(.{ .cwd_relative = b.fmt("{s}/runtime/src/iree/hal/drivers/metal/registration", .{build_dir}) });
         target.linkSystemLibrary("iree_hal_drivers_metal_metal");
         target.linkSystemLibrary("iree_hal_drivers_metal_registration_registration");
         target.linkFramework("Foundation");

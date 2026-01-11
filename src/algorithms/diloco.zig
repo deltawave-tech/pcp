@@ -41,6 +41,11 @@ const ModelSanitizer = @import("../compiler/sanitizer.zig").ModelSanitizer;
 const RECOVERY_FILENAME = "shepherd_state.bin";
 const DEFAULT_INLINE_BLOB_MAX_BYTES: usize = 512 * 1024 * 1024; // 512MiB
 
+const WorkerLoss = struct {
+    worker_id: message.NodeId,
+    loss: f32,
+};
+
 fn resolveInlineBlobMaxBytes() usize {
     if (std.posix.getenv("PCP_BLOB_INLINE_MAX_BYTES")) |raw_z| {
         const raw: []const u8 = std.mem.sliceTo(raw_z, 0);
@@ -166,6 +171,13 @@ pub const DiLoCo = struct {
     // WandB logging
     wandb_logger: wandb.WandBLogger,
 
+    // Streaming-mode worker-loss stats for the last completed outer step.
+    last_min_worker_loss: f32,
+    last_max_worker_loss: f32,
+    last_worker_losses: std.ArrayListUnmanaged(WorkerLoss),
+    // Token accounting for the last completed outer step (0 if unknown).
+    last_tokens_per_outer: u64,
+
     const Self = @This();
 
     // Change the init signature to accept the generic executor (dataset now loaded by workers)
@@ -283,12 +295,18 @@ pub const DiLoCo = struct {
             .worker_graph_mlir_source = graph, // Store the MLIR source
             .data_loader = undefined, // No longer used - workers load data locally
             .wandb_logger = logger,
+            .last_min_worker_loss = std.math.inf(f32),
+            .last_max_worker_loss = -std.math.inf(f32),
+            .last_worker_losses = .{},
+            .last_tokens_per_outer = 0,
         };
     }
 
     pub fn deinit(self: *Self) void {
         // Deinit WandB logger first
         self.wandb_logger.deinit();
+
+        self.last_worker_losses.deinit(self.allocator);
 
         if (self.master_parameters) |params| {
             for (params) |param| {
@@ -436,17 +454,37 @@ pub const DiLoCo = struct {
             monitoring.setEpochTime(epoch_time_ms);
             monitoring.setMetrics(self.current_epoch, self.metrics.loss, self.coordinator.getWorkerCount());
 
-            // Log to WandB
-            self.wandb_logger.log(.{
-                .outer_step = step,
-                .epoch = self.current_epoch,
-                .loss = self.metrics.loss,
-                .min_worker_loss = self.metrics.loss, // Note: Individual worker losses not tracked in streaming mode
-                .max_worker_loss = self.metrics.loss, // Note: Individual worker losses not tracked in streaming mode
-                .active_workers = workers_assigned,
-                .learning_rate = self.host_optimizer.config.learning_rate,
-                .epoch_time_ms = epoch_time_ms,
-            });
+            const tokens_per_sec: f64 = blk: {
+                if (epoch_time_ms == 0) break :blk 0.0;
+                const ms_f64: f64 = @floatFromInt(epoch_time_ms);
+                const tok_f64: f64 = @floatFromInt(self.last_tokens_per_outer);
+                break :blk tok_f64 / (ms_f64 / 1000.0);
+            };
+
+            // Log to WandB (including per-worker losses for this outer step).
+            if (self.wandb_logger.enabled) {
+                var arena = std.heap.ArenaAllocator.init(self.allocator);
+                defer arena.deinit();
+
+                var obj = std.json.ObjectMap.init(arena.allocator());
+                obj.put("outer_step", .{ .integer = @intCast(step) }) catch {};
+                obj.put("epoch", .{ .integer = @intCast(self.current_epoch) }) catch {};
+                obj.put("loss", .{ .float = self.metrics.loss }) catch {};
+                obj.put("min_worker_loss", .{ .float = self.last_min_worker_loss }) catch {};
+                obj.put("max_worker_loss", .{ .float = self.last_max_worker_loss }) catch {};
+                obj.put("active_workers", .{ .integer = @intCast(workers_assigned) }) catch {};
+                obj.put("learning_rate", .{ .float = self.host_optimizer.config.learning_rate }) catch {};
+                obj.put("epoch_time_ms", .{ .integer = @intCast(epoch_time_ms) }) catch {};
+                obj.put("tokens_per_outer", .{ .integer = @intCast(self.last_tokens_per_outer) }) catch {};
+                obj.put("tokens_per_sec", .{ .float = tokens_per_sec }) catch {};
+
+                for (self.last_worker_losses.items) |wl| {
+                    const key = std.fmt.allocPrint(arena.allocator(), "worker_loss/{d}", .{wl.worker_id}) catch continue;
+                    obj.put(key, .{ .float = wl.loss }) catch {};
+                }
+
+                self.wandb_logger.log(std.json.Value{ .object = obj });
+            }
 
             // Check convergence or stopping conditions
             if (self.shouldStop()) {
@@ -675,12 +713,17 @@ pub const DiLoCo = struct {
         // 1. Initialize Accumulator (Zeroed buffer matching total parameter size)
         const total_param_bytes = try totalParamBytes(self.parameter_shapes);
 
+        self.last_worker_losses.clearRetainingCapacity();
+        try self.last_worker_losses.ensureTotalCapacity(self.allocator, expected_count);
+
         const accumulator = try self.allocator.alloc(u8, total_param_bytes);
         defer self.allocator.free(accumulator);
         @memset(accumulator, 0); // Important: Init to zero
 
         var collected_count: usize = 0;
         var total_loss: f32 = 0.0;
+        var min_loss: f32 = std.math.inf(f32);
+        var max_loss: f32 = -std.math.inf(f32);
 
         std.log.info("Streaming results from {} workers...", .{expected_count});
 
@@ -771,6 +814,12 @@ pub const DiLoCo = struct {
                     }
 
                     total_loss += loss_val_f32;
+                    min_loss = @min(min_loss, loss_val_f32);
+                    max_loss = @max(max_loss, loss_val_f32);
+                    self.last_worker_losses.appendAssumeCapacity(.{
+                        .worker_id = response.sender_node,
+                        .loss = loss_val_f32,
+                    });
                     collected_count += 1;
                     continue;
                 }
@@ -817,6 +866,12 @@ pub const DiLoCo = struct {
             }
 
             total_loss += loss_val;
+            min_loss = @min(min_loss, loss_val);
+            max_loss = @max(max_loss, loss_val);
+            self.last_worker_losses.appendAssumeCapacity(.{
+                .worker_id = response.sender_node,
+                .loss = loss_val,
+            });
             collected_count += 1;
 
             // Message is freed here by the defer/arena logic, keeping memory low
@@ -864,6 +919,34 @@ pub const DiLoCo = struct {
         // Update metrics
         const avg_loss = total_loss / divisor;
         self.metrics.loss = avg_loss;
+        self.last_min_worker_loss = min_loss;
+        self.last_max_worker_loss = max_loss;
+
+        // Token accounting for FIFO slices: each inner step consumes (B*T + 1) tokens per worker.
+        // Data input 0 is input_ids with shape [B, T].
+        self.last_tokens_per_outer = blk_tok: {
+            if (self.data_input_shapes.len < 1 or self.data_input_shapes[0].len < 2) break :blk_tok 0;
+            const B_i64 = self.data_input_shapes[0][0];
+            const T_i64 = self.data_input_shapes[0][1];
+            if (B_i64 <= 0 or T_i64 <= 0) break :blk_tok 0;
+            const B_u64: u64 = @intCast(B_i64);
+            const T_u64: u64 = @intCast(T_i64);
+
+            const bt = @mulWithOverflow(B_u64, T_u64);
+            if (bt[1] != 0) break :blk_tok 0;
+            const needed = @addWithOverflow(bt[0], 1);
+            if (needed[1] != 0) break :blk_tok 0;
+
+            const tau_u64: u64 = @intCast(self.config.tau);
+            const per_worker = @mulWithOverflow(needed[0], tau_u64);
+            if (per_worker[1] != 0) break :blk_tok 0;
+
+            const workers_u64: u64 = @intCast(expected_count);
+            const total = @mulWithOverflow(per_worker[0], workers_u64);
+            if (total[1] != 0) break :blk_tok 0;
+
+            break :blk_tok total[0];
+        };
 
         if (!std.math.isFinite(avg_loss)) {
             std.log.err("Round complete with non-finite loss: {d}", .{avg_loss});

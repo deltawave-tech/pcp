@@ -10,6 +10,129 @@ const Allocator = std.mem.Allocator;
 const MLIRBuilder = ops.MLIRBuilder;
 const VJPFn = vjp_rules.VJPFn;
 
+// ============================================================================
+// Gradient Checkpointing / Activation Rematerialization
+// ============================================================================
+//
+// The default AutoDiff behavior extends the lifetime of intermediate tensors
+// (like attention matrices [B,H,S,S]) from the forward pass all the way to the
+// backward pass, causing O(L) peak memory usage where L = number of layers.
+//
+// To fix this, we detect "heavy" tensors and recompute them locally during
+// the backward pass instead of keeping them alive. This trades compute for
+// massive memory savings.
+
+/// Threshold for considering an operation "heavy" and worth rematerializing.
+/// Tensors with more elements than this will be recomputed during backward pass.
+/// 50M elements * 4 bytes = 200MB threshold
+const REMAT_ELEMENT_THRESHOLD: i64 = 50_000_000;
+
+/// Determine if an operation result should be recomputed (Gradient Checkpointing)
+/// instead of keeping the forward pass tensor alive.
+fn shouldRematerialize(op: mlir.Operation) bool {
+    const name = op.getName();
+
+    // Target heavy operations in Transformers:
+    // 1. Attention Scores (dot_general producing [B, H, S, S])
+    // 2. Softmax Exponentials (exponential producing [B, H, S, S])
+    // 3. Attention Probabilities (divide producing [B, H, S, S])
+    // 4. Sigmoid/SiLU activations (logistic)
+    const is_candidate_op = std.mem.eql(u8, name, "stablehlo.dot_general") or
+        std.mem.eql(u8, name, "stablehlo.exponential") or
+        std.mem.eql(u8, name, "stablehlo.divide") or
+        std.mem.eql(u8, name, "stablehlo.logistic");
+
+    if (!is_candidate_op) return false;
+
+    // Check tensor size heuristic
+    if (op.getNumResults() == 0) return false;
+
+    const res = op.getResult(0);
+    const type_val = res.getType();
+
+    if (!c.mlirTypeIsARankedTensor(type_val.handle)) return false;
+
+    const rank = c.mlirShapedTypeGetRank(type_val.handle);
+
+    // Rank >= 4 likely means [Batch, Heads, Seq, Seq] attention matrix
+    // These are the primary memory hogs we want to recompute
+    if (rank >= 4) {
+        // Calculate total elements
+        var total_elements: i64 = 1;
+        for (0..@intCast(rank)) |i| {
+            const dim = c.mlirShapedTypeGetDimSize(type_val.handle, @intCast(i));
+            if (dim > 0) {
+                total_elements *= dim;
+            }
+        }
+
+        // Only rematerialize if truly large
+        if (total_elements >= REMAT_ELEMENT_THRESHOLD) {
+            std.log.debug("Marking op '{s}' for rematerialization: rank={}, elements={}", .{ name, rank, total_elements });
+            return true;
+        }
+    }
+
+    return false;
+}
+
+/// Recompute an operation in the current block (Just-In-Time).
+/// This clones the operation and updates its operands to use values
+/// available in the current context (from value_map).
+/// Used for both Phase 1 (hole patching) and Phase 2 (backward pass) rematerialization.
+fn rematerializeOp(
+    builder: *MLIRBuilder,
+    original_op: mlir.Operation,
+    value_map: *std.AutoHashMap(mlir.Value, mlir.Value),
+    remat_cache: *std.AutoHashMap(mlir.Operation, mlir.Value),
+) !mlir.Value {
+    // Check cache first - don't rematerialize the same op twice within the same phase
+    if (remat_cache.get(original_op)) |cached| {
+        return cached;
+    }
+
+    // Clone the operation
+    const cloned_handle = c.operationClone(original_op.handle);
+    const cloned_op = mlir.Operation{ .handle = cloned_handle };
+
+    // Update operands to point to values available in the CURRENT context.
+    const num_operands = cloned_op.getNumOperands();
+    for (0..num_operands) |i| {
+        const old_operand = original_op.getOperand(i);
+        var new_operand: mlir.Value = undefined;
+
+        // Try standard mapping first (most common case)
+        if (value_map.get(old_operand)) |mapped| {
+            new_operand = mapped;
+        }
+        // If missing, check if it's a recursive rematerialization case
+        else if (c.mlirValueIsAOpResult(old_operand.handle)) {
+            const producer = mlir.Operation{ .handle = c.mlirOpResultGetOwner(old_operand.handle) };
+            if (shouldRematerialize(producer)) {
+                // Recursively rematerialize the producer
+                new_operand = try rematerializeOp(builder, producer, value_map, remat_cache);
+            } else {
+                return error.RematOperandNotFound;
+            }
+        } else {
+            // Block argument not in value_map
+            return error.RematOperandNotFound;
+        }
+
+        c.operationSetOperand(cloned_op.handle, @intCast(i), new_operand.handle);
+    }
+
+    // Insert into the current block (Just-In-Time execution)
+    builder.insertion_block.appendOwnedOperation(cloned_op);
+
+    const result = cloned_op.getResult(0);
+
+    // Cache the result to avoid duplicate rematerialization within this phase
+    try remat_cache.put(original_op, result);
+
+    return result;
+}
+
 
 /// MLIR-based Automatic Differentiation using Graph-to-Graph Transformation
 /// This implements reverse-mode AD on MLIR computation graphs using VJP rules
@@ -136,10 +259,22 @@ pub fn buildGradientGraph(
     const loss_grad_arg = grad_fn_block.getArgument(num_forward_args);
     try adjoint_map.put(loss_value, loss_grad_arg);
 
-    // First pass: Clone forward operations into gradient function
-    std.debug.print("First pass: Building primal value mappings in forward order...\n", .{});
+    // === FIRST PASS: CLONE FORWARD OPS (With Hole Patching) ===
+    // GRADIENT CHECKPOINTING: Skip cloning heavy operations - they will be rematerialized on-demand
+    // Key insight: When a "light" op needs a value from a "skipped heavy" op, we must
+    // rematerialize the heavy op locally to avoid dangling SSA references.
+    std.debug.print("First pass: Cloning forward ops (skipping heavy ops, with hole patching)...\n", .{});
     const ops_forward = try getOperationsInForwardOrder(allocator, forward_fn);
     defer allocator.free(ops_forward);
+
+    // Track which ops are skipped for rematerialization
+    var skipped_for_remat = std.AutoHashMap(mlir.Operation, void).init(allocator);
+    defer skipped_for_remat.deinit();
+
+    // Separate cache for Phase 1 rematerializations to keep lifetimes short
+    // We do NOT reuse this cache in Phase 2 to avoid extending lifetimes
+    var phase1_remat_cache = std.AutoHashMap(mlir.Operation, mlir.Value).init(allocator);
+    defer phase1_remat_cache.deinit();
 
     for (ops_forward) |op| {
         const op_name = op.getName();
@@ -149,12 +284,44 @@ pub fn buildGradientGraph(
             builder.insertion_block.appendOwnedOperation(cloned_op);
             try value_map.put(op.getResult(0), cloned_op.getResult(0));
         } else if (!std.mem.eql(u8, op_name, "func.return")) {
+            // 1. Skip Heavy Ops - don't clone, don't add to value_map
+            if (shouldRematerialize(op)) {
+                try skipped_for_remat.put(op, {});
+                // Do NOT add to value_map. This allows memory to be freed.
+                continue;
+            }
+
+            // 2. Clone Light Ops
             const cloned_op = mlir.Operation{ .handle = c.operationClone(op.handle) };
 
+            // 3. Link Operands (Patching Holes)
+            // For each operand, check if it's mapped. If not, it might come from a
+            // skipped heavy op - in that case, rematerialize locally.
             for (0..cloned_op.getNumOperands()) |i| {
                 const primal_operand = op.getOperand(i);
+
+                // Case A: Operand is in map (normal flow)
                 if (value_map.get(primal_operand)) |mapped_operand| {
                     c.mlirOperationSetOperand(cloned_op.handle, @intCast(i), mapped_operand.handle);
+                }
+                // Case B: Operand was skipped. We MUST rematerialize it locally.
+                // This typically happens for reductions (e.g. sum(exp(x))) or normalizations.
+                else if (c.mlirValueIsAOpResult(primal_operand.handle)) {
+                    const producer = mlir.Operation{ .handle = c.mlirOpResultGetOwner(primal_operand.handle) };
+                    if (shouldRematerialize(producer)) {
+                        // Rematerialize using Phase 1 cache.
+                        // This value is transient and only lives as long as this light op uses it.
+                        const remat_val = try rematerializeOp(builder, producer, &value_map, &phase1_remat_cache);
+                        c.mlirOperationSetOperand(cloned_op.handle, @intCast(i), remat_val.handle);
+                    } else {
+                        // Missing mapping for a non-skipped op is a real error
+                        std.debug.print("ERROR: Missing value_map entry for non-heavy op operand (op: {s}, operand {})\n", .{ op_name, i });
+                        return error.PrimalValueNotFound;
+                    }
+                } else {
+                    // Block argument should always be in value_map
+                    std.debug.print("ERROR: Block argument not in value_map (op: {s}, operand {})\n", .{ op_name, i });
+                    return error.PrimalValueNotFound;
                 }
             }
 
@@ -164,6 +331,13 @@ pub fn buildGradientGraph(
                 try value_map.put(op.getResult(i), cloned_op.getResult(i));
             }
         }
+    }
+
+    if (skipped_for_remat.count() > 0) {
+        std.log.info("Gradient Checkpointing: Skipped {} heavy operations in Phase 1", .{skipped_for_remat.count()});
+    }
+    if (phase1_remat_cache.count() > 0) {
+        std.log.info("Gradient Checkpointing: Rematerialized {} operations in Phase 1 (hole patching)", .{phase1_remat_cache.count()});
     }
 
     // Second pass: Compute gradients using use-counting (reverse Kahn's algorithm)
@@ -180,12 +354,14 @@ pub fn buildGradientGraph(
 }
 
 /// Process a single operation's VJP rule
+/// With Gradient Checkpointing: rematerializes heavy tensors instead of keeping them alive
 fn processOperationVJP(
     allocator: Allocator,
     builder: *MLIRBuilder,
     op: mlir.Operation,
     adjoint_map: *std.AutoHashMap(mlir.Value, mlir.Value),
     value_map: *std.AutoHashMap(mlir.Value, mlir.Value),
+    remat_cache: *std.AutoHashMap(mlir.Operation, mlir.Value),
     gradient_clip_min: f64,
     gradient_clip_max: f64,
 ) !void {
@@ -229,16 +405,34 @@ fn processOperationVJP(
     }
 
     if (vjp_rule) |rule| {
-        var mapped_primals = std.ArrayList(mlir.Value).init(allocator);
-        defer mapped_primals.deinit();
+        // GRADIENT CHECKPOINTING:
+        // For each operand, check if it comes from a "heavy" operation.
+        // If so, rematerialize (recompute) it instead of using the stored forward value.
+        // This breaks the liveness chain and allows memory to be freed earlier.
+        var rematerialized_primals = std.ArrayList(mlir.Value).init(allocator);
+        defer rematerialized_primals.deinit();
 
         for (0..op.getNumOperands()) |i| {
             const primal_operand = op.getOperand(i);
+
+            // Check if this operand comes from a heavy op that we should recompute
+            if (c.mlirValueIsAOpResult(primal_operand.handle)) {
+                const producer = mlir.Operation{ .handle = c.mlirOpResultGetOwner(primal_operand.handle) };
+
+                if (shouldRematerialize(producer)) {
+                    // RECOMPUTE: Clone and execute the heavy op just-in-time
+                    const remat_val = try rematerializeOp(builder, producer, value_map, remat_cache);
+                    try rematerialized_primals.append(remat_val);
+                    continue;
+                }
+            }
+
+            // Standard path: use the mapped value from forward pass
             const mapped_operand = value_map.get(primal_operand) orelse return error.PrimalValueNotFound;
-            try mapped_primals.append(mapped_operand);
+            try rematerialized_primals.append(mapped_operand);
         }
 
-        const input_gradients = try rule(builder, op, mapped_primals.items, output_gradients);
+        const input_gradients = try rule(builder, op, rematerialized_primals.items, output_gradients);
         defer builder.allocator.free(input_gradients); // Ensure VJP result slice is freed
 
         try addInputGradients(builder, op, input_gradients, adjoint_map, gradient_clip_min, gradient_clip_max);
@@ -289,6 +483,7 @@ fn createGradientFunction(builder: *MLIRBuilder, forward_fn: mlir.Operation, nam
 
 /// Process gradients using use-counting (reverse Kahn's algorithm)
 /// Ensures operations are processed only after ALL consumers have contributed gradients
+/// Uses gradient checkpointing to rematerialize heavy tensors and reduce peak memory
 fn processGradientsWithUseCounting(
     allocator: Allocator,
     builder: *MLIRBuilder,
@@ -327,12 +522,17 @@ fn processGradientsWithUseCounting(
     defer ready_queue.deinit();
     try ready_queue.append(terminator);
 
+    // GRADIENT CHECKPOINTING: Cache for rematerialized operations
+    // This prevents recomputing the same heavy tensor multiple times
+    var remat_cache = std.AutoHashMap(mlir.Operation, mlir.Value).init(allocator);
+    defer remat_cache.deinit();
+
     // Step 3: Process operations in reverse order using use-counting
     while (ready_queue.items.len > 0) {
         const current_op = ready_queue.orderedRemove(0);
 
         std.debug.print("Processing operation VJP for: {s}\n", .{current_op.getName()});
-        try processOperationVJP(allocator, builder, current_op, adjoint_map, value_map, gradient_clip_min, gradient_clip_max);
+        try processOperationVJP(allocator, builder, current_op, adjoint_map, value_map, &remat_cache, gradient_clip_min, gradient_clip_max);
 
         // Decrement use counts for producers and add to queue when ready
         for (0..current_op.getNumOperands()) |i| {
@@ -348,6 +548,11 @@ fn processGradientsWithUseCounting(
                 }
             }
         }
+    }
+
+    // Log rematerialization stats
+    if (remat_cache.count() > 0) {
+        std.log.info("Gradient Checkpointing: Rematerialized {} operations in Phase 2 (backward pass)", .{remat_cache.count()});
     }
 }
 

@@ -39,26 +39,29 @@ const GRPOJsonConfig = struct {
     num_gen_data_inputs: usize,
 };
 
-/// JSON Config File Structure
+/// JSON Config File Structure - all required fields must be explicitly set
 const ExperimentConfig = struct {
-    model_path: []const u8 = "src/models/nanogpt_forward.mlir",
-    data_path: []const u8 = "data/tiny_shakespeare.txt",
-    tokenizer: []const u8 = "char",
-    learning_rate: f32 = 0.001,
-    tau: usize = 10,
-    outer_loop_steps: usize = 100,
-    nesterov_momentum: f32 = 0.9,
-    max_epochs: usize = 10,
+    model_path: []const u8,
+    data_path: []const u8,
+    tokenizer: []const u8,
+    sampling: []const u8,
+    learning_rate: f32,
+    tau: usize,
+    outer_loop_steps: usize,
+    nesterov_momentum: f32,
+    max_epochs: usize,
 
+    // Optional: GRPO/RL configuration
     grpo_config: ?GRPOJsonConfig = null,
 
-    // WandB configuration
-    wandb_project: []const u8 = "pcp-distributed",
+    // Optional: WandB configuration
+    wandb_project: ?[]const u8 = null,
     wandb_entity: ?[]const u8 = null,
     wandb_run_name: ?[]const u8 = null,
     wandb_api_key: ?[]const u8 = null,
 
-    checkpoint_dir: []const u8 = "checkpoints",
+    // Optional: Checkpoint configuration
+    checkpoint_dir: ?[]const u8 = null,
     should_resume: bool = false,
 };
 
@@ -322,13 +325,8 @@ fn loadConfig(allocator: Allocator, path: ?[]const u8) !ConfigResult {
             .allocator = allocator,
         };
     }
-    std.log.info("No config file specified, using defaults", .{});
-    return ConfigResult{
-        .config = ExperimentConfig{},
-        .parsed = null,
-        .json_data = null,
-        .allocator = allocator,
-    };
+    std.log.err("No config file specified. Use --config <path> to provide an experiment configuration.", .{});
+    return error.ConfigFileRequired;
 }
 
 fn runRLShepherd(allocator: Allocator, args: Args) !void {
@@ -489,11 +487,12 @@ fn runShepherd(allocator: Allocator, args: Args) !void {
     diloco_config.model_mlir_path = exp_config.model_path;
     diloco_config.data_path = exp_config.data_path;
     diloco_config.tokenizer_type = exp_config.tokenizer;
+    diloco_config.sampling_type = exp_config.sampling;
     diloco_config.tau = exp_config.tau;
     diloco_config.base_config.learning_rate = exp_config.learning_rate;
     diloco_config.base_config.outer_loop_steps = exp_config.outer_loop_steps;
     diloco_config.nesterov_momentum = exp_config.nesterov_momentum;
-    diloco_config.wandb_project = exp_config.wandb_project;
+    diloco_config.wandb_project = exp_config.wandb_project orelse "pcp-distributed";
     diloco_config.wandb_entity = exp_config.wandb_entity;
     diloco_config.wandb_run_name = exp_config.wandb_run_name;
     diloco_config.wandb_api_key = exp_config.wandb_api_key;

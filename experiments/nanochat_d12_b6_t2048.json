@@ -1,0 +1,19 @@
+{
+  "model_path": "models/nanochat_d12_b6_t2048.mlir",
+  "data_path": "data/fineweb_edu_2shards_1m.u16",
+  "tokenizer": "u16",
+  "sampling": "fifo",
+  "chunk_size_mode": "diloco_slices",
+  "chunk_manifest_path": null,
+  "chunk_shuffle": false,
+  "seed": 1,
+  "learning_rate": 0.0006,
+  "tau": 100,
+  "outer_loop_steps": 378,
+  "nesterov_momentum": 0.9,
+  "max_epochs": 1,
+  "wandb_project": "pcp-nanochat",
+  "wandb_entity": null,
+  "wandb_run_name": "nanochat-d12-b6-t2048",
+  "wandb_api_key": null
+}

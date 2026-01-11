@@ -186,6 +186,9 @@ pub const MessageType = struct {
     pub const START_ROLLOUT = "StartRollout";       // Shepherd -> Worker: "Generate text for these prompts"
     pub const ROLLOUT_COMPLETE = "RolloutComplete"; // Worker -> Shepherd: "Here are the token IDs and LogProbs"
     pub const UPDATE_WEIGHTS = "UpdateWeights";     // Shepherd -> Worker: "Here are the new model weights"
+
+    // Chunked Data Transfer Protocol (for large models > Cap'n Proto limits)
+    pub const WEIGHT_CHUNK = "WeightChunk"; // { chunk_index, total_chunks, total_bytes, data: "base64..." }
 };
 
 pub const MessageHandler = *const fn (MessageEnvelope) anyerror!void;

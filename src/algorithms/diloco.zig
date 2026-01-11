@@ -49,6 +49,7 @@ pub const DiLoCoConfig = struct {
     model_mlir_path: []const u8,
     data_path: []const u8,
     tokenizer_type: []const u8,
+    sampling_type: []const u8,
 
     wandb_project: []const u8,
     wandb_entity: ?[]const u8,
@@ -68,6 +69,7 @@ pub const DiLoCoConfig = struct {
             .model_mlir_path = "src/models/nanogpt_forward.mlir",
             .data_path = "data/tiny_shakespeare.txt",
             .tokenizer_type = "char",
+            .sampling_type = "random",
             .wandb_project = "pcp-distributed",
             .wandb_entity = null,
             .wandb_run_name = null,
@@ -510,21 +512,35 @@ pub const DiLoCo = struct {
         std.log.warn("   Non-Zero: {} / {}", .{non_zero_count, f32_view.len});
         std.log.warn("   Sum: {d:.4}", .{sum});
 
-        // Create WorkerPayload with parameters (no batch data - workers load locally)
-        const empty_slice: []const u8 = &[_]u8{};
-        const worker_payload = binary_protocol.WorkerPayload{
-            .params = total_param_bytes.items,
-            .input_ids = empty_slice,
-            .targets = empty_slice,
-        };
-        const capnp_bytes = try worker_payload.serialize(self.allocator);
-        defer self.allocator.free(capnp_bytes);
+        // Use chunked transfer for large models (> 50MB raw bytes), otherwise Cap'n Proto + base64
+        const CHUNK_THRESHOLD = 50 * 1024 * 1024; // 50MB
+        const use_chunked_transfer = raw_bytes.len > CHUNK_THRESHOLD;
 
-        // Base64 encode the Cap'n Proto message for JSON transport
-        const b64_len = std.base64.standard.Encoder.calcSize(capnp_bytes.len);
-        const b64_encoded_params = try self.allocator.alloc(u8, b64_len);
-        defer self.allocator.free(b64_encoded_params);
-        const encoded_len = std.base64.standard.Encoder.encode(b64_encoded_params, capnp_bytes).len;
+        var capnp_bytes: ?[]u8 = null;
+        var b64_encoded_params: ?[]u8 = null;
+        var encoded_len: usize = 0;
+
+        if (use_chunked_transfer) {
+            // For large models: broadcast raw parameter bytes via chunked transfer
+            // This bypasses Cap'n Proto which has size limits
+            std.log.info("Using chunked transfer for {} byte payload (raw bytes)", .{raw_bytes.len});
+            try self.coordinator.broadcastLargeData(raw_bytes);
+        } else {
+            // For small models: use Cap'n Proto serialization + base64
+            const empty_slice: []const u8 = &[_]u8{};
+            const worker_payload = binary_protocol.WorkerPayload{
+                .params = total_param_bytes.items,
+                .input_ids = empty_slice,
+                .targets = empty_slice,
+            };
+            capnp_bytes = try worker_payload.serialize(self.allocator);
+
+            const b64_len = std.base64.standard.Encoder.calcSize(capnp_bytes.?.len);
+            b64_encoded_params = try self.allocator.alloc(u8, b64_len);
+            encoded_len = std.base64.standard.Encoder.encode(b64_encoded_params.?, capnp_bytes.?).len;
+        }
+        defer if (capnp_bytes) |c| self.allocator.free(c);
+        defer if (b64_encoded_params) |p| self.allocator.free(p);
 
         // Send to each worker with their assigned data chunk
         var workers_assigned: usize = 0;
@@ -540,17 +556,24 @@ pub const DiLoCo = struct {
                 continue;
             }
 
-            // Build JSON payload with params and chunk info
+            // Build JSON payload with chunk info (params omitted if using chunked transfer)
             var payload_map = std.json.ObjectMap.init(self.allocator);
             defer payload_map.deinit();
 
-            try payload_map.put("params", std.json.Value{ .string = b64_encoded_params[0..encoded_len] });
+            // Only include params if NOT using chunked transfer
+            if (!use_chunked_transfer) {
+                try payload_map.put("params", std.json.Value{ .string = b64_encoded_params.?[0..encoded_len] });
+            } else {
+                // Tell worker that weight_blob contains raw bytes (not Cap'n Proto)
+                try payload_map.put("raw_params", std.json.Value{ .bool = true });
+            }
             try payload_map.put("offset", std.json.Value{ .integer = @intCast(chunk.?.offset) });
             try payload_map.put("length", std.json.Value{ .integer = @intCast(chunk.?.length) });
             try payload_map.put("chunk_id", std.json.Value{ .integer = @intCast(chunk.?.id) });
             try payload_map.put("data_path", std.json.Value{ .string = self.config.data_path });
             try payload_map.put("tau", std.json.Value{ .integer = @intCast(self.config.tau) });
             try payload_map.put("tokenizer", std.json.Value{ .string = self.config.tokenizer_type });
+            try payload_map.put("sampling", std.json.Value{ .string = self.config.sampling_type });
 
             const json_payload = std.json.Value{ .object = payload_map };
 

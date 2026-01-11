@@ -73,6 +73,11 @@ pub const Worker = struct {
     device_kv_cache: ?[]IreeBackend.DeviceBuffer, // KV cache on GPU (pointer-swapped each step)
     device_weights_dirty: bool,                    // True if weight_blob was updated, needs re-upload
 
+    // Chunked Transfer: State for reassembling incoming weight chunks
+    incoming_weight_buffer: ?std.ArrayList(u8),
+    expected_chunks: usize,
+    received_chunks: usize,
+
     const Self = @This();
 
     pub fn init(allocator: Allocator, backend: WorkerBackend, supervisor_id: ?i64) !Self {
@@ -99,6 +104,9 @@ pub const Worker = struct {
             .device_weights = null,
             .device_kv_cache = null,
             .device_weights_dirty = false,
+            .incoming_weight_buffer = null,
+            .expected_chunks = 0,
+            .received_chunks = 0,
         };
     }
     
@@ -144,6 +152,11 @@ pub const Worker = struct {
         // Cleanup weight blob
         if (self.weight_blob) |blob| {
             self.allocator.free(blob);
+        }
+
+        // Cleanup incoming weight buffer (chunked transfer)
+        if (self.incoming_weight_buffer) |*buf| {
+            buf.deinit();
         }
 
         // Cleanup device-resident buffers
@@ -245,6 +258,8 @@ pub const Worker = struct {
             // Handle different message types
             if (std.mem.eql(u8, msg.msg_type, MessageType.INITIALIZE_GRAPH)) {
                 try self.handleInitializeGraph(msg);
+            } else if (std.mem.eql(u8, msg.msg_type, MessageType.WEIGHT_CHUNK)) {
+                try self.handleWeightChunk(msg);
             } else if (std.mem.eql(u8, msg.msg_type, MessageType.START_INNER_LOOP)) {
                 try self.handleStartInnerLoop(msg);
             } else if (std.mem.eql(u8, msg.msg_type, MessageType.START_ROLLOUT)) {
@@ -300,7 +315,59 @@ pub const Worker = struct {
             std.time.sleep(500 * std.time.ns_per_ms);
         }
     }
-    
+
+    /// Handle incoming weight chunks from chunked transfer protocol
+    fn handleWeightChunk(self: *Self, msg: MessageEnvelope) !void {
+        const payload = switch (msg.data) {
+            .object => |o| o,
+            else => return error.InvalidFormat,
+        };
+
+        const chunk_index: usize = @intCast(payload.get("chunk_index").?.integer);
+        const total_chunks: usize = @intCast(payload.get("total_chunks").?.integer);
+        const b64_data = payload.get("data").?.string;
+
+        // Initialize buffer on first chunk
+        if (chunk_index == 0) {
+            if (self.incoming_weight_buffer) |*buf| buf.deinit();
+            const total_bytes: usize = @intCast(payload.get("total_bytes").?.integer);
+            self.incoming_weight_buffer = try std.ArrayList(u8).initCapacity(self.allocator, total_bytes);
+            self.expected_chunks = total_chunks;
+            self.received_chunks = 0;
+            std.log.info("Worker {}: Started receiving weights ({} bytes in {} chunks)", .{ self.node_id.?, total_bytes, total_chunks });
+        }
+
+        // Decode and append chunk
+        const decoded_len = try std.base64.standard.Decoder.calcSizeForSlice(b64_data);
+        const decoded = try self.allocator.alloc(u8, decoded_len);
+        defer self.allocator.free(decoded);
+        try std.base64.standard.Decoder.decode(decoded, b64_data);
+
+        try self.incoming_weight_buffer.?.appendSlice(decoded);
+        self.received_chunks += 1;
+
+        if (self.received_chunks % 10 == 0 or self.received_chunks == self.expected_chunks) {
+            std.log.info("Worker {}: Received chunk {}/{}", .{ self.node_id.?, self.received_chunks, self.expected_chunks });
+        }
+
+        // Finalize when all chunks received
+        if (self.received_chunks == self.expected_chunks) {
+            std.log.info("Worker {}: Reassembly complete. {} bytes received.", .{ self.node_id.?, self.incoming_weight_buffer.?.items.len });
+
+            // Move from ArrayList to weight_blob
+            if (self.weight_blob) |blob| self.allocator.free(blob);
+            self.weight_blob = try self.incoming_weight_buffer.?.toOwnedSlice();
+
+            // Clean up builder
+            self.incoming_weight_buffer = null;
+            self.received_chunks = 0;
+            self.expected_chunks = 0;
+
+            // Mark for GPU upload on next use
+            self.device_weights_dirty = true;
+        }
+    }
+
     /// Handles the one-time setup message, caching the VMFB binary and shapes
     fn handleInitializeGraph(self: *Self, msg: MessageEnvelope) !void {
         // Free any old data
@@ -572,6 +639,13 @@ pub const Worker = struct {
             }
         else
             "char";
+        const sampling_type = if (payload.get("sampling")) |sampling_val|
+            switch (sampling_val) {
+                .string => |s| s,
+                else => "random",
+            }
+        else
+            "random";
 
         self.current_chunk_id = @intCast(chunk_id);
 
@@ -583,6 +657,7 @@ pub const Worker = struct {
         }
 
         if (std.mem.eql(u8, tokenizer_type, "byte")) {
+            if (!std.mem.eql(u8, sampling_type, "random")) return error.UnsupportedSamplingMode;
             std.log.info("Worker {}: Using ByteTokenizer (Configured)", .{self.node_id.?});
             const byte_ds = try loader.ByteTextDataset.initChunk(
                 self.allocator,
@@ -593,6 +668,7 @@ pub const Worker = struct {
             );
             self.dataset = byte_ds.asDataset();
         } else if (std.mem.eql(u8, tokenizer_type, "char")) {
+            if (!std.mem.eql(u8, sampling_type, "random")) return error.UnsupportedSamplingMode;
             std.log.info("Worker {}: Using CharTokenizer (Configured)", .{self.node_id.?});
             const char_ds = try loader.TextDataset.initChunk(
                 self.allocator,
@@ -602,28 +678,80 @@ pub const Worker = struct {
                 @intCast(self.node_id.?),
             );
             self.dataset = char_ds.asDataset();
+        } else if (std.mem.eql(u8, tokenizer_type, "u16")) {
+            if (std.mem.eql(u8, sampling_type, "fifo")) {
+                std.log.info("Worker {}: Using U16TokenDatasetFifo (Configured)", .{self.node_id.?});
+                const u16_ds = try loader.U16TokenDatasetFifo.initChunk(
+                    self.allocator,
+                    data_path,
+                    @intCast(offset),
+                    @intCast(length),
+                    @intCast(self.node_id.?),
+                );
+                self.dataset = u16_ds.asDataset();
+            } else if (std.mem.eql(u8, sampling_type, "random")) {
+                std.log.info("Worker {}: Using U16TokenDataset (Configured)", .{self.node_id.?});
+                const u16_ds = try loader.U16TokenDataset.initChunk(
+                    self.allocator,
+                    data_path,
+                    @intCast(offset),
+                    @intCast(length),
+                    @intCast(self.node_id.?),
+                );
+                self.dataset = u16_ds.asDataset();
+            } else {
+                return error.UnsupportedSamplingMode;
+            }
         } else {
             std.log.err("Unknown tokenizer type: {s}", .{tokenizer_type});
             return error.UnknownTokenizer;
         }
 
-        // 5. Decode the Base64-encoded Cap'n Proto params
-        const b64_params = switch (payload.get("params") orelse return error.MissingParams) {
-            .string => |s| s,
-            else => return error.InvalidParamsFormat,
-        };
-
+        // 5. Get params: either from chunked transfer (weight_blob) or inline base64
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
 
-        const capnp_len = try std.base64.standard.Decoder.calcSizeForSlice(b64_params);
-        const capnp_bytes = try arena.allocator().alloc(u8, capnp_len);
-        try std.base64.standard.Decoder.decode(capnp_bytes, b64_params);
+        var initial_params_bytes_temp: []const u8 = undefined;
+        const using_chunked_transfer = self.weight_blob != null and payload.get("params") == null;
+        const using_raw_params = if (payload.get("raw_params")) |v| v == .bool and v.bool else false;
 
-        // 6. Deserialize params only (no batch data)
-        const reader = try binary_protocol.WorkerPayload.Reader.init(capnp_bytes);
-        defer reader.deinit();
-        const initial_params_bytes_temp = try reader.getParams();
+        if (using_chunked_transfer) {
+            // Use pre-received weight_blob from chunked transfer
+            std.log.info("Worker {}: Using chunked transfer weights ({} bytes, raw={})", .{ self.node_id.?, self.weight_blob.?.len, using_raw_params });
+
+            if (using_raw_params) {
+                // weight_blob contains raw parameter bytes directly
+                initial_params_bytes_temp = self.weight_blob.?;
+            } else {
+                // weight_blob contains Cap'n Proto serialized bytes
+                const reader = try binary_protocol.WorkerPayload.Reader.init(self.weight_blob.?);
+                // Don't use defer - copy params before deinit to avoid use-after-free
+                const params_from_reader = try reader.getParams();
+                const params_copy = try arena.allocator().alloc(u8, params_from_reader.len);
+                @memcpy(params_copy, params_from_reader);
+                initial_params_bytes_temp = params_copy;
+                reader.deinit();
+            }
+        } else {
+            // Fall back to inline base64 params (for smaller models)
+            const b64_params = switch (payload.get("params") orelse return error.MissingParams) {
+                .string => |s| s,
+                else => return error.InvalidParamsFormat,
+            };
+
+            const capnp_len = try std.base64.standard.Decoder.calcSizeForSlice(b64_params);
+            const decoded = try arena.allocator().alloc(u8, capnp_len);
+            try std.base64.standard.Decoder.decode(decoded, b64_params);
+
+            // 6. Deserialize params from Cap'n Proto
+            const reader = try binary_protocol.WorkerPayload.Reader.init(decoded);
+            // Don't use defer - copy params before deinit to avoid use-after-free
+            const params_from_reader = try reader.getParams();
+            const params_copy = try arena.allocator().alloc(u8, params_from_reader.len);
+            @memcpy(params_copy, params_from_reader);
+            initial_params_bytes_temp = params_copy;
+            reader.deinit();
+        }
 
         // Validate Received Parameters
         var sum: f64 = 0.0;

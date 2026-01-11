@@ -36,7 +36,11 @@ def main():
             if data.get("_command") == "finish":
                 break
 
-            wandb.log(data)
+            step = data.get("outer_step")
+            if step is None:
+                wandb.log(data)
+            else:
+                wandb.log(data, step=int(step))
 
         except json.JSONDecodeError:
             continue

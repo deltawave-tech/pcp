@@ -554,6 +554,47 @@ pub const Shepherd = struct {
 
     }
 
+    /// Broadcast large binary data to all workers using chunked transfer protocol.
+    /// Splits data into 10MB chunks to avoid Cap'n Proto message size limits.
+    pub fn broadcastLargeData(self: *Self, data: []const u8) !void {
+        const CHUNK_SIZE = 10 * 1024 * 1024; // 10MB per chunk
+        const total_size = data.len;
+        const total_chunks = (total_size + CHUNK_SIZE - 1) / CHUNK_SIZE;
+
+        std.log.info("Broadcasting {} bytes in {} chunks...", .{ total_size, total_chunks });
+
+        var offset: usize = 0;
+        var chunk_idx: usize = 0;
+        while (chunk_idx < total_chunks) : (chunk_idx += 1) {
+            const end = @min(offset + CHUNK_SIZE, total_size);
+            const chunk_slice = data[offset..end];
+
+            // Base64 encode the chunk
+            const b64_len = std.base64.standard.Encoder.calcSize(chunk_slice.len);
+            const b64_chunk = try self.allocator.alloc(u8, b64_len);
+            defer self.allocator.free(b64_chunk);
+            _ = std.base64.standard.Encoder.encode(b64_chunk, chunk_slice);
+
+            // Construct Payload
+            var payload = std.json.ObjectMap.init(self.allocator);
+            defer payload.deinit();
+
+            try payload.put("chunk_index", std.json.Value{ .integer = @intCast(chunk_idx) });
+            try payload.put("total_chunks", std.json.Value{ .integer = @intCast(total_chunks) });
+            try payload.put("data", std.json.Value{ .string = b64_chunk });
+            try payload.put("total_bytes", std.json.Value{ .integer = @intCast(total_size) });
+
+            // Broadcast using existing method
+            try self.broadcastToWorkers(MessageType.WEIGHT_CHUNK, .{ .object = payload });
+
+            offset = end;
+
+            // Small sleep every 5 chunks to prevent overwhelming network buffers
+            if (chunk_idx % 5 == 4) std.time.sleep(10 * std.time.ns_per_ms);
+        }
+        std.log.info("✓ Broadcast complete ({} chunks sent).", .{total_chunks});
+    }
+
     /// Send a message to a specific worker by its NodeId
     pub fn sendToWorker(self: *Self, node_id: NodeId, msg_type: []const u8, data: std.json.Value) !void {
         self.worker_pool_mutex.lock();
@@ -606,7 +647,7 @@ pub const Shepherd = struct {
     pub fn collectFromWorkers(self: *Self, expected_msg_type: []const u8, expected_count: usize) !ArrayList(MessageEnvelope) {
         std.log.info("Collecting results (expecting {})...", .{expected_count});
 
-        const max_wait_seconds: i64 = 1200; // 20 minutes - increased to accommodate long RL generation times (180s+ per worker)
+        const max_wait_seconds: i64 = 14400; // 4 hours - accommodate large tau/models with long inner loops
         const start_time = std.time.timestamp();
 
         var loops: usize = 0;

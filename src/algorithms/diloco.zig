@@ -98,6 +98,7 @@ pub const DiLoCo = struct {
 
     // GPT-2 master parameters as multiple MLIR tensors
     master_parameters: ?[]Tensor,
+    master_param_raw_data: ?[][]u8, // Authoritative raw byte storage (MLIR may not copy data)
     parameter_shapes: [][]i64, // Multiple parameter shapes for GPT-2
     
     // NEW: Data input shapes for worker buffer creation
@@ -246,6 +247,7 @@ pub const DiLoCo = struct {
             .host_optimizer = host_opt,
             .element_type = element_type,
             .master_parameters = null,
+            .master_param_raw_data = null,
             .parameter_shapes = parameter_shapes,
             .data_input_shapes = data_input_shapes,
             .executor = executor, // Store the generic executor
@@ -264,6 +266,12 @@ pub const DiLoCo = struct {
                 param.deinit();
             }
             self.allocator.free(params);
+        }
+
+        // Free the raw parameter data
+        if (self.master_param_raw_data) |data| {
+            for (data) |bytes| self.allocator.free(bytes);
+            self.allocator.free(data);
         }
 
         self.adam_optimizer.deinit();
@@ -424,6 +432,8 @@ pub const DiLoCo = struct {
 
         // Allocate array for master parameter tensors
         const param_tensors = try self.allocator.alloc(Tensor, self.parameter_shapes.len);
+        // Allocate array for raw buffers (authoritative storage)
+        self.master_param_raw_data = try self.allocator.alloc([]u8, self.parameter_shapes.len);
         var rng = std.Random.DefaultPrng.init(12345);
 
         // Initialize each parameter tensor with appropriate shape
@@ -439,7 +449,7 @@ pub const DiLoCo = struct {
             // Calculate byte size based on target dtype
             const bytes_per_element = self.config.dtype.sizeInBytes();
             const byte_data = try self.allocator.alloc(u8, element_count * bytes_per_element);
-            defer self.allocator.free(byte_data);
+            // DO NOT defer free - we store it in master_param_raw_data
 
             // Generate Xavier-initialized values and convert to target dtype
             const scale = std.math.sqrt(2.0 / @as(f32, @floatFromInt(element_count)));
@@ -480,6 +490,9 @@ pub const DiLoCo = struct {
                 }
             }
 
+            // Store raw data in authoritative buffer
+            self.master_param_raw_data.?[i] = byte_data;
+
             param_tensor.* = try Tensor.fromBytes(self.mlir_builder, byte_data, shape, self.config.dtype);
         }
 
@@ -490,6 +503,8 @@ pub const DiLoCo = struct {
 
     /// Save current master parameters to a binary file
     fn saveCheckpoint(self: *Self, step: usize) !void {
+        if (self.master_param_raw_data == null) return;
+
         var filename_buf: [64]u8 = undefined;
         const filename = try std.fmt.bufPrint(&filename_buf, "checkpoint_{d}.bin", .{step});
 
@@ -505,29 +520,21 @@ pub const DiLoCo = struct {
         try writer.writeAll("PCPCHECK");
         try writer.writeInt(u32, 1, .little); // Version
 
-        if (self.master_parameters) |params| {
-            // 2. Number of tensors
-            try writer.writeInt(u32, @intCast(params.len), .little);
+        const raw_data = self.master_param_raw_data.?;
+        // 2. Number of tensors
+        try writer.writeInt(u32, @intCast(raw_data.len), .little);
 
-            for (params) |t| {
-                // 3a. Write Shape info
-                const rank = t.shape.rank();
-                try writer.writeInt(u8, @intCast(rank), .little);
-
-                const dims = try t.shape.getDims(self.allocator);
-                defer self.allocator.free(dims);
-                for (dims) |d| {
-                    try writer.writeInt(i64, d, .little);
-                }
-
-                // 3b. Write Data
-                const raw_bytes = try t.toBytes(self.allocator);
-                defer self.allocator.free(raw_bytes);
-
-                // Write size of data block followed by data
-                try writer.writeInt(u64, @intCast(raw_bytes.len), .little);
-                try writer.writeAll(raw_bytes);
+        for (raw_data, 0..) |bytes, i| {
+            // 3a. Write Shape info
+            const shape = self.parameter_shapes[i];
+            try writer.writeInt(u8, @intCast(shape.len), .little);
+            for (shape) |d| {
+                try writer.writeInt(i64, d, .little);
             }
+
+            // 3b. Write Data directly from raw buffer
+            try writer.writeInt(u64, @intCast(bytes.len), .little);
+            try writer.writeAll(bytes);
         }
         std.log.info("✓ Checkpoint saved.", .{});
     }
@@ -536,35 +543,67 @@ pub const DiLoCo = struct {
     /// Broadcast to snapshot participants only
     /// Returns the number of workers that were actually assigned chunks
     fn broadcastToSnapshot(self: *Self, workers: []const shepherd.WorkerConnection) !usize {
-        if (self.master_parameters == null) {
+        if (self.master_param_raw_data == null) {
             return error.ParametersNotInitialized;
         }
 
-        const param_tensors = self.master_parameters.?;
-
-        // Extract and concatenate all parameter tensor data
+        // Concatenate raw parameter data from authoritative storage
         var total_param_bytes = ArrayList(u8).init(self.allocator);
         defer total_param_bytes.deinit();
 
-        for (param_tensors) |param_tensor| {
-            const tensor_data = try param_tensor.toBytes(self.allocator);
-            defer self.allocator.free(tensor_data);
-            try total_param_bytes.appendSlice(tensor_data);
+        for (self.master_param_raw_data.?) |bytes| {
+            try total_param_bytes.appendSlice(bytes);
         }
 
-        // Validate Outgoing Parameters
+        // Validate Outgoing Parameters (DType Aware)
         const raw_bytes = total_param_bytes.items;
-        const f32_view = std.mem.bytesAsSlice(f32, raw_bytes);
         var sum: f64 = 0.0;
         var non_zero_count: usize = 0;
-        for (f32_view) |val| {
-            if (val != 0.0) non_zero_count += 1;
-            sum += @abs(val);
+        var nan_count: usize = 0;
+        var inf_count: usize = 0;
+
+        if (self.config.dtype == .f32) {
+            const f32_view = std.mem.bytesAsSlice(f32, raw_bytes);
+            for (f32_view) |val| {
+                if (std.math.isNan(val)) {
+                    nan_count += 1;
+                } else if (std.math.isInf(val)) {
+                    inf_count += 1;
+                } else {
+                    if (val != 0.0) non_zero_count += 1;
+                    sum += @abs(val);
+                }
+            }
+        } else if (self.config.dtype == .bf16) {
+            // Correctly interpret bf16 bytes
+            var i: usize = 0;
+            while (i < raw_bytes.len) : (i += 2) {
+                const u16_val = std.mem.readInt(u16, raw_bytes[i..][0..2], .little);
+                const u32_val = @as(u32, u16_val) << 16;
+                const val: f32 = @bitCast(u32_val);
+
+                if (std.math.isNan(val)) {
+                    nan_count += 1;
+                } else if (std.math.isInf(val)) {
+                    inf_count += 1;
+                } else {
+                    if (val != 0.0) non_zero_count += 1;
+                    sum += @as(f64, @abs(val));
+                }
+            }
         }
-        std.log.warn("🔍 SHEPHERD SEND CHECK:", .{});
+
+        const num_elements = raw_bytes.len / self.config.dtype.sizeInBytes();
+
+        std.log.warn("SHEPHERD SEND CHECK:", .{});
         std.log.warn("   Total Bytes: {}", .{raw_bytes.len});
-        std.log.warn("   Non-Zero: {} / {}", .{non_zero_count, f32_view.len});
-        std.log.warn("   Sum: {d:.4}", .{sum});
+        std.log.warn("   Elements: {}", .{num_elements});
+        std.log.warn("   Non-Zero: {}", .{non_zero_count});
+        std.log.warn("   Abs Sum: {d:.4}", .{sum});
+
+        if (nan_count > 0 or inf_count > 0) {
+            std.log.err("CRITICAL: Parameter corruption detected! NaNs: {}, Infs: {}", .{ nan_count, inf_count });
+        }
 
         // Use chunked transfer for large models (> 50MB raw bytes), otherwise Cap'n Proto + base64
         const CHUNK_THRESHOLD = 50 * 1024 * 1024; // 50MB
@@ -662,23 +701,27 @@ pub const DiLoCo = struct {
         if (expected_count == 0) return;
         if (self.master_parameters == null) return error.ParametersNotInitialized;
 
-        // 1. Initialize Accumulator (Zeroed buffer matching total parameter size)
-        // We calculate total size first
-        var total_param_bytes: usize = 0;
+        // 1. Calculate sizes
+        var transmission_bytes: usize = 0; // Size coming from network (e.g. bf16)
+        var accumulation_bytes: usize = 0; // Size for math (always f32)
+        const dtype_size = self.config.dtype.sizeInBytes();
+
         for (self.parameter_shapes) |shape| {
             var elem_count: usize = 1;
             for (shape) |dim| elem_count *= @intCast(dim);
-            total_param_bytes += elem_count * @sizeOf(f32);
+            transmission_bytes += elem_count * dtype_size;
+            accumulation_bytes += elem_count * @sizeOf(f32);
         }
 
-        const accumulator = try self.allocator.alloc(u8, total_param_bytes);
+        // Initialize Accumulator (Always f32 for precision during averaging)
+        const accumulator = try self.allocator.alloc(u8, accumulation_bytes);
         defer self.allocator.free(accumulator);
-        @memset(accumulator, 0); // Important: Init to zero
+        @memset(accumulator, 0);
 
         var collected_count: usize = 0;
         var total_loss: f32 = 0.0;
 
-        std.log.info("Streaming results from {} workers...", .{expected_count});
+        std.log.info("Streaming results from {} workers (Exp: {} bytes/worker)...", .{ expected_count, transmission_bytes });
 
         // 2. Collection Loop
         while (collected_count < expected_count) {
@@ -689,7 +732,7 @@ pub const DiLoCo = struct {
                 responses.deinit();
             }
 
-            if (responses.items.len == 0) continue; // Safety check
+            if (responses.items.len == 0) continue;
 
             const response = responses.items[0];
 
@@ -700,13 +743,12 @@ pub const DiLoCo = struct {
                         const chunk_id: usize = @intCast(chunk_val.integer);
                         if (self.coordinator.data_manager) |*dm| {
                             dm.markComplete(chunk_id);
-                            std.log.info("Worker {} completed chunk {}", .{ response.sender_node, chunk_id });
                         }
                     }
                 }
             }
 
-            // Decode Payload - check if using chunked transfer or legacy inline params
+            // Decode Payload
             var arena = std.heap.ArenaAllocator.init(self.allocator);
             defer arena.deinit();
 
@@ -719,106 +761,158 @@ pub const DiLoCo = struct {
                 false;
 
             if (is_chunked) {
-                // Chunked transfer: get reassembled data from shepherd
                 const update_state = self.coordinator.getReassembledUpdate(response.sender_node) orelse {
                     std.log.err("Worker {} sent chunked completion but no reassembled data found!", .{response.sender_node});
                     return error.MissingReassembledData;
                 };
-
                 delta_bytes = update_state.buffer.items;
                 loss_val = update_state.loss;
-
-                std.log.info("Worker {}: Using reassembled chunked data ({} bytes)", .{ response.sender_node, delta_bytes.len });
             } else {
-                // Legacy path: inline params via Cap'n Proto (for backwards compatibility)
+                // Legacy path (Cap'n Proto)
                 const b64_payload = switch (response.data) {
                     .string => |s| s,
-                    .object => |obj| blk: {
-                        if (obj.get("params")) |p| {
-                            break :blk switch (p) {
-                                .string => |s| s,
-                                else => return error.InvalidMessageFormat,
-                            };
-                        }
-                        return error.InvalidMessageFormat;
-                    },
+                    .object => |obj| obj.get("params").?.string,
                     else => return error.InvalidMessageFormat,
                 };
-
                 const capnp_len = try std.base64.standard.Decoder.calcSizeForSlice(b64_payload);
                 const capnp_bytes = try arena.allocator().alloc(u8, capnp_len);
                 try std.base64.standard.Decoder.decode(capnp_bytes, b64_payload);
-
                 const reader = try binary_protocol.ShepherdPayload.Reader.init(capnp_bytes);
                 defer reader.deinit();
-
                 delta_bytes = try reader.getUpdatedParams();
                 loss_val = try reader.getLoss();
             }
 
             // 3. Accumulate: Accumulator += Delta
-            if (delta_bytes.len != total_param_bytes) {
-                std.log.err("Worker delta size mismatch! Expected {}, got {}", .{ total_param_bytes, delta_bytes.len });
+            if (delta_bytes.len != transmission_bytes) {
+                std.log.err("Worker delta size mismatch! Expected {}, got {}", .{ transmission_bytes, delta_bytes.len });
                 return error.DimensionMismatch;
             }
 
             const acc_f32: [*]f32 = @ptrCast(@alignCast(accumulator.ptr));
-            const delta_f32: [*]const f32 = @ptrCast(@alignCast(delta_bytes.ptr));
-            const num_floats = total_param_bytes / @sizeOf(f32);
+            const num_floats = accumulation_bytes / @sizeOf(f32);
 
-            // Vectorize addition
-            for (0..num_floats) |i| {
-                acc_f32[i] += delta_f32[i];
+            // Handle type conversion if needed
+            switch (self.config.dtype) {
+                .f32 => {
+                    const delta_f32 = @as([*]const f32, @ptrCast(@alignCast(delta_bytes.ptr)));
+                    for (0..num_floats) |i| acc_f32[i] += delta_f32[i];
+                },
+                .bf16 => {
+                    // bf16 is u16 (2 bytes).
+                    // Conversion: shift left 16 bits to get f32 (assuming IEEE754 structure overlap)
+                    var i: usize = 0;
+                    var offset: usize = 0;
+                    while (i < num_floats) : (i += 1) {
+                        const bf16_val = std.mem.readInt(u16, delta_bytes[offset..][0..2], .little);
+                        const as_u32 = @as(u32, bf16_val) << 16;
+                        const val_f32: f32 = @bitCast(as_u32);
+                        acc_f32[i] += val_f32;
+                        offset += 2;
+                    }
+                },
+                else => {
+                    std.log.err("Unsupported accumulation dtype: {}", .{self.config.dtype});
+                    return error.UnsupportedDType;
+                },
             }
 
             total_loss += loss_val;
             collected_count += 1;
 
-            // Clean up reassembled data after use (if chunked)
             if (is_chunked) {
                 self.coordinator.clearReassembledUpdate(response.sender_node);
             }
-
-            // Message is freed here by the defer/arena logic, keeping memory low
         }
 
         // 4. Average the Accumulator
         const acc_f32: [*]f32 = @ptrCast(@alignCast(accumulator.ptr));
-        const num_floats = total_param_bytes / @sizeOf(f32);
+        const num_floats = accumulation_bytes / @sizeOf(f32);
         const divisor = @as(f32, @floatFromInt(collected_count));
 
+        var nan_grad_count: usize = 0;
         for (0..num_floats) |i| {
             acc_f32[i] /= divisor;
+
+            // NaN Guard: If gradients exploded/diverged, zero them out to save the model
+            if (std.math.isNan(acc_f32[i]) or std.math.isInf(acc_f32[i])) {
+                acc_f32[i] = 0.0;
+                nan_grad_count += 1;
+            }
+        }
+
+        if (nan_grad_count > 0) {
+            std.log.err("WARNING: Detected {} NaN/Inf values in aggregated gradients! Zeroed them out.", .{nan_grad_count});
         }
 
         // 5. Apply to Master Parameters (Per Tensor)
-        var byte_offset: usize = 0;
+        // Note: Master params might be bf16, Optimizer expects f32, Result must be bf16
+        var acc_offset: usize = 0; // Offset in the f32 accumulator
         const param_tensors = self.master_parameters.?;
 
         for (param_tensors, 0..) |*param_tensor_ptr, i| {
             const shape = self.parameter_shapes[i];
             var elem_count: usize = 1;
             for (shape) |dim| elem_count *= @intCast(dim);
-            const tensor_size = elem_count * @sizeOf(f32);
 
-            // Get current master data
-            const master_bytes = try param_tensor_ptr.toBytes(self.allocator);
-            defer self.allocator.free(master_bytes);
-            const master_f32: []f32 = @alignCast(std.mem.bytesAsSlice(f32, master_bytes));
+            // Use authoritative raw data instead of querying MLIR
+            const master_raw_bytes = self.master_param_raw_data.?[i];
 
-            // Get corresponding averaged delta
-            const grad_slice = acc_f32[byte_offset / 4 .. (byte_offset + tensor_size) / 4];
+            // Convert Master Bytes -> F32 for Optimizer
+            const master_f32_buf = try self.allocator.alloc(f32, elem_count);
+            defer self.allocator.free(master_f32_buf);
 
-            // Update using Nesterov (Host Optimizer)
-            // Note: master_f32 is modified in-place
-            try self.host_optimizer.update(i, master_f32, grad_slice);
+            switch (self.config.dtype) {
+                .f32 => {
+                    @memcpy(master_f32_buf, std.mem.bytesAsSlice(f32, master_raw_bytes));
+                },
+                .bf16 => {
+                    var off: usize = 0;
+                    for (0..elem_count) |k| {
+                        const bf16_val = std.mem.readInt(u16, master_raw_bytes[off..][0..2], .little);
+                        const val_f32: f32 = @bitCast(@as(u32, bf16_val) << 16);
+                        master_f32_buf[k] = val_f32;
+                        off += 2;
+                    }
+                },
+                else => return error.UnsupportedDType,
+            }
 
-            // Wrap back to MLIR Tensor
+            // Get corresponding averaged gradient from accumulator
+            const grad_slice = acc_f32[acc_offset .. acc_offset + elem_count];
+
+            // Update using Nesterov (Host Optimizer) - In-place on master_f32_buf
+            try self.host_optimizer.update(i, master_f32_buf, grad_slice);
+
+            // Convert Updated F32 -> Target DType Bytes
+            const updated_bytes = try self.allocator.alloc(u8, elem_count * self.config.dtype.sizeInBytes());
+
+            switch (self.config.dtype) {
+                .f32 => {
+                    @memcpy(updated_bytes, std.mem.sliceAsBytes(master_f32_buf));
+                },
+                .bf16 => {
+                    var off: usize = 0;
+                    for (master_f32_buf) |val| {
+                        const f32_bits: u32 = @bitCast(val);
+                        // Truncate to bf16
+                        const bf16_val: u16 = @truncate(f32_bits >> 16);
+                        @memcpy(updated_bytes[off..][0..2], std.mem.asBytes(&bf16_val));
+                        off += 2;
+                    }
+                },
+                else => return error.UnsupportedDType,
+            }
+
+            // Free old raw buffer and swap pointer
+            self.allocator.free(self.master_param_raw_data.?[i]);
+            self.master_param_raw_data.?[i] = updated_bytes;
+
+            // Re-create MLIR tensor (points to new buffer)
             param_tensor_ptr.deinit();
-            const updated_bytes = std.mem.sliceAsBytes(master_f32);
-            param_tensor_ptr.* = try Tensor.fromBytes(self.mlir_builder, updated_bytes, shape, .f32);
+            param_tensor_ptr.* = try Tensor.fromBytes(self.mlir_builder, updated_bytes, shape, self.config.dtype);
 
-            byte_offset += tensor_size;
+            acc_offset += elem_count;
         }
 
         // Update metrics
@@ -845,12 +939,10 @@ pub const DiLoCo = struct {
         // 1. Magic Header
         try writer.writeAll("PCP_RES");
 
-        // 2. Save Model Parameters
-        if (self.master_parameters) |params| {
-            try writer.writeInt(u32, @intCast(params.len), .little);
-            for (params) |t| {
-                const bytes = try t.toBytes(self.allocator);
-                defer self.allocator.free(bytes);
+        // 2. Save Model Parameters (use raw data, bypass MLIR)
+        if (self.master_param_raw_data) |raw_data| {
+            try writer.writeInt(u32, @intCast(raw_data.len), .little);
+            for (raw_data) |bytes| {
                 try writer.writeInt(u64, @intCast(bytes.len), .little);
                 try writer.writeAll(bytes);
             }
@@ -904,21 +996,27 @@ pub const DiLoCo = struct {
         // 2. Load Parameters
         const num_tensors = try reader.readInt(u32, .little);
         if (num_tensors > 0) {
-            // Ensure master_parameters is allocated
+            // Ensure master_parameters and raw data are allocated
             if (self.master_parameters == null) {
                 self.master_parameters = try self.allocator.alloc(Tensor, num_tensors);
+            }
+            if (self.master_param_raw_data == null) {
+                self.master_param_raw_data = try self.allocator.alloc([]u8, num_tensors);
             }
 
             for (self.master_parameters.?, 0..) |*t, i| {
                 const len = try reader.readInt(u64, .little);
                 const bytes = try self.allocator.alloc(u8, len);
-                defer self.allocator.free(bytes);
+                // DO NOT defer free - store in master_param_raw_data
                 _ = try reader.readAll(bytes);
+
+                // Store raw data
+                self.master_param_raw_data.?[i] = bytes;
 
                 // If tensor already exists, deinit it first
                 if (i < self.parameter_shapes.len) {
-                    // Recreate tensor from bytes
-                    t.* = try Tensor.fromBytes(self.mlir_builder, bytes, self.parameter_shapes[i], .f32);
+                    // Recreate tensor from bytes with correct dtype
+                    t.* = try Tensor.fromBytes(self.mlir_builder, bytes, self.parameter_shapes[i], self.config.dtype);
                 }
             }
         }

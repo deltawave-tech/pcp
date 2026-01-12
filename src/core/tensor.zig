@@ -293,11 +293,18 @@ pub fn Tensor(comptime T: type) type {
         pub fn fromBytes(builder: *MLIRBuilder, bytes: []const u8, shape_dims: []const i64, dtype: DType) !Self {
             const tensor_type = mlir.Type.rankedTensorType(builder.ctx, shape_dims, dtype.toMLIRType(builder.ctx));
 
-            // Create shape object
+            // Create shape object with explicit dtype
             const ts_shape = try Shape.initWithDims(builder.ctx, shape_dims, dtype);
 
             const value = try builder.createConstant(bytes, tensor_type, ts_shape);
-            return try builder.newTensor(value);
+
+            // Direct construction: avoid builder.newTensor() which re-infers dtype from MLIR value.
+            // Re-inference can fail for bf16 (falling back to f32), causing size mismatch in toBytes().
+            return Self{
+                .shape = ts_shape,
+                .value = value,
+                .builder = builder,
+            };
         }
 
         /// Extract raw bytes from a stablehlo.constant tensor.

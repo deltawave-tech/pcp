@@ -51,6 +51,9 @@ const ExperimentConfig = struct {
     nesterov_momentum: f32,
     max_epochs: usize,
 
+    // Required: Precision control ("f32", "bf16", or "f16")
+    dtype: []const u8,
+
     // Optional: GRPO/RL configuration
     grpo_config: ?GRPOJsonConfig = null,
 
@@ -498,6 +501,19 @@ fn runShepherd(allocator: Allocator, args: Args) !void {
     diloco_config.wandb_api_key = exp_config.wandb_api_key;
     diloco_config.checkpoint_dir = run_dir_path;
     diloco_config.resume_training = args.should_resume;
+
+    // Map dtype string to enum
+    if (std.mem.eql(u8, exp_config.dtype, "bf16")) {
+        diloco_config.dtype = .bf16;
+    } else if (std.mem.eql(u8, exp_config.dtype, "f16")) {
+        diloco_config.dtype = .f16;
+    } else if (std.mem.eql(u8, exp_config.dtype, "f32")) {
+        diloco_config.dtype = .f32;
+    } else {
+        std.log.err("Invalid dtype '{s}'. Must be 'f32', 'bf16', or 'f16'", .{exp_config.dtype});
+        return error.InvalidDType;
+    }
+    print("   Precision: {s}\n", .{exp_config.dtype});
 
     // CLI flag overrides config file
     if (args.model_path) |path| {

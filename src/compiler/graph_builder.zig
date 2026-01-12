@@ -127,7 +127,9 @@ pub const GraphBuilder = struct {
         var final_returns = std.ArrayList(mlir.Value).init(allocator);
         defer final_returns.deinit();
 
+        std.debug.print("DEBUG: Creating timestep_tensor...\n", .{});
         const timestep_tensor = try builder.newTensor(timestep_val);
+        std.debug.print("DEBUG: timestep_tensor created OK\n", .{});
         var new_params = std.ArrayList(mlir.Value).init(allocator);
         var new_ms = std.ArrayList(mlir.Value).init(allocator);
         var new_vs = std.ArrayList(mlir.Value).init(allocator);
@@ -136,12 +138,23 @@ pub const GraphBuilder = struct {
         defer new_vs.deinit();
 
         for (0..num_params) |i| {
+            std.debug.print("DEBUG: Optimizer loop iteration {}/{}\n", .{ i, num_params });
+            std.debug.print("DEBUG: Creating param_t...\n", .{});
             const param_t = try builder.newTensor(params_in[i]);
+            std.debug.print("DEBUG: Creating grad_t...\n", .{});
             const grad_t = try builder.newTensor(grad_call_op.getResult(i));
+            std.debug.print("DEBUG: Creating m_t...\n", .{});
             const m_t = try builder.newTensor(m_in[i]);
+            std.log.info("Creating v_t... v_in.len={}, i={}", .{ v_in.len, i });
+            // Debug: check if the value's type is a RankedTensorType
+            const v_type = v_in[i].getType();
+            const v_is_ranked = v_type.as(mlir.RankedTensorType) != null;
+            std.log.info("v_in[{}] type is ranked tensor: {}", .{ i, v_is_ranked });
             const v_t = try builder.newTensor(v_in[i]);
+            std.log.info("v_t created successfully, calling optimizer.update", .{});
 
             const update_res = try optimizer.update(param_t, grad_t, m_t, v_t, timestep_tensor);
+            std.log.info("optimizer.update completed for param {}", .{i});
 
             try new_params.append(update_res.new_params.value);
             try new_ms.append(update_res.new_m.value);

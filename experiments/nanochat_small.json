@@ -2,6 +2,8 @@
     "model_path": "models/nanochat_small.mlir",
     "data_path": "data/tiny_shakespeare.txt",
     "tokenizer": "char",
+    "sampling": "random",
+    "dtype": "f32",
     "learning_rate": 0.0006,
     "tau": 10,
     "outer_loop_steps": 100,

@@ -2,6 +2,8 @@
     "model_path": "models/nanogpt_medium.mlir",
     "data_path": "data/enwik8.txt",
     "tokenizer": "byte",
+    "sampling": "random",
+    "dtype": "f32",
     "learning_rate": 0.0006,
     "tau": 10,
     "outer_loop_steps": 200,

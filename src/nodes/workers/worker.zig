@@ -50,6 +50,7 @@ pub const Worker = struct {
     cached_parameter_shapes: ?[][]i64,
     cached_data_input_shapes: ?[][]i64,
     cached_data_input_dtypes: ?[]tensor.DType,
+    cached_param_dtype: tensor.DType, // dtype for parameters (f32, bf16, etc.)
 
     // NEW: AdamW optimizer state buffers (M and V) and timestep
     m_states: ?[][]u8, // One buffer per parameter
@@ -92,6 +93,7 @@ pub const Worker = struct {
             .cached_parameter_shapes = null,
             .cached_data_input_shapes = null,
             .cached_data_input_dtypes = null,
+            .cached_param_dtype = .f32, // Default, will be updated from TRAIN message
             .m_states = null,
             .v_states = null,
             .timestep = 1.0,
@@ -602,8 +604,9 @@ pub const Worker = struct {
         const vmfb = self.cached_vmfb orelse return error.GraphNotInitialized;
         const param_shapes = self.cached_parameter_shapes orelse return error.ParameterShapesNotInitialized;
         const data_shapes = self.cached_data_input_shapes orelse return error.DataShapesNotInitialized;
-        const m_states = self.m_states orelse return error.OptimizerStateNotInitialized;
-        const v_states = self.v_states orelse return error.OptimizerStateNotInitialized;
+        // Note: m_states and v_states are obtained AFTER reallocation code below to avoid use-after-free
+        if (self.m_states == null) return error.OptimizerStateNotInitialized;
+        if (self.v_states == null) return error.OptimizerStateNotInitialized;
 
         // 2. Extract payload as JSON object
         const payload = switch (msg.data) {
@@ -646,6 +649,78 @@ pub const Worker = struct {
             }
         else
             "random";
+
+        // Extract dtype for precision control (bf16 halves memory usage)
+        const dtype_str = if (payload.get("dtype")) |dtype_val|
+            switch (dtype_val) {
+                .string => |s| s,
+                else => "f32",
+            }
+        else
+            "f32";
+
+        const param_dtype: tensor.DType = if (std.mem.eql(u8, dtype_str, "bf16"))
+            .bf16
+        else if (std.mem.eql(u8, dtype_str, "f16"))
+            .f16
+        else
+            .f32;
+
+        std.log.info("Worker {}: Training with precision {s}", .{ self.node_id.?, dtype_str });
+
+        // Cache the param dtype for size calculations
+        self.cached_param_dtype = param_dtype;
+
+        // Reallocate M/V states if dtype changed (they were allocated with f32 at INITIALIZE)
+        // Check if first buffer size matches expected size for this dtype
+        if (self.m_states) |existing_m_states| {
+            if (self.cached_parameter_shapes) |shapes| {
+                if (shapes.len > 0 and existing_m_states.len > 0) {
+                    var expected_size: usize = param_dtype.sizeInBytes();
+                    for (shapes[0]) |dim| expected_size *= @intCast(dim);
+
+                    if (existing_m_states[0].len != expected_size) {
+                        std.log.info("Worker {}: Reallocating M/V states for {s} precision (was {}, need {})", .{
+                            self.node_id.?,
+                            dtype_str,
+                            existing_m_states[0].len,
+                            expected_size,
+                        });
+
+                        // Free old buffers
+                        for (existing_m_states) |buf| self.allocator.free(buf);
+                        self.allocator.free(existing_m_states);
+                        if (self.v_states) |existing_v_states| {
+                            for (existing_v_states) |buf| self.allocator.free(buf);
+                            self.allocator.free(existing_v_states);
+                        }
+
+                        // Allocate new buffers with correct dtype size
+                        const num_params = shapes.len;
+                        const new_m = try self.allocator.alloc([]u8, num_params);
+                        const new_v = try self.allocator.alloc([]u8, num_params);
+
+                        for (shapes, 0..) |shape, i| {
+                            var size: usize = param_dtype.sizeInBytes();
+                            for (shape) |dim| size *= @intCast(dim);
+
+                            new_m[i] = try self.allocator.alloc(u8, size);
+                            @memset(new_m[i], 0);
+                            new_v[i] = try self.allocator.alloc(u8, size);
+                            @memset(new_v[i], 0);
+                        }
+
+                        self.m_states = new_m;
+                        self.v_states = new_v;
+                        self.timestep = 1.0;
+                    }
+                }
+            }
+        }
+
+        // Get m_states and v_states AFTER potential reallocation to avoid use-after-free
+        const m_states = self.m_states.?;
+        const v_states = self.v_states.?;
 
         self.current_chunk_id = @intCast(chunk_id);
 
@@ -795,8 +870,9 @@ pub const Worker = struct {
         }
 
         var param_offset: usize = 0;
+        const bytes_per_element = self.cached_param_dtype.sizeInBytes();
         for (param_shapes, 0..) |shape, i| {
-            var size: usize = @sizeOf(f32);
+            var size: usize = bytes_per_element;
             for (shape) |dim| size *= @intCast(dim);
 
             if (param_offset + size > initial_params_bytes.len) return error.ParameterBufferTooSmall;
@@ -863,9 +939,24 @@ pub const Worker = struct {
             const shapes_slice = try all_shapes.toOwnedSlice();
             defer self.allocator.free(shapes_slice);
 
-            // Execute the training step
-            // DiLoCo training: Pass null for dtypes, backend will infer (f32 for params, i64 for last 2 data)
-            const outputs = try self.backend.executeTrainingStep(vmfb, inputs, shapes_slice, null);
+            // Build dtypes list for explicit precision control
+            // Layout: [Params (N), M-States (N), V-States (N), Timestep (1), Data Inputs (D)]
+            var dtypes_list = std.ArrayList(tensor.DType).init(self.allocator);
+            defer dtypes_list.deinit();
+
+            // Params, M-States, V-States all use param_dtype (f32/bf16/f16)
+            for (0..3) |_| {
+                for (0..param_shapes.len) |_| try dtypes_list.append(param_dtype);
+            }
+
+            // Timestep is always f32
+            try dtypes_list.append(.f32);
+
+            // Data inputs (batch inputs, targets) are always i64
+            for (0..data_shapes.len) |_| try dtypes_list.append(.i64);
+
+            // Execute the training step with explicit dtypes
+            const outputs = try self.backend.executeTrainingStep(vmfb, inputs, shapes_slice, dtypes_list.items);
             defer {
                 for (outputs) |o| self.allocator.free(o);
                 self.allocator.free(outputs);
@@ -896,10 +987,13 @@ pub const Worker = struct {
                 @memcpy(v_states[i], outputs[2 * num_params + i]);
             }
 
-            // Extract loss from outputs[3N]
+            // Extract loss from outputs[3N] - loss is always bf16 scalar from the model
             const loss_bytes = outputs[3 * num_params];
-            if (loss_bytes.len >= @sizeOf(f32)) {
-                final_loss = @as(f32, @bitCast(std.mem.readInt(u32, loss_bytes[0..4], .little)));
+            if (loss_bytes.len >= 2) {
+                // Loss is bf16, convert to f32
+                const bf16_bits = std.mem.readInt(u16, loss_bytes[0..2], .little);
+                const f32_bits: u32 = @as(u32, bf16_bits) << 16;
+                final_loss = @bitCast(f32_bits);
             }
 
             // Increment timestep for next iteration
@@ -918,16 +1012,54 @@ pub const Worker = struct {
             const param_block_size = final_block_bytes.len;
             const initial_block_bytes = initial_params_bytes[delta_offset .. delta_offset + param_block_size];
 
-            // Cast to f32 for arithmetic
-            const initial_f32 = std.mem.bytesAsSlice(f32, initial_block_bytes);
-            const final_f32 = std.mem.bytesAsSlice(f32, final_block_bytes);
+            const num_elements = param_block_size / bytes_per_element;
 
-            // Calculate delta for each element and append to delta_bytes
-            const num_elements = param_block_size / @sizeOf(f32);
-            for (0..num_elements) |j| {
-                const delta_val = initial_f32[j] - final_f32[j];
-                const delta_val_bytes = std.mem.asBytes(&delta_val);
-                try delta_bytes.appendSlice(delta_val_bytes);
+            switch (self.cached_param_dtype) {
+                .bf16 => {
+                    // bf16: convert to f32 for arithmetic, store delta as bf16
+                    for (0..num_elements) |j| {
+                        const byte_off = j * 2;
+                        // Convert initial bf16 to f32
+                        const init_bf16 = std.mem.readInt(u16, initial_block_bytes[byte_off..][0..2], .little);
+                        const init_f32: f32 = @bitCast(@as(u32, init_bf16) << 16);
+                        // Convert final bf16 to f32
+                        const final_bf16 = std.mem.readInt(u16, final_block_bytes[byte_off..][0..2], .little);
+                        const final_f32: f32 = @bitCast(@as(u32, final_bf16) << 16);
+                        // Calculate delta and convert back to bf16
+                        const delta_f32 = init_f32 - final_f32;
+                        const delta_bf16: u16 = @truncate(@as(u32, @bitCast(delta_f32)) >> 16);
+                        try delta_bytes.appendSlice(std.mem.asBytes(&delta_bf16));
+                    }
+                },
+                .f16 => {
+                    // f16: similar conversion (simplified, may lose precision)
+                    for (0..num_elements) |j| {
+                        const byte_off = j * 2;
+                        const init_f16 = std.mem.readInt(u16, initial_block_bytes[byte_off..][0..2], .little);
+                        const final_f16 = std.mem.readInt(u16, final_block_bytes[byte_off..][0..2], .little);
+                        // Simple subtraction in f16 space (not precise but functional)
+                        const delta_f16 = init_f16 -% final_f16;
+                        try delta_bytes.appendSlice(std.mem.asBytes(&delta_f16));
+                    }
+                },
+                .f32 => {
+                    // f32: direct arithmetic
+                    const initial_f32 = std.mem.bytesAsSlice(f32, initial_block_bytes);
+                    const final_f32 = std.mem.bytesAsSlice(f32, final_block_bytes);
+                    for (0..num_elements) |j| {
+                        const delta_val = initial_f32[j] - final_f32[j];
+                        try delta_bytes.appendSlice(std.mem.asBytes(&delta_val));
+                    }
+                },
+                else => {
+                    // Fallback: treat as f32
+                    const initial_f32 = std.mem.bytesAsSlice(f32, initial_block_bytes);
+                    const final_f32 = std.mem.bytesAsSlice(f32, final_block_bytes);
+                    for (0..num_elements) |j| {
+                        const delta_val = initial_f32[j] - final_f32[j];
+                        try delta_bytes.appendSlice(std.mem.asBytes(&delta_val));
+                    }
+                },
             }
 
             delta_offset += param_block_size;

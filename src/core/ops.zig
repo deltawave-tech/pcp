@@ -73,8 +73,8 @@ pub const MLIRBuilder = struct {
         const shaped_type = mlir_type.as(mlir.RankedTensorType) orelse {
             // If the cast fails, it's not a ranked tensor. Return an error.
             std.log.err("Attempted to create a Tensor from a non-RankedTensorType value.", .{});
-            // For better debugging, you could dump the value here:
-            // @import("mlir/c.zig").c.mlirValueDump(value.handle);
+            // For better debugging, dump the value:
+            c.mlirValueDump(value.handle);
             return error.InvalidTensorType;
         };
 
@@ -744,9 +744,15 @@ pub fn power(builder: *MLIRBuilder, base: Tensor, exponent: Tensor) !Tensor {
 }
 
 /// Type conversion operation
-pub fn convert(builder: *MLIRBuilder, a: Tensor, target_type: mlir.Type) !Tensor {
+/// target_element_type should be an element type (e.g., bf16, f32), not a tensor type
+pub fn convert(builder: *MLIRBuilder, a: Tensor, target_element_type: mlir.Type) !Tensor {
+    // Get the input tensor's shape and construct the output tensor type
+    const dims = try a.shape.getDims(builder.allocator);
+    defer builder.allocator.free(dims);
+    const result_type = mlir.Type.rankedTensorType(builder.ctx, dims, target_element_type);
+
     // Use StableHLO dialect wrapper
-    const operation = try hlo.convert(builder.allocator, builder.ctx, a.value, target_type, builder.loc);
+    const operation = try hlo.convert(builder.allocator, builder.ctx, a.value, result_type, builder.loc);
 
     return try builder.createAndAppendOp(operation);
 }
@@ -837,6 +843,7 @@ pub fn constant(builder: *MLIRBuilder, value: f64, shape: []const i64, element_t
          !element_type.isIndex()))
     {
         const f32_constant = try constant(builder, value, shape, f32_type);
+        // Convert to the target element type (convert() will construct the proper tensor type)
         return convert(builder, f32_constant, element_type);
     }
 

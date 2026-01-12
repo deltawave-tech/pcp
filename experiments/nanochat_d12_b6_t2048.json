@@ -12,6 +12,7 @@
   "outer_loop_steps": 378,
   "nesterov_momentum": 0.9,
   "max_epochs": 1,
+  "dtype": "bf16",
   "wandb_project": "pcp-nanochat",
   "wandb_entity": null,
   "wandb_run_name": "nanochat-d12-b6-t2048",

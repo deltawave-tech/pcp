@@ -1301,10 +1301,8 @@ pub fn sliceVJP(
         defer builder.allocator.free(interior_padding);
         @memset(interior_padding, 0);
 
-        // Create a scalar zero for the padding value
-        const zero_scalar_op = try hlo.scalarConstant(builder.allocator, builder.ctx, 0.0, input_type.getElementType());
-        builder.insertion_block.appendOwnedOperation(zero_scalar_op);
-        const zero_scalar = zero_scalar_op.getResult(0);
+        // Create a scalar zero for the padding value (bf16-aware)
+        const zero_scalar = try hlo.scalarConstantBF16(builder.allocator, builder.ctx, builder, 0.0, input_type.getElementType(), builder.loc);
 
         // Create the hlo.pad operation to expand grad_out back to input shape
         const pad_op = try hlo.pad(builder.allocator, builder.ctx, grad_out, zero_scalar, start_indices, padding_high, interior_padding, builder.loc);

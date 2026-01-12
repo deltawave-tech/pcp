@@ -3,6 +3,7 @@
   "data_path": "/data/fineweb_all.u16",
   "tokenizer": "u16",
   "sampling": "fifo",
+  "dtype": "bf16",
   "chunk_size_mode": "diloco_slices",
   "chunk_manifest_path": null,
   "chunk_shuffle": false,

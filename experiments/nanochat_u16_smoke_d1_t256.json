@@ -2,6 +2,8 @@
   "model_path": "models/nanochat_smoke_d1_256.mlir",
   "data_path": "data/fineweb_edu_2shards_1m.u16",
   "tokenizer": "u16",
+  "sampling": "random",
+  "dtype": "f32",
   "chunk_manifest_path": "data/fineweb_edu_2shards_1m.json",
   "chunk_shuffle": false,
   "seed": 1,

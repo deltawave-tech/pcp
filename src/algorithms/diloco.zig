@@ -140,10 +140,30 @@ pub const DiLoCo = struct {
         defer allocator.free(raw_mlir);
 
         std.debug.print("Applying ModelSanitizer patches...\n", .{});
-        const mlir_source = try ModelSanitizer.applyStabilityPatches(allocator, raw_mlir);
-        defer allocator.free(mlir_source);
+        // 1. Apply Logic/Stability Patches (Log/Div guards)
+        var current_source = try ModelSanitizer.applyStabilityPatches(allocator, raw_mlir);
 
-        // Introspect using the new ModelInspector
+        // 2. Apply BF16 Conversion Pipeline if requested
+        if (config.dtype == .bf16) {
+            std.log.info("Converting model to bf16...", .{});
+
+            // A. Sanitize Hex Constants (0x3F800000 -> 1.0)
+            // Critical step to prevent "constant out of range" error
+            std.log.info("  Step A: Sanitizing hex float constants...", .{});
+            const decimal_source = try ModelSanitizer.sanitizeHexFloats(allocator, current_source);
+            allocator.free(current_source); // Free previous stage
+
+            // B. Convert Types (f32 -> bf16)
+            std.log.info("  Step B: Converting type signatures...", .{});
+            const bf16_source = try ModelSanitizer.convertF32ToBF16(allocator, decimal_source);
+            allocator.free(decimal_source); // Free previous stage
+
+            current_source = bf16_source;
+        }
+        defer allocator.free(current_source);
+        const mlir_source = current_source;
+
+        // Introspect using the new ModelInspector (it will now see bf16 types if converted)
         const metadata = try model_introspection.ModelInspector.inspect(
             allocator,
             mlir_builder.ctx,
@@ -416,16 +436,50 @@ pub const DiLoCo = struct {
                 element_count *= @intCast(dim);
             }
 
-            // Create parameter data with Xavier initialization
-            const param_data = try self.allocator.alloc(f32, element_count);
-            defer self.allocator.free(param_data);
+            // Calculate byte size based on target dtype
+            const bytes_per_element = self.config.dtype.sizeInBytes();
+            const byte_data = try self.allocator.alloc(u8, element_count * bytes_per_element);
+            defer self.allocator.free(byte_data);
 
+            // Generate Xavier-initialized values and convert to target dtype
             const scale = std.math.sqrt(2.0 / @as(f32, @floatFromInt(element_count)));
-            for (param_data) |*param| {
-                param.* = rng.random().floatNorm(f32) * scale;
+            for (0..element_count) |j| {
+                const value = rng.random().floatNorm(f32) * scale;
+                const offset = j * bytes_per_element;
+
+                switch (self.config.dtype) {
+                    .bf16 => {
+                        // Convert f32 to bf16: just take the upper 16 bits
+                        const f32_bits: u32 = @bitCast(value);
+                        const bf16_bits: u16 = @truncate(f32_bits >> 16);
+                        @memcpy(byte_data[offset .. offset + 2], std.mem.asBytes(&bf16_bits));
+                    },
+                    .f16 => {
+                        // For f16, use a simple conversion (may lose precision)
+                        const f32_bits: u32 = @bitCast(value);
+                        const sign: u16 = @truncate((f32_bits >> 16) & 0x8000);
+                        const exp = @as(i32, @intCast((f32_bits >> 23) & 0xFF)) - 127;
+                        const mant: u16 = @truncate((f32_bits >> 13) & 0x3FF);
+                        const f16_bits: u16 = if (exp < -14) sign // Underflow to 0
+                        else if (exp > 15) sign | 0x7C00 // Overflow to inf
+                        else sign | @as(u16, @intCast((exp + 15) & 0x1F)) << 10 | mant;
+                        @memcpy(byte_data[offset .. offset + 2], std.mem.asBytes(&f16_bits));
+                    },
+                    .f32 => {
+                        @memcpy(byte_data[offset .. offset + 4], std.mem.asBytes(&value));
+                    },
+                    .f64 => {
+                        const f64_val: f64 = @floatCast(value);
+                        @memcpy(byte_data[offset .. offset + 8], std.mem.asBytes(&f64_val));
+                    },
+                    else => {
+                        // For integer types, convert to int
+                        const int_val: i32 = @intFromFloat(value * 1000.0);
+                        @memcpy(byte_data[offset .. offset + bytes_per_element], std.mem.asBytes(&int_val)[0..bytes_per_element]);
+                    },
+                }
             }
 
-            const byte_data = std.mem.sliceAsBytes(param_data);
             param_tensor.* = try Tensor.fromBytes(self.mlir_builder, byte_data, shape, self.config.dtype);
         }
 
@@ -574,6 +628,14 @@ pub const DiLoCo = struct {
             try payload_map.put("tau", std.json.Value{ .integer = @intCast(self.config.tau) });
             try payload_map.put("tokenizer", std.json.Value{ .string = self.config.tokenizer_type });
             try payload_map.put("sampling", std.json.Value{ .string = self.config.sampling_type });
+
+            // Send dtype to worker for correct precision handling
+            const dtype_str: []const u8 = switch (self.config.dtype) {
+                .bf16 => "bf16",
+                .f16 => "f16",
+                else => "f32",
+            };
+            try payload_map.put("dtype", std.json.Value{ .string = dtype_str });
 
             const json_payload = std.json.Value{ .object = payload_map };
 

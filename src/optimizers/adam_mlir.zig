@@ -98,8 +98,12 @@ pub fn AdamMLIR(comptime T: type) type {
             const new_v = try ops.add(b, term1_v, term2_v);
 
             // Bias Correction
-            const beta1_pow = try ops.power(b, beta1, timestep);
-            const beta2_pow = try ops.power(b, beta2, timestep);
+            // Convert timestep to model element type if needed (timestep may be f32 while model is bf16)
+            const timestep_converted = try ops.convert(b, timestep, self.element_type);
+            const timestep_broadcast_val = try ops.broadcastToShape(b, timestep_converted.value, dims);
+            const timestep_broadcast = try b.newTensor(timestep_broadcast_val);
+            const beta1_pow = try ops.power(b, beta1, timestep_broadcast);
+            const beta2_pow = try ops.power(b, beta2, timestep_broadcast);
             const m_corr_denom = try ops.subtract(b, one, beta1_pow);
             const v_corr_denom = try ops.subtract(b, one, beta2_pow);
 

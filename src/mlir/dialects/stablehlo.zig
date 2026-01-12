@@ -113,7 +113,7 @@ pub fn exponential(allocator: std.mem.Allocator, ctx: mlir.Context, operand: mli
 /// Creates a stablehlo.reduce operation with a 'maximum' body.
 pub fn reduce_max(
     ctx: mlir.Context,
-    builder: *const @import("../../core/ops.zig").MLIRBuilder, // Pass in the builder
+    builder: *const @import("../../core/ops.zig").MLIRBuilder,
     operand: mlir.Value,
     dimensions: []const i64,
     loc: mlir.Location,
@@ -144,14 +144,34 @@ pub fn reduce_max(
     }
     const result_type = mlir.Type.rankedTensorType(ctx, result_shape_list.items, element_type);
 
-    // 2. Create the init_value: negative infinity for floats, which is the identity element for max reduction.
-    const neg_inf = std.math.inf(f32) * -1.0;
-    const scalar_type = mlir.Type.tensor(&.{}, element_type);
-    const neg_inf_attr = mlir.Attribute.denseElementsAttrFloatSplat(scalar_type, @floatCast(neg_inf));
-    const init_constant_op = try constant(allocator, ctx, .{ .value = neg_inf_attr, .result_type = scalar_type });
+    // 2. Create the init_value: negative infinity
+    // [FIX] Handle BF16 by creating f32 constant first, then converting
+    const neg_inf = -std.math.inf(f32);
+    var init_value: mlir.Value = undefined;
 
-    builder.insertion_block.appendOwnedOperation(init_constant_op);
-    const init_value = init_constant_op.getResult(0);
+    if (element_type.isBF16(ctx)) {
+        // A. Create f32 constant
+        const f32_type = mlir.Type.f32Type(ctx);
+        const f32_scalar_type = mlir.Type.tensor(&.{}, f32_type);
+        const neg_inf_attr = mlir.Attribute.denseElementsAttrFloatSplat(f32_scalar_type, neg_inf);
+
+        const const_op = try constant(allocator, ctx, .{ .value = neg_inf_attr, .result_type = f32_scalar_type });
+        builder.insertion_block.appendOwnedOperation(const_op);
+
+        // B. Convert to BF16
+        const bf16_scalar_type = mlir.Type.tensor(&.{}, element_type);
+        const convert_op = try convert(allocator, ctx, const_op.getResult(0), bf16_scalar_type, loc);
+        builder.insertion_block.appendOwnedOperation(convert_op);
+
+        init_value = convert_op.getResult(0);
+    } else {
+        // Standard path for f32
+        const scalar_type = mlir.Type.tensor(&.{}, element_type);
+        const neg_inf_attr = mlir.Attribute.denseElementsAttrFloatSplat(scalar_type, neg_inf);
+        const init_constant_op = try constant(allocator, ctx, .{ .value = neg_inf_attr, .result_type = scalar_type });
+        builder.insertion_block.appendOwnedOperation(init_constant_op);
+        init_value = init_constant_op.getResult(0);
+    }
 
     // 3. Create the reduction body (region -> block)
     const body_region = c_api.regionCreate();
@@ -159,14 +179,15 @@ pub fn reduce_max(
     c_api.regionAppendOwnedBlock(body_region, body_block.handle);
 
     // 4. Add arguments and the 'maximum' operation to the body
-    const lhs_arg = body_block.addArgument(scalar_type, loc);
-    const rhs_arg = body_block.addArgument(scalar_type, loc);
-    const max_op = try maximum(allocator, ctx, lhs_arg, rhs_arg, loc); // Use stablehlo.maximum
+    const scalar_arg_type = mlir.Type.tensor(&.{}, element_type);
+    const lhs_arg = body_block.addArgument(scalar_arg_type, loc);
+    const rhs_arg = body_block.addArgument(scalar_arg_type, loc);
+    const max_op = try maximum(allocator, ctx, lhs_arg, rhs_arg, loc);
     c_api.blockAppendOwnedOperation(body_block.handle, max_op.handle);
     const return_op = try mlir.Operation.create(allocator, ctx, "stablehlo.return", .{ .operands = &.{max_op.getResult(0)} });
     c_api.blockAppendOwnedOperation(body_block.handle, return_op.handle);
 
-    // 5. Build the final stablehlo.reduce operation using pcpCreateOperation
+    // 5. Build the final stablehlo.reduce operation
     var operands = [_]c_api.MlirValue{ operand.handle, init_value.handle };
     var results = [_]c_api.MlirType{ result_type.handle };
     var regions = [_]c_api.MlirRegion{ body_region };
@@ -199,7 +220,7 @@ pub fn reduce_max(
 /// Creates a generic stablehlo.reduce operation with a summation body.
 pub fn reduce_sum(
     ctx: mlir.Context,
-    builder: *const @import("../../core/ops.zig").MLIRBuilder, // Pass in the builder
+    builder: *const @import("../../core/ops.zig").MLIRBuilder,
     operand: mlir.Value,
     dimensions: []const i64,
     loc: mlir.Location,
@@ -207,7 +228,7 @@ pub fn reduce_sum(
     const c_api = @import("../c.zig").c;
     const allocator = builder.allocator;
 
-    // 1. Calculate result type (always removes dimensions)
+    // 1. Calculate result type
     const input_type = operand.getType().as(mlir.RankedTensorType).?;
     const input_shape = try input_type.getShape(allocator);
     defer allocator.free(input_shape);
@@ -215,7 +236,7 @@ pub fn reduce_sum(
 
     var result_shape_list = std.ArrayList(i64).init(allocator);
     defer result_shape_list.deinit();
-    
+
     for (input_shape, 0..) |dim, i| {
         var is_reduced = false;
         for (dimensions) |red_dim| {
@@ -230,40 +251,56 @@ pub fn reduce_sum(
     }
     const result_type = mlir.Type.rankedTensorType(ctx, result_shape_list.items, element_type);
 
-    // 2. Create the zero constant for init_value using type-aware attribute creation
-    const scalar_type = mlir.Type.tensor(&.{}, element_type);
+    // 2. Create the zero constant for init_value
+    // [FIX] Handle BF16 by creating f32 constant first, then converting
+    var init_value: mlir.Value = undefined;
 
-    var zero_attr: mlir.Attribute = undefined;
-    if (element_type.isInteger() or element_type.isIndex()) {
-        const zero_val = mlir.Attribute.integerAttr(ctx, 0, element_type);
-        zero_attr = mlir.Attribute.denseElementsAttrSplat(scalar_type, zero_val);
+    if (element_type.isBF16(ctx)) {
+        // A. Create f32 zero
+        const f32_type = mlir.Type.f32Type(ctx);
+        const f32_scalar_type = mlir.Type.tensor(&.{}, f32_type);
+        const zero_attr = mlir.Attribute.denseElementsAttrFloatSplat(f32_scalar_type, 0.0);
+
+        const const_op = try constant(allocator, ctx, .{ .value = zero_attr, .result_type = f32_scalar_type });
+        builder.insertion_block.appendOwnedOperation(const_op);
+
+        // B. Convert to BF16
+        const bf16_scalar_type = mlir.Type.tensor(&.{}, element_type);
+        const convert_op = try convert(allocator, ctx, const_op.getResult(0), bf16_scalar_type, loc);
+        builder.insertion_block.appendOwnedOperation(convert_op);
+
+        init_value = convert_op.getResult(0);
     } else {
-        // Create a properly typed float attribute instead of using FloatSplat
-        const zero_val = mlir.Attribute.floatAttr(ctx, 0.0, element_type);
-        zero_attr = mlir.Attribute.denseElementsAttrSplat(scalar_type, zero_val);
+        // Standard path
+        const scalar_type = mlir.Type.tensor(&.{}, element_type);
+        var zero_attr: mlir.Attribute = undefined;
+        if (element_type.isInteger() or element_type.isIndex()) {
+            const zero_val = mlir.Attribute.integerAttr(ctx, 0, element_type);
+            zero_attr = mlir.Attribute.denseElementsAttrSplat(scalar_type, zero_val);
+        } else {
+            zero_attr = mlir.Attribute.denseElementsAttrFloatSplat(scalar_type, 0.0);
+        }
+
+        const init_constant_op = try constant(allocator, ctx, .{ .value = zero_attr, .result_type = scalar_type });
+        builder.insertion_block.appendOwnedOperation(init_constant_op);
+        init_value = init_constant_op.getResult(0);
     }
 
-    const init_constant_op = try constant(allocator, ctx, .{ .value = zero_attr, .result_type = scalar_type });
-
-    // FIX: Attach the constant op to the graph before using its result.
-    // This resolves the <<UNKNOWN SSA VALUE>> error.
-    builder.insertion_block.appendOwnedOperation(init_constant_op);
-    const init_value = init_constant_op.getResult(0);
-
-    // 3. Create the reduction body (region -> block)
+    // 3. Create the reduction body
     const body_region = c_api.regionCreate();
     const body_block = mlir.Block{ .handle = c_api.blockCreate(0, @constCast(@ptrCast(&[_]c_api.MlirType{})), @constCast(@ptrCast(&[_]*c_api.MlirLocation{}))) };
     c_api.regionAppendOwnedBlock(body_region, body_block.handle);
 
-    // 4. Add arguments and the 'add' operation to the body
-    const lhs_arg = body_block.addArgument(scalar_type, loc);
-    const rhs_arg = body_block.addArgument(scalar_type, loc);
+    // 4. Add arguments and add op
+    const scalar_arg_type = mlir.Type.tensor(&.{}, element_type);
+    const lhs_arg = body_block.addArgument(scalar_arg_type, loc);
+    const rhs_arg = body_block.addArgument(scalar_arg_type, loc);
     const add_op = try add(allocator, ctx, lhs_arg, rhs_arg, loc);
     c_api.blockAppendOwnedOperation(body_block.handle, add_op.handle);
     const return_op = try mlir.Operation.create(allocator, ctx, "stablehlo.return", .{ .operands = &.{add_op.getResult(0)} });
     c_api.blockAppendOwnedOperation(body_block.handle, return_op.handle);
 
-    // 5. Build the final stablehlo.reduce operation using pcpCreateOperation
+    // 5. Build final op
     var operands = [_]c_api.MlirValue{ operand.handle, init_value.handle };
     var results = [_]c_api.MlirType{ result_type.handle };
     var regions = [_]c_api.MlirRegion{ body_region };
@@ -638,13 +675,17 @@ pub fn reduce(allocator: std.mem.Allocator, ctx: mlir.Context, operand: mlir.Val
 /// Utility functions for creating common constants
 
 /// Create a scalar constant
+/// For bf16 types, creates an f32 constant first - caller must handle conversion
+/// Use scalarConstantWithConvert for automatic bf16 handling when builder is available
 pub fn scalarConstant(allocator: std.mem.Allocator, ctx: mlir.Context, value: f64, element_type: mlir.Type) !mlir.Operation {
-    const scalar_type = mlir.Type.tensor(&.{}, element_type); // Scalar tensor (rank 0)
+    // [FIX] For bf16, create as f32 first (caller responsible for conversion)
+    const actual_type = if (element_type.isBF16(ctx)) mlir.Type.f32Type(ctx) else element_type;
+    const scalar_type = mlir.Type.tensor(&.{}, actual_type); // Scalar tensor (rank 0)
 
     var attr: mlir.Attribute = undefined;
-    if (element_type.isInteger() or element_type.isIndex()) {
+    if (actual_type.isInteger() or actual_type.isIndex()) {
         const i_val: i64 = @intFromFloat(value);
-        const val_attr = mlir.Attribute.integerAttr(ctx, i_val, element_type);
+        const val_attr = mlir.Attribute.integerAttr(ctx, i_val, actual_type);
         attr = mlir.Attribute.denseElementsAttrSplat(scalar_type, val_attr);
     } else {
         attr = mlir.Attribute.denseElementsAttrFloatSplat(scalar_type, value);
@@ -654,6 +695,48 @@ pub fn scalarConstant(allocator: std.mem.Allocator, ctx: mlir.Context, value: f6
         .value = attr,
         .result_type = scalar_type,
     });
+}
+
+/// Create a scalar constant with automatic bf16 conversion support
+/// This version takes a builder and handles bf16 by creating f32 then converting
+pub fn scalarConstantBF16(
+    allocator: std.mem.Allocator,
+    ctx: mlir.Context,
+    builder: *const @import("../../core/ops.zig").MLIRBuilder,
+    value: f64,
+    element_type: mlir.Type,
+    loc: mlir.Location,
+) !mlir.Value {
+    if (element_type.isBF16(ctx)) {
+        // Create f32 constant first
+        const f32_type = mlir.Type.f32Type(ctx);
+        const f32_scalar_type = mlir.Type.tensor(&.{}, f32_type);
+        const f32_attr = mlir.Attribute.denseElementsAttrFloatSplat(f32_scalar_type, value);
+        const f32_const_op = try constant(allocator, ctx, .{ .value = f32_attr, .result_type = f32_scalar_type });
+        builder.insertion_block.appendOwnedOperation(f32_const_op);
+
+        // Convert to bf16
+        const bf16_scalar_type = mlir.Type.tensor(&.{}, element_type);
+        const convert_op = try convert(allocator, ctx, f32_const_op.getResult(0), bf16_scalar_type, loc);
+        builder.insertion_block.appendOwnedOperation(convert_op);
+
+        return convert_op.getResult(0);
+    } else {
+        // Standard path
+        const scalar_type = mlir.Type.tensor(&.{}, element_type);
+        var attr: mlir.Attribute = undefined;
+        if (element_type.isInteger() or element_type.isIndex()) {
+            const i_val: i64 = @intFromFloat(value);
+            const val_attr = mlir.Attribute.integerAttr(ctx, i_val, element_type);
+            attr = mlir.Attribute.denseElementsAttrSplat(scalar_type, val_attr);
+        } else {
+            attr = mlir.Attribute.denseElementsAttrFloatSplat(scalar_type, value);
+        }
+
+        const const_op = try constant(allocator, ctx, .{ .value = attr, .result_type = scalar_type });
+        builder.insertion_block.appendOwnedOperation(const_op);
+        return const_op.getResult(0);
+    }
 }
 
 /// Create a zero constant of given shape and type (renamed to avoid duplicate)

@@ -209,6 +209,12 @@ pub const MLIRContext = struct {
         // 2. Disable prefetching
         try argv.append("--iree-llvmgpu-enable-prefetch=false");
 
+        // 3. Optimize for minimal peak memory (critical for large backward graphs)
+        try argv.append("--iree-stream-partitioning-favor=min-peak-memory");
+
+        // Note: f32 -> bf16 conversion is handled by ModelSanitizer.convertF32ToBF16
+        // before compilation, not via IREE flags
+
         try argv.append("-o");
         try argv.append(temp_vmfb_path);
 

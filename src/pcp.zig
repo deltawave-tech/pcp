@@ -481,7 +481,9 @@ fn runShepherd(allocator: Allocator, args: Args) !void {
     defer file.close();
     const stat = try file.stat();
     const total_size = stat.size;
-    const chunk_size = 100 * 1024; // 100KB chunks
+    // 64MB chunks - must be large enough for tau inner loop steps
+    // Calculation: B6 * T2048 * Tau100 * 2bytes = ~2.4MB per round minimum
+    const chunk_size = 64 * 1024 * 1024;
     try shepherd_controller.initDataManager(total_size, chunk_size, exp_config.max_epochs);
     print("🌙 DataManager initialized: {} total size, {} byte chunks, {} max epochs\n", .{ total_size, chunk_size, exp_config.max_epochs });
 

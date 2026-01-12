@@ -188,7 +188,8 @@ pub const MessageType = struct {
     pub const UPDATE_WEIGHTS = "UpdateWeights";     // Shepherd -> Worker: "Here are the new model weights"
 
     // Chunked Data Transfer Protocol (for large models > Cap'n Proto limits)
-    pub const WEIGHT_CHUNK = "WeightChunk"; // { chunk_index, total_chunks, total_bytes, data: "base64..." }
+    pub const WEIGHT_CHUNK = "WeightChunk"; // Shepherd -> Worker: { chunk_index, total_chunks, total_bytes, data: "base64..." }
+    pub const UPDATE_CHUNK = "UpdateChunk"; // Worker -> Shepherd: { chunk_index, total_chunks, total_bytes, data: "base64...", loss }
 };
 
 pub const MessageHandler = *const fn (MessageEnvelope) anyerror!void;

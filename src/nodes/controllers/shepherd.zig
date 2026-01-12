@@ -90,6 +90,32 @@ pub const WorkerConnection = struct {
     }
 };
 
+/// State for reassembling chunked updates from a worker
+pub const UpdateChunkState = struct {
+    buffer: std.ArrayList(u8),
+    expected_chunks: usize,
+    received_chunks: usize,
+    total_bytes: usize,
+    loss: f32,
+    chunk_id: i64,
+
+    pub fn init(allocator: Allocator, total_bytes: usize, expected_chunks: usize) !UpdateChunkState {
+        const buffer = try std.ArrayList(u8).initCapacity(allocator, total_bytes);
+        return UpdateChunkState{
+            .buffer = buffer,
+            .expected_chunks = expected_chunks,
+            .received_chunks = 0,
+            .total_bytes = total_bytes,
+            .loss = 0.0,
+            .chunk_id = 0,
+        };
+    }
+
+    pub fn deinit(self: *UpdateChunkState) void {
+        self.buffer.deinit();
+    }
+};
+
 /// Shepherd coordinates distributed training across workers
 /// Now accepts an Executor to make algorithms backend-agnostic
 pub const Shepherd = struct {
@@ -107,6 +133,10 @@ pub const Shepherd = struct {
     result_queue_mutex: std.Thread.Mutex,
     // Data manager for chunk-based strict partitioning
     data_manager: ?data_manager.DataManager,
+
+    // Chunked Update Transfer: Map WorkerID -> reassembly state for incoming updates
+    incoming_updates: std.AutoHashMap(NodeId, UpdateChunkState),
+    incoming_updates_mutex: std.Thread.Mutex,
 
     // Supervisor Pattern: Map SupervisorID -> TCP Stream
     supervisors: std.AutoHashMap(i64, net.Stream),
@@ -129,6 +159,8 @@ pub const Shepherd = struct {
             .result_queue = ArrayList(MessageEnvelope).init(allocator),
             .result_queue_mutex = std.Thread.Mutex{},
             .data_manager = null, // Initialized when training starts
+            .incoming_updates = std.AutoHashMap(NodeId, UpdateChunkState).init(allocator),
+            .incoming_updates_mutex = std.Thread.Mutex{},
             .supervisors = std.AutoHashMap(i64, net.Stream).init(allocator),
             .worker_map = std.AutoHashMap(NodeId, i64).init(allocator),
         };
@@ -145,6 +177,13 @@ pub const Shepherd = struct {
             worker.deinit(self.allocator);
         }
         self.worker_pool.deinit();
+
+        // Clean up incoming update buffers
+        var update_iter = self.incoming_updates.valueIterator();
+        while (update_iter.next()) |state| {
+            state.deinit();
+        }
+        self.incoming_updates.deinit();
 
         // Close all supervisor connections
         var supervisor_iter = self.supervisors.valueIterator();
@@ -357,6 +396,12 @@ pub const Shepherd = struct {
             // Handle different message types
             if (std.mem.eql(u8, msg.msg_type, MessageType.HEARTBEAT)) {
                 self.handleHeartbeat(worker_id);
+            } else if (std.mem.eql(u8, msg.msg_type, MessageType.UPDATE_CHUNK)) {
+                // Handle chunked update transfer from worker
+                self.handleUpdateChunk(worker_id, msg) catch |err| {
+                    std.log.err("CRITICAL: Failed to handle update chunk from worker {}: {s}", .{ worker_id, @errorName(err) });
+                    return err;
+                };
             } else if (std.mem.eql(u8, msg.msg_type, MessageType.INNER_LOOP_COMPLETE)) {
                 self.handleInnerLoopComplete(worker_id, msg) catch |err| {
                     std.log.err("CRITICAL: Failed to queue results from worker {}: {s}", .{ worker_id, @errorName(err) });
@@ -383,7 +428,85 @@ pub const Shepherd = struct {
             }
         }
     }
-    
+
+    /// Handle chunked update transfer from worker
+    /// Reassembles chunks and queues the complete result when all chunks are received
+    fn handleUpdateChunk(self: *Self, worker_id: NodeId, msg: MessageEnvelope) !void {
+        const payload = switch (msg.data) {
+            .object => |o| o,
+            else => return error.InvalidFormat,
+        };
+
+        const chunk_index: usize = @intCast(payload.get("chunk_index").?.integer);
+        const total_chunks: usize = @intCast(payload.get("total_chunks").?.integer);
+        const total_bytes: usize = @intCast(payload.get("total_bytes").?.integer);
+        const b64_data = payload.get("data").?.string;
+        const loss = switch (payload.get("loss").?) {
+            .float => |f| @as(f32, @floatCast(f)),
+            .integer => |i| @as(f32, @floatFromInt(i)),
+            else => 0.0,
+        };
+        const chunk_id = payload.get("chunk_id").?.integer;
+
+        self.incoming_updates_mutex.lock();
+        defer self.incoming_updates_mutex.unlock();
+
+        // Initialize buffer on first chunk
+        if (chunk_index == 0) {
+            // Clean up any existing state for this worker
+            if (self.incoming_updates.getPtr(worker_id)) |existing| {
+                existing.deinit();
+            }
+            var state = try UpdateChunkState.init(self.allocator, total_bytes, total_chunks);
+            state.loss = loss;
+            state.chunk_id = chunk_id;
+            try self.incoming_updates.put(worker_id, state);
+            std.log.info("Shepherd: Started receiving update from worker {} ({} bytes in {} chunks)", .{ worker_id, total_bytes, total_chunks });
+        }
+
+        // Get state (must exist after first chunk)
+        const state = self.incoming_updates.getPtr(worker_id) orelse return error.MissingChunkState;
+
+        // Decode and append chunk
+        const decoded_len = try std.base64.standard.Decoder.calcSizeForSlice(b64_data);
+        const decoded = try self.allocator.alloc(u8, decoded_len);
+        defer self.allocator.free(decoded);
+        try std.base64.standard.Decoder.decode(decoded, b64_data);
+
+        try state.buffer.appendSlice(decoded);
+        state.received_chunks += 1;
+
+        if (state.received_chunks % 10 == 0 or state.received_chunks == state.expected_chunks) {
+            std.log.info("Shepherd: Received chunk {}/{} from worker {}", .{ state.received_chunks, state.expected_chunks, worker_id });
+        }
+
+        // When all chunks received, queue a synthetic InnerLoopComplete message
+        if (state.received_chunks == state.expected_chunks) {
+            std.log.info("Shepherd: Reassembly complete for worker {}. {} bytes received.", .{ worker_id, state.buffer.items.len });
+
+            // Store the reassembled data - we'll reference it by worker_id in diloco
+            // The InnerLoopComplete message will signal that data is ready
+            // We DON'T deinit the state here - it will be consumed by collectFromWorkers
+        }
+    }
+
+    /// Get reassembled update data for a worker (called by DiLoCo after InnerLoopComplete)
+    pub fn getReassembledUpdate(self: *Self, worker_id: NodeId) ?*UpdateChunkState {
+        self.incoming_updates_mutex.lock();
+        defer self.incoming_updates_mutex.unlock();
+        return self.incoming_updates.getPtr(worker_id);
+    }
+
+    /// Clear reassembled update data for a worker after it's been consumed
+    pub fn clearReassembledUpdate(self: *Self, worker_id: NodeId) void {
+        self.incoming_updates_mutex.lock();
+        defer self.incoming_updates_mutex.unlock();
+        if (self.incoming_updates.fetchRemove(worker_id)) |kv| {
+            var state = kv.value;
+            state.deinit();
+        }
+    }
+
     /// Handle inner loop completion from worker
     fn handleInnerLoopComplete(self: *Self, worker_id: NodeId, msg: MessageEnvelope) !void {
         std.log.info("Worker {} sent {s} result", .{ worker_id, msg.msg_type });

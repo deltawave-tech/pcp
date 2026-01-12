@@ -1065,35 +1065,71 @@ pub const Worker = struct {
             delta_offset += param_block_size;
         }
 
-        // Send Delta instead of raw params
-        const shepherd_payload = binary_protocol.ShepherdPayload{
-            .updated_params = delta_bytes.items,
-            .loss = final_loss,
-        };
-        const response_capnp_bytes = try shepherd_payload.serialize(self.allocator);
-        defer self.allocator.free(response_capnp_bytes);
+        // Send Delta using chunked transfer protocol to avoid Cap'n Proto message size limits
+        const data = delta_bytes.items;
+        const CHUNK_SIZE = 10 * 1024 * 1024; // 10MB per chunk (same as shepherd->worker)
+        const total_size = data.len;
+        const total_chunks = (total_size + CHUNK_SIZE - 1) / CHUNK_SIZE;
 
-        // Base64 encode the params+loss
-        const b64_len = std.base64.standard.Encoder.calcSize(response_capnp_bytes.len);
-        const response_b64_params = try self.allocator.alloc(u8, b64_len);
-        defer self.allocator.free(response_b64_params);
+        std.log.info("Worker {}: Sending update in {} chunks ({} bytes total)", .{ self.node_id.?, total_chunks, total_size });
 
-        const encoded_len = std.base64.standard.Encoder.encode(response_b64_params, response_capnp_bytes).len;
+        var send_offset: usize = 0;
+        var chunk_idx: usize = 0;
+        while (chunk_idx < total_chunks) : (chunk_idx += 1) {
+            const end = @min(send_offset + CHUNK_SIZE, total_size);
+            const chunk_slice = data[send_offset..end];
 
-        // Create JSON response with params and chunk_id
+            // Base64 encode the chunk
+            const b64_len = std.base64.standard.Encoder.calcSize(chunk_slice.len);
+            const b64_chunk = try self.allocator.alloc(u8, b64_len);
+            defer self.allocator.free(b64_chunk);
+            _ = std.base64.standard.Encoder.encode(b64_chunk, chunk_slice);
+
+            // Construct chunk payload
+            var chunk_payload = std.json.ObjectMap.init(self.allocator);
+            defer chunk_payload.deinit();
+
+            try chunk_payload.put("chunk_index", std.json.Value{ .integer = @intCast(chunk_idx) });
+            try chunk_payload.put("total_chunks", std.json.Value{ .integer = @intCast(total_chunks) });
+            try chunk_payload.put("total_bytes", std.json.Value{ .integer = @intCast(total_size) });
+            try chunk_payload.put("data", std.json.Value{ .string = b64_chunk });
+            try chunk_payload.put("loss", std.json.Value{ .float = final_loss });
+            try chunk_payload.put("chunk_id", std.json.Value{ .integer = @intCast(self.current_chunk_id.?) });
+
+            // Send UPDATE_CHUNK message
+            const chunk_msg = tcp_stream.createMessage(
+                self.node_id.?,
+                "worker",
+                0,
+                "shepherd",
+                MessageType.UPDATE_CHUNK,
+                msg.msg_id +% 1 +% @as(u8, @truncate(chunk_idx)),
+                std.json.Value{ .object = chunk_payload },
+            );
+
+            try self.client.send(chunk_msg);
+            send_offset = end;
+
+            // Small sleep every 5 chunks to prevent overwhelming network buffers
+            if (chunk_idx % 5 == 4) std.time.sleep(10 * std.time.ns_per_ms);
+        }
+
+        std.log.info("Worker {}: All {} chunks sent, sending completion signal", .{ self.node_id.?, total_chunks });
+
+        // Send final INNER_LOOP_COMPLETE with just metadata (no params - they were sent via chunks)
         var response_payload = std.json.ObjectMap.init(self.allocator);
         defer response_payload.deinit();
-        try response_payload.put("params", std.json.Value{ .string = response_b64_params[0..encoded_len] });
         try response_payload.put("chunk_id", std.json.Value{ .integer = @intCast(self.current_chunk_id.?) });
+        try response_payload.put("loss", std.json.Value{ .float = final_loss });
+        try response_payload.put("chunked", std.json.Value{ .bool = true }); // Signal that params were sent via chunks
 
-        // Send the response
         const response = tcp_stream.createMessage(
             self.node_id.?,
             "worker",
             0,
             "shepherd",
             MessageType.INNER_LOOP_COMPLETE,
-            msg.msg_id + 1,
+            msg.msg_id +% 1 +% @as(u8, @truncate(total_chunks)),
             std.json.Value{ .object = response_payload },
         );
 

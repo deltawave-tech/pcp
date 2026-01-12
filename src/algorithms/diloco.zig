@@ -706,34 +706,55 @@ pub const DiLoCo = struct {
                 }
             }
 
-            // Decode Payload
+            // Decode Payload - check if using chunked transfer or legacy inline params
             var arena = std.heap.ArenaAllocator.init(self.allocator);
             defer arena.deinit();
 
-            // Extract base64 payload
-            const b64_payload = switch (response.data) {
-                .string => |s| s,
-                .object => |obj| blk: {
-                    if (obj.get("params")) |p| {
-                        break :blk switch (p) {
-                            .string => |s| s,
-                            else => return error.InvalidMessageFormat,
-                        };
-                    }
-                    return error.InvalidMessageFormat;
-                },
-                else => return error.InvalidMessageFormat,
-            };
+            var delta_bytes: []const u8 = undefined;
+            var loss_val: f32 = 0.0;
 
-            const capnp_len = try std.base64.standard.Decoder.calcSizeForSlice(b64_payload);
-            const capnp_bytes = try arena.allocator().alloc(u8, capnp_len);
-            try std.base64.standard.Decoder.decode(capnp_bytes, b64_payload);
+            const is_chunked = if (response.data == .object)
+                if (response.data.object.get("chunked")) |v| v == .bool and v.bool else false
+            else
+                false;
 
-            const reader = try binary_protocol.ShepherdPayload.Reader.init(capnp_bytes);
-            defer reader.deinit();
+            if (is_chunked) {
+                // Chunked transfer: get reassembled data from shepherd
+                const update_state = self.coordinator.getReassembledUpdate(response.sender_node) orelse {
+                    std.log.err("Worker {} sent chunked completion but no reassembled data found!", .{response.sender_node});
+                    return error.MissingReassembledData;
+                };
 
-            const delta_bytes = try reader.getUpdatedParams(); // This is now the Delta
-            const loss_val = try reader.getLoss();
+                delta_bytes = update_state.buffer.items;
+                loss_val = update_state.loss;
+
+                std.log.info("Worker {}: Using reassembled chunked data ({} bytes)", .{ response.sender_node, delta_bytes.len });
+            } else {
+                // Legacy path: inline params via Cap'n Proto (for backwards compatibility)
+                const b64_payload = switch (response.data) {
+                    .string => |s| s,
+                    .object => |obj| blk: {
+                        if (obj.get("params")) |p| {
+                            break :blk switch (p) {
+                                .string => |s| s,
+                                else => return error.InvalidMessageFormat,
+                            };
+                        }
+                        return error.InvalidMessageFormat;
+                    },
+                    else => return error.InvalidMessageFormat,
+                };
+
+                const capnp_len = try std.base64.standard.Decoder.calcSizeForSlice(b64_payload);
+                const capnp_bytes = try arena.allocator().alloc(u8, capnp_len);
+                try std.base64.standard.Decoder.decode(capnp_bytes, b64_payload);
+
+                const reader = try binary_protocol.ShepherdPayload.Reader.init(capnp_bytes);
+                defer reader.deinit();
+
+                delta_bytes = try reader.getUpdatedParams();
+                loss_val = try reader.getLoss();
+            }
 
             // 3. Accumulate: Accumulator += Delta
             if (delta_bytes.len != total_param_bytes) {
@@ -752,6 +773,11 @@ pub const DiLoCo = struct {
 
             total_loss += loss_val;
             collected_count += 1;
+
+            // Clean up reassembled data after use (if chunked)
+            if (is_chunked) {
+                self.coordinator.clearReassembledUpdate(response.sender_node);
+            }
 
             // Message is freed here by the defer/arena logic, keeping memory low
         }

@@ -22,12 +22,12 @@ pub const WandBLogger = struct {
         try env_map.put("WANDB_API_KEY", config.api_key.?);
         try env_map.put("WANDB_SILENT", "true");
 
-        const argv = [_][]const u8{ "python3", "tools/wandb_adapter.py" };
+        const argv = [_][]const u8{ "/usr/bin/python3", "tools/wandb_adapter.py" };
 
         var child = std.process.Child.init(&argv, allocator);
         child.stdin_behavior = .Pipe;
-        child.stdout_behavior = .Ignore; // Ignore stdout to keep TUI clean
-        child.stderr_behavior = .Ignore; // Ignore stderr or redirect to log file
+        child.stdout_behavior = .Ignore;
+        child.stderr_behavior = .Inherit; // Show python errors in journal
         child.env_map = &env_map;
 
         try child.spawn();
@@ -47,6 +47,7 @@ pub const WandBLogger = struct {
         };
         try self.sendJson(init_payload);
 
+        std.log.info("WandB logging initialized for project: {s}", .{config.project});
         return self;
     }
 

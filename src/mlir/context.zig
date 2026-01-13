@@ -174,6 +174,8 @@ pub const MLIRContext = struct {
             std.log.info("Compiling for HIP target: {s}", .{arch});
             hip_target_arg = try std.fmt.allocPrint(allocator, "--iree-hip-target={s}", .{arch});
             try argv.append(hip_target_arg.?);
+            try argv.append("--iree-codegen-llvmgpu-use-vector-distribution=false");
+            try argv.append("--iree-codegen-llvmgpu-use-reduction-vector-distribution=false");
         } else if (is_cuda) {
             // Default to sm_80 (A100) if not specified for CUDA
             const arch = target_arch orelse "sm_80";

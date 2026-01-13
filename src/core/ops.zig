@@ -835,6 +835,7 @@ pub fn oneHot(builder: *MLIRBuilder, indices: Tensor, depth: i64, on_value: f64,
 pub fn constant(builder: *MLIRBuilder, value: f64, shape: []const i64, element_type: mlir.Type) !Tensor {
     const f32_type = mlir.Type.f32Type(builder.ctx);
     const f64_type = mlir.Type.f64Type(builder.ctx);
+    const i1_type = mlir.Type.i1Type(builder.ctx);
 
     if (element_type.isBF16(builder.ctx) or
         (!element_type.isEqual(f32_type) and
@@ -850,7 +851,13 @@ pub fn constant(builder: *MLIRBuilder, value: f64, shape: []const i64, element_t
     const tensor_type = mlir.Type.rankedTensorType(builder.ctx, shape, element_type);
     var attr: mlir.Attribute = undefined;
 
-    if (element_type.isInteger() or element_type.isIndex()) {
+    if (element_type.isEqual(i1_type)) {
+        // Special handling for boolean (i1) type - parse from string
+        const bool_str = if (value != 0.0) "true" else "false";
+        var attr_str_buf: [128]u8 = undefined;
+        const attr_str = std.fmt.bufPrint(&attr_str_buf, "dense<{s}> : {s}", .{ bool_str, tensor_type.toString() }) catch return error.FormatFailed;
+        attr = mlir.Attribute.fromParseString(builder.ctx, attr_str) catch return error.BoolConstantFailed;
+    } else if (element_type.isInteger() or element_type.isIndex()) {
         const i_val: i64 = @intFromFloat(value);
         const element_attr = mlir.Attribute.integerAttr(builder.ctx, i_val, element_type);
         attr = mlir.Attribute.denseElementsAttrSplat(tensor_type, element_attr);

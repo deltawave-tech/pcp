@@ -59,12 +59,14 @@ pub fn AdamMLIR(comptime T: type) type {
             const dims = try params.shape.getDims(b.allocator);
             defer b.allocator.free(dims);
 
-            // BF16 Safety: Clamp epsilon to prevent underflow to 0.0
-            // BF16 resolution is low; 1e-8 becomes 0.0, causing div-by-zero in the first step.
+            // BF16 Safety: Force epsilon to be at least 1e-4 for bf16 types.
+            // 1e-8 in bf16 is effectively 0.0, which causes division by zero (Inf)
+            // when v_state is 0 (initial step).
             var eps_val = @as(f64, @floatCast(self.conf.epsilon));
             if (self.element_type.isBF16(b.ctx)) {
                 if (eps_val < 1e-4) {
                     eps_val = 1e-4;
+                    std.log.info("AdamMLIR: Auto-adjusted epsilon to 1e-4 for bf16 stability", .{});
                 }
             }
 

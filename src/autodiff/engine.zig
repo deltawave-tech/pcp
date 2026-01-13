@@ -647,7 +647,7 @@ fn addInputGradients(
         const grad_reduced_raw = try ops.reduceGradient(builder, grad, operand);
 
         // --- GLOBAL FINITE GUARD START ---
-        // CRITICAL FIX: We must filter BOTH NaNs and Infs.
+        // CRITICAL FIX: We must filter BOTH NaNs and Infs (only for floating-point types).
         // An Inf gradient causes the L2 Norm to be Inf, resulting in a scale of 0.0.
         // Then Inf * 0.0 = NaN, poisoning the ENTIRE model update.
         // Method: Check if (x - x) == 0.
@@ -655,25 +655,29 @@ fn addInputGradients(
         //   Inf:    Inf - Inf = NaN. (NaN == 0) -> False
         //   NaN:    NaN - NaN = NaN. (NaN == 0) -> False
 
-        const grad_tensor = try builder.newTensor(grad_reduced_raw);
-
-        // 1. diff = grad - grad
-        const diff = try ops.subtract(builder, grad_tensor, grad_tensor);
-
-        // 2. Create zero tensor matching the gradient shape
         const grad_type = grad_reduced_raw.getType().as(mlir.RankedTensorType) orelse return error.NotRankedTensor;
-        const grad_shape = try grad_type.getShape(builder.allocator);
-        defer builder.allocator.free(grad_shape);
         const elem_type = grad_type.getElementType();
-        const zero_tensor = try ops.constant(builder, 0.0, grad_shape, elem_type);
 
-        // 3. Mask = (diff == 0.0) -> True only if Finite
-        const is_finite_mask = try ops.compare(builder, diff, zero_tensor, .EQ);
+        // Only apply NaN/Inf guard for floating-point types
+        const grad_matched = if (!elem_type.isInteger() and !elem_type.isIndex()) blk: {
+            const grad_tensor = try builder.newTensor(grad_reduced_raw);
 
-        // 4. Select: if Finite, use grad, else use 0.0
-        // We zero out bad gradients to salvage the step instead of crashing
-        const safe_grad_tensor = try ops.select(builder, is_finite_mask, grad_tensor, zero_tensor);
-        const grad_matched = safe_grad_tensor.value;
+            // 1. diff = grad - grad
+            const diff = try ops.subtract(builder, grad_tensor, grad_tensor);
+
+            // 2. Create zero tensor matching the gradient shape
+            const grad_shape = try grad_type.getShape(builder.allocator);
+            defer builder.allocator.free(grad_shape);
+            const zero_tensor = try ops.constant(builder, 0.0, grad_shape, elem_type);
+
+            // 3. Mask = (diff == 0.0) -> True only if Finite
+            const is_finite_mask = try ops.compare(builder, diff, zero_tensor, .EQ);
+
+            // 4. Select: if Finite, use grad, else use 0.0
+            // We zero out bad gradients to salvage the step instead of crashing
+            const safe_grad_tensor = try ops.select(builder, is_finite_mask, grad_tensor, zero_tensor);
+            break :blk safe_grad_tensor.value;
+        } else grad_reduced_raw;
         // --- GLOBAL FINITE GUARD END ---
 
         // Proceed with existing clipping logic using the sanitized 'grad_matched'

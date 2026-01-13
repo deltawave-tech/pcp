@@ -1056,6 +1056,45 @@ pub const Worker = struct {
 
         std.log.info("Worker {} completed {} inner loop steps, final loss: {d:.4}", .{ self.node_id.?, tau, final_loss });
 
+        // --- SELF-HEALING: Validate and Reset Optimizer States if Corrupted ---
+        // If bf16 precision issues caused NaNs in M/V states, we must reset them
+        // to prevent permanent worker poisoning.
+        var healed_count: usize = 0;
+        const num_params_healing = param_shapes.len;
+
+        for (0..num_params_healing) |i| {
+            var m_corrupt = false;
+            var v_corrupt = false;
+
+            // Check M state
+            self.validateBuffer("M-State Check", m_states[i], param_dtype) catch {
+                m_corrupt = true;
+            };
+
+            // Check V state
+            self.validateBuffer("V-State Check", v_states[i], param_dtype) catch {
+                v_corrupt = true;
+            };
+
+            if (m_corrupt or v_corrupt) {
+                std.log.warn("Worker {}: Detected corruption in optimizer state for param {}. Resetting state.", .{ self.node_id.?, i });
+
+                // Reset M
+                @memset(m_states[i], 0);
+                // Reset V
+                @memset(v_states[i], 0);
+
+                healed_count += 1;
+            }
+        }
+
+        if (healed_count > 0) {
+            std.log.warn("Worker {}: Healed {}/{} parameter states. Timestep reset.", .{ self.node_id.?, healed_count, num_params_healing });
+            // If massive corruption occurred, it's safer to reset timestep bias correction too
+            self.timestep = 1.0;
+        }
+        // ---------------------------------------------------------------------
+
         // 11. Calculate Delta = Initial_Params - Final_Params and send it
         var delta_bytes = std.ArrayList(u8).init(self.allocator);
         defer delta_bytes.deinit();

@@ -176,6 +176,12 @@ pub const MLIRContext = struct {
             try argv.append(hip_target_arg.?);
             try argv.append("--iree-codegen-llvmgpu-use-vector-distribution=false");
             try argv.append("--iree-codegen-llvmgpu-use-reduction-vector-distribution=false");
+
+            if (std.mem.indexOf(u8, arch, "gfx11") != null) {
+                try argv.append("--iree-codegen-llvmgpu-use-warp-reduce=false");
+                try argv.append("--iree-codegen-llvmgpu-enable-pipelining=false");
+                std.log.info("Applying RDNA3/gfx11 stability flags", .{});
+            }
         } else if (is_cuda) {
             // Default to sm_80 (A100) if not specified for CUDA
             const arch = target_arch orelse "sm_80";

@@ -594,7 +594,59 @@ pub const Worker = struct {
             std.log.info("Worker {} cached VMFB, {} parameter shapes, {} data input shapes, and allocated optimizer state buffers.", .{ self.node_id.?, self.cached_parameter_shapes.?.len, self.cached_data_input_shapes.?.len });
         }
     }
-    
+
+    /// Helper: Validates numerical stability of a buffer based on dtype
+    /// Returns error if NaN or Inf is detected. Handles unaligned reads safely.
+    fn validateBuffer(self: *Self, name: []const u8, bytes: []const u8, dtype: tensor.DType) !void {
+        _ = self;
+        var nan_count: usize = 0;
+        var inf_count: usize = 0;
+        var max_val: f64 = 0.0;
+        var sum_abs: f64 = 0.0;
+        const num_elements = bytes.len / dtype.sizeInBytes();
+
+        // Only validate floating point types
+        if (dtype != .f32 and dtype != .bf16 and dtype != .f16) return;
+
+        if (dtype == .f32) {
+            var i: usize = 0;
+            while (i < bytes.len) : (i += 4) {
+                if (i + 4 > bytes.len) break;
+                // Safe unaligned read
+                const u32_val = std.mem.readInt(u32, bytes[i..][0..4], .little);
+                const val: f32 = @bitCast(u32_val);
+
+                if (std.math.isNan(val)) nan_count += 1;
+                if (std.math.isInf(val)) inf_count += 1;
+                const abs_v = @abs(val);
+                if (abs_v > max_val) max_val = abs_v;
+                sum_abs += abs_v;
+            }
+        } else if (dtype == .bf16) {
+            var i: usize = 0;
+            while (i < bytes.len) : (i += 2) {
+                if (i + 2 > bytes.len) break;
+                // Safe unaligned read
+                const u16_val = std.mem.readInt(u16, bytes[i..][0..2], .little);
+                // bf16 to f32 conversion: shift left 16 bits
+                const u32_val = @as(u32, u16_val) << 16;
+                const val: f32 = @bitCast(u32_val);
+
+                if (std.math.isNan(val)) nan_count += 1;
+                if (std.math.isInf(val)) inf_count += 1;
+                const abs_v = @abs(val);
+                if (abs_v > max_val) max_val = abs_v;
+                sum_abs += abs_v;
+            }
+        }
+
+        if (nan_count > 0 or inf_count > 0) {
+            std.log.err("VALIDATION FAILED for {s}: {} NaNs, {} Infs (Max: {d:.4}, Avg: {d:.4})",
+                .{ name, nan_count, inf_count, max_val, sum_abs / @as(f64, @floatFromInt(num_elements)) });
+            return error.NumericalInstabilityDetected;
+        }
+    }
+
     /// Handle StartInnerLoop command from Shepherd using Cap'n Proto
     /// Implements the tau-step inner loop with AdamW state management and chunk-based data loading
     fn handleStartInnerLoop(self: *Self, msg: MessageEnvelope) !void {
@@ -828,25 +880,11 @@ pub const Worker = struct {
             reader.deinit();
         }
 
-        // Validate Received Parameters
-        var sum: f64 = 0.0;
-        var non_zero_count: usize = 0;
-        const f32_view = std.mem.bytesAsSlice(f32, initial_params_bytes_temp);
+        // Validate Received Parameters using the specific dtype
+        std.log.info("Worker {}: Validating initial parameters ({} bytes, dtype={s})...",
+            .{ self.node_id.?, initial_params_bytes_temp.len, @tagName(param_dtype) });
 
-        for (f32_view) |val| {
-            if (val != 0.0) non_zero_count += 1;
-            sum += @abs(val);
-        }
-
-        std.log.warn("🔍 PARAMETER INTEGRITY CHECK:", .{});
-        std.log.warn("   Bytes Received: {}", .{initial_params_bytes_temp.len});
-        std.log.warn("   Non-Zero Elements: {} / {}", .{non_zero_count, f32_view.len});
-        std.log.warn("   Abs Sum: {d:.4}", .{sum});
-
-        if (non_zero_count == 0) {
-            std.log.err("🚨 CRITICAL: Worker received ALL-ZERO parameters! Training will produce NaN.", .{});
-            return error.ReceivedZeroParameters;
-        }
+        try self.validateBuffer("Initial Params", initial_params_bytes_temp, param_dtype);
 
         // Save a persistent copy of initial params for delta calculation later
         const initial_params_bytes = try self.allocator.dupe(u8, initial_params_bytes_temp);
@@ -961,6 +999,22 @@ pub const Worker = struct {
                 for (outputs) |o| self.allocator.free(o);
                 self.allocator.free(outputs);
             }
+
+            // Validate outputs for NaNs immediately to pinpoint graph issues
+            const num_params_chk = param_shapes.len;
+
+            // Check updated parameters
+            for (0..num_params_chk) |i| {
+                if (i < outputs.len) {
+                    var name_buf: [32]u8 = undefined;
+                    const name = std.fmt.bufPrint(&name_buf, "Output Param {}", .{i}) catch "Output Param";
+                    try self.validateBuffer(name, outputs[i], param_dtype);
+                }
+            }
+
+            // Check loss (last output)
+            const loss_idx = outputs.len - 1;
+            try self.validateBuffer("Loss", outputs[loss_idx], param_dtype);
 
             // Parse outputs: [Params (N), Ms (N), Vs (N), Loss (1)]
             // Expected: 3*N + 1 outputs

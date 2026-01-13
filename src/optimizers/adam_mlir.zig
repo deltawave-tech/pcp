@@ -59,11 +59,20 @@ pub fn AdamMLIR(comptime T: type) type {
             const dims = try params.shape.getDims(b.allocator);
             defer b.allocator.free(dims);
 
+            // BF16 Safety: Clamp epsilon to prevent underflow to 0.0
+            // BF16 resolution is low; 1e-8 becomes 0.0, causing div-by-zero in the first step.
+            var eps_val = @as(f64, @floatCast(self.conf.epsilon));
+            if (self.element_type.isBF16(b.ctx)) {
+                if (eps_val < 1e-4) {
+                    eps_val = 1e-4;
+                }
+            }
+
             const beta1 = try ops.constant(b, @as(f64, @floatCast(self.conf.beta1)), dims, self.element_type);
             const beta2 = try ops.constant(b, @as(f64, @floatCast(self.conf.beta2)), dims, self.element_type);
             const one = try ops.constant(b, 1.0, dims, self.element_type);
             const lr = try ops.constant(b, @as(f64, @floatCast(self.conf.learning_rate)), dims, self.element_type);
-            const eps = try ops.constant(b, @as(f64, @floatCast(self.conf.epsilon)), dims, self.element_type);
+            const eps = try ops.constant(b, eps_val, dims, self.element_type);
             const decay = try ops.constant(b, @as(f64, @floatCast(self.conf.weight_decay)), dims, self.element_type);
             const max_norm = try ops.constant(b, @as(f64, @floatCast(self.conf.max_grad_norm)), dims, self.element_type);
 

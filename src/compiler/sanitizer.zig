@@ -4,6 +4,7 @@ const Allocator = std.mem.Allocator;
 pub const ModelSanitizer = struct {
     /// Applies numerical stability patches to MLIR source.
     /// Injects epsilon guards for log operations and division operations.
+    /// Dynamically extracts tensor types instead of matching hardcoded shapes.
     pub fn applyStabilityPatches(allocator: Allocator, source: []const u8) ![]u8 {
         var out_buffer = std.ArrayList(u8).init(allocator);
         errdefer out_buffer.deinit();
@@ -12,24 +13,35 @@ pub const ModelSanitizer = struct {
         var patch_count: usize = 0;
 
         while (lines.next()) |line| {
-            if (std.mem.indexOf(u8, line, "stablehlo.log") != null and
-                std.mem.indexOf(u8, line, "tensor<2048x1xf32>") != null)
-            {
-                try patchLogOp(&out_buffer, allocator, line, &patch_count, "tensor<2048x1xf32>");
-                continue;
+            // Dynamic type extraction instead of hardcoded shape matching
+            if (std.mem.indexOf(u8, line, "stablehlo.log") != null) {
+                if (extractType(line)) |type_str| {
+                    try patchLogOp(&out_buffer, allocator, line, &patch_count, type_str);
+                    continue;
+                }
             }
 
-            if (std.mem.indexOf(u8, line, "stablehlo.divide") != null and
-                std.mem.indexOf(u8, line, "tensor<64x4x32x32xf32>") != null)
-            {
-                try patchDivOp(&out_buffer, allocator, line, &patch_count, "tensor<64x4x32x32xf32>");
-                continue;
+            if (std.mem.indexOf(u8, line, "stablehlo.divide") != null) {
+                if (extractType(line)) |type_str| {
+                    try patchDivOp(&out_buffer, allocator, line, &patch_count, type_str);
+                    continue;
+                }
             }
 
             try appendLine(&out_buffer, line);
         }
 
         return out_buffer.toOwnedSlice();
+    }
+
+    /// Helper to extract "tensor<...>" from the end of an MLIR instruction line
+    fn extractType(line: []const u8) ?[]const u8 {
+        const last_colon = std.mem.lastIndexOfScalar(u8, line, ':') orelse return null;
+        const type_part = std.mem.trim(u8, line[last_colon + 1 ..], " \r\t");
+        if (std.mem.startsWith(u8, type_part, "tensor<")) {
+            return type_part;
+        }
+        return null;
     }
 
     fn patchLogOp(buf: *std.ArrayList(u8), allocator: Allocator, line: []const u8, counter: *usize, type_str: []const u8) !void {
@@ -46,7 +58,7 @@ pub const ModelSanitizer = struct {
 
         const eps_var = try std.fmt.allocPrint(allocator, "%eps_log_{d}", .{counter.*});
         defer allocator.free(eps_var);
-        try appendFmt(buf, "    {s} = stablehlo.constant dense<1.000000e-6> : {s}\n", .{ eps_var, type_str });
+        try appendFmt(buf, "    {s} = stablehlo.constant dense<1.000000e-4> : {s}\n", .{ eps_var, type_str });
 
         const safe_var = try std.fmt.allocPrint(allocator, "%safe_log_{d}", .{counter.*});
         defer allocator.free(safe_var);
@@ -80,7 +92,7 @@ pub const ModelSanitizer = struct {
 
         const eps_var = try std.fmt.allocPrint(allocator, "%eps_div_{d}", .{counter.*});
         defer allocator.free(eps_var);
-        try appendFmt(buf, "    {s} = stablehlo.constant dense<1.000000e-6> : {s}\n", .{ eps_var, type_str });
+        try appendFmt(buf, "    {s} = stablehlo.constant dense<1.000000e-4> : {s}\n", .{ eps_var, type_str });
 
         const safe_rhs = try std.fmt.allocPrint(allocator, "%safe_denom_{d}", .{counter.*});
         defer allocator.free(safe_rhs);

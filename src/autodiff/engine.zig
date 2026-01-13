@@ -644,34 +644,65 @@ fn addInputGradients(
         const operand = op.getOperand(i);
         const grad = input_gradients[i];
 
-        const grad_matched = try ops.reduceGradient(builder, grad, operand);
+        const grad_reduced_raw = try ops.reduceGradient(builder, grad, operand);
 
-        const grad_type = grad_matched.getType().as(mlir.RankedTensorType) orelse return error.NotRankedTensor;
+        // --- GLOBAL FINITE GUARD START ---
+        // CRITICAL FIX: We must filter BOTH NaNs and Infs.
+        // An Inf gradient causes the L2 Norm to be Inf, resulting in a scale of 0.0.
+        // Then Inf * 0.0 = NaN, poisoning the ENTIRE model update.
+        // Method: Check if (x - x) == 0.
+        //   Finite: x - x = 0.   (0 == 0) -> True
+        //   Inf:    Inf - Inf = NaN. (NaN == 0) -> False
+        //   NaN:    NaN - NaN = NaN. (NaN == 0) -> False
+
+        const grad_tensor = try builder.newTensor(grad_reduced_raw);
+
+        // 1. diff = grad - grad
+        const diff = try ops.subtract(builder, grad_tensor, grad_tensor);
+
+        // 2. Create zero tensor matching the gradient shape
+        const grad_type = grad_reduced_raw.getType().as(mlir.RankedTensorType) orelse return error.NotRankedTensor;
+        const grad_shape = try grad_type.getShape(builder.allocator);
+        defer builder.allocator.free(grad_shape);
         const elem_type = grad_type.getElementType();
+        const zero_tensor = try ops.constant(builder, 0.0, grad_shape, elem_type);
+
+        // 3. Mask = (diff == 0.0) -> True only if Finite
+        const is_finite_mask = try ops.compare(builder, diff, zero_tensor, .EQ);
+
+        // 4. Select: if Finite, use grad, else use 0.0
+        // We zero out bad gradients to salvage the step instead of crashing
+        const safe_grad_tensor = try ops.select(builder, is_finite_mask, grad_tensor, zero_tensor);
+        const grad_matched = safe_grad_tensor.value;
+        // --- GLOBAL FINITE GUARD END ---
+
+        // Proceed with existing clipping logic using the sanitized 'grad_matched'
+        const grad_type_final = grad_matched.getType().as(mlir.RankedTensorType) orelse return error.NotRankedTensor;
+        const grad_elem_type = grad_type_final.getElementType();
 
         var safe_grad = grad_matched;
 
-        if (!elem_type.isInteger() and !elem_type.isIndex()) {
-            const grad_shape = try grad_type.getShape(builder.allocator);
-            defer builder.allocator.free(grad_shape);
+        if (!grad_elem_type.isInteger() and !grad_elem_type.isIndex()) {
+            const grad_final_shape = try grad_type_final.getShape(builder.allocator);
+            defer builder.allocator.free(grad_final_shape);
 
-            const grad_tensor = try builder.newTensor(grad_matched);
+            const grad_tensor_safe = try builder.newTensor(grad_matched);
             const f32_type = mlir.Type.f32Type(builder.ctx);
 
-            const grad_f32 = if (!elem_type.isEqual(f32_type)) blk: {
-                const target_type = mlir.Type.rankedTensorType(builder.ctx, grad_shape, f32_type);
+            const grad_f32 = if (!grad_elem_type.isEqual(f32_type)) blk: {
+                const target_type = mlir.Type.rankedTensorType(builder.ctx, grad_final_shape, f32_type);
                 const convert_op = try builder.createAndAttach("stablehlo.convert", &.{grad_matched}, &.{target_type}, .{});
                 break :blk try builder.newTensor(convert_op.getResult(0));
-            } else grad_tensor;
+            } else grad_tensor_safe;
 
-            const min_val_f32 = try ops.constant(builder, gradient_clip_min, grad_shape, f32_type);
-            const max_val_f32 = try ops.constant(builder, gradient_clip_max, grad_shape, f32_type);
+            const min_val_f32 = try ops.constant(builder, gradient_clip_min, grad_final_shape, f32_type);
+            const max_val_f32 = try ops.constant(builder, gradient_clip_max, grad_final_shape, f32_type);
 
             const clamped_1 = try ops.maximum(builder, grad_f32, min_val_f32);
             const clamped_final = try ops.minimum(builder, clamped_1, max_val_f32);
 
-            safe_grad = if (!elem_type.isEqual(f32_type)) blk: {
-                const target_type = mlir.Type.rankedTensorType(builder.ctx, grad_shape, elem_type);
+            safe_grad = if (!grad_elem_type.isEqual(f32_type)) blk: {
+                const target_type = mlir.Type.rankedTensorType(builder.ctx, grad_final_shape, grad_elem_type);
                 const convert_op = try builder.createAndAttach("stablehlo.convert", &.{clamped_final.value}, &.{target_type}, .{});
                 break :blk convert_op.getResult(0);
             } else clamped_final.value;

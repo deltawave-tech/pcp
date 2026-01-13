@@ -187,12 +187,27 @@ pub fn divideVJP(
         grad_out = reshape_op.getResult(0);
     }
 
+    // --- GUARDED DENOMINATOR START ---
+    // Add epsilon guard for numerical stability (prevents div-by-zero in bf16)
+    const b_type = b.getType().as(mlir.RankedTensorType) orelse return error.InvalidTensorType;
+    const b_shape = try b_type.getShape(builder.allocator);
+    defer builder.allocator.free(b_shape);
+    const b_elem_type = b_type.getElementType();
+
+    // Create epsilon constant (1e-4) matching b's shape
+    const eps_b = try ops.constant(builder, 1e-4, b_shape, b_elem_type);
+
+    // b_safe = b + eps
+    const b_safe_op = try builder.createAndAttach("stablehlo.add", &.{ b, eps_b.value }, &.{b.getType()}, .{});
+    const b_safe = b_safe_op.getResult(0);
+    // --- GUARDED DENOMINATOR END ---
+
     var result = std.ArrayList(mlir.Value).init(builder.allocator);
     errdefer result.deinit();
 
     std.debug.print("DEBUG: divideVJP: computing grad_a\n", .{});
-    // da = grad_out / b with explicit broadcasting
-    const grad_a_broadcast = try ops.broadcastOperands(builder, grad_out, b);
+    // da = grad_out / (b + eps) with explicit broadcasting
+    const grad_a_broadcast = try ops.broadcastOperands(builder, grad_out, b_safe);
     defer builder.allocator.free(grad_a_broadcast.shape);
     const grad_a_type = grad_a_broadcast.lhs.getType();
     const grad_a_raw = try builder.createAndAttach("stablehlo.divide", &.{ grad_a_broadcast.lhs, grad_a_broadcast.rhs }, &.{grad_a_type}, .{});
@@ -202,7 +217,7 @@ pub fn divideVJP(
     try result.append(grad_a);
 
     std.debug.print("DEBUG: divideVJP: computing grad_b\n", .{});
-    // db = -grad_out * a / (b * b)
+    // db = -grad_out * a / ((b+eps) * (b+eps))
 
     // a * grad_out with explicit broadcasting
     const a_times_grad_broadcast = try ops.broadcastOperands(builder, a, grad_out);
@@ -210,10 +225,10 @@ pub fn divideVJP(
     const a_times_grad_type = a_times_grad_broadcast.lhs.getType();
     const a_times_grad = try builder.createAndAttach("stablehlo.multiply", &.{ a_times_grad_broadcast.lhs, a_times_grad_broadcast.rhs }, &.{a_times_grad_type}, .{});
 
-    // b * b (no broadcasting needed, both operands are b)
-    const b_squared = try builder.createAndAttach("stablehlo.multiply", &.{ b, b }, &.{b.getType()}, .{});
+    // b_safe * b_safe (no broadcasting needed, same operand)
+    const b_squared = try builder.createAndAttach("stablehlo.multiply", &.{ b_safe, b_safe }, &.{b.getType()}, .{});
 
-    // (a * grad_out) / (b * b) with explicit broadcasting
+    // (a * grad_out) / b_squared with explicit broadcasting
     const div_operands_broadcast = try ops.broadcastOperands(builder, a_times_grad.getResult(0), b_squared.getResult(0));
     defer builder.allocator.free(div_operands_broadcast.shape);
     const div_operands_type = div_operands_broadcast.lhs.getType();
@@ -1457,7 +1472,7 @@ pub fn expVJP(
     return result.toOwnedSlice();
 }
 
-/// VJP rule for log: da = grad_out / a
+/// VJP rule for log: da = grad_out / (a + eps)
 pub fn logVJP(
     builder: *MLIRBuilder,
     original_op: mlir.Operation,
@@ -1485,7 +1500,22 @@ pub fn logVJP(
     var result = std.ArrayList(mlir.Value).init(builder.allocator);
     defer result.deinit();
 
-    const grad_in_broadcast = try ops.broadcastOperands(builder, grad_out, a);
+    // --- GUARDED DENOMINATOR START ---
+    const a_type = a.getType().as(mlir.RankedTensorType) orelse return error.InvalidTensorType;
+    const a_shape = try a_type.getShape(builder.allocator);
+    defer builder.allocator.free(a_shape);
+    const a_elem_type = a_type.getElementType();
+
+    // Create epsilon (1e-4)
+    const eps_a = try ops.constant(builder, 1e-4, a_shape, a_elem_type);
+
+    // a_safe = a + eps
+    const a_safe_op = try builder.createAndAttach("stablehlo.add", &.{ a, eps_a.value }, &.{a.getType()}, .{});
+    const a_safe = a_safe_op.getResult(0);
+    // --- GUARDED DENOMINATOR END ---
+
+    // da = grad_out / a_safe
+    const grad_in_broadcast = try ops.broadcastOperands(builder, grad_out, a_safe);
     defer builder.allocator.free(grad_in_broadcast.shape);
     const grad_in_type = grad_in_broadcast.lhs.getType();
     const grad_in_raw = try builder.createAndAttach("stablehlo.divide", &.{grad_in_broadcast.lhs, grad_in_broadcast.rhs}, &.{grad_in_type}, .{});
@@ -1503,15 +1533,22 @@ pub fn rsqrtVJP(builder: *MLIRBuilder, original_op: mlir.Operation, primals: []c
     const tensor_type = a.getType();
     var result = std.ArrayList(mlir.Value).init(builder.allocator);
 
-    const rsqrt_op = try builder.createAndAttach("stablehlo.rsqrt", &.{a}, &.{tensor_type}, .{});
-    const rsqrt_val = rsqrt_op.getResult(0);
-    const sq = try builder.createAndAttach("stablehlo.multiply", &.{rsqrt_val, rsqrt_val}, &.{tensor_type}, .{});
-    const cub = try builder.createAndAttach("stablehlo.multiply", &.{sq.getResult(0), rsqrt_val}, &.{tensor_type}, .{});
-
+    // --- GUARDED INPUT START ---
+    // Add epsilon to prevent rsqrt(0) = inf which causes NaN in bf16
     const ranked_type = tensor_type.as(mlir.RankedTensorType) orelse return error.InvalidTensorType;
     const a_shape = try ranked_type.getShape(builder.allocator);
     defer builder.allocator.free(a_shape);
     const elem_type = ranked_type.getElementType();
+
+    const eps_a = try ops.constant(builder, 1e-4, a_shape, elem_type);
+    const a_safe_op = try builder.createAndAttach("stablehlo.add", &.{ a, eps_a.value }, &.{tensor_type}, .{});
+    const a_safe = a_safe_op.getResult(0);
+    // --- GUARDED INPUT END ---
+
+    const rsqrt_op = try builder.createAndAttach("stablehlo.rsqrt", &.{a_safe}, &.{tensor_type}, .{});
+    const rsqrt_val = rsqrt_op.getResult(0);
+    const sq = try builder.createAndAttach("stablehlo.multiply", &.{rsqrt_val, rsqrt_val}, &.{tensor_type}, .{});
+    const cub = try builder.createAndAttach("stablehlo.multiply", &.{sq.getResult(0), rsqrt_val}, &.{tensor_type}, .{});
 
     const grad_out_type = grad_out_raw.getType().as(mlir.RankedTensorType) orelse return error.InvalidTensorType;
     const grad_out_shape = try grad_out_type.getShape(builder.allocator);

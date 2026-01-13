@@ -67,9 +67,26 @@ pub fn constant(allocator: std.mem.Allocator, ctx: mlir.Context, args: struct {
 /// Creates a zero constant tensor
 pub fn zeroConstant(allocator: std.mem.Allocator, ctx: mlir.Context, shape: []const i64, element_type: mlir.Type) !mlir.Operation {
     const tensor_type = mlir.Type.rankedTensorType(ctx, shape, element_type);
+    const i1_type = mlir.Type.i1Type(ctx);
 
     var zero_attr: mlir.Attribute = undefined;
-    if (element_type.isInteger() or element_type.isIndex()) {
+    if (element_type.isEqual(i1_type)) {
+        // Special handling for i1 (boolean) - MLIR C-API splat has issues with i1
+        // Build type string manually
+        var type_buf: [256]u8 = undefined;
+        var stream = std.io.fixedBufferStream(&type_buf);
+        const writer = stream.writer();
+        writer.writeAll("tensor<") catch return error.FormatFailed;
+        for (shape) |d| {
+            writer.print("{}x", .{d}) catch return error.FormatFailed;
+        }
+        writer.writeAll("i1>") catch return error.FormatFailed;
+        const type_str = stream.getWritten();
+
+        var attr_buf: [512]u8 = undefined;
+        const attr_str = std.fmt.bufPrint(&attr_buf, "dense<false> : {s}", .{type_str}) catch return error.FormatFailed;
+        zero_attr = mlir.Attribute.fromParseString(ctx, attr_str) catch return error.BoolConstantFailed;
+    } else if (element_type.isInteger() or element_type.isIndex()) {
         const zero_val = mlir.Attribute.integerAttr(ctx, 0, element_type);
         zero_attr = mlir.Attribute.denseElementsAttrSplat(tensor_type, zero_val);
     } else {
@@ -274,7 +291,12 @@ pub fn reduce_sum(
         // Standard path
         const scalar_type = mlir.Type.tensor(&.{}, element_type);
         var zero_attr: mlir.Attribute = undefined;
-        if (element_type.isInteger() or element_type.isIndex()) {
+        const i1_type = mlir.Type.i1Type(ctx);
+
+        if (element_type.isEqual(i1_type)) {
+            // Special handling for i1 (boolean) - MLIR C-API splat has issues with i1
+            zero_attr = mlir.Attribute.fromParseString(ctx, "dense<false> : tensor<i1>") catch return error.BoolConstantFailed;
+        } else if (element_type.isInteger() or element_type.isIndex()) {
             const zero_val = mlir.Attribute.integerAttr(ctx, 0, element_type);
             zero_attr = mlir.Attribute.denseElementsAttrSplat(scalar_type, zero_val);
         } else {
@@ -681,9 +703,16 @@ pub fn scalarConstant(allocator: std.mem.Allocator, ctx: mlir.Context, value: f6
     // [FIX] For bf16, create as f32 first (caller responsible for conversion)
     const actual_type = if (element_type.isBF16(ctx)) mlir.Type.f32Type(ctx) else element_type;
     const scalar_type = mlir.Type.tensor(&.{}, actual_type); // Scalar tensor (rank 0)
+    const i1_type = mlir.Type.i1Type(ctx);
 
     var attr: mlir.Attribute = undefined;
-    if (actual_type.isInteger() or actual_type.isIndex()) {
+    if (actual_type.isEqual(i1_type)) {
+        // Special handling for i1 (boolean) - MLIR C-API splat has issues with i1
+        const bool_str = if (value != 0.0) "true" else "false";
+        var attr_buf: [64]u8 = undefined;
+        const attr_str = std.fmt.bufPrint(&attr_buf, "dense<{s}> : tensor<i1>", .{bool_str}) catch return error.FormatFailed;
+        attr = mlir.Attribute.fromParseString(ctx, attr_str) catch return error.BoolConstantFailed;
+    } else if (actual_type.isInteger() or actual_type.isIndex()) {
         const i_val: i64 = @intFromFloat(value);
         const val_attr = mlir.Attribute.integerAttr(ctx, i_val, actual_type);
         attr = mlir.Attribute.denseElementsAttrSplat(scalar_type, val_attr);
@@ -724,8 +753,14 @@ pub fn scalarConstantBF16(
     } else {
         // Standard path
         const scalar_type = mlir.Type.tensor(&.{}, element_type);
+        const i1_type = mlir.Type.i1Type(ctx);
         var attr: mlir.Attribute = undefined;
-        if (element_type.isInteger() or element_type.isIndex()) {
+        if (element_type.isEqual(i1_type)) {
+            const bool_str = if (value != 0.0) "true" else "false";
+            var attr_buf: [64]u8 = undefined;
+            const attr_str = std.fmt.bufPrint(&attr_buf, "dense<{s}> : tensor<i1>", .{bool_str}) catch return error.FormatFailed;
+            attr = mlir.Attribute.fromParseString(ctx, attr_str) catch return error.BoolConstantFailed;
+        } else if (element_type.isInteger() or element_type.isIndex()) {
             const i_val: i64 = @intFromFloat(value);
             const val_attr = mlir.Attribute.integerAttr(ctx, i_val, element_type);
             attr = mlir.Attribute.denseElementsAttrSplat(scalar_type, val_attr);
@@ -742,9 +777,25 @@ pub fn scalarConstantBF16(
 /// Create a zero constant of given shape and type (renamed to avoid duplicate)
 pub fn zeroTensor(ctx: mlir.Context, shape: []const i64, element_type: mlir.Type) mlir.Operation {
     const tensor_type = mlir.Type.tensor(shape, element_type);
+    const i1_type = mlir.Type.i1Type(ctx);
 
     var attr: mlir.Attribute = undefined;
-    if (element_type.isInteger() or element_type.isIndex()) {
+    if (element_type.isEqual(i1_type)) {
+        // Build type string for i1
+        var type_buf: [256]u8 = undefined;
+        var stream = std.io.fixedBufferStream(&type_buf);
+        const writer = stream.writer();
+        writer.writeAll("tensor<") catch @panic("Format failed");
+        for (shape) |d| {
+            writer.print("{}x", .{d}) catch @panic("Format failed");
+        }
+        writer.writeAll("i1>") catch @panic("Format failed");
+        const type_str = stream.getWritten();
+
+        var attr_buf: [512]u8 = undefined;
+        const attr_str = std.fmt.bufPrint(&attr_buf, "dense<false> : {s}", .{type_str}) catch @panic("Format failed");
+        attr = mlir.Attribute.fromParseString(ctx, attr_str) catch @panic("Bool constant failed");
+    } else if (element_type.isInteger() or element_type.isIndex()) {
         const zero_val = mlir.Attribute.integerAttr(ctx, 0, element_type);
         attr = mlir.Attribute.denseElementsAttrSplat(tensor_type, zero_val);
     } else {
@@ -762,9 +813,25 @@ pub fn zeroTensor(ctx: mlir.Context, shape: []const i64, element_type: mlir.Type
 /// Create a ones constant of given shape and type
 pub fn onesConstant(ctx: mlir.Context, shape: []const i64, element_type: mlir.Type) mlir.Operation {
     const tensor_type = mlir.Type.tensor(shape, element_type);
+    const i1_type = mlir.Type.i1Type(ctx);
 
     var attr: mlir.Attribute = undefined;
-    if (element_type.isInteger() or element_type.isIndex()) {
+    if (element_type.isEqual(i1_type)) {
+        // Build type string for i1
+        var type_buf: [256]u8 = undefined;
+        var stream = std.io.fixedBufferStream(&type_buf);
+        const writer = stream.writer();
+        writer.writeAll("tensor<") catch @panic("Format failed");
+        for (shape) |d| {
+            writer.print("{}x", .{d}) catch @panic("Format failed");
+        }
+        writer.writeAll("i1>") catch @panic("Format failed");
+        const type_str = stream.getWritten();
+
+        var attr_buf: [512]u8 = undefined;
+        const attr_str = std.fmt.bufPrint(&attr_buf, "dense<true> : {s}", .{type_str}) catch @panic("Format failed");
+        attr = mlir.Attribute.fromParseString(ctx, attr_str) catch @panic("Bool constant failed");
+    } else if (element_type.isInteger() or element_type.isIndex()) {
         const one_val = mlir.Attribute.integerAttr(ctx, 1, element_type);
         attr = mlir.Attribute.denseElementsAttrSplat(tensor_type, one_val);
     } else {

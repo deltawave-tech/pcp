@@ -582,7 +582,7 @@ pub const Context = struct {
         pub fn fromParseString(ctx: Context, attr_string: []const u8) !Self {
             const str_ref = c.c.stringRefFromString(attr_string);
             const handle = c.c.mlirAttributeParseGet(ctx.handle, str_ref);
-            if (@intFromPtr(handle) == 0) {
+            if (@intFromPtr(handle.ptr) == 0) {
                 std.log.err("Failed to parse MLIR attribute from string: {s}", .{attr_string});
                 return error.AttributeParseFailed;
             }

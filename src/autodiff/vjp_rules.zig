@@ -1638,6 +1638,7 @@ pub fn convertVJP(
 }
 
 pub fn selectVJP(builder: *MLIRBuilder, original_op: mlir.Operation, primals: []const mlir.Value, adjoints: []const mlir.Value) ![]mlir.Value {
+    std.debug.print("DEBUG selectVJP: ENTER\n", .{});
     const grad_out_raw = adjoints[0];
     const pred = primals[0];
 
@@ -1662,8 +1663,10 @@ pub fn selectVJP(builder: *MLIRBuilder, original_op: mlir.Operation, primals: []
     defer builder.allocator.free(shape);
     const elem_type = result_ranked_type.getElementType();
 
+    std.debug.print("DEBUG selectVJP: Creating zero_tensor for gradient (shape len={})\n", .{shape.len});
     const zero_tensor = try ops.constant(builder, 0.0, shape, elem_type);
     const zero = zero_tensor.value;
+    std.debug.print("DEBUG selectVJP: zero_tensor created\n", .{});
 
     const grad_true = try builder.createAndAttach("stablehlo.select", &.{pred, grad_out, zero}, &.{result_type}, .{});
     const grad_false = try builder.createAndAttach("stablehlo.select", &.{pred, zero, grad_out}, &.{result_type}, .{});
@@ -1673,12 +1676,15 @@ pub fn selectVJP(builder: *MLIRBuilder, original_op: mlir.Operation, primals: []
     defer builder.allocator.free(pred_shape);
     const pred_elem_type = pred_ranked_type.getElementType();
 
+    std.debug.print("DEBUG selectVJP: Creating pred_zero_tensor (i1 type, shape len={})\n", .{pred_shape.len});
     const pred_zero_tensor = try ops.constant(builder, 0.0, pred_shape, pred_elem_type);
+    std.debug.print("DEBUG selectVJP: pred_zero_tensor created\n", .{});
     const pred_grad = pred_zero_tensor.value;
 
     try result.append(pred_grad);
     try result.append(grad_true.getResult(0));
     try result.append(grad_false.getResult(0));
+    std.debug.print("DEBUG selectVJP: EXIT success\n", .{});
     return result.toOwnedSlice();
 }
 

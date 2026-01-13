@@ -837,11 +837,15 @@ pub fn constant(builder: *MLIRBuilder, value: f64, shape: []const i64, element_t
     const f64_type = mlir.Type.f64Type(builder.ctx);
     const i1_type = mlir.Type.i1Type(builder.ctx);
 
-    if (element_type.isBF16(builder.ctx) or
-        (!element_type.isEqual(f32_type) and
-         !element_type.isEqual(f64_type) and
-         !element_type.isInteger() and
-         !element_type.isIndex()))
+    // Type checks for proper constant creation path selection
+    const is_bf16 = element_type.isBF16(builder.ctx);
+    const is_f32 = element_type.isEqual(f32_type);
+    const is_f64 = element_type.isEqual(f64_type);
+    const is_int = element_type.isInteger();
+    const is_idx = element_type.isIndex();
+    const is_i1 = element_type.isEqual(i1_type);
+
+    if (is_bf16 or (!is_f32 and !is_f64 and !is_int and !is_idx))
     {
         const f32_constant = try constant(builder, value, shape, f32_type);
         // Convert to the target element type (convert() will construct the proper tensor type)
@@ -851,17 +855,47 @@ pub fn constant(builder: *MLIRBuilder, value: f64, shape: []const i64, element_t
     const tensor_type = mlir.Type.rankedTensorType(builder.ctx, shape, element_type);
     var attr: mlir.Attribute = undefined;
 
-    if (element_type.isEqual(i1_type)) {
+    if (is_i1) {
         // Special handling for boolean (i1) type - parse from string
+        // MLIR C-API denseElementsAttrSplat has issues with i1, so we parse from text
         const bool_str = if (value != 0.0) "true" else "false";
-        var attr_str_buf: [128]u8 = undefined;
-        const attr_str = std.fmt.bufPrint(&attr_str_buf, "dense<{s}> : {s}", .{ bool_str, tensor_type.toString() }) catch return error.FormatFailed;
-        attr = mlir.Attribute.fromParseString(builder.ctx, attr_str) catch return error.BoolConstantFailed;
-    } else if (element_type.isInteger() or element_type.isIndex()) {
+
+        // Manually construct type string (e.g. "tensor<2x2xi1>") as Type.toString() is unavailable
+        var type_buf: [256]u8 = undefined;
+        var stream = std.io.fixedBufferStream(&type_buf);
+        const writer = stream.writer();
+        try writer.writeAll("tensor<");
+        for (shape) |d| {
+            try writer.print("{}x", .{d});
+        }
+        try writer.writeAll("i1>");
+        const type_str = stream.getWritten();
+
+        var attr_buf: [512]u8 = undefined;
+        const attr_str = try std.fmt.bufPrint(&attr_buf, "dense<{s}> : {s}", .{ bool_str, type_str });
+        attr = try mlir.Attribute.fromParseString(builder.ctx, attr_str);
+    } else if (is_f64) {
+        // Special handling for f64 - mlirDenseElementsAttrFloatSplatGet takes f32
+        // Use string parsing instead
+        var type_buf: [256]u8 = undefined;
+        var stream = std.io.fixedBufferStream(&type_buf);
+        const writer = stream.writer();
+        try writer.writeAll("tensor<");
+        for (shape) |d| {
+            try writer.print("{}x", .{d});
+        }
+        try writer.writeAll("f64>");
+        const type_str = stream.getWritten();
+
+        var attr_buf: [512]u8 = undefined;
+        const attr_str = try std.fmt.bufPrint(&attr_buf, "dense<{d:.16}> : {s}", .{ value, type_str });
+        attr = try mlir.Attribute.fromParseString(builder.ctx, attr_str);
+    } else if (is_int or is_idx) {
         const i_val: i64 = @intFromFloat(value);
         const element_attr = mlir.Attribute.integerAttr(builder.ctx, i_val, element_type);
         attr = mlir.Attribute.denseElementsAttrSplat(tensor_type, element_attr);
     } else {
+        // f32 path - mlirDenseElementsAttrFloatSplatGet works with f32
         attr = mlir.Attribute.denseElementsAttrFloatSplat(tensor_type, value);
     }
 

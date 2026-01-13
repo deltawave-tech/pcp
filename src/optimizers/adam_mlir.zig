@@ -118,8 +118,12 @@ pub fn AdamMLIR(comptime T: type) type {
             const m_corr_denom = try ops.subtract(b, one, beta1_pow);
             const v_corr_denom = try ops.subtract(b, one, beta2_pow);
 
-            const m_hat = try ops.divide(b, new_m, m_corr_denom);
-            const v_hat = try ops.divide(b, new_v, v_corr_denom);
+            // Guard against division by small numbers (bf16 precision issue)
+            // Use max(denom, epsilon) to ensure stability
+            const m_corr_safe = try ops.maximum(b, m_corr_denom, eps);
+            const v_corr_safe = try ops.maximum(b, v_corr_denom, eps);
+            const m_hat = try ops.divide(b, new_m, m_corr_safe);
+            const v_hat = try ops.divide(b, new_v, v_corr_safe);
 
             // AdamW Update
             const sqrt_v = try ops.sqrt(b, v_hat);

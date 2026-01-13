@@ -22,7 +22,7 @@ pub const WandBLogger = struct {
         try env_map.put("WANDB_API_KEY", config.api_key.?);
         try env_map.put("WANDB_SILENT", "true");
 
-        const argv = [_][]const u8{ "venv/bin/python3", "tools/wandb_adapter.py" };
+        const argv = [_][]const u8{ "python3", "tools/wandb_adapter.py" };
 
         var child = std.process.Child.init(&argv, allocator);
         child.stdin_behavior = .Pipe;

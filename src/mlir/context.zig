@@ -178,12 +178,25 @@ pub const MLIRContext = struct {
             try argv.append("--iree-codegen-llvmgpu-use-reduction-vector-distribution=false");
 
             // RDNA3 (gfx11xx) Specific Stability Fixes
-            // RDNA3 is natively Wave32. Disable prefetching to prevent register spilling/hangs
-            // and hint wave occupancy to constrain register usage.
+            // RDNA3 is natively Wave32. We must disable prefetching (pipelining) to prevent
+            // register spilling/hangs (Status 10).
             if (std.mem.indexOf(u8, arch, "gfx11") != null) {
+                // 1. Disable software pipelining (Verified)
                 try argv.append("--iree-llvmgpu-enable-prefetch=false");
-                try argv.append("--iree-hip-waves-per-eu=2");
-                std.log.info("Applying RDNA3/gfx11 stability flags", .{});
+
+                // 2. Aggressively limit waves per EU to 1 (Verified)
+                // This forces minimal register usage to prevent spills on Wave32 arch.
+                try argv.append("--iree-hip-waves-per-eu=1");
+
+                // 3. Use native hardware intrinsics (Verified)
+                // Prevents complex emulation code that might trigger runtime bugs.
+                try argv.append("--iree-codegen-gpu-native-math-precision=true");
+
+                // 4. Disable Transform Dialect JIT (Verified)
+                // Forces static compilation path, avoiding complex runtime optimizations that fail on RDNA3.
+                try argv.append("--iree-codegen-llvmgpu-enable-transform-dialect-jit=false");
+
+                std.log.info("Applying RDNA3/gfx11 stability flags (waves=1, native-math, no-prefetch, no-transform-jit)", .{});
             }
         } else if (is_cuda) {
             // Default to sm_80 (A100) if not specified for CUDA

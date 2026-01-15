@@ -271,8 +271,11 @@ pub const IreeBackend = struct {
         function_name: []const u8,
         inputs: []const DeviceBuffer,
     ) ![]DeviceBuffer {
+        std.log.debug("IREE: executeWithDeviceBuffers starting for '{s}' with {} inputs", .{ function_name, inputs.len });
+
         // 1. Ensure session is loaded
         try self.loadSession(vmfb_bytes);
+        std.log.debug("IREE: Session loaded", .{});
 
         // 2. Initialize call
         var call: c.iree_runtime_call_t = undefined;
@@ -283,14 +286,18 @@ pub const IreeBackend = struct {
         const fn_name_view = c.iree_string_view_t{ .data = full_fn_name.ptr, .size = full_fn_name.len };
         try ireeCheck(c.iree_runtime_call_initialize_by_name(self.session.?, fn_name_view, &call));
         defer c.iree_runtime_call_deinitialize(&call);
+        std.log.debug("IREE: Call initialized for '{s}'", .{full_fn_name});
 
         // 3. Push Inputs (Cheap pointer push - no H2D copy!)
-        for (inputs) |buf| {
+        for (inputs, 0..) |buf, idx| {
             try ireeCheck(c.iree_runtime_call_inputs_push_back_buffer_view(&call, buf.handle));
+            std.log.debug("IREE: Pushed input {} ({} bytes)", .{ idx, buf.byteLength() });
         }
 
         // 4. Invoke (GPU Compute)
+        std.log.info("IREE: Invoking GPU kernel...", .{});
         try ireeCheck(c.iree_runtime_call_invoke(&call, 0));
+        std.log.info("IREE: GPU kernel completed successfully", .{});
 
         // 5. Collect Outputs as DeviceBuffers (No D2H copy yet!)
         var outputs_list = std.ArrayList(DeviceBuffer).init(self.allocator);
@@ -303,12 +310,14 @@ pub const IreeBackend = struct {
         const output_count = c.iree_vm_list_size(outputs);
         var i: c.iree_host_size_t = 0;
 
+        std.log.debug("IREE: Collecting {} outputs", .{output_count});
         while (i < output_count) : (i += 1) {
             var output_view: ?*c.iree_hal_buffer_view_t = null;
             // Pop retains the buffer view, so we own it now
             try ireeCheck(c.iree_runtime_call_outputs_pop_front_buffer_view(&call, @ptrCast(&output_view)));
             try outputs_list.append(DeviceBuffer{ .handle = output_view.? });
         }
+        std.log.debug("IREE: executeWithDeviceBuffers completed", .{});
 
         return outputs_list.toOwnedSlice();
     }
@@ -344,8 +353,11 @@ pub const IreeBackend = struct {
         input_shapes: [][]const i64,
         input_dtypes: ?[]const DType,
     ) ![][]u8 {
+        std.log.info("IREE: execute starting for '{s}' with {} inputs", .{ function_name, inputs_data.len });
+
         // 1. Ensure session is loaded
         try self.loadSession(vmfb_bytes);
+        std.log.debug("IREE: Session loaded", .{});
 
         // 2. Initialize call
         var call: c.iree_runtime_call_t = undefined;
@@ -357,10 +369,12 @@ pub const IreeBackend = struct {
         const fn_name_view = c.iree_string_view_t{ .data = full_fn_name.ptr, .size = full_fn_name.len };
         try ireeCheck(c.iree_runtime_call_initialize_by_name(self.session.?, fn_name_view, &call));
         defer c.iree_runtime_call_deinitialize(&call);
+        std.log.debug("IREE: Call initialized for '{s}'", .{full_fn_name});
 
         // 3. Prepare Inputs (Host -> Device)
         std.debug.assert(inputs_data.len == input_shapes.len);
 
+        std.log.debug("IREE: Uploading {} inputs to device...", .{inputs_data.len});
         for (inputs_data, input_shapes, 0..) |input_slice, shape_slice, i| {
             // Convert shapes to IREE format
             var iree_shape = try self.allocator.alloc(c.iree_hal_dim_t, shape_slice.len);
@@ -392,10 +406,13 @@ pub const IreeBackend = struct {
             defer c.iree_hal_buffer_view_release(buffer_view.?);
 
             try ireeCheck(c.iree_runtime_call_inputs_push_back_buffer_view(&call, buffer_view.?));
+            std.log.debug("IREE: Uploaded input {} ({} bytes)", .{ i, input_slice.len });
         }
 
         // 4. Invoke
+        std.log.info("IREE: Invoking GPU kernel for '{s}'...", .{function_name});
         try ireeCheck(c.iree_runtime_call_invoke(&call, 0));
+        std.log.info("IREE: GPU kernel '{s}' completed successfully", .{function_name});
 
         // 5. Read Outputs (Device -> Host)
         var outputs_list = std.ArrayList([]u8).init(self.allocator);
@@ -408,6 +425,7 @@ pub const IreeBackend = struct {
         const output_count = c.iree_vm_list_size(outputs);
         var i: c.iree_host_size_t = 0;
 
+        std.log.debug("IREE: Reading {} outputs from device...", .{output_count});
         while (i < output_count) : (i += 1) {
             var output_buffer_view: ?*c.iree_hal_buffer_view_t = null;
             try ireeCheck(c.iree_runtime_call_outputs_pop_front_buffer_view(&call, @ptrCast(&output_buffer_view)));
@@ -428,8 +446,10 @@ pub const IreeBackend = struct {
             ));
 
             try outputs_list.append(output_data);
+            std.log.debug("IREE: Downloaded output {} ({} bytes)", .{ i, buffer_byte_length });
         }
 
+        std.log.info("IREE: execute completed for '{s}'", .{function_name});
         return outputs_list.toOwnedSlice();
     }
 

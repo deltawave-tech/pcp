@@ -177,9 +177,12 @@ pub const MLIRContext = struct {
             try argv.append("--iree-codegen-llvmgpu-use-vector-distribution=false");
             try argv.append("--iree-codegen-llvmgpu-use-reduction-vector-distribution=false");
 
+            // RDNA3 (gfx11xx) Specific Stability Fixes
+            // RDNA3 is natively Wave32. Disable prefetching to prevent register spilling/hangs
+            // and hint wave occupancy to constrain register usage.
             if (std.mem.indexOf(u8, arch, "gfx11") != null) {
-                try argv.append("--iree-codegen-llvmgpu-use-warp-reduce=false");
-                try argv.append("--iree-codegen-llvmgpu-enable-pipelining=false");
+                try argv.append("--iree-llvmgpu-enable-prefetch=false");
+                try argv.append("--iree-hip-waves-per-eu=2");
                 std.log.info("Applying RDNA3/gfx11 stability flags", .{});
             }
         } else if (is_cuda) {

@@ -151,6 +151,12 @@
         };
         checks.pcp = packages.pcp;
 
+        packages.pcp-wandb-adapter =
+
+          pkgs.writers.writePython3Bin "wandb_adapter.py" {
+            libraries = [ pkgs.python3Packages.wandb ];
+          } (builtins.readFile tools/wandb_adapter.py);
+
         packages.pcp-docker = pkgs.dockerTools.buildImage {
           name = "pcp";
           config = { Cmd = [ "${packages.pcp}/bin/pcp" ]; };

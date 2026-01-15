@@ -151,11 +151,16 @@
         };
         checks.pcp = packages.pcp;
 
-        packages.pcp-wandb-adapter =
-
-          pkgs.writers.writePython3Bin "wandb_adapter.py" {
-            libraries = [ pkgs.python3Packages.wandb ];
-          } (builtins.readFile tools/wandb_adapter.py);
+        packages.pcp-wandb-adapter = let
+          wandb_module_splitted = pkgs.lib.strings.splitString "\n"
+            (builtins.readFile tools/wandb_adapter.py);
+          wandb_module_cut_shebang =
+            pkgs.lib.lists.drop 1 wandb_module_splitted;
+          wandb_module_no_shebang =
+            builtins.concatStringsSep "\n" wandb_module_cut_shebang;
+        in pkgs.writers.writePython3Bin "wandb_adapter.py" {
+          libraries = [ pkgs.python3Packages.wandb ];
+        } wandb_module_no_shebang;
 
         packages.pcp-docker = pkgs.dockerTools.buildImage {
           name = "pcp";

@@ -148,6 +148,7 @@
             fi
 
             wrapProgram $out/bin/pcp \
+              --prefix PATH : "${packages.pcp-wandb-adapter}/bin" \
               --suffix PATH : "${packages.iree-sdk}/bin"
           '';
         };

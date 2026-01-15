@@ -21,10 +21,8 @@ pub const WandBLogger = struct {
         defer env_map.deinit();
         try env_map.put("WANDB_API_KEY", config.api_key.?);
         try env_map.put("WANDB_SILENT", "true");
-        // Ensure Python can find pip-installed packages
-        try env_map.put("PYTHONPATH", "/usr/local/lib/python3.12/dist-packages:/usr/local/lib/python3/dist-packages:/usr/lib/python3/dist-packages");
 
-        const argv = [_][]const u8{ "/usr/bin/python3", "tools/wandb_adapter.py" };
+        const argv = [_][]const u8{"wandb_adapter.py"};
 
         var child = std.process.Child.init(&argv, allocator);
         child.stdin_behavior = .Pipe;

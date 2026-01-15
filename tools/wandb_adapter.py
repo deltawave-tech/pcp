@@ -1,8 +1,10 @@
-# wandb_adapter.py
-import sys
+#!/usr/bin/env python3
+
 import json
-import os
+import sys
+
 import wandb
+
 
 def main():
     # Read config from first line of stdin
@@ -17,7 +19,7 @@ def main():
             project=config.get("project", "pcp-distributed"),
             entity=config.get("entity", None),
             name=config.get("run_name", None),
-            config=config.get("hyperparameters", {})
+            config=config.get("hyperparameters", {}),
         )
     except Exception as e:
         print(f"Error initializing wandb: {e}", file=sys.stderr)
@@ -28,7 +30,7 @@ def main():
         try:
             line = sys.stdin.readline()
             if not line:
-                break # EOF
+                break  # EOF
 
             data = json.loads(line)
 
@@ -48,6 +50,7 @@ def main():
             print(f"WandB Adapter Error: {e}", file=sys.stderr)
 
     wandb.finish()
+
 
 if __name__ == "__main__":
     main()

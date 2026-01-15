@@ -52,7 +52,9 @@
           nativeBuildInputs = packages.pcp.nativeBuildInputs
             ++ [ pkgs.cachix pkgs.claude-code pkgs.lldb pkgs.act zls ];
           buildInputs = packages.pcp.buildInputs
-            ++ packages.pcp.propagatedBuildInputs;
+            ++ packages.pcp.propagatedBuildInputs
+            # For wandb_adapter.py
+            ++ [ (pkgs.python3.withPackages (ps: [ ps.wandb ])) ];
           shellHook = ''
             echo "Zig development environment loaded"
             echo "Zig version: $(zig version)"
@@ -146,10 +148,22 @@
             fi
 
             wrapProgram $out/bin/pcp \
+              --prefix PATH : "${packages.pcp-wandb-adapter}/bin" \
               --suffix PATH : "${packages.iree-sdk}/bin"
           '';
         };
         checks.pcp = packages.pcp;
+
+        packages.pcp-wandb-adapter = let
+          wandb_module_splitted = pkgs.lib.strings.splitString "\n"
+            (builtins.readFile tools/wandb_adapter.py);
+          wandb_module_cut_shebang =
+            pkgs.lib.lists.drop 1 wandb_module_splitted;
+          wandb_module_no_shebang =
+            builtins.concatStringsSep "\n" wandb_module_cut_shebang;
+        in pkgs.writers.writePython3Bin "wandb_adapter.py" {
+          libraries = [ pkgs.python3Packages.wandb ];
+        } wandb_module_no_shebang;
 
         packages.pcp-docker = pkgs.dockerTools.buildImage {
           name = "pcp";

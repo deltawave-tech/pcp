@@ -52,7 +52,9 @@
           nativeBuildInputs = packages.pcp.nativeBuildInputs
             ++ [ pkgs.cachix pkgs.claude-code pkgs.lldb pkgs.act zls ];
           buildInputs = packages.pcp.buildInputs
-            ++ packages.pcp.propagatedBuildInputs;
+            ++ packages.pcp.propagatedBuildInputs
+            # For wandb_adapter.py
+            ++ [ (pkgs.python3.withPackages (ps: [ ps.wandb ])) ];
           shellHook = ''
             echo "Zig development environment loaded"
             echo "Zig version: $(zig version)"

@@ -214,6 +214,46 @@
           '';
         };
 
+        packages.iree-mlir = llvmPkg.stdenv.mkDerivation {
+          pname = "iree-mlir";
+          version = iree-version;
+          src = packages.iree-src;
+
+          nativeBuildInputs = [ pkgs.cmake pkgs.ninja pkgs.python3 ];
+          # Python bindings deps if MLIR_ENABLE_BINDINGS_PYTHON is ON
+          buildInputs = [ packages.iree-llvm pkgs.libxml2 pkgs.zlib ];
+
+          sourceRoot = "source/third_party/llvm-project/mlir";
+
+          cmakeFlags = [
+            (lib.cmakeFeature "LLVM_DIR" "${packages.iree-llvm}/lib/cmake/llvm")
+            (lib.cmakeBool "MLIR_ENABLE_BINDINGS_PYTHON" false)
+            (lib.cmakeFeature "CMAKE_BUILD_TYPE" "RelWithDebInfo")
+            (lib.cmakeBool "LLVM_ENABLE_ASSERTIONS" true)
+            (lib.cmakeBool "LLVM_ENABLE_LLD" true)
+
+            (lib.cmakeBool "LLVM_BUILD_TOOLS" true)
+            (lib.cmakeFeature "MLIR_TOOLS_INSTALL_DIR"
+              "${placeholder "out"}/bin/")
+            (lib.cmakeFeature "MLIR_TABLEGEN_EXE"
+              "${placeholder "out"}/bin/mlir-tblgen")
+          ];
+
+          ninjaFlags = [
+            "mlir-cmake-exports"
+            "mlir-headers"
+            "mlir-libraries"
+            # Tools
+            "mlir-opt"
+            "mlir-reduce"
+            "mlir-tblgen"
+            "mlir-translate"
+          ];
+          postInstall = ''
+            cp bin/mlir-tblgen $out/bin/
+          '';
+        };
+
         packages.iree-sdk = llvmPkg.stdenv.mkDerivation rec {
           pname = "iree-sdk";
           version = iree-version;

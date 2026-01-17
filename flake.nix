@@ -45,6 +45,9 @@
             });
           })
         ];
+
+        iree-version = "3.9.0";
+
       in rec {
         packages.default = packages.pcp;
 
@@ -170,16 +173,51 @@
           config = { Cmd = [ "${packages.pcp}/bin/pcp" ]; };
         };
 
+        # ---- #
+        # IREE #
+        # ---- #
+
+        packages.iree-src = pkgs.fetchFromGitHub {
+          owner = "iree-org";
+          repo = "iree";
+          rev = "v${iree-version}";
+          hash = "sha256-O+yp6ysHQJKlgLnoK1esGdRmce6M4nPgFTsxEck0xw0=";
+          fetchSubmodules = true;
+        };
+
+        packages.iree-llvm = llvmPkg.stdenv.mkDerivation {
+          pname = "iree-llvm";
+          version = iree-version;
+          src = packages.iree-src;
+
+          nativeBuildInputs =
+            [ llvmPkg.lld pkgs.bintools pkgs.cmake pkgs.ninja pkgs.python3 ];
+          buildInputs = [ pkgs.zlib pkgs.libxml2 ];
+
+          # Point CMake to the llvm-project submodule
+          sourceRoot = "source/third_party/llvm-project/llvm";
+          # Flags derived from byo_llvm.sh -> do_build_llvm
+          cmakeFlags = [
+            (lib.cmakeFeature "LLVM_ENABLE_PROJECTS" "clang;lld")
+            (lib.cmakeBool "LLVM_ENABLE_LLD" true)
+            (lib.cmakeFeature "CMAKE_BUILD_TYPE" "RelWithDebInfo")
+            (lib.cmakeBool "LLVM_INSTALL_UTILS" true)
+            (lib.cmakeBool "LLVM_ENABLE_ASSERTIONS" true)
+            # Use the config file provided by IREE source
+            "-C${packages.iree-src}/build_tools/cmake/iree_llvm.cmake"
+          ];
+
+          # The byo_llvm script uses a custom target, but standard install works 
+          # provided we enabled the right projects.
+          installPhase = ''
+            cmake --build . --target install
+          '';
+        };
+
         packages.iree-sdk = llvmPkg.stdenv.mkDerivation rec {
           pname = "iree-sdk";
-          version = "3.9.0";
-          src = pkgs.fetchFromGitHub {
-            owner = "iree-org";
-            repo = "iree";
-            rev = "v${version}";
-            hash = "sha256-O+yp6ysHQJKlgLnoK1esGdRmce6M4nPgFTsxEck0xw0=";
-            fetchSubmodules = true;
-          };
+          version = iree-version;
+          src = packages.iree-src;
           nativeBuildInputs =
             [ pkgs.cmake pkgs.ninja pkgs.python3 pkgs.bintools pkgs.patchelf ];
           # Mix together a couple of dependencies needed to build the CUDA layer.  See

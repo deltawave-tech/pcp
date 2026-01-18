@@ -254,16 +254,101 @@
           '';
         };
 
-        packages.iree-sdk = llvmPkg.stdenv.mkDerivation rec {
+        packages.iree-sdk = llvmPkg.stdenv.mkDerivation {
           pname = "iree-sdk";
           version = iree-version;
           src = packages.iree-src;
-          nativeBuildInputs =
-            [ pkgs.cmake pkgs.ninja pkgs.python3 pkgs.bintools pkgs.patchelf ];
+          nativeBuildInputs = [
+            packages.iree-llvm
+            packages.iree-mlir
+            pkgs.cmake
+            pkgs.ninja
+            pkgs.python3
+            pkgs.bintools
+            pkgs.patchelf
+          ];
           # Mix together a couple of dependencies needed to build the CUDA layer.  See
           # 'build_tools/scripts/fetch_cuda_deps.sh'.
           postUnpack = ''
             set -e
+
+            # The following cannot be the right approach.  We somehow have to teach 'iree-mlir' to
+            # correctly propagate the path to 'mlir-tblgen'.
+            echo "Symlinking needed mlir-tblgen"
+            for tgt in \
+              compiler/plugins/input/StableHLO/Conversion/ \
+              compiler/plugins/input/StableHLO/Conversion/Preprocessing/ \
+              compiler/plugins/input/TOSA/InputConversion/ \
+              compiler/plugins/input/Torch/InputConversion/ \
+              compiler/plugins/input/Torch/torch-mlir-dialects/ \
+              compiler/plugins/input/Torch/torch-mlir/ \
+              compiler/plugins/target/ROCM/Dialect/ROCM/IR/ \
+              compiler/plugins/target/ROCM/Dialect/ROCM/Transforms/ \
+              compiler/src/iree/compiler/Bindings/Native/Transforms/ \
+              compiler/src/iree/compiler/Bindings/TFLite/Transforms/ \
+              compiler/src/iree/compiler/Codegen/ \
+              compiler/src/iree/compiler/Codegen/Common/ \
+              compiler/src/iree/compiler/Codegen/Common/CPU/ \
+              compiler/src/iree/compiler/Codegen/Common/GPU/ \
+              compiler/src/iree/compiler/Codegen/Common/TransformExtensions/ \
+              compiler/src/iree/compiler/Codegen/Dialect/CPU/IR/ \
+              compiler/src/iree/compiler/Codegen/Dialect/Codegen/IR/ \
+              compiler/src/iree/compiler/Codegen/Dialect/GPU/IR/ \
+              compiler/src/iree/compiler/Codegen/Dialect/GPU/TransformExtensions/ \
+              compiler/src/iree/compiler/Codegen/Dialect/GPU/Transforms/ \
+              compiler/src/iree/compiler/Codegen/Dialect/VectorExt/IR/ \
+              compiler/src/iree/compiler/Codegen/Dialect/VectorExt/Transforms/ \
+              compiler/src/iree/compiler/Codegen/Interfaces/ \
+              compiler/src/iree/compiler/Codegen/LLVMCPU/ \
+              compiler/src/iree/compiler/Codegen/LLVMCPU/TransformExtensions/ \
+              compiler/src/iree/compiler/Codegen/LLVMGPU/ \
+              compiler/src/iree/compiler/Codegen/LLVMGPU/TransformExtensions/ \
+              compiler/src/iree/compiler/Codegen/SPIRV/ \
+              compiler/src/iree/compiler/Codegen/VMVX/ \
+              compiler/src/iree/compiler/Codegen/WGSL/ \
+              compiler/src/iree/compiler/ConstEval/ \
+              compiler/src/iree/compiler/Dialect/Encoding/IR/ \
+              compiler/src/iree/compiler/Dialect/Flow/IR/ \
+              compiler/src/iree/compiler/Dialect/Flow/TransformExtensions/ \
+              compiler/src/iree/compiler/Dialect/Flow/Transforms/ \
+              compiler/src/iree/compiler/Dialect/HAL/IR/ \
+              compiler/src/iree/compiler/Dialect/HAL/Transforms/ \
+              compiler/src/iree/compiler/Dialect/LinalgExt/IR/ \
+              compiler/src/iree/compiler/Dialect/LinalgExt/TransformExtensions/ \
+              compiler/src/iree/compiler/Dialect/LinalgExt/Transforms/ \
+              compiler/src/iree/compiler/Dialect/Stream/IR/ \
+              compiler/src/iree/compiler/Dialect/Stream/Transforms/ \
+              compiler/src/iree/compiler/Dialect/TensorExt/IR/ \
+              compiler/src/iree/compiler/Dialect/Util/IR/ \
+              compiler/src/iree/compiler/Dialect/Util/TransformOps/ \
+              compiler/src/iree/compiler/Dialect/Util/Transforms/ \
+              compiler/src/iree/compiler/Dialect/VM/IR/ \
+              compiler/src/iree/compiler/Dialect/VM/Transforms/ \
+              compiler/src/iree/compiler/Dialect/VMVX/IR/ \
+              compiler/src/iree/compiler/Dialect/VMVX/Transforms/ \
+              compiler/src/iree/compiler/DispatchCreation/ \
+              compiler/src/iree/compiler/GlobalOptimization/ \
+              compiler/src/iree/compiler/InputConversion/Common/ \
+              compiler/src/iree/compiler/Modules/Check/IR/ \
+              compiler/src/iree/compiler/Modules/HAL/Inline/IR/ \
+              compiler/src/iree/compiler/Modules/HAL/Inline/Transforms/ \
+              compiler/src/iree/compiler/Modules/HAL/Loader/IR/ \
+              compiler/src/iree/compiler/Modules/HAL/Loader/Transforms/ \
+              compiler/src/iree/compiler/Modules/IO/Parameters/IR/ \
+              compiler/src/iree/compiler/Modules/IO/Parameters/Transforms/ \
+              compiler/src/iree/compiler/Preprocessing/Common/ \
+              compiler/src/iree/compiler/Preprocessing/TransformExtensions/ \
+              llvm-external-projects/iree-dialects/include/iree-dialects/Dialect/LinalgTransform/ \
+              samples/compiler_plugins/simple_io_sample/ \
+              third_party/stablehlo/stablehlo/conversions/linalg/transforms/ \
+              third_party/stablehlo/stablehlo/dialect/ \
+              third_party/stablehlo/stablehlo/reference/ \
+              third_party/stablehlo/stablehlo/tests/ \
+              third_party/stablehlo/stablehlo/transforms/ \
+              third_party/stablehlo/stablehlo/transforms/optimization/ \
+              ; do
+                ln -s ${packages.iree-mlir}/bin/mlir-tblgen source/$tgt
+            done
 
             echo "Copying needed cuda artifacts"
             icd=/build/iree_cuda_deps
@@ -279,8 +364,8 @@
             cp -r ${pkgs.cudaPackages_12_2.cuda_nvcc}/nvvm/libdevice/ $icd/nvvm/
             chmod u+w $icd
           '';
-          propagatedBuildInputs = [ llvmPkg.lld llvmPkg.libllvm ];
-          buildInputs = [ pkgs.gtest ];
+          propagatedBuildInputs = [ ];
+          buildInputs = [ pkgs.libxml2 pkgs.zlib pkgs.gtest ];
           cmakeFlags = [
             # Flags suggested in
             # https://iree.dev/building-from-source/getting-started/#configuration-settings
@@ -301,6 +386,17 @@
             (lib.cmakeBool "IREE_HAL_DRIVER_VULKAN" true)
             (lib.cmakeBool "IREE_TARGET_BACKEND_CUDA" true)
             (lib.cmakeBool "IREE_TARGET_BACKEND_ROCM" true)
+
+            # Plug in the seperatley built iree-llvm and iree-mlir
+            (lib.cmakeBool "IREE_BUILD_BUNDLED_LLVM" false)
+            (lib.cmakeFeature "LLVM_DIR" "${packages.iree-llvm}/lib/cmake/llvm")
+            (lib.cmakeFeature "LLD_DIR" "${packages.iree-llvm}/lib/cmake/lld")
+            (lib.cmakeFeature "Clang_DIR"
+              "${packages.iree-llvm}/lib/cmake/clang")
+            (lib.cmakeFeature "MLIR_DIR" "${packages.iree-mlir}/lib/cmake/mlir")
+            (lib.cmakeFeature "MLIR_TABLEGEN_EXE"
+              "${packages.iree-mlir}/bin/mlir-tblgen")
+
             "-B"
             "/build/build"
           ];

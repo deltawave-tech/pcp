@@ -12,7 +12,7 @@ pub fn AdamMLIRConfiguration(comptime DataType: type) type {
         learning_rate: DataType = 0.001,
         beta1: DataType = 0.9,
         beta2: DataType = 0.999,
-        epsilon: DataType = 1e-6,
+        epsilon: DataType = 1e-8,
         weight_decay: DataType = 0.01,
         max_grad_norm: DataType = 1.0,
         gradient_clip_min: DataType = -100.0,

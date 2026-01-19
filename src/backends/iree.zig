@@ -26,22 +26,10 @@ const DType = pcp.tensor.DType;
 fn ireeCheck(status: c.iree_status_t) !void {
     // In IREE, null status indicates success, non-null indicates error
     if (status != null) {
-        // Try to get more detailed error information
-        std.debug.print("IREE Error Details:\n", .{});
-
-        // Get error code if available
-        const code = c.iree_status_code(status);
-        std.debug.print("  Status code: {}\n", .{code});
-
-        // Try to get error message
-        var buffer: [1024]u8 = undefined;
-        var out_length: c.iree_host_size_t = 0;
-        _ = c.iree_status_format(status, buffer.len, &buffer, &out_length);
-        if (out_length > 0 and out_length < buffer.len) {
-            const msg_len: usize = @intCast(out_length);
-            std.debug.print("  Error message: {s}\n", .{buffer[0..msg_len]});
-        }
-
+        std.debug.print("\n======== IREE RUNTIME ERROR ========\n", .{});
+        // Use iree_status_fprint for full error output including annotations
+        c.iree_status_fprint(c.stderr, status);
+        std.debug.print("====================================\n\n", .{});
         c.iree_status_free(status);
         return error.IreeRuntimeError;
     }

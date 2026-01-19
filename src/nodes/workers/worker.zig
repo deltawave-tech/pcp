@@ -647,147 +647,6 @@ pub const Worker = struct {
         }
     }
 
-    /// BF16 DEBUG: Compute detailed tensor statistics for hypothesis verification
-    /// Returns: (min, max, mean, num_zeros, num_denormals, num_very_small)
-    fn computeTensorStats(bytes: []const u8, dtype: tensor.DType) struct {
-        min: f64,
-        max: f64,
-        mean: f64,
-        num_zeros: usize,
-        num_denormals: usize,
-        num_very_small: usize, // |x| < 1e-6 (precision loss in bf16)
-        nan_count: usize,
-        inf_count: usize,
-    } {
-        var min_val: f64 = std.math.floatMax(f64);
-        var max_val: f64 = -std.math.floatMax(f64);
-        var sum: f64 = 0.0;
-        var num_zeros: usize = 0;
-        var num_denormals: usize = 0;
-        var num_very_small: usize = 0;
-        var nan_count: usize = 0;
-        var inf_count: usize = 0;
-        var count: usize = 0;
-
-        if (dtype == .bf16) {
-            var i: usize = 0;
-            while (i < bytes.len) : (i += 2) {
-                if (i + 2 > bytes.len) break;
-                const u16_val = std.mem.readInt(u16, bytes[i..][0..2], .little);
-                const u32_val = @as(u32, u16_val) << 16;
-                const val: f32 = @bitCast(u32_val);
-                const f64_val: f64 = @floatCast(val);
-
-                if (std.math.isNan(val)) {
-                    nan_count += 1;
-                } else if (std.math.isInf(val)) {
-                    inf_count += 1;
-                } else {
-                    if (val == 0.0) num_zeros += 1;
-                    // bf16 denormal check: exponent bits are 0 but mantissa is not
-                    const exp_bits = (u16_val >> 7) & 0xFF;
-                    const mantissa_bits = u16_val & 0x7F;
-                    if (exp_bits == 0 and mantissa_bits != 0) num_denormals += 1;
-                    // Very small values that lose precision in bf16 (Hypothesis C)
-                    if (@abs(val) > 0 and @abs(val) < 1e-6) num_very_small += 1;
-
-                    if (f64_val < min_val) min_val = f64_val;
-                    if (f64_val > max_val) max_val = f64_val;
-                    sum += f64_val;
-                }
-                count += 1;
-            }
-        } else if (dtype == .f32) {
-            var i: usize = 0;
-            while (i < bytes.len) : (i += 4) {
-                if (i + 4 > bytes.len) break;
-                const u32_val = std.mem.readInt(u32, bytes[i..][0..4], .little);
-                const val: f32 = @bitCast(u32_val);
-                const f64_val: f64 = @floatCast(val);
-
-                if (std.math.isNan(val)) {
-                    nan_count += 1;
-                } else if (std.math.isInf(val)) {
-                    inf_count += 1;
-                } else {
-                    if (val == 0.0) num_zeros += 1;
-                    if (@abs(val) > 0 and @abs(val) < 1e-6) num_very_small += 1;
-
-                    if (f64_val < min_val) min_val = f64_val;
-                    if (f64_val > max_val) max_val = f64_val;
-                    sum += f64_val;
-                }
-                count += 1;
-            }
-        }
-
-        const mean = if (count > 0) sum / @as(f64, @floatFromInt(count)) else 0.0;
-        return .{
-            .min = if (min_val == std.math.floatMax(f64)) 0.0 else min_val,
-            .max = if (max_val == -std.math.floatMax(f64)) 0.0 else max_val,
-            .mean = mean,
-            .num_zeros = num_zeros,
-            .num_denormals = num_denormals,
-            .num_very_small = num_very_small,
-            .nan_count = nan_count,
-            .inf_count = inf_count,
-        };
-    }
-
-    /// BF16 DEBUG: Log optimizer state health (Hypothesis C: Optimizer State Collapse)
-    fn logOptimizerStateHealth(m_states: [][]u8, v_states: [][]u8, dtype: tensor.DType, step: usize) void {
-        std.log.warn("=== BF16 DEBUG: Optimizer State Health (Step {}) ===", .{step});
-
-        var total_m_zeros: usize = 0;
-        var total_v_zeros: usize = 0;
-        var total_m_very_small: usize = 0;
-        var total_v_very_small: usize = 0;
-        var total_m_elements: usize = 0;
-        var total_v_elements: usize = 0;
-
-        // Sample first few parameter states for detailed logging
-        const max_detailed = @min(m_states.len, 3);
-
-        for (0..m_states.len) |i| {
-            const m_stats = computeTensorStats(m_states[i], dtype);
-            const v_stats = computeTensorStats(v_states[i], dtype);
-
-            const m_elements = m_states[i].len / dtype.sizeInBytes();
-            const v_elements = v_states[i].len / dtype.sizeInBytes();
-
-            total_m_zeros += m_stats.num_zeros;
-            total_v_zeros += v_stats.num_zeros;
-            total_m_very_small += m_stats.num_very_small;
-            total_v_very_small += v_stats.num_very_small;
-            total_m_elements += m_elements;
-            total_v_elements += v_elements;
-
-            if (i < max_detailed) {
-                std.log.warn("  Param {}: M[min={e:.2}, max={e:.2}, mean={e:.2}, zeros={}/{}, tiny={}]", .{
-                    i, m_stats.min, m_stats.max, m_stats.mean, m_stats.num_zeros, m_elements, m_stats.num_very_small,
-                });
-                std.log.warn("  Param {}: V[min={e:.2}, max={e:.2}, mean={e:.2}, zeros={}/{}, tiny={}]", .{
-                    i, v_stats.min, v_stats.max, v_stats.mean, v_stats.num_zeros, v_elements, v_stats.num_very_small,
-                });
-            }
-        }
-
-        // Summary statistics
-        const m_zero_pct = if (total_m_elements > 0) @as(f64, @floatFromInt(total_m_zeros)) / @as(f64, @floatFromInt(total_m_elements)) * 100.0 else 0.0;
-        const v_zero_pct = if (total_v_elements > 0) @as(f64, @floatFromInt(total_v_zeros)) / @as(f64, @floatFromInt(total_v_elements)) * 100.0 else 0.0;
-        const m_tiny_pct = if (total_m_elements > 0) @as(f64, @floatFromInt(total_m_very_small)) / @as(f64, @floatFromInt(total_m_elements)) * 100.0 else 0.0;
-        const v_tiny_pct = if (total_v_elements > 0) @as(f64, @floatFromInt(total_v_very_small)) / @as(f64, @floatFromInt(total_v_elements)) * 100.0 else 0.0;
-
-        std.log.warn("  SUMMARY: M-state zeros: {d:.1}%, tiny(<1e-6): {d:.1}%", .{ m_zero_pct, m_tiny_pct });
-        std.log.warn("  SUMMARY: V-state zeros: {d:.1}%, tiny(<1e-6): {d:.1}%", .{ v_zero_pct, v_tiny_pct });
-
-        // Hypothesis C check: If V-state has >90% zeros or tiny values, optimizer is collapsing
-        if (v_zero_pct > 90.0 or v_tiny_pct > 50.0) {
-            std.log.err("  HYPOTHESIS C LIKELY: V-state has {d:.1}% zeros, {d:.1}% tiny - variance estimate collapsed!", .{ v_zero_pct, v_tiny_pct });
-        }
-        std.log.warn("=========================================================", .{});
-    }
-
     /// Handle StartInnerLoop command from Shepherd using Cap'n Proto
     /// Implements the tau-step inner loop with AdamW state management and chunk-based data loading
     fn handleStartInnerLoop(self: *Self, msg: MessageEnvelope) !void {
@@ -1258,38 +1117,11 @@ pub const Worker = struct {
                 return error.InvalidLossSize;
             }
 
-            // === DEBUG: Loss tracking ===
-            const step_num = step + 1;
-            std.log.warn("=== Loss Analysis (Step {}/{}) ===", .{ step_num, tau });
-            if (loss_bytes.len == 4) {
-                std.log.warn("  Loss value: {d:.6} (F32, {} bytes)", .{ final_loss, loss_bytes.len });
-            } else {
-                std.log.warn("  Loss value: {d:.6} (BF16 bits: 0x{X:0>4})", .{
-                    final_loss,
-                    std.mem.readInt(u16, loss_bytes[0..2], .little),
-                });
-            }
-
-            // Check for suspicious "constant" loss values that indicate broken training
-            // Common failure modes: 0.125 (1/8), 0.25 (1/4), 0.5 (1/2), exact integers
-            const is_power_of_two = (final_loss == 0.125 or final_loss == 0.25 or final_loss == 0.5 or
-                final_loss == 1.0 or final_loss == 2.0 or final_loss == 4.0 or final_loss == 8.0);
-            if (is_power_of_two) {
-                std.log.err("  HYPOTHESIS A LIKELY: Loss is exact power-of-two ({d}) - suggests exp() overflow/NaN in softmax!", .{final_loss});
-            }
-
             // Check for NaN/Inf in loss (indicates catastrophic failure)
             if (std.math.isNan(final_loss)) {
-                std.log.err("  CRITICAL: Loss is NaN - training has diverged!", .{});
+                std.log.err("Worker {}: Loss is NaN - training has diverged!", .{self.node_id.?});
             } else if (std.math.isInf(final_loss)) {
-                std.log.err("  CRITICAL: Loss is Inf - numerical overflow!", .{});
-            }
-            std.log.warn("=====================================================", .{});
-
-            // === BF16 DEBUG: Log optimizer state health every few steps ===
-            // Note: M/V states are always f32 in mixed precision mode
-            if (step_num == 1 or step_num == tau or step_num % 5 == 0) {
-                logOptimizerStateHealth(m_states, v_states, .f32, step_num);
+                std.log.err("Worker {}: Loss is Inf - numerical overflow!", .{self.node_id.?});
             }
 
             // Increment timestep for next iteration

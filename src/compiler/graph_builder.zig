@@ -156,11 +156,13 @@ pub const GraphBuilder = struct {
         const one_tensor = try ops.constant(builder, 1.0, &.{}, loss_elem_type);
         try grad_operands.append(one_tensor.value);
 
-        // Prepare result types for grad call (uses model's original dtype, NOT F32)
+        // Prepare result types for grad call (must match autodiff output types exactly)
         var grad_result_types = std.ArrayList(mlir.Type).init(allocator);
         defer grad_result_types.deinit();
-        for (0..num_params) |i| try grad_result_types.append(forward_fn_type.getInput(i));
-        for (data_in) |d| try grad_result_types.append(d.getType());
+        const num_forward_inputs_total = forward_fn_type.getNumInputs();
+        for (0..num_forward_inputs_total) |i| {
+            try grad_result_types.append(forward_fn_type.getInput(i));
+        }
 
         const grad_callee_attr = mlir.Attribute.symbolRefAttr(builder.ctx, grad_fn_name);
         const grad_call_op = try builder.createAndAttach("func.call", grad_operands.items, grad_result_types.items, .{
@@ -200,7 +202,8 @@ pub const GraphBuilder = struct {
             const update_res = try optimizer.update(param_t, grad_t, m_t, v_t, timestep_tensor);
             std.log.info("optimizer.update completed for param {}", .{i});
 
-            try new_params.append(update_res.new_params.value);
+            const new_param_f32 = try ops.convert(builder, update_res.new_params, f32_type);
+            try new_params.append(new_param_f32.value);
             try new_ms.append(update_res.new_m.value);
             try new_vs.append(update_res.new_v.value);
         }

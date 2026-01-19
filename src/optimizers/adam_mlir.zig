@@ -12,7 +12,7 @@ pub fn AdamMLIRConfiguration(comptime DataType: type) type {
         learning_rate: DataType = 0.001,
         beta1: DataType = 0.9,
         beta2: DataType = 0.999,
-        epsilon: DataType = 1e-8,
+        epsilon: DataType = 1e-6,
         weight_decay: DataType = 0.01,
         max_grad_norm: DataType = 1.0,
         gradient_clip_min: DataType = -100.0,
@@ -45,8 +45,8 @@ pub fn AdamMLIR(comptime T: type) type {
             _ = self; // Nothing to deinit in stateless version
         }
 
-        /// Stateless update function for Graph construction.
-        /// Returns new values for {params, m, v} to be passed to the next step.
+        /// Stateless update function for Graph construction (Mixed Precision).
+        /// All math is performed in f32. M/V states stay in f32. Params are cast back to original type.
         pub fn update(
             self: *Self,
             params: Tensor,
@@ -56,85 +56,90 @@ pub fn AdamMLIR(comptime T: type) type {
             timestep: Tensor,
         ) !struct { new_params: Tensor, new_m: Tensor, new_v: Tensor } {
             const b = self.builder;
+            const f32_type = mlir.Type.f32Type(b.ctx);
+            const original_param_type = params.value.getType().as(mlir.RankedTensorType).?.getElementType();
+
+            const params_f32 = try ops.convert(b, params, f32_type);
+            const grads_f32 = try ops.convert(b, grads, f32_type);
+
             const dims = try params.shape.getDims(b.allocator);
             defer b.allocator.free(dims);
 
-            // BF16 Safety: Force epsilon to be at least 1e-4 for bf16 types.
-            // 1e-8 in bf16 is effectively 0.0, which causes division by zero (Inf)
-            // when v_state is 0 (initial step).
-            var eps_val = @as(f64, @floatCast(self.conf.epsilon));
-            if (self.element_type.isBF16(b.ctx)) {
-                if (eps_val < 1e-4) {
-                    eps_val = 1e-4;
-                    std.log.info("AdamMLIR: Auto-adjusted epsilon to 1e-4 for bf16 stability", .{});
-                }
+            const eps_val = @as(f64, @floatCast(self.conf.epsilon));
+            const beta1 = try ops.constant(b, @as(f64, @floatCast(self.conf.beta1)), dims, f32_type);
+            const beta2 = try ops.constant(b, @as(f64, @floatCast(self.conf.beta2)), dims, f32_type);
+            const one = try ops.constant(b, 1.0, dims, f32_type);
+            const lr = try ops.constant(b, @as(f64, @floatCast(self.conf.learning_rate)), dims, f32_type);
+            const eps = try ops.constant(b, eps_val, dims, f32_type);
+            const decay = try ops.constant(b, @as(f64, @floatCast(self.conf.weight_decay)), dims, f32_type);
+
+            // Tensor-wise L2 Gradient Clipping with Iterative Dimensional Reduction
+            const scalar_shape = &[_]i64{};
+
+            // Pre-clamp gradients to prevent norm overflow (g^2 must fit in f32)
+            const clamp_min = try ops.constant(b, -1000.0, scalar_shape, f32_type);
+            const clamp_max = try ops.constant(b, 1000.0, scalar_shape, f32_type);
+            const g_clamped_1 = try ops.maximum(b, grads_f32, clamp_min);
+            const g_for_norm = try ops.minimum(b, g_clamped_1, clamp_max);
+
+            // Use clamped gradients for norm calculation only
+            const g_squared = try ops.multiply(b, g_for_norm, g_for_norm);
+
+            // Iterative Reduction: reduce one dimension at a time to avoid shared memory overflow
+            var sum_sq = g_squared;
+            const rank = params.shape.rank();
+            var i: usize = 0;
+            while (i < rank) : (i += 1) {
+                const reduce_dim = [_]i64{0};
+                sum_sq = try ops.reduceSum(b, sum_sq, &reduce_dim, false);
             }
 
-            const beta1 = try ops.constant(b, @as(f64, @floatCast(self.conf.beta1)), dims, self.element_type);
-            const beta2 = try ops.constant(b, @as(f64, @floatCast(self.conf.beta2)), dims, self.element_type);
-            const one = try ops.constant(b, 1.0, dims, self.element_type);
-            const lr = try ops.constant(b, @as(f64, @floatCast(self.conf.learning_rate)), dims, self.element_type);
-            const eps = try ops.constant(b, eps_val, dims, self.element_type);
-            const decay = try ops.constant(b, @as(f64, @floatCast(self.conf.weight_decay)), dims, self.element_type);
-            const max_norm = try ops.constant(b, @as(f64, @floatCast(self.conf.max_grad_norm)), dims, self.element_type);
-
-            // Tensor-wise L2 Gradient Clipping
-            const g_squared = try ops.multiply(b, grads, grads);
-
-            var all_dims = std.ArrayList(i64).init(b.allocator);
-            defer all_dims.deinit();
-            for (0..params.shape.rank()) |i| try all_dims.append(@intCast(i));
-
-            const sum_sq = try ops.reduceSum(b, g_squared, all_dims.items, true);
-
             const norm_raw = try ops.sqrt(b, sum_sq);
-            const norm = try ops.add(b, norm_raw, eps);
 
-            const max_val = try ops.maximum(b, norm, max_norm);
-            const clip_scale = try ops.divide(b, max_norm, max_val);
+            const eps_scalar = try ops.constant(b, eps_val, scalar_shape, f32_type);
+            const norm = try ops.add(b, norm_raw, eps_scalar);
 
-            const clipped_grads = try ops.multiply(b, grads, clip_scale);
+            const max_norm_scalar = try ops.constant(b, @as(f64, @floatCast(self.conf.max_grad_norm)), scalar_shape, f32_type);
+            const max_val = try ops.maximum(b, norm, max_norm_scalar);
+            const clip_scale = try ops.divide(b, max_norm_scalar, max_val);
 
-            // Update m_state
+            // Apply scale to ORIGINAL grads (preserve direction, just scale magnitude)
+            const clipped_grads = try ops.multiply(b, grads_f32, clip_scale);
+
             const one_minus_beta1 = try ops.subtract(b, one, beta1);
             const term1_m = try ops.multiply(b, beta1, m_state);
             const term2_m = try ops.multiply(b, one_minus_beta1, clipped_grads);
             const new_m = try ops.add(b, term1_m, term2_m);
 
-            // Update v_state
             const one_minus_beta2 = try ops.subtract(b, one, beta2);
             const term1_v = try ops.multiply(b, beta2, v_state);
             const clipped_grads_sq = try ops.multiply(b, clipped_grads, clipped_grads);
             const term2_v = try ops.multiply(b, one_minus_beta2, clipped_grads_sq);
             const new_v = try ops.add(b, term1_v, term2_v);
 
-            // Bias Correction
-            // Convert timestep to model element type if needed (timestep may be f32 while model is bf16)
-            const timestep_converted = try ops.convert(b, timestep, self.element_type);
-            const timestep_broadcast_val = try ops.broadcastToShape(b, timestep_converted.value, dims);
+            const timestep_broadcast_val = try ops.broadcastToShape(b, timestep.value, dims);
             const timestep_broadcast = try b.newTensor(timestep_broadcast_val);
             const beta1_pow = try ops.power(b, beta1, timestep_broadcast);
             const beta2_pow = try ops.power(b, beta2, timestep_broadcast);
             const m_corr_denom = try ops.subtract(b, one, beta1_pow);
             const v_corr_denom = try ops.subtract(b, one, beta2_pow);
 
-            // Guard against division by small numbers (bf16 precision issue)
-            // Use max(denom, epsilon) to ensure stability
             const m_corr_safe = try ops.maximum(b, m_corr_denom, eps);
             const v_corr_safe = try ops.maximum(b, v_corr_denom, eps);
             const m_hat = try ops.divide(b, new_m, m_corr_safe);
             const v_hat = try ops.divide(b, new_v, v_corr_safe);
 
-            // AdamW Update
             const sqrt_v = try ops.sqrt(b, v_hat);
             const denom = try ops.add(b, sqrt_v, eps);
 
             const ratio = try ops.divide(b, m_hat, denom);
-            const decay_term = try ops.multiply(b, decay, params);
+            const decay_term = try ops.multiply(b, decay, params_f32);
             const combined = try ops.add(b, ratio, decay_term);
 
             const scaled_step = try ops.multiply(b, lr, combined);
-            const new_params = try ops.subtract(b, params, scaled_step);
+            const new_params_f32 = try ops.subtract(b, params_f32, scaled_step);
+
+            const new_params = try ops.convert(b, new_params_f32, original_param_type);
 
             return .{
                 .new_params = new_params,

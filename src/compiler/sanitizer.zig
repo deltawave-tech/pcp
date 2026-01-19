@@ -124,6 +124,13 @@ pub const ModelSanitizer = struct {
         var out = std.ArrayList(u8).init(allocator);
         errdefer out.deinit();
 
+        // === BF16 DEBUG: Track special value statistics (Hypothesis B: -inf Masking Bug) ===
+        var nan_count: usize = 0;
+        var pos_inf_count: usize = 0;
+        var neg_inf_count: usize = 0;
+        var total_hex_floats: usize = 0;
+        var large_value_count: usize = 0; // Values that might overflow exp() in bf16
+
         // Find where dialect_resources section starts (if present)
         // We must NOT process binary blob data in this section
         const resources_marker = "dialect_resources:";
@@ -134,6 +141,16 @@ pub const ModelSanitizer = struct {
             // Look for "0x" followed by 8 hex digits (standard f32 hex length)
             if (i + 10 <= safe_end and std.mem.eql(u8, source[i .. i + 2], "0x")) {
                 const hex_slice = source[i + 2 .. i + 10];
+
+                // Explicitly catch F32 -Inf (0xFF800000) and replace with -65504.0
+                if (std.mem.eql(u8, hex_slice, "FF800000")) {
+                    neg_inf_count += 1;
+                    total_hex_floats += 1;
+                    try out.appendSlice("-6.550400e+04");
+                    i += 10;
+                    continue;
+                }
+
                 var is_valid_hex = true;
                 for (hex_slice) |c| {
                     if (!std.ascii.isHex(c)) {
@@ -144,21 +161,30 @@ pub const ModelSanitizer = struct {
 
                 // If valid f32 hex string
                 if (is_valid_hex) {
+                    total_hex_floats += 1;
+
                     // Parse hex to u32 -> bitcast to f32
                     const int_val = std.fmt.parseInt(u32, hex_slice, 16) catch 0;
                     const float_val: f32 = @bitCast(int_val);
 
                     // Handle special float values that can't be represented as decimal
                     if (std.math.isNan(float_val)) {
+                        nan_count += 1;
                         // NaN: bf16 representation 0x7FC0 (quiet NaN)
                         try out.appendSlice("0x7FC0");
                     } else if (std.math.isPositiveInf(float_val)) {
+                        pos_inf_count += 1;
                         // +Inf: bf16 representation 0x7F80
                         try out.appendSlice("0x7F80");
                     } else if (std.math.isNegativeInf(float_val)) {
+                        neg_inf_count += 1;
                         // -Inf: bf16 representation 0xFF80
                         try out.appendSlice("0xFF80");
                     } else {
+                        // Track values that could cause exp() overflow (|x| > 88.7 overflows in bf16)
+                        if (@abs(float_val) > 88.0) {
+                            large_value_count += 1;
+                        }
                         // Normal float: format as scientific decimal
                         // This is safe for bf16 (parser handles the truncation)
                         const s = try std.fmt.allocPrint(allocator, "{e:.6}", .{float_val});
@@ -179,6 +205,33 @@ pub const ModelSanitizer = struct {
         // Append the rest of the file (dialect_resources section) unchanged
         if (safe_end < source.len) {
             try out.appendSlice(source[safe_end..]);
+        }
+
+        // === BF16 DEBUG: Log special value summary ===
+        if (total_hex_floats > 0) {
+            std.log.warn("=== BF16 SANITIZER DEBUG (Hypothesis B: -inf Masking) ===", .{});
+            std.log.warn("  Total hex floats processed: {}", .{total_hex_floats});
+            if (nan_count > 0) {
+                std.log.err("  NaN values found: {} - WARNING: NaN in model constants!", .{nan_count});
+            } else {
+                std.log.warn("  NaN values found: 0", .{});
+            }
+            if (pos_inf_count > 0) {
+                std.log.err("  +Inf values found: {} - WARNING: +Inf in model constants!", .{pos_inf_count});
+            } else {
+                std.log.warn("  +Inf values found: 0", .{});
+            }
+            if (neg_inf_count > 0) {
+                std.log.err("  -Inf values found: {} - CRITICAL: -Inf detected (likely attention mask)!", .{neg_inf_count});
+            } else {
+                std.log.warn("  -Inf values found: 0", .{});
+            }
+            if (large_value_count > 0) {
+                std.log.err("  Large values (|x|>88, exp overflow risk): {} - May cause exp() overflow in bf16!", .{large_value_count});
+            } else {
+                std.log.warn("  Large values (|x|>88): 0", .{});
+            }
+            std.log.warn("=======================================================", .{});
         }
 
         return out.toOwnedSlice();

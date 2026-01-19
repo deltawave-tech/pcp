@@ -647,6 +647,147 @@ pub const Worker = struct {
         }
     }
 
+    /// BF16 DEBUG: Compute detailed tensor statistics for hypothesis verification
+    /// Returns: (min, max, mean, num_zeros, num_denormals, num_very_small)
+    fn computeTensorStats(bytes: []const u8, dtype: tensor.DType) struct {
+        min: f64,
+        max: f64,
+        mean: f64,
+        num_zeros: usize,
+        num_denormals: usize,
+        num_very_small: usize, // |x| < 1e-6 (precision loss in bf16)
+        nan_count: usize,
+        inf_count: usize,
+    } {
+        var min_val: f64 = std.math.floatMax(f64);
+        var max_val: f64 = -std.math.floatMax(f64);
+        var sum: f64 = 0.0;
+        var num_zeros: usize = 0;
+        var num_denormals: usize = 0;
+        var num_very_small: usize = 0;
+        var nan_count: usize = 0;
+        var inf_count: usize = 0;
+        var count: usize = 0;
+
+        if (dtype == .bf16) {
+            var i: usize = 0;
+            while (i < bytes.len) : (i += 2) {
+                if (i + 2 > bytes.len) break;
+                const u16_val = std.mem.readInt(u16, bytes[i..][0..2], .little);
+                const u32_val = @as(u32, u16_val) << 16;
+                const val: f32 = @bitCast(u32_val);
+                const f64_val: f64 = @floatCast(val);
+
+                if (std.math.isNan(val)) {
+                    nan_count += 1;
+                } else if (std.math.isInf(val)) {
+                    inf_count += 1;
+                } else {
+                    if (val == 0.0) num_zeros += 1;
+                    // bf16 denormal check: exponent bits are 0 but mantissa is not
+                    const exp_bits = (u16_val >> 7) & 0xFF;
+                    const mantissa_bits = u16_val & 0x7F;
+                    if (exp_bits == 0 and mantissa_bits != 0) num_denormals += 1;
+                    // Very small values that lose precision in bf16 (Hypothesis C)
+                    if (@abs(val) > 0 and @abs(val) < 1e-6) num_very_small += 1;
+
+                    if (f64_val < min_val) min_val = f64_val;
+                    if (f64_val > max_val) max_val = f64_val;
+                    sum += f64_val;
+                }
+                count += 1;
+            }
+        } else if (dtype == .f32) {
+            var i: usize = 0;
+            while (i < bytes.len) : (i += 4) {
+                if (i + 4 > bytes.len) break;
+                const u32_val = std.mem.readInt(u32, bytes[i..][0..4], .little);
+                const val: f32 = @bitCast(u32_val);
+                const f64_val: f64 = @floatCast(val);
+
+                if (std.math.isNan(val)) {
+                    nan_count += 1;
+                } else if (std.math.isInf(val)) {
+                    inf_count += 1;
+                } else {
+                    if (val == 0.0) num_zeros += 1;
+                    if (@abs(val) > 0 and @abs(val) < 1e-6) num_very_small += 1;
+
+                    if (f64_val < min_val) min_val = f64_val;
+                    if (f64_val > max_val) max_val = f64_val;
+                    sum += f64_val;
+                }
+                count += 1;
+            }
+        }
+
+        const mean = if (count > 0) sum / @as(f64, @floatFromInt(count)) else 0.0;
+        return .{
+            .min = if (min_val == std.math.floatMax(f64)) 0.0 else min_val,
+            .max = if (max_val == -std.math.floatMax(f64)) 0.0 else max_val,
+            .mean = mean,
+            .num_zeros = num_zeros,
+            .num_denormals = num_denormals,
+            .num_very_small = num_very_small,
+            .nan_count = nan_count,
+            .inf_count = inf_count,
+        };
+    }
+
+    /// BF16 DEBUG: Log optimizer state health (Hypothesis C: Optimizer State Collapse)
+    fn logOptimizerStateHealth(m_states: [][]u8, v_states: [][]u8, dtype: tensor.DType, step: usize) void {
+        std.log.warn("=== BF16 DEBUG: Optimizer State Health (Step {}) ===", .{step});
+
+        var total_m_zeros: usize = 0;
+        var total_v_zeros: usize = 0;
+        var total_m_very_small: usize = 0;
+        var total_v_very_small: usize = 0;
+        var total_m_elements: usize = 0;
+        var total_v_elements: usize = 0;
+
+        // Sample first few parameter states for detailed logging
+        const max_detailed = @min(m_states.len, 3);
+
+        for (0..m_states.len) |i| {
+            const m_stats = computeTensorStats(m_states[i], dtype);
+            const v_stats = computeTensorStats(v_states[i], dtype);
+
+            const m_elements = m_states[i].len / dtype.sizeInBytes();
+            const v_elements = v_states[i].len / dtype.sizeInBytes();
+
+            total_m_zeros += m_stats.num_zeros;
+            total_v_zeros += v_stats.num_zeros;
+            total_m_very_small += m_stats.num_very_small;
+            total_v_very_small += v_stats.num_very_small;
+            total_m_elements += m_elements;
+            total_v_elements += v_elements;
+
+            if (i < max_detailed) {
+                std.log.warn("  Param {}: M[min={e:.2}, max={e:.2}, mean={e:.2}, zeros={}/{}, tiny={}]", .{
+                    i, m_stats.min, m_stats.max, m_stats.mean, m_stats.num_zeros, m_elements, m_stats.num_very_small,
+                });
+                std.log.warn("  Param {}: V[min={e:.2}, max={e:.2}, mean={e:.2}, zeros={}/{}, tiny={}]", .{
+                    i, v_stats.min, v_stats.max, v_stats.mean, v_stats.num_zeros, v_elements, v_stats.num_very_small,
+                });
+            }
+        }
+
+        // Summary statistics
+        const m_zero_pct = if (total_m_elements > 0) @as(f64, @floatFromInt(total_m_zeros)) / @as(f64, @floatFromInt(total_m_elements)) * 100.0 else 0.0;
+        const v_zero_pct = if (total_v_elements > 0) @as(f64, @floatFromInt(total_v_zeros)) / @as(f64, @floatFromInt(total_v_elements)) * 100.0 else 0.0;
+        const m_tiny_pct = if (total_m_elements > 0) @as(f64, @floatFromInt(total_m_very_small)) / @as(f64, @floatFromInt(total_m_elements)) * 100.0 else 0.0;
+        const v_tiny_pct = if (total_v_elements > 0) @as(f64, @floatFromInt(total_v_very_small)) / @as(f64, @floatFromInt(total_v_elements)) * 100.0 else 0.0;
+
+        std.log.warn("  SUMMARY: M-state zeros: {d:.1}%, tiny(<1e-6): {d:.1}%", .{ m_zero_pct, m_tiny_pct });
+        std.log.warn("  SUMMARY: V-state zeros: {d:.1}%, tiny(<1e-6): {d:.1}%", .{ v_zero_pct, v_tiny_pct });
+
+        // Hypothesis C check: If V-state has >90% zeros or tiny values, optimizer is collapsing
+        if (v_zero_pct > 90.0 or v_tiny_pct > 50.0) {
+            std.log.err("  HYPOTHESIS C LIKELY: V-state has {d:.1}% zeros, {d:.1}% tiny - variance estimate collapsed!", .{ v_zero_pct, v_tiny_pct });
+        }
+        std.log.warn("=========================================================", .{});
+    }
+
     /// Handle StartInnerLoop command from Shepherd using Cap'n Proto
     /// Implements the tau-step inner loop with AdamW state management and chunk-based data loading
     fn handleStartInnerLoop(self: *Self, msg: MessageEnvelope) !void {
@@ -723,52 +864,8 @@ pub const Worker = struct {
         // Cache the param dtype for size calculations
         self.cached_param_dtype = param_dtype;
 
-        // Reallocate M/V states if dtype changed (they were allocated with f32 at INITIALIZE)
-        // Check if first buffer size matches expected size for this dtype
-        if (self.m_states) |existing_m_states| {
-            if (self.cached_parameter_shapes) |shapes| {
-                if (shapes.len > 0 and existing_m_states.len > 0) {
-                    var expected_size: usize = param_dtype.sizeInBytes();
-                    for (shapes[0]) |dim| expected_size *= @intCast(dim);
-
-                    if (existing_m_states[0].len != expected_size) {
-                        std.log.info("Worker {}: Reallocating M/V states for {s} precision (was {}, need {})", .{
-                            self.node_id.?,
-                            dtype_str,
-                            existing_m_states[0].len,
-                            expected_size,
-                        });
-
-                        // Free old buffers
-                        for (existing_m_states) |buf| self.allocator.free(buf);
-                        self.allocator.free(existing_m_states);
-                        if (self.v_states) |existing_v_states| {
-                            for (existing_v_states) |buf| self.allocator.free(buf);
-                            self.allocator.free(existing_v_states);
-                        }
-
-                        // Allocate new buffers with correct dtype size
-                        const num_params = shapes.len;
-                        const new_m = try self.allocator.alloc([]u8, num_params);
-                        const new_v = try self.allocator.alloc([]u8, num_params);
-
-                        for (shapes, 0..) |shape, i| {
-                            var size: usize = param_dtype.sizeInBytes();
-                            for (shape) |dim| size *= @intCast(dim);
-
-                            new_m[i] = try self.allocator.alloc(u8, size);
-                            @memset(new_m[i], 0);
-                            new_v[i] = try self.allocator.alloc(u8, size);
-                            @memset(new_v[i], 0);
-                        }
-
-                        self.m_states = new_m;
-                        self.v_states = new_v;
-                        self.timestep = 1.0;
-                    }
-                }
-            }
-        }
+        // Mixed Precision: M/V optimizer states are ALWAYS f32, regardless of model dtype.
+        // No reallocation needed - initial allocation already uses f32.
 
         // Get m_states and v_states AFTER potential reallocation to avoid use-after-free
         const m_states = self.m_states.?;
@@ -900,25 +997,102 @@ pub const Worker = struct {
         // Ensure timestep is initialized if it's the very first run
         if (self.timestep == 0.0) self.timestep = 1.0;
 
-        // 8. Copy initial params into working buffers (we'll update these in the loop)
+        // 8. Copy initial params into working buffers (F32 Master Weights)
+        // CRITICAL: Always store working params as F32 to prevent precision loss during training.
+        // BF16 storage causes small gradient updates to be truncated, leading to "stuck" training.
+        // The model dtype (bf16) is only used for graph execution and network transmission.
         var current_params = try self.allocator.alloc([]u8, param_shapes.len);
         defer {
             for (current_params) |buf| self.allocator.free(buf);
             self.allocator.free(current_params);
         }
 
-        var param_offset: usize = 0;
-        const bytes_per_element = self.cached_param_dtype.sizeInBytes();
-        for (param_shapes, 0..) |shape, i| {
-            var size: usize = bytes_per_element;
-            for (shape) |dim| size *= @intCast(dim);
-
-            if (param_offset + size > initial_params_bytes.len) return error.ParameterBufferTooSmall;
-
-            current_params[i] = try self.allocator.alloc(u8, size);
-            @memcpy(current_params[i], initial_params_bytes[param_offset .. param_offset + size]);
-            param_offset += size;
+        // Also create an F32 copy of initial params for accurate delta calculation later
+        var initial_params_f32 = try self.allocator.alloc([]u8, param_shapes.len);
+        defer {
+            for (initial_params_f32) |buf| self.allocator.free(buf);
+            self.allocator.free(initial_params_f32);
         }
+
+        var param_offset: usize = 0;
+        const src_bytes_per_element = self.cached_param_dtype.sizeInBytes();
+        const master_bytes_per_element: usize = 4; // F32 master weights
+
+        for (param_shapes, 0..) |shape, i| {
+            // Calculate element count for this parameter tensor
+            var elem_count: usize = 1;
+            for (shape) |dim| elem_count *= @intCast(dim);
+
+            const src_size = elem_count * src_bytes_per_element;
+            const f32_size = elem_count * master_bytes_per_element;
+
+            if (param_offset + src_size > initial_params_bytes.len) return error.ParameterBufferTooSmall;
+
+            // Allocate F32 buffers for both current and initial
+            current_params[i] = try self.allocator.alloc(u8, f32_size);
+            initial_params_f32[i] = try self.allocator.alloc(u8, f32_size);
+
+            const src_bytes = initial_params_bytes[param_offset .. param_offset + src_size];
+
+            // UPCAST COPY: Convert incoming params to F32 master weights
+            switch (self.cached_param_dtype) {
+                .bf16 => {
+                    // BF16 -> F32: Shift u16 into high bits of u32
+                    const dest_f32_current = std.mem.bytesAsSlice(f32, current_params[i]);
+                    const dest_f32_initial = std.mem.bytesAsSlice(f32, initial_params_f32[i]);
+                    var k: usize = 0;
+                    while (k < elem_count) : (k += 1) {
+                        const u16_val = std.mem.readInt(u16, src_bytes[k * 2 ..][0..2], .little);
+                        const u32_val = @as(u32, u16_val) << 16;
+                        const f32_val: f32 = @bitCast(u32_val);
+                        dest_f32_current[k] = f32_val;
+                        dest_f32_initial[k] = f32_val;
+                    }
+                },
+                .f16 => {
+                    // F16 -> F32 (simplified conversion)
+                    const dest_f32_current = std.mem.bytesAsSlice(f32, current_params[i]);
+                    const dest_f32_initial = std.mem.bytesAsSlice(f32, initial_params_f32[i]);
+                    var k: usize = 0;
+                    while (k < elem_count) : (k += 1) {
+                        const u16_val = std.mem.readInt(u16, src_bytes[k * 2 ..][0..2], .little);
+                        // F16 to F32 conversion (IEEE 754 half to single)
+                        const sign: u32 = (@as(u32, u16_val) & 0x8000) << 16;
+                        const exp: u32 = (@as(u32, u16_val) >> 10) & 0x1F;
+                        const mant: u32 = @as(u32, u16_val) & 0x3FF;
+                        var f32_bits: u32 = undefined;
+                        if (exp == 0) {
+                            f32_bits = sign; // Zero or denormal -> zero
+                        } else if (exp == 31) {
+                            f32_bits = sign | 0x7F800000 | (mant << 13); // Inf/NaN
+                        } else {
+                            f32_bits = sign | ((exp + 112) << 23) | (mant << 13);
+                        }
+                        const f32_val: f32 = @bitCast(f32_bits);
+                        dest_f32_current[k] = f32_val;
+                        dest_f32_initial[k] = f32_val;
+                    }
+                },
+                .f32 => {
+                    // Already F32, just copy
+                    @memcpy(current_params[i], src_bytes);
+                    @memcpy(initial_params_f32[i], src_bytes);
+                },
+                else => {
+                    // Fallback: treat as F32
+                    @memcpy(current_params[i], src_bytes);
+                    @memcpy(initial_params_f32[i], src_bytes);
+                },
+            }
+
+            param_offset += src_size;
+        }
+
+        std.log.info("Worker {}: Using F32 master weights ({} params, {} bytes each)", .{
+            self.node_id.?,
+            param_shapes.len,
+            if (param_shapes.len > 0) current_params[0].len else 0,
+        });
 
         // 9. Extract batch_size and block_size from data_shapes
         const batch_size: usize = @intCast(data_shapes[0][0]);
@@ -955,6 +1129,30 @@ pub const Worker = struct {
             try inputs_list.append(batch.inputs);
             try inputs_list.append(batch.targets);
 
+            // Sanity check: verify batch data isn't all zeros (first step only)
+            if (step == 0) {
+                const ids = std.mem.bytesAsSlice(i64, batch.inputs);
+                const tgts = std.mem.bytesAsSlice(i64, batch.targets);
+                var non_zero_ids: usize = 0;
+                var non_zero_tgts: usize = 0;
+                for (ids) |id| if (id != 0) {
+                    non_zero_ids += 1;
+                };
+                for (tgts) |t| if (t != 0) {
+                    non_zero_tgts += 1;
+                };
+                std.log.info("Worker {}: Batch sanity check - inputs: {}/{} non-zero, targets: {}/{} non-zero", .{
+                    self.node_id.?,
+                    non_zero_ids,
+                    ids.len,
+                    non_zero_tgts,
+                    tgts.len,
+                });
+                if (ids.len > 0) {
+                    std.log.info("Worker {}: First input={}, first target={}", .{ self.node_id.?, ids[0], tgts[0] });
+                }
+            }
+
             const inputs = try inputs_list.toOwnedSlice();
             defer self.allocator.free(inputs);
 
@@ -977,14 +1175,18 @@ pub const Worker = struct {
             const shapes_slice = try all_shapes.toOwnedSlice();
             defer self.allocator.free(shapes_slice);
 
-            // Build dtypes list for explicit precision control
+            // Build dtypes list for explicit precision control (Mixed Precision with F32 Master Weights)
             // Layout: [Params (N), M-States (N), V-States (N), Timestep (1), Data Inputs (D)]
+            // CRITICAL: Params are now F32 master weights. Graph accepts F32 and casts internally.
             var dtypes_list = std.ArrayList(tensor.DType).init(self.allocator);
             defer dtypes_list.deinit();
 
-            // Params, M-States, V-States all use param_dtype (f32/bf16/f16)
-            for (0..3) |_| {
-                for (0..param_shapes.len) |_| try dtypes_list.append(param_dtype);
+            // Params are now F32 master weights (regardless of model dtype)
+            for (0..param_shapes.len) |_| try dtypes_list.append(.f32);
+
+            // M-States and V-States are ALWAYS f32 in mixed precision
+            for (0..2) |_| {
+                for (0..param_shapes.len) |_| try dtypes_list.append(.f32);
             }
 
             // Timestep is always f32
@@ -1003,16 +1205,16 @@ pub const Worker = struct {
             // Validate outputs for NaNs immediately to pinpoint graph issues
             const num_params_chk = param_shapes.len;
 
-            // Check updated parameters
+            // Check updated parameters (F32 master weights)
             for (0..num_params_chk) |i| {
                 if (i < outputs.len) {
                     var name_buf: [32]u8 = undefined;
                     const name = std.fmt.bufPrint(&name_buf, "Output Param {}", .{i}) catch "Output Param";
-                    try self.validateBuffer(name, outputs[i], param_dtype);
+                    try self.validateBuffer(name, outputs[i], .f32); // Params are now F32
                 }
             }
 
-            // Check loss (last output)
+            // Check loss (last output) - loss remains in model dtype (bf16)
             const loss_idx = outputs.len - 1;
             try self.validateBuffer("Loss", outputs[loss_idx], param_dtype);
 
@@ -1041,13 +1243,53 @@ pub const Worker = struct {
                 @memcpy(v_states[i], outputs[2 * num_params + i]);
             }
 
-            // Extract loss from outputs[3N] - loss is always bf16 scalar from the model
+            // Extract loss - auto-detect dtype from byte size (Mixed Precision returns F32 loss)
             const loss_bytes = outputs[3 * num_params];
-            if (loss_bytes.len >= 2) {
-                // Loss is bf16, convert to f32
+            if (loss_bytes.len == 4) {
+                // F32 loss (Mixed Precision or F32 training)
+                final_loss = std.mem.bytesAsSlice(f32, loss_bytes)[0];
+            } else if (loss_bytes.len == 2) {
+                // BF16 loss (Pure BF16 training)
                 const bf16_bits = std.mem.readInt(u16, loss_bytes[0..2], .little);
                 const f32_bits: u32 = @as(u32, bf16_bits) << 16;
                 final_loss = @bitCast(f32_bits);
+            } else {
+                std.log.err("Worker {}: Unknown loss byte size: {}", .{ self.node_id.?, loss_bytes.len });
+                return error.InvalidLossSize;
+            }
+
+            // === DEBUG: Loss tracking ===
+            const step_num = step + 1;
+            std.log.warn("=== Loss Analysis (Step {}/{}) ===", .{ step_num, tau });
+            if (loss_bytes.len == 4) {
+                std.log.warn("  Loss value: {d:.6} (F32, {} bytes)", .{ final_loss, loss_bytes.len });
+            } else {
+                std.log.warn("  Loss value: {d:.6} (BF16 bits: 0x{X:0>4})", .{
+                    final_loss,
+                    std.mem.readInt(u16, loss_bytes[0..2], .little),
+                });
+            }
+
+            // Check for suspicious "constant" loss values that indicate broken training
+            // Common failure modes: 0.125 (1/8), 0.25 (1/4), 0.5 (1/2), exact integers
+            const is_power_of_two = (final_loss == 0.125 or final_loss == 0.25 or final_loss == 0.5 or
+                final_loss == 1.0 or final_loss == 2.0 or final_loss == 4.0 or final_loss == 8.0);
+            if (is_power_of_two) {
+                std.log.err("  HYPOTHESIS A LIKELY: Loss is exact power-of-two ({d}) - suggests exp() overflow/NaN in softmax!", .{final_loss});
+            }
+
+            // Check for NaN/Inf in loss (indicates catastrophic failure)
+            if (std.math.isNan(final_loss)) {
+                std.log.err("  CRITICAL: Loss is NaN - training has diverged!", .{});
+            } else if (std.math.isInf(final_loss)) {
+                std.log.err("  CRITICAL: Loss is Inf - numerical overflow!", .{});
+            }
+            std.log.warn("=====================================================", .{});
+
+            // === BF16 DEBUG: Log optimizer state health every few steps ===
+            // Note: M/V states are always f32 in mixed precision mode
+            if (step_num == 1 or step_num == tau or step_num % 5 == 0) {
+                logOptimizerStateHealth(m_states, v_states, .f32, step_num);
             }
 
             // Increment timestep for next iteration
@@ -1066,13 +1308,13 @@ pub const Worker = struct {
             var m_corrupt = false;
             var v_corrupt = false;
 
-            // Check M state
-            self.validateBuffer("M-State Check", m_states[i], param_dtype) catch {
+            // Check M state (always f32 in mixed precision)
+            self.validateBuffer("M-State Check", m_states[i], .f32) catch {
                 m_corrupt = true;
             };
 
-            // Check V state
-            self.validateBuffer("V-State Check", v_states[i], param_dtype) catch {
+            // Check V state (always f32 in mixed precision)
+            self.validateBuffer("V-State Check", v_states[i], .f32) catch {
                 v_corrupt = true;
             };
 
@@ -1096,66 +1338,62 @@ pub const Worker = struct {
         // ---------------------------------------------------------------------
 
         // 11. Calculate Delta = Initial_Params - Final_Params and send it
+        // CRITICAL: Both current_params and initial_params_f32 are F32 master weights.
+        // We compute delta in F32 for accuracy, then convert to model dtype for transmission.
         var delta_bytes = std.ArrayList(u8).init(self.allocator);
         defer delta_bytes.deinit();
 
-        // Iterate over parameter blocks to compute delta
-        var delta_offset: usize = 0;
-        for (current_params) |final_block_bytes| {
-            const param_block_size = final_block_bytes.len;
-            const initial_block_bytes = initial_params_bytes[delta_offset .. delta_offset + param_block_size];
+        // Iterate over parameter blocks to compute delta (both are F32)
+        for (current_params, 0..) |final_block_bytes, param_idx| {
+            const initial_block_bytes = initial_params_f32[param_idx];
 
-            const num_elements = param_block_size / bytes_per_element;
+            // Both are F32, so element count = size / 4
+            const num_elements = final_block_bytes.len / 4;
 
+            // Compute delta in F32 space for maximum precision
+            const initial_f32 = std.mem.bytesAsSlice(f32, initial_block_bytes);
+            const final_f32 = std.mem.bytesAsSlice(f32, final_block_bytes);
+
+            // Convert to model dtype for network transmission
             switch (self.cached_param_dtype) {
                 .bf16 => {
-                    // bf16: convert to f32 for arithmetic, store delta as bf16
+                    // F32 delta -> BF16 for transmission
                     for (0..num_elements) |j| {
-                        const byte_off = j * 2;
-                        // Convert initial bf16 to f32
-                        const init_bf16 = std.mem.readInt(u16, initial_block_bytes[byte_off..][0..2], .little);
-                        const init_f32: f32 = @bitCast(@as(u32, init_bf16) << 16);
-                        // Convert final bf16 to f32
-                        const final_bf16 = std.mem.readInt(u16, final_block_bytes[byte_off..][0..2], .little);
-                        const final_f32: f32 = @bitCast(@as(u32, final_bf16) << 16);
-                        // Calculate delta and convert back to bf16
-                        const delta_f32 = init_f32 - final_f32;
+                        const delta_f32 = initial_f32[j] - final_f32[j];
                         const delta_bf16: u16 = @truncate(@as(u32, @bitCast(delta_f32)) >> 16);
                         try delta_bytes.appendSlice(std.mem.asBytes(&delta_bf16));
                     }
                 },
                 .f16 => {
-                    // f16: similar conversion (simplified, may lose precision)
+                    // F32 delta -> F16 for transmission
                     for (0..num_elements) |j| {
-                        const byte_off = j * 2;
-                        const init_f16 = std.mem.readInt(u16, initial_block_bytes[byte_off..][0..2], .little);
-                        const final_f16 = std.mem.readInt(u16, final_block_bytes[byte_off..][0..2], .little);
-                        // Simple subtraction in f16 space (not precise but functional)
-                        const delta_f16 = init_f16 -% final_f16;
-                        try delta_bytes.appendSlice(std.mem.asBytes(&delta_f16));
+                        const delta_f32 = initial_f32[j] - final_f32[j];
+                        // F32 to F16 conversion
+                        const f32_bits: u32 = @bitCast(delta_f32);
+                        const sign: u16 = @truncate((f32_bits >> 16) & 0x8000);
+                        const exp = @as(i32, @intCast((f32_bits >> 23) & 0xFF)) - 127;
+                        const mant: u16 = @truncate((f32_bits >> 13) & 0x3FF);
+                        const f16_bits: u16 = if (exp < -14) sign // Underflow
+                        else if (exp > 15) sign | 0x7C00 // Overflow
+                        else sign | @as(u16, @intCast((exp + 15) & 0x1F)) << 10 | mant;
+                        try delta_bytes.appendSlice(std.mem.asBytes(&f16_bits));
                     }
                 },
                 .f32 => {
-                    // f32: direct arithmetic
-                    const initial_f32 = std.mem.bytesAsSlice(f32, initial_block_bytes);
-                    const final_f32 = std.mem.bytesAsSlice(f32, final_block_bytes);
+                    // F32 delta -> F32 (direct)
                     for (0..num_elements) |j| {
                         const delta_val = initial_f32[j] - final_f32[j];
                         try delta_bytes.appendSlice(std.mem.asBytes(&delta_val));
                     }
                 },
                 else => {
-                    // Fallback: treat as f32
-                    const initial_f32 = std.mem.bytesAsSlice(f32, initial_block_bytes);
-                    const final_f32 = std.mem.bytesAsSlice(f32, final_block_bytes);
+                    // Fallback: transmit as F32
                     for (0..num_elements) |j| {
                         const delta_val = initial_f32[j] - final_f32[j];
                         try delta_bytes.appendSlice(std.mem.asBytes(&delta_val));
                     }
                 },
             }
-
-            delta_offset += param_block_size;
         }
 
         // Send Delta using chunked transfer protocol to avoid Cap'n Proto message size limits

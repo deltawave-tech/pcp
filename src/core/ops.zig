@@ -512,29 +512,30 @@ pub fn negate(builder: *MLIRBuilder, a: Tensor) !Tensor {
     return try builder.createAndAppendOp(operation);
 }
 
-/// Softmax operation
+/// Softmax operation (Mixed Precision: always computed in f32 for numerical stability)
 pub fn softmax(builder: *MLIRBuilder, a: Tensor) !Tensor {
-    // Softmax: exp(x - max(x)) / sum(exp(x - max(x)))
-    // This is numerically stable version
+    const f32_type = mlir.Type.f32Type(builder.ctx);
+    const original_elem_type = a.value.getType().as(mlir.RankedTensorType).?.getElementType();
 
-    // Step 1: Find max along last dimension for numerical stability
-    const max_val = try reduceMax(builder, a, &[_]i64{@intCast(a.shape.rank() - 1)}, true); // keep_dims=true for broadcasting
+    const a_f32 = try convert(builder, a, f32_type);
+    defer a_f32.deinit();
+
+    const max_val = try reduceMax(builder, a_f32, &[_]i64{@intCast(a.shape.rank() - 1)}, true);
     defer max_val.deinit();
 
-    // Step 2: Subtract max from input: x - max(x)
-    const shifted = try subtract(builder, a, max_val);
+    const shifted = try subtract(builder, a_f32, max_val);
     defer shifted.deinit();
 
-    // Step 3: Compute exp(x - max(x))
     const exp_shifted = try exp(builder, shifted);
     defer exp_shifted.deinit();
 
-    // Step 4: Sum exp values along last dimension, keeping rank for broadcasting
-    const sum_exp = try reduceSum(builder, exp_shifted, &[_]i64{@intCast(a.shape.rank() - 1)}, true); // FIX: keep_dims = true
+    const sum_exp = try reduceSum(builder, exp_shifted, &[_]i64{@intCast(a.shape.rank() - 1)}, true);
     defer sum_exp.deinit();
 
-    // Step 5: Divide: exp(x - max(x)) / sum(exp(x - max(x)))
-    return divide(builder, exp_shifted, sum_exp);
+    const result_f32 = try divide(builder, exp_shifted, sum_exp);
+    defer result_f32.deinit();
+
+    return convert(builder, result_f32, original_elem_type);
 }
 
 /// Element-wise exponential

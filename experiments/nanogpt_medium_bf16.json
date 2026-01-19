@@ -1,0 +1,16 @@
+{
+    "model_path": "models/nanogpt_medium_bf16.mlir",
+    "data_path": "data/enwik8.txt",
+    "tokenizer": "byte",
+    "sampling": "random",
+    "dtype": "bf16",
+    "learning_rate": 0.0006,
+    "tau": 10,
+    "outer_loop_steps": 200,
+    "nesterov_momentum": 0.9,
+    "max_epochs": 10,
+    "wandb_project": "pcp-distributed",
+    "wandb_entity": null,
+    "wandb_run_name": "nanogpt-medium-bf16-experiment",
+    "wandb_api_key": null
+}

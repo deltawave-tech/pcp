@@ -144,22 +144,19 @@ pub const DiLoCo = struct {
         // 1. Apply Logic/Stability Patches (Log/Div guards)
         var current_source = try ModelSanitizer.applyStabilityPatches(allocator, raw_mlir);
 
-        // 2. Apply BF16 Conversion Pipeline if requested
+        // 2. Apply BF16 Sanitization (model is now natively BF16 from Python export)
         if (config.dtype == .bf16) {
-            std.log.info("Converting model to bf16...", .{});
+            std.log.info("Sanitizing BF16 model...", .{});
 
-            // A. Sanitize Hex Constants (0x3F800000 -> 1.0)
-            // Critical step to prevent "constant out of range" error
+            // A. Sanitize Hex Constants (fixes -inf/NaN constants)
             std.log.info("  Step A: Sanitizing hex float constants...", .{});
             const decimal_source = try ModelSanitizer.sanitizeHexFloats(allocator, current_source);
-            allocator.free(current_source); // Free previous stage
+            allocator.free(current_source);
 
-            // B. Convert Types (f32 -> bf16)
-            std.log.info("  Step B: Converting type signatures...", .{});
-            const bf16_source = try ModelSanitizer.convertF32ToBF16(allocator, decimal_source);
-            allocator.free(decimal_source); // Free previous stage
+            // B. DISABLED: Model is natively BF16 from Python with F32 Softmax preserved
+            // Running convertF32ToBF16 would destroy the explicit F32 softmax operations
 
-            current_source = bf16_source;
+            current_source = decimal_source;
         }
         defer allocator.free(current_source);
         const mlir_source = current_source;
@@ -451,8 +448,12 @@ pub const DiLoCo = struct {
             const byte_data = try self.allocator.alloc(u8, element_count * bytes_per_element);
             // DO NOT defer free - we store it in master_param_raw_data
 
-            // Generate Xavier-initialized values and convert to target dtype
-            const scale = std.math.sqrt(2.0 / @as(f32, @floatFromInt(element_count)));
+            // GPT-2 Standard Initialization: Fixed 0.02 stddev
+            // NOTE: The original Xavier initialization used total element count instead of fan-in,
+            // resulting in ~30x smaller weights (0.003 vs 0.088). This caused:
+            // - F32: Gradients ~1e-8 -> Adam v ~1e-16 -> explosion due to epsilon dominance
+            // - BF16: Immediate overflow to Inf -> finite guard zeros grads -> model freezes at ~0.25 loss
+            const scale: f32 = 0.02;
             for (0..element_count) |j| {
                 const value = rng.random().floatNorm(f32) * scale;
                 const offset = j * bytes_per_element;

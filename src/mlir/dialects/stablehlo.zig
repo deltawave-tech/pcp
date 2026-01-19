@@ -290,22 +290,45 @@ pub fn reduce_sum(
     } else {
         // Standard path
         const scalar_type = mlir.Type.tensor(&.{}, element_type);
-        var zero_attr: mlir.Attribute = undefined;
         const i1_type = mlir.Type.i1Type(ctx);
+        const f32_type = mlir.Type.f32Type(ctx);
+        const f64_type = mlir.Type.f64Type(ctx);
 
         if (element_type.isEqual(i1_type)) {
             // Special handling for i1 (boolean) - MLIR C-API splat has issues with i1
-            zero_attr = mlir.Attribute.fromParseString(ctx, "dense<false> : tensor<i1>") catch return error.BoolConstantFailed;
+            const zero_attr = mlir.Attribute.fromParseString(ctx, "dense<false> : tensor<i1>") catch return error.BoolConstantFailed;
+            const init_constant_op = try constant(allocator, ctx, .{ .value = zero_attr, .result_type = scalar_type });
+            builder.insertion_block.appendOwnedOperation(init_constant_op);
+            init_value = init_constant_op.getResult(0);
+        } else if (element_type.isEqual(f64_type)) {
+            // Special handling for f64 - denseElementsAttrFloatSplat only works for f32
+            const zero_attr = mlir.Attribute.fromParseString(ctx, "dense<0.0> : tensor<f64>") catch return error.F64ConstantFailed;
+            const init_constant_op = try constant(allocator, ctx, .{ .value = zero_attr, .result_type = scalar_type });
+            builder.insertion_block.appendOwnedOperation(init_constant_op);
+            init_value = init_constant_op.getResult(0);
         } else if (element_type.isInteger() or element_type.isIndex()) {
             const zero_val = mlir.Attribute.integerAttr(ctx, 0, element_type);
-            zero_attr = mlir.Attribute.denseElementsAttrSplat(scalar_type, zero_val);
+            const zero_attr = mlir.Attribute.denseElementsAttrSplat(scalar_type, zero_val);
+            const init_constant_op = try constant(allocator, ctx, .{ .value = zero_attr, .result_type = scalar_type });
+            builder.insertion_block.appendOwnedOperation(init_constant_op);
+            init_value = init_constant_op.getResult(0);
+        } else if (element_type.isEqual(f32_type)) {
+            // f32: use the optimized C API path
+            const zero_attr = mlir.Attribute.denseElementsAttrFloatSplat(scalar_type, 0.0);
+            const init_constant_op = try constant(allocator, ctx, .{ .value = zero_attr, .result_type = scalar_type });
+            builder.insertion_block.appendOwnedOperation(init_constant_op);
+            init_value = init_constant_op.getResult(0);
         } else {
-            zero_attr = mlir.Attribute.denseElementsAttrFloatSplat(scalar_type, 0.0);
+            // f16 and other float types: create f32 first, then convert
+            const f32_scalar_type = mlir.Type.tensor(&.{}, f32_type);
+            const zero_attr = mlir.Attribute.denseElementsAttrFloatSplat(f32_scalar_type, 0.0);
+            const f32_const_op = try constant(allocator, ctx, .{ .value = zero_attr, .result_type = f32_scalar_type });
+            builder.insertion_block.appendOwnedOperation(f32_const_op);
+            // Convert to target type
+            const convert_op = try convert(allocator, ctx, f32_const_op.getResult(0), scalar_type, loc);
+            builder.insertion_block.appendOwnedOperation(convert_op);
+            init_value = convert_op.getResult(0);
         }
-
-        const init_constant_op = try constant(allocator, ctx, .{ .value = zero_attr, .result_type = scalar_type });
-        builder.insertion_block.appendOwnedOperation(init_constant_op);
-        init_value = init_constant_op.getResult(0);
     }
 
     // 3. Create the reduction body

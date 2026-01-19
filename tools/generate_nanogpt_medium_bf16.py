@@ -14,7 +14,6 @@ N_HEAD = 8
 N_LAYER = 4
 DROPOUT = 0.0
 
-
 class CausalSelfAttention(nn.Module):
     def __init__(self):
         super().__init__()
@@ -32,14 +31,24 @@ class CausalSelfAttention(nn.Module):
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
 
         att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+
+        # --- FIX 1: Safe Masking ---
+        # Use -65504.0 (min finite bf16) instead of -inf to prevent NaN propagation
         mask = torch.tril(torch.ones(T, T, device=x.device)).view(1, 1, T, T)
-        att = att.masked_fill(mask == 0, float("-inf"))
-        att = F.softmax(att, dim=-1)
+        att = att.masked_fill(mask == 0, -65504.0)
+
+        # --- FIX 2: Stable Softmax (F32 Accumulation) ---
+        # 1. Cast to F32
+        att_f32 = att.float()
+        # 2. Compute Softmax in F32 (avoids exp() overflow)
+        att_softmax = F.softmax(att_f32, dim=-1)
+        # 3. Cast back to BF16 for matrix multiplication
+        att = att_softmax.to(torch.bfloat16)
+
         y = att @ v
         y = y.transpose(1, 2).contiguous().view(B, T, C)
         y = self.c_proj(y)
         return y
-
 
 class MLP(nn.Module):
     def __init__(self):
@@ -53,7 +62,6 @@ class MLP(nn.Module):
         x = self.c_proj(x)
         return x
 
-
 class Block(nn.Module):
     def __init__(self):
         super().__init__()
@@ -66,7 +74,6 @@ class Block(nn.Module):
         x = x + self.attn(self.ln1(x))
         x = x + self.mlp(self.ln2(x))
         return x
-
 
 class NanoTransformer(nn.Module):
     def __init__(self):
@@ -85,13 +92,18 @@ class NanoTransformer(nn.Module):
         x = self.blocks(x)
         x = self.ln_f(x)
         logits = self.lm_head(x)
-        # Flatten for cross_entropy
-        loss = F.cross_entropy(logits.view(-1, VOCAB_SIZE), targets.view(-1))
-        return loss
 
+        # Force loss calculation in F32 to prevent exp() overflow in LogSoftmax
+        # BF16 logits can overflow when exp() is applied (values > 88 overflow)
+        # This returns tensor<f32> in MLIR, giving high-precision gradients
+        loss = F.cross_entropy(logits.view(-1, VOCAB_SIZE).float(), targets.view(-1))
+        return loss
 
 # --- Setup and Export ---
 model = NanoTransformer()
+
+# --- FIX 3: Set Model Topology to BFloat16 ---
+model.to(torch.bfloat16)
 model.train()
 
 idx = torch.zeros((BATCH_SIZE, BLOCK_SIZE), dtype=torch.int64)
@@ -99,8 +111,9 @@ targets = torch.zeros((BATCH_SIZE, BLOCK_SIZE), dtype=torch.int64)
 
 params_dict = dict(model.named_parameters())
 param_names = list(params_dict.keys())
-param_values = list(params_dict.values())
 
+# Ensure parameters passed to exporter are BF16
+param_values = [p.to(torch.bfloat16) for p in params_dict.values()]
 
 class StatelessWrapper(nn.Module):
     def __init__(self, base_model, param_names):
@@ -109,20 +122,25 @@ class StatelessWrapper(nn.Module):
         self.param_names = param_names
 
     def forward(self, *args):
+        # Slice args
         params = args[:-2]
         idx = args[-2]
         targets = args[-1]
+
+        # Note: Functional call uses the exact types passed in `params`.
+        # Since we passed BF16 params, the model runs in BF16.
         params_dict = {name: param for name, param in zip(self.param_names, params)}
         return functional_call(self.base_model, params_dict, (idx, targets))
-
 
 wrapper = StatelessWrapper(model, param_names)
 full_inputs = param_values + [idx, targets]
 
-print(f"Compiling Medium NanoGPT (F32) (Layers: {N_LAYER}, Embd: {N_EMBD})...")
+print(f"Compiling Medium NanoGPT (BF16 with F32 Softmax) (Layers: {N_LAYER}, Embd: {N_EMBD})...")
+
+# The output_type="stablehlo" combined with BF16 inputs generates a BF16 graph
 module = fx.export_and_import(wrapper, *full_inputs, output_type="stablehlo")
 
-output_path = "models/nanogpt_medium.mlir"
+output_path = "models/nanogpt_medium_bf16.mlir"
 with open(output_path, "w") as f:
     f.write(str(module.operation))
 print(f"Saved to {output_path}")

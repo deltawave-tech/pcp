@@ -13,30 +13,29 @@ const MLIRBuilder = ops.MLIRBuilder;
 const AdamMLIR = adam_mlir.AdamMLIR(f32); // Assuming f32 for DiLoCo
 
 pub const GraphBuilder = struct {
-    /// Builds the complete training graph: Forward -> Gradient -> Optimizer Update
+    /// Builds the training graph with two entry points for gradient accumulation:
+    /// - @compute_gradients: Forward -> Gradient (run N times for micro-batches)
+    /// - @apply_optimizer: Apply accumulated gradients to update weights (run once)
     /// Returns the serialized MLIR module bytes.
     pub fn buildTrainingGraph(
         allocator: Allocator,
         builder: *MLIRBuilder,
         forward_mlir_source: []const u8,
         optimizer: *AdamMLIR,
-        num_params: usize, // Must be passed in, derived from introspection in Init
+        num_params: usize,
     ) ![]u8 {
-        std.debug.print("Compiling training graph via GraphBuilder...\n", .{});
+        std.debug.print("Compiling training graph via GraphBuilder (gradient accumulation mode)...\n", .{});
 
         // === PHASE 1: LOAD AND PARSE FORWARD PASS ===
-        // Parse the text file into a temporary module to extract the function
         const temp_module = try mlir.Module.parse(builder.ctx, forward_mlir_source);
         defer temp_module.deinit();
 
-        // Find "main" in the temp module using the helper from Step 2C
         const forward_fn_to_clone = try temp_module.findFunction("main");
 
         // === PHASE 2: CLONE INTO MAIN MODULE ===
         const c_api = @import("../mlir/c.zig").c;
         const cloned_forward_fn = mlir.Operation{ .handle = c_api.operationClone(forward_fn_to_clone.handle) };
 
-        // Rename to avoid conflict with the new 'main' we will create
         const new_fn_name = "model_forward_pass";
         const new_name_attr = mlir.Attribute.stringAttr(builder.ctx, new_fn_name);
         const sym_name_ref = c_api.stringRefFromString("sym_name");
@@ -51,195 +50,191 @@ pub const GraphBuilder = struct {
         _ = try autodiff.buildGradientGraph(allocator, builder, cloned_forward_fn, gradient_clip_min, gradient_clip_max);
         const grad_fn_name = "model_forward_pass_grad";
 
-        // === PHASE 4: BUILD ORCHESTRATOR 'main' ===
-        std.debug.print("GraphBuilder: Structuring 'main' with Optimizer...\n", .{});
-
         const forward_fn_type = cloned_forward_fn.getType().as(mlir.FunctionType) orelse return error.NotAFunctionType;
-        const num_forward_inputs = forward_fn_type.getNumInputs();
-
-        // 4.1 Define Types (Mixed Precision with F32 Master Weights)
-        // CRITICAL: Parameters are now F32 "master weights" to prevent precision loss.
-        // The gradient function still expects the model's original dtype (bf16), so we cast internally.
-        var main_input_types = std.ArrayList(mlir.Type).init(allocator);
-        defer main_input_types.deinit();
-
         const f32_type = mlir.Type.f32Type(builder.ctx);
 
-        // A. Parameters (N) - FORCE F32 for master weights (prevents small update truncation)
-        for (0..num_params) |i| {
-            const param_type = forward_fn_type.getInput(i).as(mlir.RankedTensorType).?;
-            const shape = try param_type.getShape(allocator);
-            defer allocator.free(shape);
-            const f32_param_type = mlir.Type.rankedTensorType(builder.ctx, shape, f32_type);
-            try main_input_types.append(f32_param_type);
+        // === PHASE 4A: BUILD @compute_gradients ===
+        // Inputs: [Params(F32)..., Data...]
+        // Outputs: [Gradients(F32)..., Loss]
+        std.debug.print("GraphBuilder: Building @compute_gradients...\n", .{});
+        {
+            var grad_input_types = std.ArrayList(mlir.Type).init(allocator);
+            defer grad_input_types.deinit();
+
+            // Parameters as F32 master weights
+            for (0..num_params) |i| {
+                const param_type = forward_fn_type.getInput(i).as(mlir.RankedTensorType).?;
+                const shape = try param_type.getShape(allocator);
+                defer allocator.free(shape);
+                const f32_param_type = mlir.Type.rankedTensorType(builder.ctx, shape, f32_type);
+                try grad_input_types.append(f32_param_type);
+            }
+
+            // Data inputs (remaining inputs from forward function)
+            const num_forward_inputs = forward_fn_type.getNumInputs();
+            for (num_params..num_forward_inputs) |i| {
+                try grad_input_types.append(forward_fn_type.getInput(i));
+            }
+
+            // Output types: Gradients (F32) + Loss
+            var grad_output_types = std.ArrayList(mlir.Type).init(allocator);
+            defer grad_output_types.deinit();
+
+            // Gradients as F32
+            for (0..num_params) |i| {
+                try grad_output_types.append(grad_input_types.items[i]);
+            }
+
+            // Loss in model's original dtype
+            try grad_output_types.append(forward_fn_type.getResult(0));
+
+            const grad_func_type = try mlir.Type.functionType(allocator, builder.ctx, grad_input_types.items, grad_output_types.items);
+            const grad_func = try builder.createFunction("compute_gradients", grad_func_type);
+            builder.setInsertionBlock(grad_func.entry_block);
+
+            const args = try grad_func.entry_block.getArguments(allocator);
+            defer allocator.free(args);
+
+            const params_in = args[0..num_params];
+            const data_in = args[num_params..];
+
+            // Cast F32 params to model dtype for gradient function
+            var grad_call_operands = std.ArrayList(mlir.Value).init(allocator);
+            defer grad_call_operands.deinit();
+
+            for (0..num_params) |i| {
+                const target_type = forward_fn_type.getInput(i).as(mlir.RankedTensorType).?;
+                const target_elem_type = target_type.getElementType();
+
+                const p_f32_tensor = try builder.newTensor(params_in[i]);
+                const p_model_dtype = try ops.convert(builder, p_f32_tensor, target_elem_type);
+                try grad_call_operands.append(p_model_dtype.value);
+            }
+            try grad_call_operands.appendSlice(data_in);
+
+            // Add loss gradient (1.0)
+            const loss_result_type = forward_fn_type.getResult(0);
+            const loss_elem_type = loss_result_type.as(mlir.RankedTensorType).?.getElementType();
+            const one_tensor = try ops.constant(builder, 1.0, &.{}, loss_elem_type);
+            try grad_call_operands.append(one_tensor.value);
+
+            // Result types for grad call
+            var grad_call_result_types = std.ArrayList(mlir.Type).init(allocator);
+            defer grad_call_result_types.deinit();
+            for (0..num_forward_inputs) |i| {
+                try grad_call_result_types.append(forward_fn_type.getInput(i));
+            }
+
+            const grad_callee_attr = mlir.Attribute.symbolRefAttr(builder.ctx, grad_fn_name);
+            const grad_call_op = try builder.createAndAttach("func.call", grad_call_operands.items, grad_call_result_types.items, .{
+                .attributes = &.{.{ "callee", grad_callee_attr }},
+            });
+
+            // Call forward pass to get loss
+            var fwd_operands = std.ArrayList(mlir.Value).init(allocator);
+            defer fwd_operands.deinit();
+
+            for (0..num_params) |i| {
+                const target_type = forward_fn_type.getInput(i).as(mlir.RankedTensorType).?;
+                const target_elem_type = target_type.getElementType();
+
+                const p_f32_tensor = try builder.newTensor(params_in[i]);
+                const p_model_dtype = try ops.convert(builder, p_f32_tensor, target_elem_type);
+                try fwd_operands.append(p_model_dtype.value);
+            }
+            try fwd_operands.appendSlice(data_in);
+
+            const fwd_callee_attr = mlir.Attribute.symbolRefAttr(builder.ctx, new_fn_name);
+            const fwd_call_op = try builder.createAndAttach("func.call", fwd_operands.items, &.{forward_fn_type.getResult(0)}, .{
+                .attributes = &.{.{ "callee", fwd_callee_attr }},
+            });
+
+            // Build return values: [Gradients(F32)..., Loss]
+            var returns = std.ArrayList(mlir.Value).init(allocator);
+            defer returns.deinit();
+
+            // Convert gradients to F32 for accumulation
+            for (0..num_params) |i| {
+                const grad_model_dtype = try builder.newTensor(grad_call_op.getResult(i));
+                const grad_f32 = try ops.convert(builder, grad_model_dtype, f32_type);
+                try returns.append(grad_f32.value);
+            }
+            try returns.append(fwd_call_op.getResult(0));
+
+            _ = try builder.createAndAttach("func.return", returns.items, &.{}, .{});
         }
 
-        // B. M States (N) - FORCE F32 for mixed precision
-        for (0..num_params) |i| {
-            const param_type = forward_fn_type.getInput(i).as(mlir.RankedTensorType).?;
-            const shape = try param_type.getShape(allocator);
-            defer allocator.free(shape);
-            const state_type = mlir.Type.rankedTensorType(builder.ctx, shape, f32_type);
-            try main_input_types.append(state_type);
+        // === PHASE 4B: BUILD @apply_optimizer ===
+        // Inputs: [Params(F32)..., Grads(F32)..., M(F32)..., V(F32)..., Timestep(F32)]
+        // Outputs: [NewParams(F32)..., NewM(F32)..., NewV(F32)...]
+        std.debug.print("GraphBuilder: Building @apply_optimizer...\n", .{});
+        {
+            var opt_input_types = std.ArrayList(mlir.Type).init(allocator);
+            defer opt_input_types.deinit();
+
+            // Params, Grads, M, V (all F32)
+            for (0..4) |_| {
+                for (0..num_params) |i| {
+                    const param_type = forward_fn_type.getInput(i).as(mlir.RankedTensorType).?;
+                    const shape = try param_type.getShape(allocator);
+                    defer allocator.free(shape);
+                    try opt_input_types.append(mlir.Type.rankedTensorType(builder.ctx, shape, f32_type));
+                }
+            }
+
+            // Timestep (scalar F32)
+            try opt_input_types.append(mlir.Type.rankedTensorType(builder.ctx, &.{}, f32_type));
+
+            // Output types: NewParams, NewM, NewV (all F32)
+            var opt_output_types = std.ArrayList(mlir.Type).init(allocator);
+            defer opt_output_types.deinit();
+
+            for (0..3) |_| {
+                for (0..num_params) |i| {
+                    try opt_output_types.append(opt_input_types.items[i]);
+                }
+            }
+
+            const opt_func_type = try mlir.Type.functionType(allocator, builder.ctx, opt_input_types.items, opt_output_types.items);
+            const opt_func = try builder.createFunction("apply_optimizer", opt_func_type);
+            builder.setInsertionBlock(opt_func.entry_block);
+
+            const args = try opt_func.entry_block.getArguments(allocator);
+            defer allocator.free(args);
+
+            const params_in = args[0..num_params];
+            const grads_in = args[num_params .. num_params * 2];
+            const m_in = args[num_params * 2 .. num_params * 3];
+            const v_in = args[num_params * 3 .. num_params * 4];
+            const t_in = args[num_params * 4];
+
+            var returns = std.ArrayList(mlir.Value).init(allocator);
+            defer returns.deinit();
+            var new_m_list = std.ArrayList(mlir.Value).init(allocator);
+            defer new_m_list.deinit();
+            var new_v_list = std.ArrayList(mlir.Value).init(allocator);
+            defer new_v_list.deinit();
+
+            const t_tensor = try builder.newTensor(t_in);
+
+            for (0..num_params) |i| {
+                const p = try builder.newTensor(params_in[i]);
+                const g = try builder.newTensor(grads_in[i]);
+                const m = try builder.newTensor(m_in[i]);
+                const v = try builder.newTensor(v_in[i]);
+
+                const res = try optimizer.update(p, g, m, v, t_tensor);
+
+                try returns.append(res.new_params.value);
+                try new_m_list.append(res.new_m.value);
+                try new_v_list.append(res.new_v.value);
+            }
+
+            try returns.appendSlice(new_m_list.items);
+            try returns.appendSlice(new_v_list.items);
+
+            _ = try builder.createAndAttach("func.return", returns.items, &.{}, .{});
         }
-
-        // C. V States (N) - FORCE F32 for mixed precision
-        for (0..num_params) |i| {
-            const param_type = forward_fn_type.getInput(i).as(mlir.RankedTensorType).?;
-            const shape = try param_type.getShape(allocator);
-            defer allocator.free(shape);
-            const state_type = mlir.Type.rankedTensorType(builder.ctx, shape, f32_type);
-            try main_input_types.append(state_type);
-        }
-
-        // D. Timestep (Scalar f32)
-        const scalar_type = mlir.Type.rankedTensorType(builder.ctx, &.{}, f32_type);
-        try main_input_types.append(scalar_type);
-
-        // E. Data Inputs (Remaining)
-        for (num_params..num_forward_inputs) |i| try main_input_types.append(forward_fn_type.getInput(i));
-
-        // Define Outputs: [NewParams, NewM, NewV, Loss]
-        var main_output_types = std.ArrayList(mlir.Type).init(allocator);
-        defer main_output_types.deinit();
-
-        // New Params - FORCE F32 for master weights (use types from step A)
-        for (0..num_params) |i| try main_output_types.append(main_input_types.items[i]);
-
-        // New M - FORCE F32 (use types from step B)
-        for (num_params..num_params * 2) |i| try main_output_types.append(main_input_types.items[i]);
-
-        // New V - FORCE F32 (use types from step C)
-        for (num_params * 2..num_params * 3) |i| try main_output_types.append(main_input_types.items[i]);
-
-        // Loss
-        try main_output_types.append(forward_fn_type.getResult(0));
-
-        const main_func_type = try mlir.Type.functionType(allocator, builder.ctx, main_input_types.items, main_output_types.items);
-
-        // 4.2 Create Function
-        const main_result = try builder.createFunction("main", main_func_type);
-        const main_block = main_result.entry_block;
-        builder.setInsertionBlock(main_block);
-
-        // 4.3 Slice Arguments
-        const main_func_args = try main_block.getArguments(allocator);
-        defer allocator.free(main_func_args);
-
-        const params_in = main_func_args[0..num_params];
-        const m_in = main_func_args[num_params .. num_params * 2];
-        const v_in = main_func_args[num_params * 2 .. num_params * 3];
-        const timestep_val = main_func_args[num_params * 3];
-        const data_in = main_func_args[num_params * 3 + 1 ..];
-
-        // 4.4 Calculate Gradients
-        // CRITICAL: Gradient function expects model's original dtype (bf16), but params_in are F32.
-        // Cast F32 params -> model dtype before calling gradient function.
-        var grad_operands = std.ArrayList(mlir.Value).init(allocator);
-        defer grad_operands.deinit();
-
-        // Cast F32 params to model's original dtype for gradient function
-        for (0..num_params) |i| {
-            const p_f32 = params_in[i];
-            const target_type = forward_fn_type.getInput(i).as(mlir.RankedTensorType).?;
-            const target_elem_type = target_type.getElementType();
-
-            const p_f32_tensor = try builder.newTensor(p_f32);
-            const p_model_dtype = try ops.convert(builder, p_f32_tensor, target_elem_type);
-            try grad_operands.append(p_model_dtype.value);
-        }
-        try grad_operands.appendSlice(data_in);
-
-        // Helper to create 1.0 constant for loss gradient
-        const loss_result_type = forward_fn_type.getResult(0); // Loss tensor type
-        const loss_elem_type = loss_result_type.as(mlir.RankedTensorType).?.getElementType();
-        const one_tensor = try ops.constant(builder, 1.0, &.{}, loss_elem_type);
-        try grad_operands.append(one_tensor.value);
-
-        // Prepare result types for grad call (must match autodiff output types exactly)
-        var grad_result_types = std.ArrayList(mlir.Type).init(allocator);
-        defer grad_result_types.deinit();
-        const num_forward_inputs_total = forward_fn_type.getNumInputs();
-        for (0..num_forward_inputs_total) |i| {
-            try grad_result_types.append(forward_fn_type.getInput(i));
-        }
-
-        const grad_callee_attr = mlir.Attribute.symbolRefAttr(builder.ctx, grad_fn_name);
-        const grad_call_op = try builder.createAndAttach("func.call", grad_operands.items, grad_result_types.items, .{
-            .attributes = &.{.{ "callee", grad_callee_attr }},
-        });
-
-        // 4.5 Optimizer Step
-        var final_returns = std.ArrayList(mlir.Value).init(allocator);
-        defer final_returns.deinit();
-
-        std.debug.print("DEBUG: Creating timestep_tensor...\n", .{});
-        const timestep_tensor = try builder.newTensor(timestep_val);
-        std.debug.print("DEBUG: timestep_tensor created OK\n", .{});
-        var new_params = std.ArrayList(mlir.Value).init(allocator);
-        var new_ms = std.ArrayList(mlir.Value).init(allocator);
-        var new_vs = std.ArrayList(mlir.Value).init(allocator);
-        defer new_params.deinit();
-        defer new_ms.deinit();
-        defer new_vs.deinit();
-
-        for (0..num_params) |i| {
-            std.debug.print("DEBUG: Optimizer loop iteration {}/{}\n", .{ i, num_params });
-            std.debug.print("DEBUG: Creating param_t...\n", .{});
-            const param_t = try builder.newTensor(params_in[i]);
-            std.debug.print("DEBUG: Creating grad_t...\n", .{});
-            const grad_t = try builder.newTensor(grad_call_op.getResult(i));
-            std.debug.print("DEBUG: Creating m_t...\n", .{});
-            const m_t = try builder.newTensor(m_in[i]);
-            std.log.info("Creating v_t... v_in.len={}, i={}", .{ v_in.len, i });
-            // Debug: check if the value's type is a RankedTensorType
-            const v_type = v_in[i].getType();
-            const v_is_ranked = v_type.as(mlir.RankedTensorType) != null;
-            std.log.info("v_in[{}] type is ranked tensor: {}", .{ i, v_is_ranked });
-            const v_t = try builder.newTensor(v_in[i]);
-            std.log.info("v_t created successfully, calling optimizer.update", .{});
-
-            const update_res = try optimizer.update(param_t, grad_t, m_t, v_t, timestep_tensor);
-            std.log.info("optimizer.update completed for param {}", .{i});
-
-            const new_param_f32 = try ops.convert(builder, update_res.new_params, f32_type);
-            try new_params.append(new_param_f32.value);
-            try new_ms.append(update_res.new_m.value);
-            try new_vs.append(update_res.new_v.value);
-        }
-
-        // 4.6 Calculate Forward Loss (for reporting)
-        // We re-call forward just to get the loss value cleanly, or we could have returned it from grad
-        // To save compute, usually grad returns the loss too, but standard VJP here doesn't.
-        // We will call the forward pass function.
-        // NOTE: Forward function expects model's original dtype, so we must cast F32 params.
-        var fwd_operands = std.ArrayList(mlir.Value).init(allocator);
-        defer fwd_operands.deinit();
-
-        // Cast updated F32 params to model dtype for forward call
-        for (0..num_params) |i| {
-            const p_f32 = new_params.items[i];
-            const target_type = forward_fn_type.getInput(i).as(mlir.RankedTensorType).?;
-            const target_elem_type = target_type.getElementType();
-
-            const p_f32_tensor = try builder.newTensor(p_f32);
-            const p_model_dtype = try ops.convert(builder, p_f32_tensor, target_elem_type);
-            try fwd_operands.append(p_model_dtype.value);
-        }
-        try fwd_operands.appendSlice(data_in);
-
-        const fwd_callee_attr = mlir.Attribute.symbolRefAttr(builder.ctx, new_fn_name);
-        const fwd_call_op = try builder.createAndAttach("func.call", fwd_operands.items, &.{forward_fn_type.getResult(0)}, .{
-            .attributes = &.{.{ "callee", fwd_callee_attr }},
-        });
-
-        // 4.7 Return
-        try final_returns.appendSlice(new_params.items);
-        try final_returns.appendSlice(new_ms.items);
-        try final_returns.appendSlice(new_vs.items);
-        try final_returns.append(fwd_call_op.getResult(0)); // The loss
-
-        _ = try builder.createAndAttach("func.return", final_returns.items, &.{}, .{});
 
         // === PHASE 5: SERIALIZE ===
         if (!builder.module.op().verify()) {

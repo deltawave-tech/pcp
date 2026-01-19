@@ -59,6 +59,7 @@ pub const DiLoCoConfig = struct {
     checkpoint_dir: []const u8,
     resume_training: bool,
     dtype: tensor.DType = .f32,
+    effective_batch_size: ?usize = null,
 
     pub fn default() DiLoCoConfig {
         return DiLoCoConfig{
@@ -668,6 +669,9 @@ pub const DiLoCo = struct {
             try payload_map.put("tau", std.json.Value{ .integer = @intCast(self.config.tau) });
             try payload_map.put("tokenizer", std.json.Value{ .string = self.config.tokenizer_type });
             try payload_map.put("sampling", std.json.Value{ .string = self.config.sampling_type });
+            if (self.config.effective_batch_size) |ebs| {
+                try payload_map.put("effective_batch_size", std.json.Value{ .integer = @intCast(ebs) });
+            }
 
             // Send dtype to worker for correct precision handling
             const dtype_str: []const u8 = switch (self.config.dtype) {

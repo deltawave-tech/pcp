@@ -13,6 +13,7 @@
     "nesterov_momentum": 0.9,
     "max_epochs": 4,
     "dtype": "bf16",
+    "effective_batch_size": 8,
     "wandb_project": "pcp-nanochat",
     "wandb_entity": null,
     "wandb_run_name": "nanochat-d8-b4-t2048-bf16-mixed-precision",

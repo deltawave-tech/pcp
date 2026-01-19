@@ -448,10 +448,16 @@ pub const IreeBackend = struct {
             .ptr = self,
             .vtable = &.{
                 .executeTrainingStep = executeTrainingStepInterface,
+                .executeFunction = executeFunctionInterface,
                 .getBackendType = getBackendTypeInterface,
                 .deinit = deinitInterface,
             },
         };
+    }
+
+    fn executeFunctionInterface(ptr: *anyopaque, artifact: []const u8, function_name: []const u8, data: [][]const u8, shapes: [][]const i64, dtypes: ?[]const DType) anyerror![][]u8 {
+        const self: *Self = @ptrCast(@alignCast(ptr));
+        return self.execute(artifact, function_name, data, shapes, dtypes);
     }
 
     fn executeTrainingStepInterface(ptr: *anyopaque, artifact: []const u8, data: [][]const u8, shapes: [][]const i64, provided_dtypes: ?[]const DType) anyerror![][]u8 {

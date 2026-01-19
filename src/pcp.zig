@@ -54,6 +54,9 @@ const ExperimentConfig = struct {
     // Required: Precision control ("f32", "bf16", or "f16")
     dtype: []const u8,
 
+    // Optional: Effective batch size for gradient accumulation
+    effective_batch_size: ?usize = null,
+
     // Optional: GRPO/RL configuration
     grpo_config: ?GRPOJsonConfig = null,
 
@@ -516,6 +519,11 @@ fn runShepherd(allocator: Allocator, args: Args) !void {
         return error.InvalidDType;
     }
     print("   Precision: {s}\n", .{exp_config.dtype});
+
+    if (exp_config.effective_batch_size) |ebs| {
+        diloco_config.effective_batch_size = ebs;
+        print("   Effective Batch Size: {}\n", .{ebs});
+    }
 
     // CLI flag overrides config file
     if (args.model_path) |path| {

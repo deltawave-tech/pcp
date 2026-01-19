@@ -23,6 +23,16 @@ pub const WorkerBackend = struct {
             input_dtypes: ?[]const tensor.DType,
         ) anyerror![][]u8,
 
+        /// Executes a specific function within the compiled artifact.
+        executeFunction: *const fn(
+            ptr: *anyopaque,
+            compiled_artifact: []const u8,
+            function_name: []const u8,
+            inputs_data: [][]const u8,
+            input_shapes: [][]const i64,
+            input_dtypes: ?[]const tensor.DType,
+        ) anyerror![][]u8,
+
         /// Get the backend type
         getBackendType: *const fn(ptr: *anyopaque) backend_selection.Backend,
 
@@ -33,6 +43,11 @@ pub const WorkerBackend = struct {
     /// Execute a training step with the given artifact and inputs.
     pub fn executeTrainingStep(self: WorkerBackend, artifact: []const u8, data: [][]const u8, shapes: [][]const i64, dtypes: ?[]const tensor.DType) ![][]u8 {
         return self.vtable.executeTrainingStep(self.ptr, artifact, data, shapes, dtypes);
+    }
+
+    /// Execute a specific function within the artifact.
+    pub fn executeFunction(self: WorkerBackend, artifact: []const u8, function_name: []const u8, data: [][]const u8, shapes: [][]const i64, dtypes: ?[]const tensor.DType) ![][]u8 {
+        return self.vtable.executeFunction(self.ptr, artifact, function_name, data, shapes, dtypes);
     }
 
     /// Get the backend type

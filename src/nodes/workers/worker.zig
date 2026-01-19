@@ -647,26 +647,41 @@ pub const Worker = struct {
         }
     }
 
-    /// Handle StartInnerLoop command from Shepherd using Cap'n Proto
-    /// Implements the tau-step inner loop with AdamW state management and chunk-based data loading
+    fn accumulateGradients(dst: []u8, src: []const u8) void {
+        const dst_f32 = std.mem.bytesAsSlice(f32, dst);
+        if (@intFromPtr(src.ptr) % 4 == 0) {
+            const src_f32 = std.mem.bytesAsSlice(f32, src);
+            for (dst_f32, src_f32) |*d, s| d.* += s;
+        } else {
+            var i: usize = 0;
+            while (i < src.len) : (i += 4) {
+                const val: f32 = @bitCast(std.mem.readInt(u32, src[i..][0..4], .little));
+                dst_f32[i / 4] += val;
+            }
+        }
+    }
+
+    fn scaleBuffer(buf: []u8, scale: f32) void {
+        const slice = std.mem.bytesAsSlice(f32, buf);
+        for (slice) |*v| v.* *= scale;
+    }
+
+    /// Handle StartInnerLoop command from Shepherd
+    /// Implements gradient accumulation: run compute_gradients N times, then apply_optimizer once
     fn handleStartInnerLoop(self: *Self, msg: MessageEnvelope) !void {
         self.state = .training;
 
-        // 1. Ensure the VMFB, shapes, and optimizer states have been cached.
         const vmfb = self.cached_vmfb orelse return error.GraphNotInitialized;
         const param_shapes = self.cached_parameter_shapes orelse return error.ParameterShapesNotInitialized;
         const data_shapes = self.cached_data_input_shapes orelse return error.DataShapesNotInitialized;
-        // Note: m_states and v_states are obtained AFTER reallocation code below to avoid use-after-free
         if (self.m_states == null) return error.OptimizerStateNotInitialized;
         if (self.v_states == null) return error.OptimizerStateNotInitialized;
 
-        // 2. Extract payload as JSON object
         const payload = switch (msg.data) {
             .object => |obj| obj,
             else => return error.InvalidMessageFormat,
         };
 
-        // 3. Extract chunk metadata
         const offset = switch (payload.get("offset") orelse return error.MissingOffset) {
             .integer => |i| i,
             else => return error.InvalidOffsetFormat,
@@ -702,7 +717,6 @@ pub const Worker = struct {
         else
             "random";
 
-        // Extract dtype for precision control (bf16 halves memory usage)
         const dtype_str = if (payload.get("dtype")) |dtype_val|
             switch (dtype_val) {
                 .string => |s| s,
@@ -718,69 +732,43 @@ pub const Worker = struct {
         else
             .f32;
 
-        std.log.info("Worker {}: Training with precision {s}", .{ self.node_id.?, dtype_str });
+        const micro_batch: usize = @intCast(data_shapes[0][0]);
+        const effective_batch: usize = if (payload.get("effective_batch_size")) |v|
+            switch (v) {
+                .integer => |i| @as(usize, @intCast(i)),
+                else => micro_batch,
+            }
+        else
+            micro_batch;
 
-        // Cache the param dtype for size calculations
+        const accumulation_steps = effective_batch / micro_batch;
+        if (effective_batch % micro_batch != 0) return error.InvalidBatchSize;
+
+        std.log.info("Worker {}: Training with precision {s}, micro_batch={}, effective_batch={}, accumulation_steps={}", .{ self.node_id.?, dtype_str, micro_batch, effective_batch, accumulation_steps });
+
         self.cached_param_dtype = param_dtype;
-
-        // Mixed Precision: M/V optimizer states are ALWAYS f32, regardless of model dtype.
-        // No reallocation needed - initial allocation already uses f32.
-
-        // Get m_states and v_states AFTER potential reallocation to avoid use-after-free
         const m_states = self.m_states.?;
         const v_states = self.v_states.?;
-
         self.current_chunk_id = @intCast(chunk_id);
 
         std.log.info("Worker {}: Assigned chunk {} (offset={}, length={})", .{ self.node_id.?, chunk_id, offset, length });
 
-        // 4. Initialize dataset for this chunk using Factory Pattern
-        if (self.dataset) |ds| {
-            ds.deinit();
-        }
+        if (self.dataset) |ds| ds.deinit();
 
         if (std.mem.eql(u8, tokenizer_type, "byte")) {
             if (!std.mem.eql(u8, sampling_type, "random")) return error.UnsupportedSamplingMode;
-            std.log.info("Worker {}: Using ByteTokenizer (Configured)", .{self.node_id.?});
-            const byte_ds = try loader.ByteTextDataset.initChunk(
-                self.allocator,
-                data_path,
-                @intCast(offset),
-                @intCast(length),
-                @intCast(self.node_id.?),
-            );
+            const byte_ds = try loader.ByteTextDataset.initChunk(self.allocator, data_path, @intCast(offset), @intCast(length), @intCast(self.node_id.?));
             self.dataset = byte_ds.asDataset();
         } else if (std.mem.eql(u8, tokenizer_type, "char")) {
             if (!std.mem.eql(u8, sampling_type, "random")) return error.UnsupportedSamplingMode;
-            std.log.info("Worker {}: Using CharTokenizer (Configured)", .{self.node_id.?});
-            const char_ds = try loader.TextDataset.initChunk(
-                self.allocator,
-                data_path,
-                @intCast(offset),
-                @intCast(length),
-                @intCast(self.node_id.?),
-            );
+            const char_ds = try loader.TextDataset.initChunk(self.allocator, data_path, @intCast(offset), @intCast(length), @intCast(self.node_id.?));
             self.dataset = char_ds.asDataset();
         } else if (std.mem.eql(u8, tokenizer_type, "u16")) {
             if (std.mem.eql(u8, sampling_type, "fifo")) {
-                std.log.info("Worker {}: Using U16TokenDatasetFifo (Configured)", .{self.node_id.?});
-                const u16_ds = try loader.U16TokenDatasetFifo.initChunk(
-                    self.allocator,
-                    data_path,
-                    @intCast(offset),
-                    @intCast(length),
-                    @intCast(self.node_id.?),
-                );
+                const u16_ds = try loader.U16TokenDatasetFifo.initChunk(self.allocator, data_path, @intCast(offset), @intCast(length), @intCast(self.node_id.?));
                 self.dataset = u16_ds.asDataset();
             } else if (std.mem.eql(u8, sampling_type, "random")) {
-                std.log.info("Worker {}: Using U16TokenDataset (Configured)", .{self.node_id.?});
-                const u16_ds = try loader.U16TokenDataset.initChunk(
-                    self.allocator,
-                    data_path,
-                    @intCast(offset),
-                    @intCast(length),
-                    @intCast(self.node_id.?),
-                );
+                const u16_ds = try loader.U16TokenDataset.initChunk(self.allocator, data_path, @intCast(offset), @intCast(length), @intCast(self.node_id.?));
                 self.dataset = u16_ds.asDataset();
             } else {
                 return error.UnsupportedSamplingMode;
@@ -790,7 +778,6 @@ pub const Worker = struct {
             return error.UnknownTokenizer;
         }
 
-        // 5. Get params: either from chunked transfer (weight_blob) or inline base64
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
 
@@ -799,16 +786,10 @@ pub const Worker = struct {
         const using_raw_params = if (payload.get("raw_params")) |v| v == .bool and v.bool else false;
 
         if (using_chunked_transfer) {
-            // Use pre-received weight_blob from chunked transfer
-            std.log.info("Worker {}: Using chunked transfer weights ({} bytes, raw={})", .{ self.node_id.?, self.weight_blob.?.len, using_raw_params });
-
             if (using_raw_params) {
-                // weight_blob contains raw parameter bytes directly
                 initial_params_bytes_temp = self.weight_blob.?;
             } else {
-                // weight_blob contains Cap'n Proto serialized bytes
                 const reader = try binary_protocol.WorkerPayload.Reader.init(self.weight_blob.?);
-                // Don't use defer - copy params before deinit to avoid use-after-free
                 const params_from_reader = try reader.getParams();
                 const params_copy = try arena.allocator().alloc(u8, params_from_reader.len);
                 @memcpy(params_copy, params_from_reader);
@@ -816,19 +797,14 @@ pub const Worker = struct {
                 reader.deinit();
             }
         } else {
-            // Fall back to inline base64 params (for smaller models)
             const b64_params = switch (payload.get("params") orelse return error.MissingParams) {
                 .string => |s| s,
                 else => return error.InvalidParamsFormat,
             };
-
             const capnp_len = try std.base64.standard.Decoder.calcSizeForSlice(b64_params);
             const decoded = try arena.allocator().alloc(u8, capnp_len);
             try std.base64.standard.Decoder.decode(decoded, b64_params);
-
-            // 6. Deserialize params from Cap'n Proto
             const reader = try binary_protocol.WorkerPayload.Reader.init(decoded);
-            // Don't use defer - copy params before deinit to avoid use-after-free
             const params_from_reader = try reader.getParams();
             const params_copy = try arena.allocator().alloc(u8, params_from_reader.len);
             @memcpy(params_copy, params_from_reader);
@@ -836,37 +812,19 @@ pub const Worker = struct {
             reader.deinit();
         }
 
-        // Validate Received Parameters using the specific dtype
-        std.log.info("Worker {}: Validating initial parameters ({} bytes, dtype={s})...",
-            .{ self.node_id.?, initial_params_bytes_temp.len, @tagName(param_dtype) });
-
         try self.validateBuffer("Initial Params", initial_params_bytes_temp, param_dtype);
 
-        // Save a persistent copy of initial params for delta calculation later
         const initial_params_bytes = try self.allocator.dupe(u8, initial_params_bytes_temp);
         defer self.allocator.free(initial_params_bytes);
 
-        std.log.info("Starting inner loop: params={} bytes, chunk={}", .{ initial_params_bytes.len, chunk_id });
-
-        // 7. Persistent optimizer states
-        // We do NOT reset m_states, v_states, or timestep.
-        // They must persist to maintain local momentum and curvature information
-        // across communication rounds (as per DiLoCo Sec 6.1).
-
-        // Ensure timestep is initialized if it's the very first run
         if (self.timestep == 0.0) self.timestep = 1.0;
 
-        // 8. Copy initial params into working buffers (F32 Master Weights)
-        // CRITICAL: Always store working params as F32 to prevent precision loss during training.
-        // BF16 storage causes small gradient updates to be truncated, leading to "stuck" training.
-        // The model dtype (bf16) is only used for graph execution and network transmission.
         var current_params = try self.allocator.alloc([]u8, param_shapes.len);
         defer {
             for (current_params) |buf| self.allocator.free(buf);
             self.allocator.free(current_params);
         }
 
-        // Also create an F32 copy of initial params for accurate delta calculation later
         var initial_params_f32 = try self.allocator.alloc([]u8, param_shapes.len);
         defer {
             for (initial_params_f32) |buf| self.allocator.free(buf);
@@ -875,55 +833,47 @@ pub const Worker = struct {
 
         var param_offset: usize = 0;
         const src_bytes_per_element = self.cached_param_dtype.sizeInBytes();
-        const master_bytes_per_element: usize = 4; // F32 master weights
 
         for (param_shapes, 0..) |shape, i| {
-            // Calculate element count for this parameter tensor
             var elem_count: usize = 1;
             for (shape) |dim| elem_count *= @intCast(dim);
 
             const src_size = elem_count * src_bytes_per_element;
-            const f32_size = elem_count * master_bytes_per_element;
+            const f32_size = elem_count * 4;
 
             if (param_offset + src_size > initial_params_bytes.len) return error.ParameterBufferTooSmall;
 
-            // Allocate F32 buffers for both current and initial
             current_params[i] = try self.allocator.alloc(u8, f32_size);
             initial_params_f32[i] = try self.allocator.alloc(u8, f32_size);
 
             const src_bytes = initial_params_bytes[param_offset .. param_offset + src_size];
 
-            // UPCAST COPY: Convert incoming params to F32 master weights
             switch (self.cached_param_dtype) {
                 .bf16 => {
-                    // BF16 -> F32: Shift u16 into high bits of u32
                     const dest_f32_current = std.mem.bytesAsSlice(f32, current_params[i]);
                     const dest_f32_initial = std.mem.bytesAsSlice(f32, initial_params_f32[i]);
                     var k: usize = 0;
                     while (k < elem_count) : (k += 1) {
                         const u16_val = std.mem.readInt(u16, src_bytes[k * 2 ..][0..2], .little);
-                        const u32_val = @as(u32, u16_val) << 16;
-                        const f32_val: f32 = @bitCast(u32_val);
+                        const f32_val: f32 = @bitCast(@as(u32, u16_val) << 16);
                         dest_f32_current[k] = f32_val;
                         dest_f32_initial[k] = f32_val;
                     }
                 },
                 .f16 => {
-                    // F16 -> F32 (simplified conversion)
                     const dest_f32_current = std.mem.bytesAsSlice(f32, current_params[i]);
                     const dest_f32_initial = std.mem.bytesAsSlice(f32, initial_params_f32[i]);
                     var k: usize = 0;
                     while (k < elem_count) : (k += 1) {
                         const u16_val = std.mem.readInt(u16, src_bytes[k * 2 ..][0..2], .little);
-                        // F16 to F32 conversion (IEEE 754 half to single)
                         const sign: u32 = (@as(u32, u16_val) & 0x8000) << 16;
                         const exp: u32 = (@as(u32, u16_val) >> 10) & 0x1F;
                         const mant: u32 = @as(u32, u16_val) & 0x3FF;
                         var f32_bits: u32 = undefined;
                         if (exp == 0) {
-                            f32_bits = sign; // Zero or denormal -> zero
+                            f32_bits = sign;
                         } else if (exp == 31) {
-                            f32_bits = sign | 0x7F800000 | (mant << 13); // Inf/NaN
+                            f32_bits = sign | 0x7F800000 | (mant << 13);
                         } else {
                             f32_bits = sign | ((exp + 112) << 23) | (mant << 13);
                         }
@@ -933,12 +883,10 @@ pub const Worker = struct {
                     }
                 },
                 .f32 => {
-                    // Already F32, just copy
                     @memcpy(current_params[i], src_bytes);
                     @memcpy(initial_params_f32[i], src_bytes);
                 },
                 else => {
-                    // Fallback: treat as F32
                     @memcpy(current_params[i], src_bytes);
                     @memcpy(initial_params_f32[i], src_bytes);
                 },
@@ -947,249 +895,188 @@ pub const Worker = struct {
             param_offset += src_size;
         }
 
-        std.log.info("Worker {}: Using F32 master weights ({} params, {} bytes each)", .{
-            self.node_id.?,
-            param_shapes.len,
-            if (param_shapes.len > 0) current_params[0].len else 0,
-        });
-
-        // 9. Extract batch_size and block_size from data_shapes
-        const batch_size: usize = @intCast(data_shapes[0][0]);
         const block_size: usize = @intCast(data_shapes[0][1]);
+        const num_params = param_shapes.len;
 
-        // 10. Run the inner loop for tau steps
+        var accum_grads = try self.allocator.alloc([]u8, num_params);
+        defer {
+            for (accum_grads) |buf| self.allocator.free(buf);
+            self.allocator.free(accum_grads);
+        }
+        for (param_shapes, 0..) |shape, i| {
+            var elem_count: usize = 1;
+            for (shape) |dim| elem_count *= @intCast(dim);
+            accum_grads[i] = try self.allocator.alloc(u8, elem_count * 4);
+        }
+
         var final_loss: f32 = 0.0;
 
         for (0..tau) |step| {
             std.log.info("Worker {} inner loop step {}/{}", .{ self.node_id.?, step + 1, tau });
 
-            // A. Generate batch locally from dataset
-            const batch = try self.dataset.?.getBatch(batch_size, block_size);
-            defer batch.deinit();
+            for (accum_grads) |buf| @memset(buf, 0);
+            var avg_loss: f32 = 0.0;
 
-            // Build input list: [Params (N), Ms (N), Vs (N), Timestep (1), Data (D)]
-            var inputs_list = std.ArrayList([]const u8).init(self.allocator);
-            defer inputs_list.deinit();
+            for (0..accumulation_steps) |acc_step| {
+                const batch = try self.dataset.?.getBatch(micro_batch, block_size);
+                defer batch.deinit();
 
-            // Add current parameters
-            for (current_params) |p| try inputs_list.append(p);
+                var inputs_list = std.ArrayList([]const u8).init(self.allocator);
+                defer inputs_list.deinit();
 
-            // Add M states
-            for (m_states) |m| try inputs_list.append(m);
+                for (current_params) |p| try inputs_list.append(p);
+                try inputs_list.append(batch.inputs);
+                try inputs_list.append(batch.targets);
 
-            // Add V states
-            for (v_states) |v| try inputs_list.append(v);
+                const inputs = try inputs_list.toOwnedSlice();
+                defer self.allocator.free(inputs);
 
-            // Add timestep (as bytes of f32)
-            const timestep_bytes = std.mem.asBytes(&self.timestep);
-            try inputs_list.append(timestep_bytes);
+                var all_shapes = std.ArrayList([]const i64).init(self.allocator);
+                defer all_shapes.deinit();
 
-            // Add data inputs (from locally generated batch)
-            try inputs_list.append(batch.inputs);
-            try inputs_list.append(batch.targets);
-
-            // Sanity check: verify batch data isn't all zeros (first step only)
-            if (step == 0) {
-                const ids = std.mem.bytesAsSlice(i64, batch.inputs);
-                const tgts = std.mem.bytesAsSlice(i64, batch.targets);
-                var non_zero_ids: usize = 0;
-                var non_zero_tgts: usize = 0;
-                for (ids) |id| if (id != 0) {
-                    non_zero_ids += 1;
-                };
-                for (tgts) |t| if (t != 0) {
-                    non_zero_tgts += 1;
-                };
-                std.log.info("Worker {}: Batch sanity check - inputs: {}/{} non-zero, targets: {}/{} non-zero", .{
-                    self.node_id.?,
-                    non_zero_ids,
-                    ids.len,
-                    non_zero_tgts,
-                    tgts.len,
-                });
-                if (ids.len > 0) {
-                    std.log.info("Worker {}: First input={}, first target={}", .{ self.node_id.?, ids[0], tgts[0] });
-                }
-            }
-
-            const inputs = try inputs_list.toOwnedSlice();
-            defer self.allocator.free(inputs);
-
-            // Build shape list: [param_shapes (N), param_shapes (N), param_shapes (N), scalar, data_shapes (D)]
-            var all_shapes = std.ArrayList([]const i64).init(self.allocator);
-            defer all_shapes.deinit();
-
-            // Params, M, V shapes (3 * N)
-            for (0..3) |_| {
                 for (param_shapes) |shape| try all_shapes.append(shape);
-            }
 
-            // Timestep shape (scalar)
-            const scalar_shape = &[_]i64{};
-            try all_shapes.append(scalar_shape);
+                var micro_data_shapes: [2][]const i64 = undefined;
+                const micro_shape_0 = &[_]i64{ @intCast(micro_batch), @intCast(block_size) };
+                const micro_shape_1 = &[_]i64{ @intCast(micro_batch), @intCast(block_size) };
+                micro_data_shapes[0] = micro_shape_0;
+                micro_data_shapes[1] = micro_shape_1;
+                for (micro_data_shapes) |shape| try all_shapes.append(shape);
 
-            // Data shapes
-            for (data_shapes) |shape| try all_shapes.append(shape);
+                const shapes_slice = try all_shapes.toOwnedSlice();
+                defer self.allocator.free(shapes_slice);
 
-            const shapes_slice = try all_shapes.toOwnedSlice();
-            defer self.allocator.free(shapes_slice);
+                var dtypes_list = std.ArrayList(tensor.DType).init(self.allocator);
+                defer dtypes_list.deinit();
 
-            // Build dtypes list for explicit precision control (Mixed Precision with F32 Master Weights)
-            // Layout: [Params (N), M-States (N), V-States (N), Timestep (1), Data Inputs (D)]
-            // CRITICAL: Params are now F32 master weights. Graph accepts F32 and casts internally.
-            var dtypes_list = std.ArrayList(tensor.DType).init(self.allocator);
-            defer dtypes_list.deinit();
+                for (0..num_params) |_| try dtypes_list.append(.f32);
+                for (0..2) |_| try dtypes_list.append(.i64);
 
-            // Params are now F32 master weights (regardless of model dtype)
-            for (0..param_shapes.len) |_| try dtypes_list.append(.f32);
+                const outputs = try self.backend.executeFunction(vmfb, "compute_gradients", inputs, shapes_slice, dtypes_list.items);
+                defer {
+                    for (outputs) |o| self.allocator.free(o);
+                    self.allocator.free(outputs);
+                }
 
-            // M-States and V-States are ALWAYS f32 in mixed precision
-            for (0..2) |_| {
-                for (0..param_shapes.len) |_| try dtypes_list.append(.f32);
-            }
+                for (0..num_params) |i| {
+                    accumulateGradients(accum_grads[i], outputs[i]);
+                }
 
-            // Timestep is always f32
-            try dtypes_list.append(.f32);
+                const loss_bytes = outputs[num_params];
+                var current_loss: f32 = undefined;
+                if (loss_bytes.len == 4) {
+                    current_loss = std.mem.bytesAsSlice(f32, loss_bytes)[0];
+                } else if (loss_bytes.len == 2) {
+                    const bf16_bits = std.mem.readInt(u16, loss_bytes[0..2], .little);
+                    current_loss = @bitCast(@as(u32, bf16_bits) << 16);
+                } else {
+                    return error.InvalidLossSize;
+                }
+                avg_loss += current_loss;
 
-            // Data inputs (batch inputs, targets) are always i64
-            for (0..data_shapes.len) |_| try dtypes_list.append(.i64);
-
-            // Execute the training step with explicit dtypes
-            const outputs = try self.backend.executeTrainingStep(vmfb, inputs, shapes_slice, dtypes_list.items);
-            defer {
-                for (outputs) |o| self.allocator.free(o);
-                self.allocator.free(outputs);
-            }
-
-            // Validate outputs for NaNs immediately to pinpoint graph issues
-            const num_params_chk = param_shapes.len;
-
-            // Check updated parameters (F32 master weights)
-            for (0..num_params_chk) |i| {
-                if (i < outputs.len) {
-                    var name_buf: [32]u8 = undefined;
-                    const name = std.fmt.bufPrint(&name_buf, "Output Param {}", .{i}) catch "Output Param";
-                    try self.validateBuffer(name, outputs[i], .f32); // Params are now F32
+                if (acc_step == 0) {
+                    std.log.info("Worker {}: Accumulation step {}/{}, loss: {d:.4}", .{ self.node_id.?, acc_step + 1, accumulation_steps, current_loss });
                 }
             }
 
-            // Check loss (last output) - loss remains in model dtype (bf16)
-            const loss_idx = outputs.len - 1;
-            try self.validateBuffer("Loss", outputs[loss_idx], param_dtype);
+            avg_loss /= @as(f32, @floatFromInt(accumulation_steps));
+            const scale = 1.0 / @as(f32, @floatFromInt(accumulation_steps));
+            for (accum_grads) |buf| scaleBuffer(buf, scale);
 
-            // Parse outputs: [Params (N), Ms (N), Vs (N), Loss (1)]
-            // Expected: 3*N + 1 outputs
-            const expected_outputs = param_shapes.len * 3 + 1;
-            if (outputs.len != expected_outputs) {
-                std.log.err("Expected {} outputs, got {}", .{ expected_outputs, outputs.len });
-                return error.UnexpectedOutputCount;
+            var opt_inputs_list = std.ArrayList([]const u8).init(self.allocator);
+            defer opt_inputs_list.deinit();
+
+            for (current_params) |p| try opt_inputs_list.append(p);
+            for (accum_grads) |g| try opt_inputs_list.append(g);
+            for (m_states) |m| try opt_inputs_list.append(m);
+            for (v_states) |v| try opt_inputs_list.append(v);
+
+            const timestep_bytes = std.mem.asBytes(&self.timestep);
+            try opt_inputs_list.append(timestep_bytes);
+
+            const opt_inputs = try opt_inputs_list.toOwnedSlice();
+            defer self.allocator.free(opt_inputs);
+
+            var opt_shapes = std.ArrayList([]const i64).init(self.allocator);
+            defer opt_shapes.deinit();
+
+            for (0..4) |_| {
+                for (param_shapes) |shape| try opt_shapes.append(shape);
+            }
+            const scalar_shape = &[_]i64{};
+            try opt_shapes.append(scalar_shape);
+
+            const opt_shapes_slice = try opt_shapes.toOwnedSlice();
+            defer self.allocator.free(opt_shapes_slice);
+
+            var opt_dtypes_list = std.ArrayList(tensor.DType).init(self.allocator);
+            defer opt_dtypes_list.deinit();
+
+            for (0..4) |_| {
+                for (0..num_params) |_| try opt_dtypes_list.append(.f32);
+            }
+            try opt_dtypes_list.append(.f32);
+
+            const opt_outputs = try self.backend.executeFunction(vmfb, "apply_optimizer", opt_inputs, opt_shapes_slice, opt_dtypes_list.items);
+            defer {
+                for (opt_outputs) |o| self.allocator.free(o);
+                self.allocator.free(opt_outputs);
             }
 
-            const num_params = param_shapes.len;
-
-            // Update current_params with new_params from outputs[0..N]
             for (0..num_params) |i| {
-                @memcpy(current_params[i], outputs[i]);
+                @memcpy(current_params[i], opt_outputs[i]);
             }
-
-            // Update m_states with new_m from outputs[N..2N]
             for (0..num_params) |i| {
-                @memcpy(m_states[i], outputs[num_params + i]);
+                @memcpy(m_states[i], opt_outputs[num_params + i]);
             }
-
-            // Update v_states with new_v from outputs[2N..3N]
             for (0..num_params) |i| {
-                @memcpy(v_states[i], outputs[2 * num_params + i]);
+                @memcpy(v_states[i], opt_outputs[2 * num_params + i]);
             }
 
-            // Extract loss - auto-detect dtype from byte size (Mixed Precision returns F32 loss)
-            const loss_bytes = outputs[3 * num_params];
-            if (loss_bytes.len == 4) {
-                // F32 loss (Mixed Precision or F32 training)
-                final_loss = std.mem.bytesAsSlice(f32, loss_bytes)[0];
-            } else if (loss_bytes.len == 2) {
-                // BF16 loss (Pure BF16 training)
-                const bf16_bits = std.mem.readInt(u16, loss_bytes[0..2], .little);
-                const f32_bits: u32 = @as(u32, bf16_bits) << 16;
-                final_loss = @bitCast(f32_bits);
-            } else {
-                std.log.err("Worker {}: Unknown loss byte size: {}", .{ self.node_id.?, loss_bytes.len });
-                return error.InvalidLossSize;
-            }
-
-            // Check for NaN/Inf in loss (indicates catastrophic failure)
-            if (std.math.isNan(final_loss)) {
-                std.log.err("Worker {}: Loss is NaN - training has diverged!", .{self.node_id.?});
-            } else if (std.math.isInf(final_loss)) {
-                std.log.err("Worker {}: Loss is Inf - numerical overflow!", .{self.node_id.?});
-            }
-
-            // Increment timestep for next iteration
+            final_loss = avg_loss;
             self.timestep += 1.0;
+
+            std.log.info("Worker {} step {}/{} complete, avg_loss: {d:.4}", .{ self.node_id.?, step + 1, tau, avg_loss });
         }
 
         std.log.info("Worker {} completed {} inner loop steps, final loss: {d:.4}", .{ self.node_id.?, tau, final_loss });
 
-        // --- SELF-HEALING: Validate and Reset Optimizer States if Corrupted ---
-        // If bf16 precision issues caused NaNs in M/V states, we must reset them
-        // to prevent permanent worker poisoning.
         var healed_count: usize = 0;
-        const num_params_healing = param_shapes.len;
-
-        for (0..num_params_healing) |i| {
+        for (0..num_params) |i| {
             var m_corrupt = false;
             var v_corrupt = false;
 
-            // Check M state (always f32 in mixed precision)
             self.validateBuffer("M-State Check", m_states[i], .f32) catch {
                 m_corrupt = true;
             };
-
-            // Check V state (always f32 in mixed precision)
             self.validateBuffer("V-State Check", v_states[i], .f32) catch {
                 v_corrupt = true;
             };
 
             if (m_corrupt or v_corrupt) {
                 std.log.warn("Worker {}: Detected corruption in optimizer state for param {}. Resetting state.", .{ self.node_id.?, i });
-
-                // Reset M
                 @memset(m_states[i], 0);
-                // Reset V
                 @memset(v_states[i], 0);
-
                 healed_count += 1;
             }
         }
 
         if (healed_count > 0) {
-            std.log.warn("Worker {}: Healed {}/{} parameter states. Timestep reset.", .{ self.node_id.?, healed_count, num_params_healing });
-            // If massive corruption occurred, it's safer to reset timestep bias correction too
+            std.log.warn("Worker {}: Healed {}/{} parameter states. Timestep reset.", .{ self.node_id.?, healed_count, num_params });
             self.timestep = 1.0;
         }
-        // ---------------------------------------------------------------------
 
-        // 11. Calculate Delta = Initial_Params - Final_Params and send it
-        // CRITICAL: Both current_params and initial_params_f32 are F32 master weights.
-        // We compute delta in F32 for accuracy, then convert to model dtype for transmission.
         var delta_bytes = std.ArrayList(u8).init(self.allocator);
         defer delta_bytes.deinit();
 
-        // Iterate over parameter blocks to compute delta (both are F32)
         for (current_params, 0..) |final_block_bytes, param_idx| {
             const initial_block_bytes = initial_params_f32[param_idx];
-
-            // Both are F32, so element count = size / 4
             const num_elements = final_block_bytes.len / 4;
-
-            // Compute delta in F32 space for maximum precision
             const initial_f32 = std.mem.bytesAsSlice(f32, initial_block_bytes);
             const final_f32 = std.mem.bytesAsSlice(f32, final_block_bytes);
 
-            // Convert to model dtype for network transmission
             switch (self.cached_param_dtype) {
                 .bf16 => {
-                    // F32 delta -> BF16 for transmission
                     for (0..num_elements) |j| {
                         const delta_f32 = initial_f32[j] - final_f32[j];
                         const delta_bf16: u16 = @truncate(@as(u32, @bitCast(delta_f32)) >> 16);
@@ -1197,29 +1084,23 @@ pub const Worker = struct {
                     }
                 },
                 .f16 => {
-                    // F32 delta -> F16 for transmission
                     for (0..num_elements) |j| {
                         const delta_f32 = initial_f32[j] - final_f32[j];
-                        // F32 to F16 conversion
                         const f32_bits: u32 = @bitCast(delta_f32);
                         const sign: u16 = @truncate((f32_bits >> 16) & 0x8000);
                         const exp = @as(i32, @intCast((f32_bits >> 23) & 0xFF)) - 127;
                         const mant: u16 = @truncate((f32_bits >> 13) & 0x3FF);
-                        const f16_bits: u16 = if (exp < -14) sign // Underflow
-                        else if (exp > 15) sign | 0x7C00 // Overflow
-                        else sign | @as(u16, @intCast((exp + 15) & 0x1F)) << 10 | mant;
+                        const f16_bits: u16 = if (exp < -14) sign else if (exp > 15) sign | 0x7C00 else sign | @as(u16, @intCast((exp + 15) & 0x1F)) << 10 | mant;
                         try delta_bytes.appendSlice(std.mem.asBytes(&f16_bits));
                     }
                 },
                 .f32 => {
-                    // F32 delta -> F32 (direct)
                     for (0..num_elements) |j| {
                         const delta_val = initial_f32[j] - final_f32[j];
                         try delta_bytes.appendSlice(std.mem.asBytes(&delta_val));
                     }
                 },
                 else => {
-                    // Fallback: transmit as F32
                     for (0..num_elements) |j| {
                         const delta_val = initial_f32[j] - final_f32[j];
                         try delta_bytes.appendSlice(std.mem.asBytes(&delta_val));
@@ -1228,9 +1109,8 @@ pub const Worker = struct {
             }
         }
 
-        // Send Delta using chunked transfer protocol to avoid Cap'n Proto message size limits
         const data = delta_bytes.items;
-        const CHUNK_SIZE = 10 * 1024 * 1024; // 10MB per chunk (same as shepherd->worker)
+        const CHUNK_SIZE = 10 * 1024 * 1024;
         const total_size = data.len;
         const total_chunks = (total_size + CHUNK_SIZE - 1) / CHUNK_SIZE;
 
@@ -1242,13 +1122,11 @@ pub const Worker = struct {
             const end = @min(send_offset + CHUNK_SIZE, total_size);
             const chunk_slice = data[send_offset..end];
 
-            // Base64 encode the chunk
             const b64_len = std.base64.standard.Encoder.calcSize(chunk_slice.len);
             const b64_chunk = try self.allocator.alloc(u8, b64_len);
             defer self.allocator.free(b64_chunk);
             _ = std.base64.standard.Encoder.encode(b64_chunk, chunk_slice);
 
-            // Construct chunk payload
             var chunk_payload = std.json.ObjectMap.init(self.allocator);
             defer chunk_payload.deinit();
 
@@ -1259,7 +1137,6 @@ pub const Worker = struct {
             try chunk_payload.put("loss", std.json.Value{ .float = final_loss });
             try chunk_payload.put("chunk_id", std.json.Value{ .integer = @intCast(self.current_chunk_id.?) });
 
-            // Send UPDATE_CHUNK message
             const chunk_msg = tcp_stream.createMessage(
                 self.node_id.?,
                 "worker",
@@ -1273,18 +1150,16 @@ pub const Worker = struct {
             try self.client.send(chunk_msg);
             send_offset = end;
 
-            // Small sleep every 5 chunks to prevent overwhelming network buffers
             if (chunk_idx % 5 == 4) std.time.sleep(10 * std.time.ns_per_ms);
         }
 
         std.log.info("Worker {}: All {} chunks sent, sending completion signal", .{ self.node_id.?, total_chunks });
 
-        // Send final INNER_LOOP_COMPLETE with just metadata (no params - they were sent via chunks)
         var response_payload = std.json.ObjectMap.init(self.allocator);
         defer response_payload.deinit();
         try response_payload.put("chunk_id", std.json.Value{ .integer = @intCast(self.current_chunk_id.?) });
         try response_payload.put("loss", std.json.Value{ .float = final_loss });
-        try response_payload.put("chunked", std.json.Value{ .bool = true }); // Signal that params were sent via chunks
+        try response_payload.put("chunked", std.json.Value{ .bool = true });
 
         const response = tcp_stream.createMessage(
             self.node_id.?,

@@ -221,7 +221,7 @@ const Args = struct {
                         return error.InvalidBackend;
                     }
                 }
-            } else if (std.mem.eql(u8, args[i], "--target")) {
+            } else if (std.mem.eql(u8, args[i], "--target-arch")) {
                 i += 1;
                 if (i < args.len) {
                     target_arch = args[i];

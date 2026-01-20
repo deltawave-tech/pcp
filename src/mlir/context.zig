@@ -187,8 +187,6 @@ pub const MLIRContext = struct {
                 // 2. Aggressively limit waves per EU to 1
                 // This forces minimal register usage to prevent spills on Wave32 arch.
                 try argv.append("--iree-hip-waves-per-eu=1");
-
-                std.log.info("Applying RDNA3/gfx11 stability flags (waves=1, no-prefetch)", .{});
             }
         } else if (is_cuda) {
             // Default to sm_80 (A100) if not specified for CUDA

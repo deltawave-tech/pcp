@@ -201,7 +201,7 @@ pub const DiLoCo = struct {
         // Initialize Host Optimizer for OUTER loop (master updates on CPU)
         // Per DiLoCo paper: "the outer optimizer is Nesterov momentum"
         var host_opt = NesterovHost.init(allocator, .{
-            .learning_rate = config.base_config.learning_rate,
+            .learning_rate = 0.7,
             .momentum = config.nesterov_momentum,
         });
 

@@ -1128,6 +1128,90 @@ pub fn reduceGradient(builder: *MLIRBuilder, grad: mlir.Value, target_shape: mli
     return reshape_op.getResult(0);
 }
 
+// ============================================================================
+// SCF Loop Support Functions
+// ============================================================================
+
+/// Create a tensor from scalar elements (tensor.from_elements)
+pub fn tensorFromElements(builder: *MLIRBuilder, elements: []const mlir.Value, result_type: mlir.Type) !mlir.Value {
+    const op = try builder.createAndAttach("tensor.from_elements", elements, &.{result_type}, .{});
+    return op.getResult(0);
+}
+
+/// Dynamic Slice (StableHLO)
+/// operand: The tensor to slice
+/// start_indices: Slice of Values (one per dimension)
+/// slice_sizes: Shape of the output slice
+pub fn dynamicSlice(builder: *MLIRBuilder, operand: mlir.Value, start_indices: []const mlir.Value, slice_sizes: []const i64) !mlir.Value {
+    const attr = mlir.Attribute.denseI64ArrayAttr(builder.ctx, slice_sizes);
+
+    const input_type = operand.getType().as(mlir.RankedTensorType) orelse return error.InvalidType;
+    const elem_type = input_type.getElementType();
+    const result_type = mlir.Type.rankedTensorType(builder.ctx, slice_sizes, elem_type);
+
+    var operands = std.ArrayList(mlir.Value).init(builder.allocator);
+    defer operands.deinit();
+    try operands.append(operand);
+    try operands.appendSlice(start_indices);
+
+    const op = try builder.createAndAttach(
+        "stablehlo.dynamic_slice",
+        operands.items,
+        &.{result_type},
+        .{ .attributes = &.{.{ "slice_sizes", attr }} },
+    );
+    return op.getResult(0);
+}
+
+/// Create an index constant
+pub fn indexConstant(builder: *MLIRBuilder, value: i64) !mlir.Value {
+    const index_type = mlir.Type{ .handle = c.mlirIndexTypeGet(builder.ctx.handle) };
+    const attr = c.mlirIntegerAttrGet(index_type.handle, value);
+    const op = try builder.createAndAttach(
+        "arith.constant",
+        &.{},
+        &.{index_type},
+        .{ .attributes = &.{.{ "value", mlir.Attribute{ .handle = attr } }} },
+    );
+    return op.getResult(0);
+}
+
+/// Create an i64 constant
+pub fn i64Constant(builder: *MLIRBuilder, value: i64) !mlir.Value {
+    const i64_type = mlir.Type.i64Type(builder.ctx);
+    const attr = c.mlirIntegerAttrGet(i64_type.handle, value);
+    const op = try builder.createAndAttach(
+        "arith.constant",
+        &.{},
+        &.{i64_type},
+        .{ .attributes = &.{.{ "value", mlir.Attribute{ .handle = attr } }} },
+    );
+    return op.getResult(0);
+}
+
+/// Multiply two index values
+pub fn indexMul(builder: *MLIRBuilder, a: mlir.Value, b: mlir.Value) !mlir.Value {
+    const index_type = mlir.Type{ .handle = c.mlirIndexTypeGet(builder.ctx.handle) };
+    const op = try builder.createAndAttach("arith.muli", &.{ a, b }, &.{index_type}, .{});
+    return op.getResult(0);
+}
+
+/// Cast index to i64
+pub fn indexToI64(builder: *MLIRBuilder, idx: mlir.Value) !mlir.Value {
+    const i64_type = mlir.Type.i64Type(builder.ctx);
+    const op = try builder.createAndAttach("arith.index_cast", &.{idx}, &.{i64_type}, .{});
+    return op.getResult(0);
+}
+
+/// Wrap an i64 scalar into a 0D tensor (tensor<i64>)
+/// Required for stablehlo.dynamic_slice which expects 0D tensor indices
+pub fn scalarToTensor0D(builder: *MLIRBuilder, scalar: mlir.Value) !mlir.Value {
+    const i64_type = mlir.Type.i64Type(builder.ctx);
+    const tensor_0d_type = mlir.Type.rankedTensorType(builder.ctx, &.{}, i64_type);
+    const op = try builder.createAndAttach("tensor.from_elements", &.{scalar}, &.{tensor_0d_type}, .{});
+    return op.getResult(0);
+}
+
 /// Test function for MLIR operations using dialect wrappers
 pub fn testMLIROpGeneration(allocator: std.mem.Allocator) !void {
     std.debug.print("\n=== Testing MLIR Operation Generation with Dialect Wrappers ===\n", .{});
@@ -1137,7 +1221,7 @@ pub fn testMLIROpGeneration(allocator: std.mem.Allocator) !void {
     defer ctx.deinit();
     const c_api = @import("../mlir/c.zig").c;
     c_api.mlirContextSetAllowUnregisteredDialects(ctx.handle, true);
-    
+
     // Create MLIR builder
     var builder = try MLIRBuilder.init(allocator, ctx);
     defer builder.deinit();

@@ -424,4 +424,370 @@ pub const GraphBuilder = struct {
         std.debug.print("✓ GRPO Backward Pass graph built successfully\n", .{});
         return mlir_ctx.serializeMLIRModule(allocator, builder.module);
     }
+
+    /// Builds a training graph with SCF-loop-based gradient accumulation.
+    /// Instead of calling compute_gradients N times from Zig, this creates a single
+    /// MLIR function that internally loops over micro-batches using scf.for.
+    /// This allows IREE to schedule memory more efficiently across iterations.
+    ///
+    /// Inputs: [Params(F32)..., FullBatchData...]
+    /// Outputs: [AccumulatedGrads(F32)..., TotalLoss]
+    pub fn buildAccumulatedTrainingGraph(
+        allocator: Allocator,
+        builder: *MLIRBuilder,
+        forward_mlir_source: []const u8,
+        optimizer: *AdamMLIR,
+        num_params: usize,
+        micro_batch_size: i64,
+        accumulation_steps: i64,
+    ) ![]u8 {
+        const c_api = @import("../mlir/c.zig").c;
+        std.debug.print("Compiling accumulated training graph (SCF loop mode)...\n", .{});
+        std.debug.print("  micro_batch_size={}, accumulation_steps={}\n", .{ micro_batch_size, accumulation_steps });
+
+        // === PHASE 1: LOAD AND PARSE FORWARD PASS ===
+        const temp_module = try mlir.Module.parse(builder.ctx, forward_mlir_source);
+        defer temp_module.deinit();
+
+        const forward_fn_to_clone = try temp_module.findFunction("main");
+
+        // === PHASE 2: CLONE INTO MAIN MODULE ===
+        const cloned_forward_fn = mlir.Operation{ .handle = c_api.operationClone(forward_fn_to_clone.handle) };
+
+        const new_fn_name = "model_forward_pass";
+        const new_name_attr = mlir.Attribute.stringAttr(builder.ctx, new_fn_name);
+        const sym_name_ref = c_api.stringRefFromString("sym_name");
+        c_api.operationSetAttributeByName(cloned_forward_fn.handle, sym_name_ref, new_name_attr.handle);
+
+        builder.module_body.appendOwnedOperation(cloned_forward_fn);
+
+        // === PHASE 3: AUTODIFF ===
+        std.debug.print("GraphBuilder: Running Autodiff...\n", .{});
+        const gradient_clip_min = @as(f64, @floatCast(optimizer.conf.gradient_clip_min));
+        const gradient_clip_max = @as(f64, @floatCast(optimizer.conf.gradient_clip_max));
+        _ = try autodiff.buildGradientGraph(allocator, builder, cloned_forward_fn, gradient_clip_min, gradient_clip_max);
+        const grad_fn_name = "model_forward_pass_grad";
+
+        const forward_fn_type = cloned_forward_fn.getType().as(mlir.FunctionType) orelse return error.NotAFunctionType;
+        const f32_type = mlir.Type.f32Type(builder.ctx);
+        const index_type = mlir.Type{ .handle = c_api.mlirIndexTypeGet(builder.ctx.handle) };
+
+        // === PHASE 4A: BUILD @compute_gradients_accumulated ===
+        // This function uses an SCF loop to accumulate gradients across micro-batches
+        std.debug.print("GraphBuilder: Building @compute_gradients_accumulated...\n", .{});
+        {
+            var func_input_types = std.ArrayList(mlir.Type).init(allocator);
+            defer func_input_types.deinit();
+
+            // Parameters as F32 master weights
+            for (0..num_params) |i| {
+                const param_type = forward_fn_type.getInput(i).as(mlir.RankedTensorType).?;
+                const shape = try param_type.getShape(allocator);
+                defer allocator.free(shape);
+                const f32_param_type = mlir.Type.rankedTensorType(builder.ctx, shape, f32_type);
+                try func_input_types.append(f32_param_type);
+            }
+
+            // Data inputs with FULL batch size (effective_batch = micro_batch * accumulation_steps)
+            const num_forward_inputs = forward_fn_type.getNumInputs();
+            for (num_params..num_forward_inputs) |i| {
+                const micro_type = forward_fn_type.getInput(i).as(mlir.RankedTensorType).?;
+                const micro_shape = try micro_type.getShape(allocator);
+                defer allocator.free(micro_shape);
+
+                var full_shape = try allocator.alloc(i64, micro_shape.len);
+                defer allocator.free(full_shape);
+                @memcpy(full_shape, micro_shape);
+                full_shape[0] = micro_batch_size * accumulation_steps;
+
+                const full_type = mlir.Type.rankedTensorType(builder.ctx, full_shape, micro_type.getElementType());
+                try func_input_types.append(full_type);
+            }
+
+            // Output types: Accumulated Gradients (F32) + Accumulated Loss
+            var func_output_types = std.ArrayList(mlir.Type).init(allocator);
+            defer func_output_types.deinit();
+
+            for (0..num_params) |i| {
+                try func_output_types.append(func_input_types.items[i]);
+            }
+            try func_output_types.append(forward_fn_type.getResult(0));
+
+            const func_type = try mlir.Type.functionType(allocator, builder.ctx, func_input_types.items, func_output_types.items);
+            const func_result = try builder.createFunction("compute_gradients_accumulated", func_type);
+            builder.setInsertionBlock(func_result.entry_block);
+
+            const func_args = try func_result.entry_block.getArguments(allocator);
+            defer allocator.free(func_args);
+
+            const params_in = func_args[0..num_params];
+            const full_data_in = func_args[num_params..];
+
+            // Initialize accumulators to zero
+            var init_accs = std.ArrayList(mlir.Value).init(allocator);
+            defer init_accs.deinit();
+
+            for (0..num_params) |i| {
+                const param_type = func_input_types.items[i].as(mlir.RankedTensorType).?;
+                const shape = try param_type.getShape(allocator);
+                defer allocator.free(shape);
+                const zero = try ops.constant(builder, 0.0, shape, f32_type);
+                try init_accs.append(zero.value);
+            }
+
+            const loss_type = forward_fn_type.getResult(0).as(mlir.RankedTensorType).?;
+            const loss_elem_type = loss_type.getElementType();
+            const loss_shape = try loss_type.getShape(allocator);
+            defer allocator.free(loss_shape);
+            const zero_loss = try ops.constant(builder, 0.0, loss_shape, loss_elem_type);
+            try init_accs.append(zero_loss.value);
+
+            // Create SCF for loop bounds
+            const lb = try ops.indexConstant(builder, 0);
+            const ub = try ops.indexConstant(builder, accumulation_steps);
+            const step = try ops.indexConstant(builder, 1);
+
+            // Build iter_args types for the loop (same as output types)
+            var iter_arg_types = std.ArrayList(mlir.Type).init(allocator);
+            defer iter_arg_types.deinit();
+            for (func_output_types.items) |t| {
+                try iter_arg_types.append(t);
+            }
+
+            // Create the scf.for region
+            const loop_region = c_api.mlirRegionCreate();
+            const loop_body = try ops.MLIRBuilder.createBlock();
+            c_api.mlirRegionAppendOwnedBlock(loop_region, loop_body.handle);
+
+            // Add block arguments: induction variable + iter_args
+            _ = loop_body.addArgument(index_type, builder.loc);
+            for (iter_arg_types.items) |t| {
+                _ = loop_body.addArgument(t, builder.loc);
+            }
+
+            // Build loop operands
+            var loop_operands = std.ArrayList(mlir.Value).init(allocator);
+            defer loop_operands.deinit();
+            try loop_operands.append(lb);
+            try loop_operands.append(ub);
+            try loop_operands.append(step);
+            try loop_operands.appendSlice(init_accs.items);
+
+            // Create scf.for operation
+            var regions = [_]c_api.MlirRegion{loop_region};
+            var operand_handles: []c_api.MlirValue = try allocator.alloc(c_api.MlirValue, loop_operands.items.len);
+            defer allocator.free(operand_handles);
+            for (loop_operands.items, 0..) |op, i| {
+                operand_handles[i] = op.handle;
+            }
+
+            var result_type_handles: []c_api.MlirType = try allocator.alloc(c_api.MlirType, iter_arg_types.items.len);
+            defer allocator.free(result_type_handles);
+            for (iter_arg_types.items, 0..) |t, i| {
+                result_type_handles[i] = t.handle;
+            }
+
+            const op_name = c_api.stringRefFromString("scf.for");
+            const op_args = c_api.PcpOpArgs{
+                .nResults = @intCast(result_type_handles.len),
+                .results = result_type_handles.ptr,
+                .nOperands = @intCast(operand_handles.len),
+                .operands = operand_handles.ptr,
+                .nAttributes = 0,
+                .attributes = null,
+                .nRegions = 1,
+                .regions = &regions,
+            };
+
+            const loop_op_handle = c_api.pcpCreateOperation(&op_name, &builder.loc.handle, &op_args);
+            const loop_op = mlir.Operation{ .handle = loop_op_handle };
+            builder.insertion_block.appendOwnedOperation(loop_op);
+
+            // === BUILD LOOP BODY ===
+            const saved_block = builder.getInsertionBlock();
+            builder.setInsertionBlock(loop_body);
+
+            const body_args = try loop_body.getArguments(allocator);
+            defer allocator.free(body_args);
+
+            const iv = body_args[0];
+            const current_accs = body_args[1..];
+
+            // Compute slice offset: iv * micro_batch_size
+            const mb_const = try ops.indexConstant(builder, micro_batch_size);
+            const offset_idx = try ops.indexMul(builder, iv, mb_const);
+            const offset_i64 = try ops.indexToI64(builder, offset_idx);
+            const offset_tensor = try ops.scalarToTensor0D(builder, offset_i64);
+            const zero_i64 = try ops.i64Constant(builder, 0);
+            const zero_tensor = try ops.scalarToTensor0D(builder, zero_i64);
+
+            // Build call operands
+            var call_operands = std.ArrayList(mlir.Value).init(allocator);
+            defer call_operands.deinit();
+
+            // Convert F32 params to model dtype
+            for (0..num_params) |i| {
+                const target_type = forward_fn_type.getInput(i).as(mlir.RankedTensorType).?;
+                const target_elem_type = target_type.getElementType();
+                const p_tensor = try builder.newTensor(params_in[i]);
+                const p_converted = try ops.convert(builder, p_tensor, target_elem_type);
+                try call_operands.append(p_converted.value);
+            }
+
+            // Slice data for this micro-batch
+            for (num_params..num_forward_inputs) |i| {
+                const data_idx = i - num_params;
+                const micro_type = forward_fn_type.getInput(i).as(mlir.RankedTensorType).?;
+                const micro_shape = try micro_type.getShape(allocator);
+                defer allocator.free(micro_shape);
+
+                // Build start indices: [offset, 0, 0, ...] (must be 0D tensors for stablehlo.dynamic_slice)
+                var start_indices = std.ArrayList(mlir.Value).init(allocator);
+                defer start_indices.deinit();
+                try start_indices.append(offset_tensor);
+                for (1..micro_shape.len) |_| {
+                    try start_indices.append(zero_tensor);
+                }
+
+                const sliced = try ops.dynamicSlice(builder, full_data_in[data_idx], start_indices.items, micro_shape);
+                try call_operands.append(sliced);
+            }
+
+            // Add loss gradient (1.0)
+            const one_tensor = try ops.constant(builder, 1.0, loss_shape, loss_elem_type);
+            try call_operands.append(one_tensor.value);
+
+            // Result types for grad call
+            var grad_call_result_types = std.ArrayList(mlir.Type).init(allocator);
+            defer grad_call_result_types.deinit();
+            for (0..num_forward_inputs) |i| {
+                try grad_call_result_types.append(forward_fn_type.getInput(i));
+            }
+
+            // Call gradient function
+            const grad_callee_attr = mlir.Attribute.symbolRefAttr(builder.ctx, grad_fn_name);
+            const grad_call_op = try builder.createAndAttach("func.call", call_operands.items, grad_call_result_types.items, .{
+                .attributes = &.{.{ "callee", grad_callee_attr }},
+            });
+
+            // Call forward pass to get loss
+            var fwd_operands = std.ArrayList(mlir.Value).init(allocator);
+            defer fwd_operands.deinit();
+            for (call_operands.items[0 .. call_operands.items.len - 1]) |op| {
+                try fwd_operands.append(op);
+            }
+
+            const fwd_callee_attr = mlir.Attribute.symbolRefAttr(builder.ctx, new_fn_name);
+            const fwd_call_op = try builder.createAndAttach("func.call", fwd_operands.items, &.{forward_fn_type.getResult(0)}, .{
+                .attributes = &.{.{ "callee", fwd_callee_attr }},
+            });
+
+            // Accumulate gradients
+            var new_accs = std.ArrayList(mlir.Value).init(allocator);
+            defer new_accs.deinit();
+
+            for (0..num_params) |i| {
+                const grad_model = try builder.newTensor(grad_call_op.getResult(i));
+                const grad_f32 = try ops.convert(builder, grad_model, f32_type);
+                const acc = try builder.newTensor(current_accs[i]);
+                const new_acc = try ops.add(builder, acc, grad_f32);
+                try new_accs.append(new_acc.value);
+            }
+
+            // Accumulate loss
+            const step_loss = try builder.newTensor(fwd_call_op.getResult(0));
+            const acc_loss = try builder.newTensor(current_accs[num_params]);
+            const new_loss = try ops.add(builder, acc_loss, step_loss);
+            try new_accs.append(new_loss.value);
+
+            // Yield new accumulators
+            _ = try builder.createAndAttach("scf.yield", new_accs.items, &.{}, .{});
+
+            // Restore insertion point and return loop results
+            builder.setInsertionBlock(saved_block);
+
+            var return_vals = std.ArrayList(mlir.Value).init(allocator);
+            defer return_vals.deinit();
+            for (0..func_output_types.items.len) |i| {
+                try return_vals.append(loop_op.getResult(i));
+            }
+
+            _ = try builder.createAndAttach("func.return", return_vals.items, &.{}, .{});
+        }
+
+        // === PHASE 4B: BUILD @apply_optimizer (same as before) ===
+        std.debug.print("GraphBuilder: Building @apply_optimizer...\n", .{});
+        {
+            var opt_input_types = std.ArrayList(mlir.Type).init(allocator);
+            defer opt_input_types.deinit();
+
+            for (0..4) |_| {
+                for (0..num_params) |i| {
+                    const param_type = forward_fn_type.getInput(i).as(mlir.RankedTensorType).?;
+                    const shape = try param_type.getShape(allocator);
+                    defer allocator.free(shape);
+                    try opt_input_types.append(mlir.Type.rankedTensorType(builder.ctx, shape, f32_type));
+                }
+            }
+            try opt_input_types.append(mlir.Type.rankedTensorType(builder.ctx, &.{}, f32_type));
+
+            var opt_output_types = std.ArrayList(mlir.Type).init(allocator);
+            defer opt_output_types.deinit();
+
+            for (0..3) |_| {
+                for (0..num_params) |i| {
+                    try opt_output_types.append(opt_input_types.items[i]);
+                }
+            }
+
+            const opt_func_type = try mlir.Type.functionType(allocator, builder.ctx, opt_input_types.items, opt_output_types.items);
+            const opt_func = try builder.createFunction("apply_optimizer", opt_func_type);
+            builder.setInsertionBlock(opt_func.entry_block);
+
+            const args = try opt_func.entry_block.getArguments(allocator);
+            defer allocator.free(args);
+
+            const opt_params_in = args[0..num_params];
+            const grads_in = args[num_params .. num_params * 2];
+            const m_in = args[num_params * 2 .. num_params * 3];
+            const v_in = args[num_params * 3 .. num_params * 4];
+            const t_in = args[num_params * 4];
+
+            var returns = std.ArrayList(mlir.Value).init(allocator);
+            defer returns.deinit();
+            var new_m_list = std.ArrayList(mlir.Value).init(allocator);
+            defer new_m_list.deinit();
+            var new_v_list = std.ArrayList(mlir.Value).init(allocator);
+            defer new_v_list.deinit();
+
+            const t_tensor = try builder.newTensor(t_in);
+
+            for (0..num_params) |i| {
+                const p = try builder.newTensor(opt_params_in[i]);
+                const g = try builder.newTensor(grads_in[i]);
+                const m = try builder.newTensor(m_in[i]);
+                const v = try builder.newTensor(v_in[i]);
+
+                const res = try optimizer.update(p, g, m, v, t_tensor);
+
+                try returns.append(res.new_params.value);
+                try new_m_list.append(res.new_m.value);
+                try new_v_list.append(res.new_v.value);
+            }
+
+            try returns.appendSlice(new_m_list.items);
+            try returns.appendSlice(new_v_list.items);
+
+            _ = try builder.createAndAttach("func.return", returns.items, &.{}, .{});
+        }
+
+        // === PHASE 5: SERIALIZE ===
+        if (!builder.module.op().verify()) {
+            builder.module.op().dump();
+            return error.ModuleVerificationFailed;
+        }
+
+        std.debug.print("✓ Accumulated training graph built successfully\n", .{});
+        return mlir_ctx.serializeMLIRModule(allocator, builder.module);
+    }
 };

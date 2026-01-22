@@ -227,14 +227,46 @@ pub const DiLoCo = struct {
         });
 
         // Build the worker graph ONCE during initialization using the sanitized source
-        std.debug.print("Building worker training graph...\n", .{});
-        const graph = try GraphBuilder.buildTrainingGraph(
-            allocator,
-            mlir_builder,
-            mlir_source,
-            adam_optimizer,
-            parameter_shapes.len,
-        );
+        // Check if we need gradient accumulation (effective_batch_size > micro_batch_size)
+        const micro_batch_size: i64 = if (data_input_shapes.len > 0 and data_input_shapes[0].len > 0)
+            @intCast(data_input_shapes[0][0])
+        else
+            1;
+
+        const graph = if (config.effective_batch_size) |ebs| blk: {
+            const accumulation_steps = @divExact(@as(i64, @intCast(ebs)), micro_batch_size);
+            if (accumulation_steps > 1) {
+                std.debug.print("Building ACCUMULATED training graph (SCF loop mode)...\n", .{});
+                std.debug.print("  effective_batch_size={}, micro_batch_size={}, accumulation_steps={}\n", .{ ebs, micro_batch_size, accumulation_steps });
+                break :blk try GraphBuilder.buildAccumulatedTrainingGraph(
+                    allocator,
+                    mlir_builder,
+                    mlir_source,
+                    adam_optimizer,
+                    parameter_shapes.len,
+                    micro_batch_size,
+                    accumulation_steps,
+                );
+            } else {
+                std.debug.print("Building worker training graph (standard mode)...\n", .{});
+                break :blk try GraphBuilder.buildTrainingGraph(
+                    allocator,
+                    mlir_builder,
+                    mlir_source,
+                    adam_optimizer,
+                    parameter_shapes.len,
+                );
+            }
+        } else blk: {
+            std.debug.print("Building worker training graph (standard mode)...\n", .{});
+            break :blk try GraphBuilder.buildTrainingGraph(
+                allocator,
+                mlir_builder,
+                mlir_source,
+                adam_optimizer,
+                parameter_shapes.len,
+            );
+        };
 
         return Self{
             .allocator = allocator,

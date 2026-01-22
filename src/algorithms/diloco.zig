@@ -159,8 +159,11 @@ pub const DiLoCo = struct {
 
             current_source = decimal_source;
         }
-        defer allocator.free(current_source);
-        const mlir_source = current_source;
+
+        std.log.info("Sanitizing large constants...", .{});
+        const mlir_source = try ModelSanitizer.sanitizeLargeConstants(allocator, current_source);
+        allocator.free(current_source);
+        defer allocator.free(mlir_source);
 
         // Introspect using the new ModelInspector (it will now see bf16 types if converted)
         const metadata = try model_introspection.ModelInspector.inspect(

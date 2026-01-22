@@ -64,6 +64,7 @@ pub const MLIRContext = struct {
         c.mlirDialectHandleInsertDialect(c.mlirGetDialectHandle__func__(), registry);
         c.mlirDialectHandleInsertDialect(c.mlirGetDialectHandle__stablehlo__(), registry);
         c.mlirDialectHandleInsertDialect(c.mlirGetDialectHandle__arith__(), registry);
+        c.mlirDialectHandleInsertDialect(c.mlirGetDialectHandle__shape__(), registry);
 
         // 3. Append the configured registry to the context.
         std.debug.print("Appending registry to context...\n", .{});

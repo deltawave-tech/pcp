@@ -58,6 +58,10 @@ pub const c = struct {
     // StableHLO dialect handle (defined in pass_anchors.cpp via MLIR_DEFINE_CAPI_DIALECT_REGISTRATION)
     pub extern fn mlirGetDialectHandle__stablehlo__() mlir_c.MlirDialectHandle;
 
+    // Shape dialect handle (defined in pass_anchors.cpp via MLIR_DEFINE_CAPI_DIALECT_REGISTRATION)
+    // Required for dynamic shape support in torch_mlir exports
+    pub extern fn mlirGetDialectHandle__shape__() mlir_c.MlirDialectHandle;
+
     pub const mlirLocationUnknownGet = mlir_c.mlirLocationUnknownGet;
     pub const locationUnknownGet = mlir_c.mlirLocationUnknownGet;
     pub const mlirLocationFileLineColGet = mlir_c.mlirLocationFileLineColGet;

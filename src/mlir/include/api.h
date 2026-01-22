@@ -10,6 +10,7 @@
 #include "mlir-c/Dialect/Func.h"
 #include "mlir-c/Dialect/Arith.h"
 #include "mlir-c/Dialect/SCF.h"
+#include "mlir-c/Dialect/Shape.h"
 #include "mlir-c/RegisterEverything.h"
 
 // StableHLO C API

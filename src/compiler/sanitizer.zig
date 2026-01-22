@@ -35,10 +35,16 @@ pub const ModelSanitizer = struct {
     }
 
     /// Helper to extract "tensor<...>" from the end of an MLIR instruction line
+    /// Returns null for dynamic shapes (containing '?') since we can't create
+    /// dense constants with dynamic types - MLIR requires static shapes for literals.
     fn extractType(line: []const u8) ?[]const u8 {
         const last_colon = std.mem.lastIndexOfScalar(u8, line, ':') orelse return null;
         const type_part = std.mem.trim(u8, line[last_colon + 1 ..], " \r\t");
         if (std.mem.startsWith(u8, type_part, "tensor<")) {
+            // Skip dynamic shapes - can't create dense constants with dynamic types
+            if (std.mem.indexOf(u8, type_part, "?") != null) {
+                return null;
+            }
             return type_part;
         }
         return null;
@@ -235,6 +241,76 @@ pub const ModelSanitizer = struct {
         }
 
         return out.toOwnedSlice();
+    }
+
+    pub fn sanitizeLargeConstants(allocator: Allocator, source: []const u8) ![]u8 {
+        var out = std.ArrayList(u8).init(allocator);
+        errdefer out.deinit();
+
+        var lines = std.mem.splitScalar(u8, source, '\n');
+
+        const ELEMENT_THRESHOLD = 1024;
+
+        while (lines.next()) |line| {
+            if (std.mem.indexOf(u8, line, "stablehlo.constant") != null and
+                std.mem.indexOf(u8, line, "dense<") != null and
+                std.mem.indexOf(u8, line, "dense_resource<") == null)
+            {
+                if (std.mem.indexOf(u8, line, "[") == null) {
+                    if (extractType(line)) |type_str| {
+                        if (isLargeTensor(type_str, ELEMENT_THRESHOLD)) |elem_type| {
+                            try rewriteAsBroadcast(&out, allocator, line, type_str, elem_type);
+                            continue;
+                        }
+                    }
+                }
+            }
+
+            try out.appendSlice(line);
+            try out.append('\n');
+        }
+        return out.toOwnedSlice();
+    }
+
+    fn isLargeTensor(type_str: []const u8, threshold: usize) ?[]const u8 {
+        const start = std.mem.indexOf(u8, type_str, "<") orelse return null;
+        const end = std.mem.lastIndexOf(u8, type_str, ">") orelse return null;
+        const content = type_str[start + 1 .. end];
+
+        var total_elems: usize = 1;
+        var it = std.mem.tokenizeScalar(u8, content, 'x');
+        var last_part: []const u8 = "";
+
+        while (it.next()) |part| {
+            last_part = part;
+            if (std.fmt.parseInt(usize, part, 10)) |dim| {
+                total_elems *= dim;
+            } else |_| {}
+        }
+
+        if (total_elems > threshold) {
+            return last_part;
+        }
+        return null;
+    }
+
+    fn rewriteAsBroadcast(buf: *std.ArrayList(u8), allocator: Allocator, line: []const u8, full_type: []const u8, elem_type: []const u8) !void {
+        const eq_pos = std.mem.indexOf(u8, line, "=") orelse return error.ParseError;
+        const lhs_name = std.mem.trim(u8, line[0..eq_pos], " \t");
+
+        const dense_start = std.mem.indexOf(u8, line, "dense<") orelse return error.ParseError;
+        const val_start = dense_start + 6;
+        const dense_end = std.mem.indexOfScalarPos(u8, line, val_start, '>') orelse return error.ParseError;
+        const val_str = line[val_start..dense_end];
+
+        const scalar_name = try std.fmt.allocPrint(allocator, "{s}_scalar", .{lhs_name});
+        defer allocator.free(scalar_name);
+
+        try appendFmt(buf, "    {s} = stablehlo.constant dense<{s}> : tensor<{s}>\n", .{ scalar_name, val_str, elem_type });
+
+        try appendFmt(buf, "    {s} = stablehlo.broadcast_in_dim {s}, dims = [] : (tensor<{s}>) -> {s}\n", .{ lhs_name, scalar_name, elem_type, full_type });
+
+        std.log.info("Sanitizer: Compressed constant {s} ({s})", .{ lhs_name, full_type });
     }
 
     /// Converts f32 types to bf16 in the MLIR source text.

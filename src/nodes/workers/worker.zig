@@ -732,7 +732,11 @@ pub const Worker = struct {
         else
             .f32;
 
-        const micro_batch: usize = @intCast(data_shapes[0][0]);
+        var micro_batch: usize = @intCast(data_shapes[0][0]);
+        if (micro_batch > 1000000) {
+            micro_batch = 64;
+            std.log.info("Worker {}: Dynamic batch detected, defaulting micro_batch to {}", .{ self.node_id.?, micro_batch });
+        }
         const effective_batch: usize = if (payload.get("effective_batch_size")) |v|
             switch (v) {
                 .integer => |i| @as(usize, @intCast(i)),
@@ -911,58 +915,76 @@ pub const Worker = struct {
 
         var final_loss: f32 = 0.0;
 
+        const iree_impl: *IreeBackend = @ptrCast(@alignCast(self.backend.ptr));
+        const data_shape = &[_]i64{ @intCast(micro_batch), @intCast(block_size) };
+
+        var device_params = try self.allocator.alloc(IreeBackend.DeviceBuffer, num_params);
+        defer {
+            for (device_params) |buf| buf.release();
+            self.allocator.free(device_params);
+        }
+        for (current_params, 0..) |p, i| {
+            device_params[i] = try iree_impl.moveToDevice(p, param_shapes[i], .f32);
+        }
+
         for (0..tau) |step| {
             std.log.info("Worker {} inner loop step {}/{}", .{ self.node_id.?, step + 1, tau });
 
-            for (accum_grads) |buf| @memset(buf, 0);
+            var device_accumulators = try self.allocator.alloc(IreeBackend.DeviceBuffer, num_params);
+            for (param_shapes, 0..) |shape, i| {
+                device_accumulators[i] = try iree_impl.allocateZerosDevice(shape, .f32);
+            }
+
             var avg_loss: f32 = 0.0;
 
             for (0..accumulation_steps) |acc_step| {
                 const batch = try self.dataset.?.getBatch(micro_batch, block_size);
                 defer batch.deinit();
 
-                var inputs_list = std.ArrayList([]const u8).init(self.allocator);
-                defer inputs_list.deinit();
+                var grad_inputs = std.ArrayList(IreeBackend.DeviceBuffer).init(self.allocator);
+                defer grad_inputs.deinit();
 
-                for (current_params) |p| try inputs_list.append(p);
-                try inputs_list.append(batch.inputs);
-                try inputs_list.append(batch.targets);
-
-                const inputs = try inputs_list.toOwnedSlice();
-                defer self.allocator.free(inputs);
-
-                var all_shapes = std.ArrayList([]const i64).init(self.allocator);
-                defer all_shapes.deinit();
-
-                for (param_shapes) |shape| try all_shapes.append(shape);
-
-                var micro_data_shapes: [2][]const i64 = undefined;
-                const micro_shape_0 = &[_]i64{ @intCast(micro_batch), @intCast(block_size) };
-                const micro_shape_1 = &[_]i64{ @intCast(micro_batch), @intCast(block_size) };
-                micro_data_shapes[0] = micro_shape_0;
-                micro_data_shapes[1] = micro_shape_1;
-                for (micro_data_shapes) |shape| try all_shapes.append(shape);
-
-                const shapes_slice = try all_shapes.toOwnedSlice();
-                defer self.allocator.free(shapes_slice);
-
-                var dtypes_list = std.ArrayList(tensor.DType).init(self.allocator);
-                defer dtypes_list.deinit();
-
-                for (0..num_params) |_| try dtypes_list.append(.f32);
-                for (0..2) |_| try dtypes_list.append(.i64);
-
-                const outputs = try self.backend.executeFunction(vmfb, "compute_gradients", inputs, shapes_slice, dtypes_list.items);
-                defer {
-                    for (outputs) |o| self.allocator.free(o);
-                    self.allocator.free(outputs);
+                for (device_params) |p| {
+                    p.retain();
+                    try grad_inputs.append(p);
                 }
 
+                const dev_input_ids = try iree_impl.moveToDevice(batch.inputs, data_shape, .i64);
+                try grad_inputs.append(dev_input_ids);
+                const dev_targets = try iree_impl.moveToDevice(batch.targets, data_shape, .i64);
+                try grad_inputs.append(dev_targets);
+
+                const grad_outputs = try iree_impl.executeWithDeviceBuffers(vmfb, "compute_gradients", grad_inputs.items);
+                defer self.allocator.free(grad_outputs);
+
+                for (grad_inputs.items) |buf| buf.release();
+
+                var acc_inputs = std.ArrayList(IreeBackend.DeviceBuffer).init(self.allocator);
+                defer acc_inputs.deinit();
+
+                for (device_accumulators) |acc| {
+                    acc.retain();
+                    try acc_inputs.append(acc);
+                }
                 for (0..num_params) |i| {
-                    accumulateGradients(accum_grads[i], outputs[i]);
+                    try acc_inputs.append(grad_outputs[i]);
                 }
 
-                const loss_bytes = outputs[num_params];
+                const acc_outputs = try iree_impl.executeWithDeviceBuffers(vmfb, "accumulate_gradients", acc_inputs.items);
+
+                for (device_accumulators) |old| old.release();
+                for (0..num_params) |i| {
+                    device_accumulators[i] = acc_outputs[i];
+                }
+                self.allocator.free(acc_outputs);
+
+                for (acc_inputs.items) |buf| buf.release();
+
+                const loss_buf = grad_outputs[num_params];
+                const loss_bytes = try iree_impl.readToHost(loss_buf);
+                defer self.allocator.free(loss_bytes);
+                loss_buf.release();
+
                 var current_loss: f32 = undefined;
                 if (loss_bytes.len == 4) {
                     current_loss = std.mem.bytesAsSlice(f32, loss_bytes)[0];
@@ -978,6 +1000,14 @@ pub const Worker = struct {
                     std.log.info("Worker {}: Accumulation step {}/{}, loss: {d:.4}", .{ self.node_id.?, acc_step + 1, accumulation_steps, current_loss });
                 }
             }
+
+            for (0..num_params) |i| {
+                const grad_bytes = try iree_impl.readToHost(device_accumulators[i]);
+                @memcpy(accum_grads[i], grad_bytes);
+                self.allocator.free(grad_bytes);
+                device_accumulators[i].release();
+            }
+            self.allocator.free(device_accumulators);
 
             avg_loss /= @as(f32, @floatFromInt(accumulation_steps));
             const scale = 1.0 / @as(f32, @floatFromInt(accumulation_steps));
@@ -1031,6 +1061,11 @@ pub const Worker = struct {
             }
             for (0..num_params) |i| {
                 @memcpy(v_states[i], opt_outputs[2 * num_params + i]);
+            }
+
+            for (device_params) |old| old.release();
+            for (current_params, 0..) |p, i| {
+                device_params[i] = try iree_impl.moveToDevice(p, param_shapes[i], .f32);
             }
 
             final_loss = avg_loss;

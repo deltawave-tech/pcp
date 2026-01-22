@@ -236,6 +236,47 @@ pub const GraphBuilder = struct {
             _ = try builder.createAndAttach("func.return", returns.items, &.{}, .{});
         }
 
+        // === PHASE 4C: BUILD @accumulate_gradients ===
+        std.debug.print("GraphBuilder: Building @accumulate_gradients...\n", .{});
+        {
+            var acc_input_types = std.ArrayList(mlir.Type).init(allocator);
+            defer acc_input_types.deinit();
+            var acc_output_types = std.ArrayList(mlir.Type).init(allocator);
+            defer acc_output_types.deinit();
+
+            for (0..num_params) |i| {
+                const param_type = forward_fn_type.getInput(i).as(mlir.RankedTensorType).?;
+                const shape = try param_type.getShape(allocator);
+                defer allocator.free(shape);
+                const grad_type = mlir.Type.rankedTensorType(builder.ctx, shape, f32_type);
+                try acc_input_types.append(grad_type);
+                try acc_output_types.append(grad_type);
+            }
+
+            for (0..num_params) |i| {
+                try acc_input_types.append(acc_output_types.items[i]);
+            }
+
+            const acc_func_type = try mlir.Type.functionType(allocator, builder.ctx, acc_input_types.items, acc_output_types.items);
+            const acc_func = try builder.createFunction("accumulate_gradients", acc_func_type);
+            builder.setInsertionBlock(acc_func.entry_block);
+
+            const args = try acc_func.entry_block.getArguments(allocator);
+            defer allocator.free(args);
+
+            var results = std.ArrayList(mlir.Value).init(allocator);
+            defer results.deinit();
+
+            for (0..num_params) |i| {
+                const acc = try builder.newTensor(args[i]);
+                const new_grad = try builder.newTensor(args[num_params + i]);
+                const sum = try ops.add(builder, acc, new_grad);
+                try results.append(sum.value);
+            }
+
+            _ = try builder.createAndAttach("func.return", results.items, &.{}, .{});
+        }
+
         // === PHASE 5: SERIALIZE ===
         if (!builder.module.op().verify()) {
             builder.module.op().dump();

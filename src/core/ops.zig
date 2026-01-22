@@ -1206,9 +1206,12 @@ pub fn indexToI64(builder: *MLIRBuilder, idx: mlir.Value) !mlir.Value {
 /// Wrap an i64 scalar into a 0D tensor (tensor<i64>)
 /// Required for stablehlo.dynamic_slice which expects 0D tensor indices
 pub fn scalarToTensor0D(builder: *MLIRBuilder, scalar: mlir.Value) !mlir.Value {
+    std.debug.print("DEBUG: scalarToTensor0D called\n", .{});
     const i64_type = mlir.Type.i64Type(builder.ctx);
     const tensor_0d_type = mlir.Type.rankedTensorType(builder.ctx, &.{}, i64_type);
+    std.debug.print("DEBUG: creating tensor.from_elements op\n", .{});
     const op = try builder.createAndAttach("tensor.from_elements", &.{scalar}, &.{tensor_0d_type}, .{});
+    std.debug.print("DEBUG: tensor.from_elements created successfully\n", .{});
     return op.getResult(0);
 }
 

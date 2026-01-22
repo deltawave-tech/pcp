@@ -4,6 +4,8 @@
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Shape/IR/Shape.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "stablehlo/dialect/StablehloOps.h"
 #include "mlir-c/IR.h"
 #include <cstdio>
@@ -16,6 +18,8 @@ extern "C" {
 MLIR_DEFINE_CAPI_DIALECT_REGISTRATION(Func, func, mlir::func::FuncDialect)
 MLIR_DEFINE_CAPI_DIALECT_REGISTRATION(Arith, arith, mlir::arith::ArithDialect)
 MLIR_DEFINE_CAPI_DIALECT_REGISTRATION(Shape, shape, mlir::shape::ShapeDialect)
+MLIR_DEFINE_CAPI_DIALECT_REGISTRATION(SCF, scf, mlir::scf::SCFDialect)
+MLIR_DEFINE_CAPI_DIALECT_REGISTRATION(Tensor, tensor, mlir::tensor::TensorDialect)
 MLIR_DEFINE_CAPI_DIALECT_REGISTRATION(Stablehlo, stablehlo, mlir::stablehlo::StablehloDialect)
 
 // Packed argument struct to ensure stable ABI (all passed via pointer)

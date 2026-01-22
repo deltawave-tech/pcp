@@ -57,6 +57,11 @@ const ExperimentConfig = struct {
     // Optional: Effective batch size for gradient accumulation
     effective_batch_size: ?usize = null,
 
+    // Optional: Use in-graph SCF loop for gradient accumulation (default: false = use in-code accumulation)
+    // In-code accumulation calls compute_gradients multiple times from worker code
+    // In-graph accumulation uses a single compute_gradients_accumulated call with internal SCF loop
+    use_in_graph_accumulation: bool = false,
+
     // Optional: GRPO/RL configuration
     grpo_config: ?GRPOJsonConfig = null,
 
@@ -523,6 +528,13 @@ fn runShepherd(allocator: Allocator, args: Args) !void {
     if (exp_config.effective_batch_size) |ebs| {
         diloco_config.effective_batch_size = ebs;
         print("   Effective Batch Size: {}\n", .{ebs});
+    }
+
+    diloco_config.use_in_graph_accumulation = exp_config.use_in_graph_accumulation;
+    if (exp_config.use_in_graph_accumulation) {
+        print("   Gradient Accumulation: in-graph (SCF loop)\n", .{});
+    } else {
+        print("   Gradient Accumulation: in-code (multiple kernel calls)\n", .{});
     }
 
     // CLI flag overrides config file

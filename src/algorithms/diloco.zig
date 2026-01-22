@@ -60,6 +60,7 @@ pub const DiLoCoConfig = struct {
     resume_training: bool,
     dtype: tensor.DType = .f32,
     effective_batch_size: ?usize = null,
+    use_in_graph_accumulation: bool = false,
 
     pub fn default() DiLoCoConfig {
         return DiLoCoConfig{
@@ -235,8 +236,9 @@ pub const DiLoCo = struct {
 
         const graph = if (config.effective_batch_size) |ebs| blk: {
             const accumulation_steps = @divExact(@as(i64, @intCast(ebs)), micro_batch_size);
-            if (accumulation_steps > 1) {
-                std.debug.print("Building ACCUMULATED training graph (SCF loop mode)...\n", .{});
+            if (accumulation_steps > 1 and config.use_in_graph_accumulation) {
+                // In-graph accumulation: single kernel with internal SCF loop
+                std.debug.print("Building ACCUMULATED training graph (in-graph SCF loop mode)...\n", .{});
                 std.debug.print("  effective_batch_size={}, micro_batch_size={}, accumulation_steps={}\n", .{ ebs, micro_batch_size, accumulation_steps });
                 break :blk try GraphBuilder.buildAccumulatedTrainingGraph(
                     allocator,
@@ -248,7 +250,8 @@ pub const DiLoCo = struct {
                     accumulation_steps,
                 );
             } else {
-                std.debug.print("Building worker training graph (standard mode)...\n", .{});
+                // In-code accumulation: worker calls compute_gradients multiple times
+                std.debug.print("Building worker training graph (in-code accumulation mode)...\n", .{});
                 break :blk try GraphBuilder.buildTrainingGraph(
                     allocator,
                     mlir_builder,
@@ -707,6 +710,7 @@ pub const DiLoCo = struct {
             if (self.config.effective_batch_size) |ebs| {
                 try payload_map.put("effective_batch_size", std.json.Value{ .integer = @intCast(ebs) });
             }
+            try payload_map.put("use_in_graph_accumulation", std.json.Value{ .bool = self.config.use_in_graph_accumulation });
 
             // Send dtype to worker for correct precision handling
             const dtype_str: []const u8 = switch (self.config.dtype) {

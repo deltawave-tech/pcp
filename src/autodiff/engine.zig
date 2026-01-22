@@ -22,31 +22,22 @@ const VJPFn = vjp_rules.VJPFn;
 // the backward pass instead of keeping them alive. This trades compute for
 // massive memory savings.
 
-/// Threshold for considering an operation "heavy" and worth rematerializing.
-/// Tensors with more elements than this will be recomputed during backward pass.
-/// 50M elements * 4 bytes = 200MB threshold
-const REMAT_ELEMENT_THRESHOLD: i64 = 50_000_000;
+const REMAT_ELEMENT_THRESHOLD: i64 = 1_000_000;
 
-/// Determine if an operation result should be recomputed (Gradient Checkpointing)
-/// instead of keeping the forward pass tensor alive.
 fn shouldRematerialize(op: mlir.Operation) bool {
     const name = op.getName();
 
-    // Target heavy operations in Transformers:
-    // 1. Attention Scores (dot_general producing [B, H, S, S])
-    // 2. Softmax Exponentials (exponential producing [B, H, S, S])
-    // 3. Attention Probabilities (divide producing [B, H, S, S])
-    // 4. Sigmoid/SiLU activations (logistic)
-    const is_candidate_op = std.mem.eql(u8, name, "stablehlo.dot_general") or
+    const is_heavy_math = std.mem.eql(u8, name, "stablehlo.dot_general") or
         std.mem.eql(u8, name, "stablehlo.exponential") or
         std.mem.eql(u8, name, "stablehlo.divide") or
-        std.mem.eql(u8, name, "stablehlo.logistic");
+        std.mem.eql(u8, name, "stablehlo.logistic") or
+        std.mem.eql(u8, name, "stablehlo.tanh") or
+        std.mem.eql(u8, name, "stablehlo.maximum") or
+        std.mem.eql(u8, name, "stablehlo.add");
 
-    if (!is_candidate_op) return false;
+    if (!is_heavy_math) return false;
 
-    // Check tensor size heuristic
     if (op.getNumResults() == 0) return false;
-
     const res = op.getResult(0);
     const type_val = res.getType();
 
@@ -54,83 +45,85 @@ fn shouldRematerialize(op: mlir.Operation) bool {
 
     const rank = c.mlirShapedTypeGetRank(type_val.handle);
 
-    // Rank >= 4 likely means [Batch, Heads, Seq, Seq] attention matrix
-    // These are the primary memory hogs we want to recompute
-    if (rank >= 4) {
-        // Calculate total elements
+    if (rank >= 3) {
         var total_elements: i64 = 1;
         for (0..@intCast(rank)) |i| {
             const dim = c.mlirShapedTypeGetDimSize(type_val.handle, @intCast(i));
-            if (dim > 0) {
-                total_elements *= dim;
-            }
+            if (dim > 0) total_elements *= dim;
         }
-
-        // Only rematerialize if truly large
-        if (total_elements >= REMAT_ELEMENT_THRESHOLD) {
-            std.log.debug("Marking op '{s}' for rematerialization: rank={}, elements={}", .{ name, rank, total_elements });
-            return true;
-        }
+        return total_elements >= REMAT_ELEMENT_THRESHOLD;
     }
 
     return false;
 }
 
-/// Recompute an operation in the current block (Just-In-Time).
-/// This clones the operation and updates its operands to use values
-/// available in the current context (from value_map).
-/// Used for both Phase 1 (hole patching) and Phase 2 (backward pass) rematerialization.
 fn rematerializeOp(
     builder: *MLIRBuilder,
     original_op: mlir.Operation,
     value_map: *std.AutoHashMap(mlir.Value, mlir.Value),
     remat_cache: *std.AutoHashMap(mlir.Operation, mlir.Value),
+    dependency_token: ?mlir.Value,
 ) !mlir.Value {
-    // Check cache first - don't rematerialize the same op twice within the same phase
     if (remat_cache.get(original_op)) |cached| {
         return cached;
     }
 
-    // Clone the operation
     const cloned_handle = c.operationClone(original_op.handle);
     const cloned_op = mlir.Operation{ .handle = cloned_handle };
 
-    // Update operands to point to values available in the CURRENT context.
     const num_operands = cloned_op.getNumOperands();
     for (0..num_operands) |i| {
         const old_operand = original_op.getOperand(i);
         var new_operand: mlir.Value = undefined;
+        var handled = false;
 
-        // Try standard mapping first (most common case)
-        if (value_map.get(old_operand)) |mapped| {
-            new_operand = mapped;
-        }
-        // If missing, check if it's a recursive rematerialization case
-        else if (c.mlirValueIsAOpResult(old_operand.handle)) {
+        if (c.mlirValueIsAOpResult(old_operand.handle)) {
             const producer = mlir.Operation{ .handle = c.mlirOpResultGetOwner(old_operand.handle) };
+
             if (shouldRematerialize(producer)) {
-                // Recursively rematerialize the producer
-                new_operand = try rematerializeOp(builder, producer, value_map, remat_cache);
+                new_operand = try rematerializeOp(builder, producer, value_map, remat_cache, dependency_token);
+                handled = true;
+            }
+        }
+
+        if (!handled) {
+            if (value_map.get(old_operand)) |mapped| {
+                new_operand = mapped;
             } else {
+                std.log.err("Rematerialize Error: Operand not found for {s}", .{original_op.getName()});
                 return error.RematOperandNotFound;
             }
-        } else {
-            // Block argument not in value_map
-            return error.RematOperandNotFound;
         }
 
         c.operationSetOperand(cloned_op.handle, @intCast(i), new_operand.handle);
     }
 
-    // Insert into the current block (Just-In-Time execution)
     builder.insertion_block.appendOwnedOperation(cloned_op);
 
-    const result = cloned_op.getResult(0);
+    const raw_result = cloned_op.getResult(0);
+    const res_type = raw_result.getType();
 
-    // Cache the result to avoid duplicate rematerialization within this phase
-    try remat_cache.put(original_op, result);
+    var barrier_op: mlir.Operation = undefined;
+    if (dependency_token) |token| {
+        barrier_op = try builder.createAndAttach(
+            "util.optimization_barrier",
+            &.{ raw_result, token },
+            &.{ res_type, token.getType() },
+            .{},
+        );
+    } else {
+        barrier_op = try builder.createAndAttach(
+            "util.optimization_barrier",
+            &.{raw_result},
+            &.{res_type},
+            .{},
+        );
+    }
 
-    return result;
+    const barrier_result = barrier_op.getResult(0);
+    try remat_cache.put(original_op, barrier_result);
+
+    return barrier_result;
 }
 
 
@@ -311,7 +304,8 @@ pub fn buildGradientGraph(
                     if (shouldRematerialize(producer)) {
                         // Rematerialize using Phase 1 cache.
                         // This value is transient and only lives as long as this light op uses it.
-                        const remat_val = try rematerializeOp(builder, producer, &value_map, &phase1_remat_cache);
+                        // No anchor token in phase 1 since we don't have gradients yet.
+                        const remat_val = try rematerializeOp(builder, producer, &value_map, &phase1_remat_cache, null);
                         c.mlirOperationSetOperand(cloned_op.handle, @intCast(i), remat_val.handle);
                     } else {
                         // Missing mapping for a non-skipped op is a real error
@@ -361,32 +355,24 @@ fn processOperationVJP(
     op: mlir.Operation,
     adjoint_map: *std.AutoHashMap(mlir.Value, mlir.Value),
     value_map: *std.AutoHashMap(mlir.Value, mlir.Value),
-    remat_cache: *std.AutoHashMap(mlir.Operation, mlir.Value),
     gradient_clip_min: f64,
     gradient_clip_max: f64,
 ) !void {
     const op_name = op.getName();
-    // Get gradients (now safely handles empty case)
     const output_gradients = try getOutputGradients(allocator, op, adjoint_map);
-
-    // Always free the slice. Since getOutputGradients now guarantees a safe slice (even if len 0),
-    // this allocator.free call is safe.
     defer allocator.free(output_gradients);
 
     if (output_gradients.len == 0) return;
     if (std.mem.eql(u8, op_name, "stablehlo.constant")) return;
 
-    // Special handling for stablehlo.reduce - inspect the body to determine VJP rule
     var vjp_rule: ?VJPFn = getVjpFn(op_name);
     if (vjp_rule == null and std.mem.eql(u8, op_name, "stablehlo.reduce")) {
-        // Inspect the reduction region to decide VJP rule
         const region = op.getRegion(0);
         const block = region.getBlock(0);
 
         var is_max = false;
         var maybe_op = block.getFirstOp();
 
-        // Iterate through ops in the reduce body (usually just one math op and a return)
         while (maybe_op) |body_op| {
             const name = body_op.getName();
             if (std.mem.eql(u8, name, "stablehlo.maximum")) {
@@ -399,41 +385,40 @@ fn processOperationVJP(
         if (is_max) {
             vjp_rule = vjp_rules.reduceMaxVJP;
         } else {
-            // Default to Sum for stablehlo.add or complex reductions (safe fallback for now)
             vjp_rule = vjp_rules.reduceSumVJP;
         }
     }
 
     if (vjp_rule) |rule| {
-        // GRADIENT CHECKPOINTING:
-        // For each operand, check if it comes from a "heavy" operation.
-        // If so, rematerialize (recompute) it instead of using the stored forward value.
-        // This breaks the liveness chain and allows memory to be freed earlier.
         var rematerialized_primals = std.ArrayList(mlir.Value).init(allocator);
         defer rematerialized_primals.deinit();
 
+        const anchor_token: ?mlir.Value = if (output_gradients.len > 0) output_gradients[0] else null;
+
         for (0..op.getNumOperands()) |i| {
             const primal_operand = op.getOperand(i);
+            var primal_val: mlir.Value = undefined;
+            var is_recomputed = false;
 
-            // Check if this operand comes from a heavy op that we should recompute
             if (c.mlirValueIsAOpResult(primal_operand.handle)) {
                 const producer = mlir.Operation{ .handle = c.mlirOpResultGetOwner(primal_operand.handle) };
 
                 if (shouldRematerialize(producer)) {
-                    // RECOMPUTE: Clone and execute the heavy op just-in-time
-                    const remat_val = try rematerializeOp(builder, producer, value_map, remat_cache);
-                    try rematerialized_primals.append(remat_val);
-                    continue;
+                    var local_cache = std.AutoHashMap(mlir.Operation, mlir.Value).init(allocator);
+                    primal_val = try rematerializeOp(builder, producer, value_map, &local_cache, anchor_token);
+                    local_cache.deinit();
+                    is_recomputed = true;
                 }
             }
 
-            // Standard path: use the mapped value from forward pass
-            const mapped_operand = value_map.get(primal_operand) orelse return error.PrimalValueNotFound;
-            try rematerialized_primals.append(mapped_operand);
+            if (!is_recomputed) {
+                primal_val = value_map.get(primal_operand) orelse return error.PrimalValueNotFound;
+            }
+            try rematerialized_primals.append(primal_val);
         }
 
         const input_gradients = try rule(builder, op, rematerialized_primals.items, output_gradients);
-        defer builder.allocator.free(input_gradients); // Ensure VJP result slice is freed
+        defer builder.allocator.free(input_gradients);
 
         try addInputGradients(builder, op, input_gradients, adjoint_map, gradient_clip_min, gradient_clip_max);
     }
@@ -522,19 +507,12 @@ fn processGradientsWithUseCounting(
     defer ready_queue.deinit();
     try ready_queue.append(terminator);
 
-    // GRADIENT CHECKPOINTING: Cache for rematerialized operations
-    // This prevents recomputing the same heavy tensor multiple times
-    var remat_cache = std.AutoHashMap(mlir.Operation, mlir.Value).init(allocator);
-    defer remat_cache.deinit();
-
-    // Step 3: Process operations in reverse order using use-counting
     while (ready_queue.items.len > 0) {
         const current_op = ready_queue.orderedRemove(0);
 
         std.debug.print("Processing operation VJP for: {s}\n", .{current_op.getName()});
-        try processOperationVJP(allocator, builder, current_op, adjoint_map, value_map, &remat_cache, gradient_clip_min, gradient_clip_max);
+        try processOperationVJP(allocator, builder, current_op, adjoint_map, value_map, gradient_clip_min, gradient_clip_max);
 
-        // Decrement use counts for producers and add to queue when ready
         for (0..current_op.getNumOperands()) |i| {
             const operand = current_op.getOperand(i);
             if (c.mlirValueIsAOpResult(operand.handle)) {
@@ -548,11 +526,6 @@ fn processGradientsWithUseCounting(
                 }
             }
         }
-    }
-
-    // Log rematerialization stats
-    if (remat_cache.count() > 0) {
-        std.log.info("Gradient Checkpointing: Rematerialized {} operations in Phase 2 (backward pass)", .{remat_cache.count()});
     }
 }
 

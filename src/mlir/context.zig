@@ -65,6 +65,8 @@ pub const MLIRContext = struct {
         c.mlirDialectHandleInsertDialect(c.mlirGetDialectHandle__stablehlo__(), registry);
         c.mlirDialectHandleInsertDialect(c.mlirGetDialectHandle__arith__(), registry);
         c.mlirDialectHandleInsertDialect(c.mlirGetDialectHandle__shape__(), registry);
+        c.mlirDialectHandleInsertDialect(c.mlirGetDialectHandle__scf__(), registry);
+        c.mlirDialectHandleInsertDialect(c.mlirGetDialectHandle__tensor__(), registry);
 
         // 3. Append the configured registry to the context.
         std.debug.print("Appending registry to context...\n", .{});
@@ -227,8 +229,8 @@ pub const MLIRContext = struct {
         // 3. Optimize for minimal peak memory (critical for large backward graphs)
         try argv.append("--iree-stream-partitioning-favor=min-peak-memory");
 
-        // Note: f32 -> bf16 conversion is handled by ModelSanitizer.convertF32ToBF16
-        // before compilation, not via IREE flags
+        // 4. Cap individual allocs to 4GB to force tiling
+        try argv.append("--iree-stream-resource-max-allocation-size=4294967296");
 
         try argv.append("-o");
         try argv.append(temp_vmfb_path);

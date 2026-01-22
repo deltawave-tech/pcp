@@ -62,6 +62,12 @@ pub const c = struct {
     // Required for dynamic shape support in torch_mlir exports
     pub extern fn mlirGetDialectHandle__shape__() mlir_c.MlirDialectHandle;
 
+    // Tensor dialect handle for tensor.from_elements etc.
+    pub extern fn mlirGetDialectHandle__tensor__() mlir_c.MlirDialectHandle;
+
+    // Index type
+    pub const mlirIndexTypeGet = mlir_c.mlirIndexTypeGet;
+
     pub const mlirLocationUnknownGet = mlir_c.mlirLocationUnknownGet;
     pub const locationUnknownGet = mlir_c.mlirLocationUnknownGet;
     pub const mlirLocationFileLineColGet = mlir_c.mlirLocationFileLineColGet;

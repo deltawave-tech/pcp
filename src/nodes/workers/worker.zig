@@ -677,6 +677,10 @@ pub const Worker = struct {
         if (self.m_states == null) return error.OptimizerStateNotInitialized;
         if (self.v_states == null) return error.OptimizerStateNotInitialized;
 
+        self.timestep = 1.0;
+        for (self.m_states.?) |buf| @memset(buf, 0);
+        for (self.v_states.?) |buf| @memset(buf, 0);
+
         const payload = switch (msg.data) {
             .object => |obj| obj,
             else => return error.InvalidMessageFormat,

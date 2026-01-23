@@ -951,7 +951,6 @@ pub const Worker = struct {
 
                 // Get FULL batch (effective_batch_size samples)
                 const full_batch_size = micro_batch * accumulation_steps;
-                const full_data_shape = &[_]i64{ @intCast(full_batch_size), @intCast(block_size) };
 
                 const full_batch = try self.dataset.?.getBatch(full_batch_size, block_size);
                 defer full_batch.deinit();
@@ -965,10 +964,13 @@ pub const Worker = struct {
                     try grad_inputs.append(p);
                 }
 
-                // Add full batch data
-                const dev_input_ids = try iree_impl.moveToDevice(full_batch.inputs, full_data_shape, .i64);
+                // Reshape data to [Steps, MicroBatch, SeqLen] for efficient in-graph slicing
+                const folded_data_shape = &[_]i64{ @intCast(accumulation_steps), @intCast(micro_batch), @intCast(block_size) };
+
+                // Upload with the folded shape (same bytes, different shape descriptor)
+                const dev_input_ids = try iree_impl.moveToDevice(full_batch.inputs, folded_data_shape, .i64);
                 try grad_inputs.append(dev_input_ids);
-                const dev_targets = try iree_impl.moveToDevice(full_batch.targets, full_data_shape, .i64);
+                const dev_targets = try iree_impl.moveToDevice(full_batch.targets, folded_data_shape, .i64);
                 try grad_inputs.append(dev_targets);
 
                 // Call the accumulated gradient function (has internal loop)

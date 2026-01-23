@@ -223,13 +223,19 @@ pub const MLIRContext = struct {
         try argv.append("--iree-stream-resource-index-bits=64");
         try argv.append("--iree-input-demote-i64-to-i32=false");
 
-        // 2. Disable prefetching
+        // 2. Force aggressive fusion to merge func.call into SCF loop body
+        // NOTE: These flags cause MLIR domination errors when fusing into scf.for loops
+        // try argv.append("--iree-dispatch-creation-enable-aggressive-fusion");
+        // try argv.append("--iree-dispatch-creation-fuse-multi-use");
+        try argv.append("--iree-global-opt-propagate-transposes");
+
+        // 3. Disable prefetching
         try argv.append("--iree-llvmgpu-enable-prefetch=false");
 
-        // 3. Optimize for minimal peak memory (critical for large backward graphs)
+        // 4. Optimize for minimal peak memory (critical for large backward graphs)
         try argv.append("--iree-stream-partitioning-favor=min-peak-memory");
 
-        // 4. Cap individual allocs to 4GB to force tiling
+        // 5. Cap individual allocs to 4GB to force tiling
         try argv.append("--iree-stream-resource-max-allocation-size=4294967296");
 
         try argv.append("-o");

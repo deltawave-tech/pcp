@@ -488,19 +488,20 @@ pub const GraphBuilder = struct {
                 try func_input_types.append(f32_param_type);
             }
 
-            // Data inputs with FULL batch size (effective_batch = micro_batch * accumulation_steps)
+            // Data inputs reshaped to [Steps, MicroBatch, ...] for efficient slicing
             const num_forward_inputs = forward_fn_type.getNumInputs();
             for (num_params..num_forward_inputs) |i| {
                 const micro_type = forward_fn_type.getInput(i).as(mlir.RankedTensorType).?;
                 const micro_shape = try micro_type.getShape(allocator);
                 defer allocator.free(micro_shape);
 
-                var full_shape = try allocator.alloc(i64, micro_shape.len);
-                defer allocator.free(full_shape);
-                @memcpy(full_shape, micro_shape);
-                full_shape[0] = micro_batch_size * accumulation_steps;
+                // Reshape: [MicroBatch, Seq, ...] -> [Steps, MicroBatch, Seq, ...]
+                var folded_shape = std.ArrayList(i64).init(allocator);
+                defer folded_shape.deinit();
+                try folded_shape.append(accumulation_steps);
+                for (micro_shape) |d| try folded_shape.append(d);
 
-                const full_type = mlir.Type.rankedTensorType(builder.ctx, full_shape, micro_type.getElementType());
+                const full_type = mlir.Type.rankedTensorType(builder.ctx, folded_shape.items, micro_type.getElementType());
                 try func_input_types.append(full_type);
             }
 
@@ -613,11 +614,9 @@ pub const GraphBuilder = struct {
             const iv = body_args[0];
             const current_accs = body_args[1..];
 
-            // Compute slice offset: iv * micro_batch_size
-            const mb_const = try ops.indexConstant(builder, micro_batch_size);
-            const offset_idx = try ops.indexMul(builder, iv, mb_const);
-            const offset_i64 = try ops.indexToI64(builder, offset_idx);
-            const offset_tensor = try ops.scalarToTensor0D(builder, offset_i64);
+            // Convert IV to i64 for dynamic_slice (0D tensor)
+            const iv_i64 = try ops.indexToI64(builder, iv);
+            const iv_tensor = try ops.scalarToTensor0D(builder, iv_i64);
             const zero_i64 = try ops.i64Constant(builder, 0);
             const zero_tensor = try ops.scalarToTensor0D(builder, zero_i64);
 
@@ -634,23 +633,34 @@ pub const GraphBuilder = struct {
                 try call_operands.append(p_converted.value);
             }
 
-            // Slice data for this micro-batch
+            // Slice data for this micro-batch from folded [Steps, MicroBatch, ...] input
             for (num_params..num_forward_inputs) |i| {
                 const data_idx = i - num_params;
                 const micro_type = forward_fn_type.getInput(i).as(mlir.RankedTensorType).?;
                 const micro_shape = try micro_type.getShape(allocator);
                 defer allocator.free(micro_shape);
 
-                // Build start indices: [offset, 0, 0, ...] (must be 0D tensors for stablehlo.dynamic_slice)
+                // Build start indices: [iv, 0, 0, ...] for folded input
+                // Folded input has rank = micro_shape.len + 1 (Steps dimension prepended)
                 var start_indices = std.ArrayList(mlir.Value).init(allocator);
                 defer start_indices.deinit();
-                try start_indices.append(offset_tensor);
-                for (1..micro_shape.len) |_| {
+                try start_indices.append(iv_tensor);
+                for (0..micro_shape.len) |_| {
                     try start_indices.append(zero_tensor);
                 }
 
-                const sliced = try ops.dynamicSlice(builder, full_data_in[data_idx], start_indices.items, micro_shape);
-                try call_operands.append(sliced);
+                // Slice sizes: [1, micro_batch, seq_len, ...]
+                var slice_sizes = std.ArrayList(i64).init(allocator);
+                defer slice_sizes.deinit();
+                try slice_sizes.append(1);
+                for (micro_shape) |d| try slice_sizes.append(d);
+
+                // Slice [1, MicroBatch, Seq, ...] from [Steps, MicroBatch, Seq, ...]
+                const sliced_folded = try ops.dynamicSlice(builder, full_data_in[data_idx], start_indices.items, slice_sizes.items);
+
+                // Reshape [1, MicroBatch, Seq, ...] -> [MicroBatch, Seq, ...] to match function signature
+                const reshaped_slice = try ops.reshape(builder, try builder.newTensor(sliced_folded), micro_shape);
+                try call_operands.append(reshaped_slice.value);
             }
 
             // Add loss gradient (1.0)

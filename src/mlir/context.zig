@@ -185,11 +185,11 @@ pub const MLIRContext = struct {
             // register spilling/hangs (Status 10).
             if (std.mem.indexOf(u8, arch, "gfx11") != null) {
                 // 1. Disable software pipelining (Verified in IREE help output)
-                // try argv.append("--iree-llvmgpu-enable-prefetch=false");
+                try argv.append("--iree-llvmgpu-enable-prefetch=false");
 
                 // 2. Aggressively limit waves per EU to 1
                 // This forces minimal register usage to prevent spills on Wave32 arch.
-                // try argv.append("--iree-hip-waves-per-eu=1");
+                try argv.append("--iree-hip-waves-per-eu=1");
             }
         } else if (is_cuda) {
             // Default to sm_80 (A100) if not specified for CUDA

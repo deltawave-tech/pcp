@@ -50,6 +50,20 @@ pub const WorkerConfig = struct {
     }
 };
 
+pub const WorkerConfigContext = struct {
+    pub fn hash(self: @This(), key: WorkerConfig) u64 {
+        _ = self;
+        var hasher = std.hash.Wyhash.init(0);
+        key.hash(&hasher);
+        return hasher.final();
+    }
+
+    pub fn eql(self: @This(), a: WorkerConfig, b: WorkerConfig) bool {
+        _ = self;
+        return a.eql(b);
+    }
+};
+
 /// Represents a connected worker
 pub const WorkerConnection = struct {
     node_id: NodeId,
@@ -127,7 +141,7 @@ pub const Shepherd = struct {
     is_running: bool,
     algorithm: ?*training_algorithm.TrainingAlgorithm, // Training algorithm interface
     executor: ?Executor, // Generic execution backend for algorithms
-    compiled_artifacts: std.HashMap(WorkerConfig, []const u8, std.hash_map.AutoContext(WorkerConfig), std.hash_map.default_max_load_percentage), // Cache: WorkerConfig -> VMFB bytes
+    compiled_artifacts: std.HashMap(WorkerConfig, []const u8, WorkerConfigContext, std.hash_map.default_max_load_percentage),
     // Message queue for collecting worker results
     result_queue: ArrayList(MessageEnvelope),
     result_queue_mutex: std.Thread.Mutex,
@@ -155,7 +169,7 @@ pub const Shepherd = struct {
             .is_running = false,
             .algorithm = null,
             .executor = null,
-            .compiled_artifacts = std.HashMap(WorkerConfig, []const u8, std.hash_map.AutoContext(WorkerConfig), std.hash_map.default_max_load_percentage).init(allocator),
+            .compiled_artifacts = std.HashMap(WorkerConfig, []const u8, WorkerConfigContext, std.hash_map.default_max_load_percentage).init(allocator),
             .result_queue = ArrayList(MessageEnvelope).init(allocator),
             .result_queue_mutex = std.Thread.Mutex{},
             .data_manager = null, // Initialized when training starts
@@ -842,7 +856,7 @@ pub const Shepherd = struct {
         data_input_shapes: [][]i64,
     ) !void {
         // 1. Identify unique configs that need compilation
-        var config_set = std.HashMap(WorkerConfig, void, std.hash_map.AutoContext(WorkerConfig), std.hash_map.default_max_load_percentage).init(self.allocator);
+        var config_set = std.HashMap(WorkerConfig, void, WorkerConfigContext, std.hash_map.default_max_load_percentage).init(self.allocator);
         defer config_set.deinit();
 
         self.worker_pool_mutex.lock();

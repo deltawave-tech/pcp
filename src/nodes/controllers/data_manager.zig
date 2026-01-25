@@ -110,6 +110,8 @@ pub const DataManager = struct {
                 // Recursively call to get a chunk from the new epoch
                 return self.assignNextChunk(worker_id);
             } else {
+                // Increment past max_epochs to signal completion to shouldStop()
+                self.current_epoch += 1;
                 std.log.info("DataManager: All epochs ({}) completed.", .{self.max_epochs});
                 return null; // Training finished
             }

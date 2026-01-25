@@ -50,13 +50,19 @@ pub const MLIRContext = struct {
         const context = c.contextCreate();
         c.contextSetAllowUnregisteredDialects(context, true);
 
-        // Register StableHLO dialect explicitly (external dialect, needs CAPI registration)
+        // Register all required dialects explicitly
+        // These are defined in pass_anchors.cpp since libIREECompiler doesn't export them
         const registry = c.dialectRegistryCreate();
         defer c.dialectRegistryDestroy(registry);
+        c.mlirDialectHandleInsertDialect(c.mlirGetDialectHandle__func__(), registry);
         c.mlirDialectHandleInsertDialect(c.mlirGetDialectHandle__stablehlo__(), registry);
+        c.mlirDialectHandleInsertDialect(c.mlirGetDialectHandle__arith__(), registry);
+        c.mlirDialectHandleInsertDialect(c.mlirGetDialectHandle__shape__(), registry);
+        c.mlirDialectHandleInsertDialect(c.mlirGetDialectHandle__scf__(), registry);
+        c.mlirDialectHandleInsertDialect(c.mlirGetDialectHandle__tensor__(), registry);
         c.contextAppendDialectRegistry(context, registry);
 
-        // Load all available dialects (core MLIR dialects from libIREECompiler)
+        // Load all registered dialects
         c.contextLoadAllAvailableDialects(context);
 
         std.debug.print("Checking if stablehlo.constant operation is registered...\n", .{});

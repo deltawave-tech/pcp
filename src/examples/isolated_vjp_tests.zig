@@ -50,7 +50,7 @@ pub const ExecutionHelper = struct {
         var mlir_context = try mlir_ctx.MLIRContext.init(self.allocator);
         defer mlir_context.deinit();
 
-        const backend = backend_selection.Backend.cuda;
+        const backend = backend_selection.Backend.metal;
 
         // Serialize the MLIR module to a string first
         const mlir_source = try mlir_ctx.serializeMLIRModule(self.allocator, module);

@@ -28,8 +28,8 @@ pub const RolloutData = struct {
 pub const RLShepherd = struct {
     base: Shepherd, // Composition
 
-    // Weight management
-    weight_buffer: ?[]align(4096) u8, // Raw weight file buffer (page-aligned for mmap)
+    // Weight management (alignment must match system page size for mmap)
+    weight_buffer: ?[]align(std.mem.page_size) u8,
     master_parameters: ?[][]const u8, // Sliced parameter tensors (trainable only)
     parameter_shapes: ?[][]const i64, // Shapes for each trainable parameter
     buffer_shapes: ?[][]const i64, // Shapes for non-trainable buffers (e.g., rope constants)

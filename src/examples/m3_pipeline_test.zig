@@ -55,7 +55,7 @@ pub fn main() !void {
     std.debug.print("✓ Compiled to VMFB artifact ({} bytes)\n", .{vmfb_binary.len});
 
     // 4. Initialize the correct IREE runtime backend
-    var iree_backend = try IreeBackend.init(allocator, target_backend);
+    var iree_backend = try IreeBackend.init(allocator, target_backend, 0);
     defer iree_backend.deinit();
     std.debug.print("✓ Initialized IREE runtime for {s}\n", .{target_backend.toString()});
 

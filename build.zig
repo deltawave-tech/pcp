@@ -342,9 +342,7 @@ fn addIreeDependencies(target: *std.Build.Step.Compile, b: *std.Build, iree_conf
     // FlatCC Dependency
     target.linkSystemLibrary("flatcc_parsing");
 
-    // MLIR libraries needed for the dialect registration in pass_anchors
-    target.linkSystemLibrary("MLIRFuncDialect");
-    target.linkSystemLibrary("MLIRArithDialect");
+    // StableHLO (external dialect, not in core MLIR)
     target.linkSystemLibrary("StablehloOps");
 
     // IREE HAL driver initialization (enables use_all_available_drivers)
@@ -356,9 +354,23 @@ fn addIreeDependencies(target: *std.Build.Step.Compile, b: *std.Build, iree_conf
 
     // Platform-specific GPU drivers
     if (target.root_module.resolved_target.?.result.os.tag == .macos) {
-        // Metal driver for macOS (M3)
+        // Metal driver for macOS
+        target.addLibraryPath(.{ .cwd_relative = b.fmt("{s}/runtime/src/iree/hal/drivers/metal", .{build_dir}) });
+        target.addLibraryPath(.{ .cwd_relative = b.fmt("{s}/runtime/src/iree/hal/drivers/metal/registration", .{build_dir}) });
+        target.addLibraryPath(.{ .cwd_relative = b.fmt("{s}/runtime/src/iree/hal/drivers/metal/builtin", .{build_dir}) });
+        target.addLibraryPath(.{ .cwd_relative = b.fmt("{s}/third_party/spirv_cross", .{build_dir}) });
         target.linkSystemLibrary("iree_hal_drivers_metal_metal");
+        target.linkSystemLibrary("iree_hal_drivers_metal_builtin_builtin");
+        target.linkSystemLibrary("spirv-cross-msl");
+        target.linkSystemLibrary("spirv-cross-core");
+
+        // Force include Metal driver registration symbol to prevent linker from stripping it
+        // The drivers lib references this symbol but the linker may strip it as "unused"
+        target.forceUndefinedSymbol("_iree_hal_metal_driver_module_register");
         target.linkSystemLibrary("iree_hal_drivers_metal_registration_registration");
+        target.root_module.addRPathSpecial("@executable_path");
+        target.linkSystemLibrary("objc");
+
         target.linkFramework("Foundation");
         target.linkFramework("Metal");
         target.linkFramework("CoreGraphics");

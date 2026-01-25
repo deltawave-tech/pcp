@@ -22,13 +22,18 @@ const mlir = @import("../mlir/wrapper.zig");
 const pcp = @import("../main.zig");
 const DType = pcp.tensor.DType;
 
-// Helper to check for IREE errors
+fn getStderr() [*c]c.FILE {
+    if (comptime @import("builtin").os.tag == .macos) {
+        return c.__stderrp;
+    } else {
+        return c.stderr;
+    }
+}
+
 fn ireeCheck(status: c.iree_status_t) !void {
-    // In IREE, null status indicates success, non-null indicates error
     if (status != null) {
         std.debug.print("\n======== IREE RUNTIME ERROR ========\n", .{});
-        // Use iree_status_fprint for full error output including annotations
-        c.iree_status_fprint(c.stderr, status);
+        c.iree_status_fprint(getStderr(), status);
         std.debug.print("====================================\n\n", .{});
         c.iree_status_free(status);
         return error.IreeRuntimeError;
@@ -105,7 +110,7 @@ pub const IreeBackend = struct {
         // 2. Create device using HAL driver API for proper device selection
         const driver_name = backend.toIreeDriverName();
 
-        if (backend == .cuda or backend == .rocm) {
+        if (backend == .cuda or backend == .rocm or backend == .metal) {
             // For GPU backends, use the HAL driver API to select specific device by ordinal
             std.log.info("Creating {s} device with ordinal {}", .{ backend.toString(), device_id });
 
@@ -118,12 +123,18 @@ pub const IreeBackend = struct {
 
             // Create the driver
             var driver: ?*c.iree_hal_driver_t = null;
-            try ireeCheck(c.iree_hal_driver_registry_try_create(
+            const create_result = c.iree_hal_driver_registry_try_create(
                 registry.?,
                 c.iree_string_view_t{ .data = driver_name.ptr, .size = driver_name.len },
                 c.iree_allocator_system(),
                 &driver,
-            ));
+            );
+            if (create_result != null) {
+                std.log.err("Failed to create {s} driver. The driver may not be registered.", .{driver_name});
+                std.log.err("Make sure the Metal HAL driver is linked correctly.", .{});
+                c.iree_status_free(create_result);
+                return error.DriverCreationFailed;
+            }
             defer if (driver) |d| c.iree_hal_driver_release(d);
 
             // Create device by ordinal (0, 1, 2, ... for each GPU)
@@ -138,7 +149,7 @@ pub const IreeBackend = struct {
 
             std.log.info("Successfully created device {} for {s} backend", .{ device_id, backend.toString() });
         } else {
-            // For CPU and other backends, use default device
+            // For CPU backends, use default device
             std.log.info("Creating default device for {s} backend", .{backend.toString()});
             try ireeCheck(c.iree_runtime_instance_try_create_default_device(
                 self.instance.?,

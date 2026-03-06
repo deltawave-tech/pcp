@@ -190,6 +190,11 @@ pub const MessageType = struct {
     // Chunked Data Transfer Protocol (for large models > Cap'n Proto limits)
     pub const WEIGHT_CHUNK = "WeightChunk"; // Shepherd -> Worker: { chunk_index, total_chunks, total_bytes, data: "base64..." }
     pub const UPDATE_CHUNK = "UpdateChunk"; // Worker -> Shepherd: { chunk_index, total_chunks, total_bytes, data: "base64...", loss }
+
+    // Streaming DiLoCo Protocol
+    pub const START_STREAMING_LOOP = "StartStreamingLoop"; // Shepherd -> Worker: "Start continuous streaming mode"
+    pub const FRAGMENT_UPDATE = "FragmentUpdate"; // Worker -> Shepherd: "Here is the gradient delta for fragment P"
+    pub const FRAGMENT_READY = "FragmentReady";   // Shepherd -> Worker: "Here are the merged global weights for fragment P"
 };
 
 pub const MessageHandler = *const fn (MessageEnvelope) anyerror!void;

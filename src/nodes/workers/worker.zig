@@ -1535,16 +1535,30 @@ pub const Worker = struct {
                 return error.InsufficientParameterData;
             }
 
-            // Extract parameter slice
+            // Extract parameter slice and convert to f32 (same as regular DiLoCo path)
             const param_bytes = decoded[param_offset .. param_offset + size];
             param_offset += size;
 
-            // Upload to device
-            device_params[i] = try iree_impl.moveToDevice(param_bytes, shape, .f32);
+            const f32_size = elem_count * 4;
+            const f32_buf = try self.allocator.alloc(u8, f32_size);
+            defer self.allocator.free(f32_buf);
 
-            // Create snapshot for delta computation
-            self.tensor_snapshots.?[i] = try self.allocator.alloc(u8, size);
-            @memcpy(self.tensor_snapshots.?[i], param_bytes);
+            if (bytes_per_element == 2) {
+                // bf16 -> f32 conversion
+                const dest = std.mem.bytesAsSlice(f32, f32_buf);
+                for (0..elem_count) |k| {
+                    const u16_val = std.mem.readInt(u16, param_bytes[k * 2 ..][0..2], .little);
+                    dest[k] = @bitCast(@as(u32, u16_val) << 16);
+                }
+            } else {
+                @memcpy(f32_buf, param_bytes);
+            }
+
+            // Upload f32 data to device (MLIR pipeline works in f32)
+            device_params[i] = try iree_impl.moveToDevice(f32_buf, shape, .f32);
+
+            // Create snapshot as f32 (matches what readToHost returns after optimizer)
+            self.tensor_snapshots.?[i] = try self.allocator.dupe(u8, f32_buf);
         }
         std.log.info("Worker {}: Successfully initialized all parameters", .{self.node_id.?});
 
@@ -1735,6 +1749,7 @@ pub const Worker = struct {
         var updates = std.json.Array.init(arena.allocator());
 
         // Iterate over all tensors belonging to this fragment (strided assignment)
+        // Device params and snapshots are always f32 (MLIR pipeline works in f32)
         for (param_shapes, 0..) |shape, i| {
             if (i % self.num_fragments != fragment_id) continue;
 
@@ -1752,7 +1767,6 @@ pub const Worker = struct {
             var delta_f32 = try arena.allocator().alloc(f32, elem_count);
             for (0..elem_count) |idx| {
                 delta_f32[idx] = snapshot_f32[idx] - current_f32[idx];
-                // Update snapshot for next sync
                 snapshot_f32[idx] = current_f32[idx];
             }
 
@@ -1833,7 +1847,7 @@ pub const Worker = struct {
             defer self.allocator.free(global_bytes);
             try std.base64.standard.Decoder.decode(global_bytes, data_b64);
 
-            // Download current weights from device
+            // Download current weights from device (always f32)
             const current_bytes = try iree_impl.readToHost(device_params.*[tensor_idx]);
             defer self.allocator.free(current_bytes);
 
@@ -1842,10 +1856,10 @@ pub const Worker = struct {
             const global_f32 = std.mem.bytesAsSlice(f32, global_bytes);
             const blended = try self.allocator.alloc(u8, current_bytes.len);
             defer self.allocator.free(blended);
-
             const blended_f32 = std.mem.bytesAsSlice(f32, blended);
-            for (0..current_f32.len) |i| {
-                blended_f32[i] = self.alpha * current_f32[i] + (1.0 - self.alpha) * global_f32[i];
+
+            for (0..current_f32.len) |idx| {
+                blended_f32[idx] = self.alpha * current_f32[idx] + (1.0 - self.alpha) * global_f32[idx];
             }
 
             // Upload blended weights back to device

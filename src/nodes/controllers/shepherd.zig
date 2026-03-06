@@ -427,6 +427,12 @@ pub const Shepherd = struct {
                     std.log.err("CRITICAL: Failed to queue rollout result from worker {}: {s}", .{ worker_id, @errorName(err) });
                     return err;
                 };
+            } else if (std.mem.eql(u8, msg.msg_type, MessageType.FRAGMENT_UPDATE)) {
+                // Queue fragment update for StreamingDiLoCo to collect
+                self.handleInnerLoopComplete(worker_id, msg) catch |err| {
+                    std.log.err("CRITICAL: Failed to queue fragment update from worker {}: {s}", .{ worker_id, @errorName(err) });
+                    return err;
+                };
             } else {
                 std.log.warn("Unknown message type from worker {}: {s}", .{ worker_id, msg.msg_type });
             }

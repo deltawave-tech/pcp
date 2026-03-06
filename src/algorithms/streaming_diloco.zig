@@ -127,7 +127,7 @@ pub const StreamingDiLoCo = struct {
         });
         try host_opt.initParameters(parameter_shapes);
 
-        // Allocate master parameters
+        // Allocate master parameters (always f32, matching the MLIR pipeline)
         var master_raw = try allocator.alloc([]u8, parameter_shapes.len);
         var rng = std.Random.DefaultPrng.init(12345);
 
@@ -135,27 +135,13 @@ pub const StreamingDiLoCo = struct {
             var elem_count: usize = 1;
             for (shape) |dim| elem_count *= @intCast(dim);
 
-            const bytes_per_element = config.dtype.sizeInBytes();
-            master_raw[i] = try allocator.alloc(u8, elem_count * bytes_per_element);
+            master_raw[i] = try allocator.alloc(u8, elem_count * 4);
+            const dest = std.mem.bytesAsSlice(f32, master_raw[i]);
 
             // GPT-2 Standard Initialization: Fixed 0.02 stddev
             const scale: f32 = 0.02;
             for (0..elem_count) |j| {
-                const value = rng.random().floatNorm(f32) * scale;
-                const offset = j * bytes_per_element;
-
-                switch (config.dtype) {
-                    .f32 => std.mem.writeInt(u32, master_raw[i][offset..][0..4], @bitCast(value), .little),
-                    .f16 => {
-                        const f16_val: f16 = @floatCast(value);
-                        std.mem.writeInt(u16, master_raw[i][offset..][0..2], @bitCast(f16_val), .little);
-                    },
-                    .bf16 => {
-                        const bf16_bits: u16 = @truncate(@as(u32, @bitCast(value)) >> 16);
-                        std.mem.writeInt(u16, master_raw[i][offset..][0..2], bf16_bits, .little);
-                    },
-                    else => return error.UnsupportedDtype,
-                }
+                dest[j] = rng.random().floatNorm(f32) * scale;
             }
         }
 
@@ -323,12 +309,10 @@ pub const StreamingDiLoCo = struct {
                 val.* /= divisor;
             }
 
-            // 2. Fetch master parameters (Convert bytes to f32 if needed based on dtype)
+            // 2. Fetch master parameters (already f32)
             const master_raw = self.master_param_raw_data[tensor_idx];
             const master_f32 = try self.allocator.alloc(f32, acc_buffer.len);
             defer self.allocator.free(master_f32);
-
-            // (Mocking the conversion: assuming f32 for this step)
             @memcpy(master_f32, std.mem.bytesAsSlice(f32, master_raw));
 
             // 3. Apply Nesterov Update (in-place modifies master_f32)

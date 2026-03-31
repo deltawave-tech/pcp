@@ -51,3 +51,6 @@ models/qwen_rl_generation.mlir
 # Nix artifacts
 result
 build*.log
+
+# Local working notes
+NOTES.md

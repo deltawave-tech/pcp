@@ -111,6 +111,7 @@ const Args = struct {
     rl_mode: bool,
     no_dashboard: bool,
     terminate: bool,
+    streaming_mode: bool,
     child_args: std.ArrayList([]const u8),
 
     const Mode = enum {
@@ -140,6 +141,7 @@ const Args = struct {
                 .rl_mode = false,
                 .no_dashboard = false,
                 .terminate = false,
+                .streaming_mode = false,
                 .child_args = child_args_list,
             };
         }
@@ -160,6 +162,7 @@ const Args = struct {
         var rl_mode: bool = false;
         var no_dashboard: bool = false;
         var terminate: bool = false;
+        var streaming_mode: bool = false;
 
         var i: usize = 1;
         while (i < args.len) {
@@ -254,6 +257,8 @@ const Args = struct {
                 no_dashboard = true;
             } else if (std.mem.eql(u8, args[i], "--terminate")) {
                 terminate = true;
+            } else if (std.mem.eql(u8, args[i], "--streaming")) {
+                streaming_mode = true;
             } else if (std.mem.eql(u8, args[i], "--supervise")) {
                 supervise = true;
                 i += 1;
@@ -282,6 +287,7 @@ const Args = struct {
             .rl_mode = rl_mode,
             .no_dashboard = no_dashboard,
             .terminate = terminate,
+            .streaming_mode = streaming_mode,
             .child_args = child_args_list,
         };
     }
@@ -303,6 +309,7 @@ const Args = struct {
         print("  --rl                 Enable RL mode with GRPO algorithm (Shepherd only)\n", .{});
         print("  --no-dashboard       Disable TUI dashboard for clean log output (Shepherd only)\n", .{});
         print("  --terminate          Auto-terminate shepherd when training completes\n", .{});
+        print("  --streaming          Enable Streaming DiLoCo mode for asynchronous fragment updates\n", .{});
         print("  --backend <type>     Backend to use: cpu, cuda, metal, vulkan, rocm (default: auto)\n", .{});
         print("  --target <arch>      GPU target architecture (e.g., gfx942 for MI300X, sm_80 for A100)\n", .{});
         print("  --device-id <id>     GPU device ID to use (default: 0, for multi-GPU nodes)\n", .{});
@@ -545,14 +552,51 @@ fn runShepherd(allocator: Allocator, args: Args) !void {
         print("   Model: {s}\n", .{diloco_config.model_mlir_path});
     }
 
-    print("Initializing DiLoCo algorithm...\n", .{});
-    // This will trigger Autodiff -> Compilation
-    var diloco_algo = try DiLoCo.init(allocator, shepherd_controller, diloco_config, system.executor, &mlir_builder);
-    defer diloco_algo.deinit();
-    print("🌙 DiLoCo algorithm initialized successfully\n", .{});
+    var diloco_algo: DiLoCo = undefined;
+    var streaming_algo: @import("algorithms/streaming_diloco.zig").StreamingDiLoCo = undefined;
+    var training_algo: training_algorithm.TrainingAlgorithm = undefined;
 
-    var training_algo = diloco_algo.asTrainingAlgorithm();
+    if (args.streaming_mode) {
+        print("Initializing StreamingDiLoCo algorithm...\n", .{});
+        const stream_config = @import("algorithms/streaming_diloco.zig").StreamingDiLoCoConfig{
+            .num_fragments = 4,
+            .inner_steps = exp_config.tau,
+            .overlap_tau = 1,
+            .alpha = 0.5,
+            .learning_rate = exp_config.learning_rate,
+            .nesterov_momentum = exp_config.nesterov_momentum,
+            .max_epochs = exp_config.max_epochs,
+            .model_mlir_path = exp_config.model_path,
+            .data_path = exp_config.data_path,
+            .tokenizer_type = exp_config.tokenizer,
+            .sampling_type = exp_config.sampling,
+            .dtype = diloco_config.dtype,
+        };
+
+        streaming_algo = try @import("algorithms/streaming_diloco.zig").StreamingDiLoCo.init(
+            allocator,
+            shepherd_controller,
+            stream_config,
+            &mlir_builder
+        );
+        training_algo = streaming_algo.asTrainingAlgorithm();
+        print("🌊 StreamingDiLoCo initialized successfully\n", .{});
+    } else {
+        print("Initializing Standard DiLoCo algorithm...\n", .{});
+        diloco_algo = try DiLoCo.init(allocator, shepherd_controller, diloco_config, system.executor, &mlir_builder);
+        training_algo = diloco_algo.asTrainingAlgorithm();
+        print("🌙 DiLoCo algorithm initialized successfully\n", .{});
+    }
+
     shepherd_controller.setAlgorithm(&training_algo);
+
+    defer {
+        if (args.streaming_mode) {
+            streaming_algo.deinit();
+        } else {
+            diloco_algo.deinit();
+        }
+    }
 
     // Start listening for workers in a separate thread
     const listen_thread = try std.Thread.spawn(.{}, shepherdListenThread, .{ shepherd_controller, args.host, args.port });

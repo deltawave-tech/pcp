@@ -23,6 +23,7 @@ pub const controllers = struct {
 pub const worker = @import("nodes/workers/worker.zig");
 pub const algorithms = struct {
     pub const diloco = @import("algorithms/diloco.zig");
+    pub const streaming_diloco = @import("algorithms/streaming_diloco.zig");
 };
 
 // Models

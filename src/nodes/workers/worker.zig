@@ -23,6 +23,10 @@ const NodeId = message.NodeId;
 const WorkerBackend = worker_backend.WorkerBackend;
 const Dataset = dataset_mod.Dataset;
 
+const FragmentKey = struct {
+    fragment_id: usize,
+    fragment_round: usize,
+};
 
 /// Worker state
 pub const WorkerState = enum {
@@ -79,6 +83,28 @@ pub const Worker = struct {
     expected_chunks: usize,
     received_chunks: usize,
 
+    // Streaming DiLoCo State
+    streaming_mode: bool,
+    current_step: usize,
+    num_fragments: usize,
+    inner_steps: usize, // H
+    overlap_tau: usize, // tau
+    alpha: f32,
+
+    // Snapshots of parameters to compute Delta = Snapshot - Current
+    // We store a snapshot for every tensor. We only update the ones for fragment P when P syncs.
+    tensor_snapshots: ?[][]u8,
+
+    // Async I/O State for Streaming DiLoCo
+    tx_queue: std.ArrayList(message.MessageEnvelope),
+    tx_mutex: std.Thread.Mutex,
+    tx_cond: std.Thread.Condition,
+
+    // Stores out-of-order fragment responses until the compute loop needs them.
+    rx_map: std.AutoHashMap(FragmentKey, message.MessageEnvelope),
+    rx_mutex: std.Thread.Mutex,
+    rx_cond: std.Thread.Condition,
+
     const Self = @This();
 
     pub fn init(allocator: Allocator, backend: WorkerBackend, supervisor_id: ?i64) !Self {
@@ -109,6 +135,20 @@ pub const Worker = struct {
             .incoming_weight_buffer = null,
             .expected_chunks = 0,
             .received_chunks = 0,
+            .streaming_mode = false,
+            .current_step = 0,
+            .num_fragments = 4,
+            .inner_steps = 100,
+            .overlap_tau = 1,
+            .alpha = 0.5,
+            .tensor_snapshots = null,
+            // Async I/O State for Streaming DiLoCo
+            .tx_queue = std.ArrayList(message.MessageEnvelope).init(allocator),
+            .tx_mutex = std.Thread.Mutex{},
+            .tx_cond = std.Thread.Condition{},
+            .rx_map = std.AutoHashMap(FragmentKey, message.MessageEnvelope).init(allocator),
+            .rx_mutex = std.Thread.Mutex{},
+            .rx_cond = std.Thread.Condition{},
         };
     }
     
@@ -160,6 +200,22 @@ pub const Worker = struct {
         if (self.incoming_weight_buffer) |*buf| {
             buf.deinit();
         }
+
+        // Cleanup tensor snapshots (streaming mode)
+        if (self.tensor_snapshots) |snapshots| {
+            for (snapshots) |s| self.allocator.free(s);
+            self.allocator.free(snapshots);
+        }
+
+        // Cleanup async I/O queues
+        for (self.tx_queue.items) |*msg| msg.deinitClone(self.allocator);
+        self.tx_queue.deinit();
+
+        var rx_it = self.rx_map.iterator();
+        while (rx_it.next()) |entry| {
+            entry.value_ptr.*.deinitClone(self.allocator);
+        }
+        self.rx_map.deinit();
 
         // Cleanup device-resident buffers
         if (self.device_weights) |weights| {
@@ -264,6 +320,8 @@ pub const Worker = struct {
                 try self.handleWeightChunk(msg);
             } else if (std.mem.eql(u8, msg.msg_type, MessageType.START_INNER_LOOP)) {
                 try self.handleStartInnerLoop(msg);
+            } else if (std.mem.eql(u8, msg.msg_type, MessageType.START_STREAMING_LOOP)) {
+                try self.handleStartStreamingLoop(msg);
             } else if (std.mem.eql(u8, msg.msg_type, MessageType.START_ROLLOUT)) {
                 try self.handleStartRollout(msg);
             } else if (std.mem.eql(u8, msg.msg_type, MessageType.UPDATE_WEIGHTS)) {
@@ -1302,6 +1360,673 @@ pub const Worker = struct {
         try self.client.send(response);
         self.state = .connected;
     }
+
+    /// Background Thread: Empties the Tx Queue and sends to Shepherd
+    fn txLoop(self: *Self) void {
+        std.log.info("Worker {}: Tx Thread started.", .{self.node_id.?});
+        while (true) {
+            self.tx_mutex.lock();
+            while (self.tx_queue.items.len == 0 and self.is_running and self.streaming_mode) {
+                self.tx_cond.wait(&self.tx_mutex);
+            }
+            if (!self.is_running or !self.streaming_mode) {
+                self.tx_mutex.unlock();
+                break;
+            }
+            // Pop the oldest message
+            const msg = self.tx_queue.orderedRemove(0);
+            self.tx_mutex.unlock();
+
+            // Send over TCP (Blocking I/O happens here, off the compute thread!)
+            self.client.send(msg) catch |err| {
+                std.log.err("Worker {}: Tx Thread failed to send: {}", .{self.node_id.?, err});
+            };
+
+            // Free the cloned message now that it's sent
+            var msg_mut = msg;
+            msg_mut.deinitClone(self.allocator);
+        }
+    }
+
+    /// Background Thread: Listens to TCP and puts fragments into the Rx Map
+    fn rxLoop(self: *Self) void {
+        std.log.info("Worker {}: Rx Thread started.", .{self.node_id.?});
+        while (self.is_running) {
+            const res = self.client.receive() catch |err| {
+                if (self.is_running) {
+                    std.log.err("Worker {}: Rx Thread failed to receive: {}", .{self.node_id.?, err});
+                }
+                self.is_running = false;
+                self.rx_cond.broadcast(); // Wake up compute thread if it's waiting
+                break;
+            };
+
+            const msg = res.parsed.value;
+
+            if (std.mem.eql(u8, msg.msg_type, MessageType.FRAGMENT_READY)) {
+                const frag_id = @as(usize, @intCast(msg.data.object.get("fragment_id").?.integer));
+                const frag_round = @as(usize, @intCast(msg.data.object.get("fragment_round").?.integer));
+                const key = FragmentKey{
+                    .fragment_id = frag_id,
+                    .fragment_round = frag_round,
+                };
+
+                // We MUST clone the message because `res.parsed` relies on temporary `res.buffer`
+                if (msg.clone(self.allocator)) |msg_clone| {
+                    self.rx_mutex.lock();
+                    self.rx_map.put(key, msg_clone) catch |err| {
+                        std.log.err("Worker {}: Failed to put fragment in Rx Map: {}", .{self.node_id.?, err});
+                        var msg_clone_mut = msg_clone;
+                        msg_clone_mut.deinitClone(self.allocator);
+                    };
+                    self.rx_cond.broadcast(); // Wake up compute thread!
+                    self.rx_mutex.unlock();
+
+                    std.log.info("Worker {}: Network received Fragment {} round {}", .{
+                        self.node_id.?, frag_id, frag_round,
+                    });
+                } else |err| {
+                    std.log.err("Worker {}: Failed to clone FRAGMENT_READY: {}", .{self.node_id.?, err});
+                }
+            } else {
+                // If it's a shutdown or other async command, handle it
+                if (std.mem.eql(u8, msg.msg_type, MessageType.SHUTDOWN)) {
+                    self.handleShutdown(msg);
+                }
+            }
+
+            res.parsed.deinit();
+            self.allocator.free(res.buffer);
+        }
+    }
+
+    /// Handle START_STREAMING_LOOP message - implements continuous streaming DiLoCo
+    fn handleStartStreamingLoop(self: *Self, msg: MessageEnvelope) !void {
+        self.state = .training;
+        self.streaming_mode = true;
+        self.current_step = 0;
+        errdefer {
+            self.streaming_mode = false;
+            if (self.state == .training) {
+                self.state = .connected;
+            }
+        }
+
+        const vmfb = self.cached_vmfb orelse return error.GraphNotInitialized;
+        const param_shapes = self.cached_parameter_shapes orelse return error.ParameterShapesNotInitialized;
+        const data_shapes = self.cached_data_input_shapes orelse return error.DataShapesNotInitialized;
+
+        const payload = msg.data.object;
+        self.num_fragments = @intCast(payload.get("num_fragments").?.integer);
+        self.inner_steps = @intCast(payload.get("inner_steps").?.integer); // H
+        self.overlap_tau = @intCast(payload.get("overlap_tau").?.integer); // tau
+        self.alpha = @as(f32, @floatCast(payload.get("alpha").?.float));
+        const max_rounds: usize = @intCast(payload.get("max_rounds").?.integer);
+
+        const micro_batch: usize = @intCast(payload.get("micro_batch").?.integer);
+
+        const data_path = payload.get("data_path").?.string;
+        const offset: usize = @intCast(payload.get("offset").?.integer);
+        const length: usize = @intCast(payload.get("length").?.integer);
+        const chunk_id: usize = @intCast(payload.get("chunk_id").?.integer);
+        const tokenizer_type = payload.get("tokenizer").?.string;
+
+        // Check if using raw_params (chunked transfer) or base64
+        const use_raw_params = payload.get("raw_params") orelse std.json.Value{ .bool = false };
+        const initial_params_b64 = if (use_raw_params.bool)
+            null
+        else
+            payload.get("initial_params").?.string;
+
+        self.current_chunk_id = chunk_id;
+        if (self.dataset) |ds| ds.deinit();
+
+        if (std.mem.eql(u8, tokenizer_type, "byte")) {
+            const byte_ds = try loader.ByteTextDataset.initChunk(self.allocator, data_path, offset, length, @intCast(self.node_id.?));
+            self.dataset = byte_ds.asDataset();
+        } else if (std.mem.eql(u8, tokenizer_type, "char")) {
+            const char_ds = try loader.TextDataset.initChunk(self.allocator, data_path, offset, length, @intCast(self.node_id.?));
+            self.dataset = char_ds.asDataset();
+        } else if (std.mem.eql(u8, tokenizer_type, "u16")) {
+            const u16_ds = try loader.U16TokenDataset.initChunk(self.allocator, data_path, offset, length, @intCast(self.node_id.?));
+            self.dataset = u16_ds.asDataset();
+        } else {
+            return error.UnknownTokenizer;
+        }
+
+        std.log.info("Worker {}: Starting Continuous Streaming Loop. P={}, H={}, overlap={}", .{
+            self.node_id.?, self.num_fragments, self.inner_steps, self.overlap_tau
+        });
+
+        if (self.tensor_snapshots) |snapshots| {
+            for (snapshots) |snapshot| self.allocator.free(snapshot);
+            self.allocator.free(snapshots);
+            self.tensor_snapshots = null;
+        }
+        self.clearReceivedFragments();
+
+        // Get initial parameters (either from base64 or weight_blob)
+        var decoded: []u8 = undefined;
+        var should_free_decoded = false;
+
+        if (use_raw_params.bool) {
+            // Parameters were sent via chunked transfer, use weight_blob
+            decoded = self.weight_blob orelse return error.WeightBlobNotReceived;
+            std.log.info("Worker {}: Using weight_blob with {} bytes", .{self.node_id.?, decoded.len});
+        } else {
+            // Parameters sent via base64 encoding
+            const decoded_size = try std.base64.standard.Decoder.calcSizeForSlice(initial_params_b64.?);
+            decoded = try self.allocator.alloc(u8, decoded_size);
+            should_free_decoded = true;
+            try std.base64.standard.Decoder.decode(decoded, initial_params_b64.?);
+            std.log.info("Worker {}: Decoded {} bytes from base64", .{self.node_id.?, decoded.len});
+        }
+        defer if (should_free_decoded) self.allocator.free(decoded);
+
+        // Initialize device parameters
+        const iree_impl: *IreeBackend = @ptrCast(@alignCast(self.backend.ptr));
+        var device_params = try self.allocator.alloc(IreeBackend.DeviceBuffer, param_shapes.len);
+        defer {
+            for (device_params) |buf| buf.release();
+            self.allocator.free(device_params);
+        }
+
+        // Upload initial parameters and create snapshots
+        std.log.info("Worker {}: Initializing {} parameters", .{self.node_id.?, param_shapes.len});
+        self.tensor_snapshots = try self.allocator.alloc([]u8, param_shapes.len);
+
+        // Determine the dtype size from the payload (default to f32 if not specified)
+        const dtype_str = payload.get("dtype");
+        const bytes_per_element: usize = if (dtype_str) |dt| blk: {
+            if (std.mem.eql(u8, dt.string, "bf16")) {
+                break :blk 2;
+            } else if (std.mem.eql(u8, dt.string, "f16")) {
+                break :blk 2;
+            } else {
+                break :blk 4; // f32
+            }
+        } else 4; // default to f32
+
+        var param_offset: usize = 0;
+        for (param_shapes, 0..) |shape, i| {
+            var elem_count: usize = 1;
+            for (shape) |dim| elem_count *= @intCast(dim);
+            const size = elem_count * bytes_per_element;
+
+            // Check if we have enough data remaining
+            if (param_offset + size > decoded.len) {
+                std.log.err("Worker {}: Parameter {} requires {} bytes but only {} available (offset={})", .{
+                    self.node_id.?, i, size, decoded.len - param_offset, param_offset
+                });
+                return error.InsufficientParameterData;
+            }
+
+            // Extract parameter slice and convert to f32 (same as regular DiLoCo path)
+            const param_bytes = decoded[param_offset .. param_offset + size];
+            param_offset += size;
+
+            const f32_size = elem_count * 4;
+            const f32_buf = try self.allocator.alloc(u8, f32_size);
+            defer self.allocator.free(f32_buf);
+
+            if (bytes_per_element == 2) {
+                // bf16 -> f32 conversion
+                const dest = std.mem.bytesAsSlice(f32, f32_buf);
+                for (0..elem_count) |k| {
+                    const u16_val = std.mem.readInt(u16, param_bytes[k * 2 ..][0..2], .little);
+                    dest[k] = @bitCast(@as(u32, u16_val) << 16);
+                }
+            } else {
+                @memcpy(f32_buf, param_bytes);
+            }
+
+            // Upload f32 data to device (MLIR pipeline works in f32)
+            device_params[i] = try iree_impl.moveToDevice(f32_buf, shape, .f32);
+
+            // Create snapshot as f32 (matches what readToHost returns after optimizer)
+            self.tensor_snapshots.?[i] = try self.allocator.dupe(u8, f32_buf);
+        }
+        std.log.info("Worker {}: Successfully initialized all parameters", .{self.node_id.?});
+
+        // Prepare optimizer states if needed
+        if (self.m_states == null) {
+            std.log.info("Worker {}: Initializing optimizer states", .{self.node_id.?});
+            try self.initializeOptimizerStates(param_shapes);
+            std.log.info("Worker {}: Optimizer states initialized", .{self.node_id.?});
+        }
+
+        const block_size: usize = @intCast(data_shapes[0][1]);
+        const data_shape = &[_]i64{ @intCast(micro_batch), @intCast(block_size) };
+        std.log.info("Worker {}: Data shape: [{}, {}]", .{self.node_id.?, micro_batch, block_size});
+
+        // Start the asynchronous Tx thread.
+        std.log.info("Worker {}: Starting streaming Tx thread", .{self.node_id.?});
+        const tx_thread = try std.Thread.spawn(.{}, txLoop, .{self});
+        defer {
+            self.tx_mutex.lock();
+            self.streaming_mode = false;
+            self.tx_cond.broadcast();
+            self.tx_mutex.unlock();
+            tx_thread.join();
+        }
+
+        // Allow time for the final fragment merge of the last fragment.
+        const last_fragment_offset = self.fragmentPhaseStart(self.num_fragments - 1);
+        const max_steps = max_rounds * self.inner_steps + last_fragment_offset + self.overlap_tau;
+        std.log.info("Worker {}: Entering main streaming loop (max_steps={}, max_rounds={})", .{
+            self.node_id.?, max_steps, max_rounds,
+        });
+        while (self.current_step < max_steps and self.is_running) {
+            self.current_step += 1;
+            const t = self.current_step;
+
+            std.log.info("Worker {}: Step {} starting", .{self.node_id.?, t});
+
+            // --- A. MERGE SCHEDULE (RECEIVE) ---
+            for (0..self.num_fragments) |p| {
+                const t_p = self.fragmentPhaseStart(p);
+                if (t > (t_p + self.overlap_tau)) {
+                    if ((t - t_p - self.overlap_tau) % self.inner_steps == 0) {
+                        const fragment_round = self.fragmentReceiveRound(p, t);
+                        if (fragment_round >= max_rounds) continue;
+                        std.log.info("Worker {}: Step {} - Receiving fragment {}", .{self.node_id.?, t, p});
+                        try self.receiveAndMergeFragment(p, fragment_round, &device_params);
+                    }
+                }
+            }
+
+            // --- B. COMPUTE ONE STEP ---
+            std.log.info("Worker {}: Step {} - Executing training step", .{self.node_id.?, t});
+            try self.executeOneTrainingStep(vmfb, &device_params, micro_batch, block_size, data_shape);
+
+            // --- C. SYNC SCHEDULE (SEND) ---
+            for (0..self.num_fragments) |p| {
+                const t_p = self.fragmentPhaseStart(p);
+                if (t > t_p and (t - t_p) % self.inner_steps == 0) {
+                    const fragment_round = self.fragmentSendRound(p, t);
+                    if (fragment_round >= max_rounds) continue;
+                    std.log.info("Worker {}: Step {} - Sending fragment {}", .{self.node_id.?, t, p});
+                    try self.extractAndSendFragment(p, fragment_round, device_params);
+                }
+            }
+        }
+
+        if (self.state == .training) {
+            self.state = .connected;
+        }
+        std.log.info("Worker {}: Streaming loop complete after {} steps", .{self.node_id.?, self.current_step});
+    }
+
+    /// Executes exactly one micro-batch step on the GPU
+    fn executeOneTrainingStep(self: *Self, vmfb: []const u8, device_params: *[]IreeBackend.DeviceBuffer, micro_batch: usize, block_size: usize, data_shape: *const [2]i64) !void {
+        const iree_impl: *IreeBackend = @ptrCast(@alignCast(self.backend.ptr));
+        const num_params = device_params.len;
+
+        // Get next batch of data
+        const batch = try self.dataset.?.getBatch(micro_batch, block_size);
+        defer batch.deinit();
+
+        // Prepare inputs for gradient computation
+        var grad_inputs = std.ArrayList(IreeBackend.DeviceBuffer).init(self.allocator);
+        defer grad_inputs.deinit();
+
+        for (device_params.*) |p| {
+            p.retain();
+            try grad_inputs.append(p);
+        }
+
+        const dev_input_ids = try iree_impl.moveToDevice(batch.inputs, data_shape, .i64);
+        try grad_inputs.append(dev_input_ids);
+        const dev_targets = try iree_impl.moveToDevice(batch.targets, data_shape, .i64);
+        try grad_inputs.append(dev_targets);
+
+        // Compute gradients
+        const grad_outputs = try iree_impl.executeWithDeviceBuffers(vmfb, "compute_gradients", grad_inputs.items);
+        defer {
+            for (grad_outputs) |buf| buf.release();
+            self.allocator.free(grad_outputs);
+        }
+
+        for (grad_inputs.items) |buf| buf.release();
+
+        // Validate gradient outputs
+        if (grad_outputs.len < num_params + 1) {
+            std.log.err("Worker {}: compute_gradients returned {} outputs, expected at least {} (params + loss)", .{ self.node_id.?, grad_outputs.len, num_params + 1 });
+            return error.InsufficientGradientOutputs;
+        }
+
+        // Apply AdamW optimizer update
+        var opt_inputs = std.ArrayList(IreeBackend.DeviceBuffer).init(self.allocator);
+        defer opt_inputs.deinit();
+
+        // Add current params, gradients, m_states, v_states
+        for (device_params.*) |p| {
+            p.retain();
+            try opt_inputs.append(p);
+        }
+        for (0..num_params) |i| {
+            grad_outputs[i].retain();
+            try opt_inputs.append(grad_outputs[i]);
+        }
+
+        // Upload optimizer states
+        for (self.m_states.?, 0..) |m_state, i| {
+            const m_buf = try iree_impl.moveToDevice(m_state, self.cached_parameter_shapes.?[i], .f32);
+            try opt_inputs.append(m_buf);
+        }
+        for (self.v_states.?, 0..) |v_state, i| {
+            const v_buf = try iree_impl.moveToDevice(v_state, self.cached_parameter_shapes.?[i], .f32);
+            try opt_inputs.append(v_buf);
+        }
+
+        // Add timestep
+        const timestep_bytes = std.mem.asBytes(&self.timestep);
+        const timestep_buf = try iree_impl.moveToDevice(timestep_bytes, &[_]i64{}, .f32);
+        try opt_inputs.append(timestep_buf);
+
+        // Execute optimizer
+        const opt_outputs = try iree_impl.executeWithDeviceBuffers(vmfb, "apply_optimizer", opt_inputs.items);
+        defer self.allocator.free(opt_outputs);
+
+        for (opt_inputs.items) |buf| buf.release();
+
+        // Validate optimizer outputs
+        const expected_opt_outputs = 3 * num_params; // params + m_states + v_states
+        if (opt_outputs.len < expected_opt_outputs) {
+            std.log.err("Worker {}: apply_optimizer returned {} outputs, expected at least {}", .{ self.node_id.?, opt_outputs.len, expected_opt_outputs });
+            return error.InsufficientOptimizerOutputs;
+        }
+
+        // Update device parameters and optimizer states
+        for (device_params.*) |old| old.release();
+        for (0..num_params) |i| {
+            device_params.*[i] = opt_outputs[i];
+
+            // Update m and v states
+            const m_bytes = try iree_impl.readToHost(opt_outputs[num_params + i]);
+            @memcpy(self.m_states.?[i], m_bytes);
+            self.allocator.free(m_bytes);
+            opt_outputs[num_params + i].release();
+
+            const v_bytes = try iree_impl.readToHost(opt_outputs[2 * num_params + i]);
+            @memcpy(self.v_states.?[i], v_bytes);
+            self.allocator.free(v_bytes);
+            opt_outputs[2 * num_params + i].release();
+        }
+
+        self.timestep += 1.0;
+
+        // Extract and log loss
+        const loss_buf = grad_outputs[num_params];
+        const loss_bytes = try iree_impl.readToHost(loss_buf);
+        defer self.allocator.free(loss_bytes);
+
+        var loss: f32 = undefined;
+        if (loss_bytes.len == 4) {
+            loss = std.mem.bytesAsSlice(f32, loss_bytes)[0];
+        } else if (loss_bytes.len == 2) {
+            const bf16_bits = std.mem.readInt(u16, loss_bytes[0..2], .little);
+            loss = @bitCast(@as(u32, bf16_bits) << 16);
+        }
+
+        if (self.current_step % 10 == 0) {
+            std.log.info("Worker {}: Step {}, loss: {d:.4}", .{self.node_id.?, self.current_step, loss});
+        }
+    }
+
+    /// Extracts fragment P from the GPU, computes Delta, and sends to Shepherd
+    fn fragmentPhaseStart(self: *Self, fragment_id: usize) usize {
+        return @as(usize, @intFromFloat(@floor(
+            @as(f64, @floatFromInt(fragment_id)) *
+                @as(f64, @floatFromInt(self.inner_steps)) /
+                @as(f64, @floatFromInt(self.num_fragments)),
+        )));
+    }
+
+    fn fragmentSendRound(self: *Self, fragment_id: usize, step: usize) usize {
+        const phase_start = self.fragmentPhaseStart(fragment_id);
+        return ((step - phase_start) / self.inner_steps) - 1;
+    }
+
+    fn fragmentReceiveRound(self: *Self, fragment_id: usize, step: usize) usize {
+        const phase_start = self.fragmentPhaseStart(fragment_id);
+        return ((step - phase_start - self.overlap_tau) / self.inner_steps) - 1;
+    }
+
+    fn clearReceivedFragments(self: *Self) void {
+        self.rx_mutex.lock();
+        defer self.rx_mutex.unlock();
+
+        var it = self.rx_map.iterator();
+        while (it.next()) |entry| {
+            entry.value_ptr.*.deinitClone(self.allocator);
+        }
+        self.rx_map.clearRetainingCapacity();
+    }
+
+    fn extractAndSendFragment(
+        self: *Self,
+        fragment_id: usize,
+        fragment_round: usize,
+        device_params: []IreeBackend.DeviceBuffer,
+    ) !void {
+        std.log.info("Worker {}: [t={}] Extracting and sending Fragment {} round {}", .{
+            self.node_id.?, self.current_step, fragment_id, fragment_round,
+        });
+
+        const iree_impl: *IreeBackend = @ptrCast(@alignCast(self.backend.ptr));
+        const param_shapes = self.cached_parameter_shapes.?;
+
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+
+        var updates = std.json.Array.init(arena.allocator());
+
+        // Iterate over all tensors belonging to this fragment (strided assignment)
+        // Device params and snapshots are always f32 (MLIR pipeline works in f32)
+        for (param_shapes, 0..) |shape, i| {
+            if (i % self.num_fragments != fragment_id) continue;
+
+            var elem_count: usize = 1;
+            for (shape) |dim| elem_count *= @intCast(dim);
+
+            // Download current tensor from GPU
+            const current_bytes = try iree_impl.readToHost(device_params[i]);
+            defer self.allocator.free(current_bytes);
+
+            const current_f32 = std.mem.bytesAsSlice(f32, current_bytes);
+            const snapshot_f32 = std.mem.bytesAsSlice(f32, self.tensor_snapshots.?[i]);
+
+            // Compute Delta = Snapshot - Current
+            var delta_f32 = try arena.allocator().alloc(f32, elem_count);
+            for (0..elem_count) |idx| {
+                delta_f32[idx] = snapshot_f32[idx] - current_f32[idx];
+                snapshot_f32[idx] = current_f32[idx];
+            }
+
+            // Base64 encode the delta
+            const delta_bytes = std.mem.sliceAsBytes(delta_f32);
+            const b64_len = std.base64.standard.Encoder.calcSize(delta_bytes.len);
+            const b64_chunk = try arena.allocator().alloc(u8, b64_len);
+            _ = std.base64.standard.Encoder.encode(b64_chunk, delta_bytes);
+
+            var update = std.json.ObjectMap.init(arena.allocator());
+            try update.put("tensor_idx", std.json.Value{ .integer = @intCast(i) });
+            try update.put("data", std.json.Value{ .string = b64_chunk });
+            try updates.append(std.json.Value{ .object = update });
+        }
+
+        // Send FRAGMENT_UPDATE to Shepherd
+        var msg_data = std.json.ObjectMap.init(arena.allocator());
+        try msg_data.put("fragment_id", std.json.Value{ .integer = @intCast(fragment_id) });
+        try msg_data.put("fragment_round", std.json.Value{ .integer = @intCast(fragment_round) });
+        try msg_data.put("updates", std.json.Value{ .array = updates });
+
+        const msg = tcp_stream.createMessage(
+            self.node_id.?, "worker", 0, "shepherd",
+            message.MessageType.FRAGMENT_UPDATE, @truncate(self.current_step),
+            std.json.Value{ .object = msg_data },
+        );
+
+        const msg_clone = try msg.clone(self.allocator);
+
+        self.tx_mutex.lock();
+        try self.tx_queue.append(msg_clone);
+        self.tx_cond.signal();
+        self.tx_mutex.unlock();
+
+        std.log.info("Worker {}: [t={}] Pushed Fragment {} round {} to Tx Queue.", .{
+            self.node_id.?, self.current_step, fragment_id, fragment_round,
+        });
+    }
+
+    /// Pops merged Fragment P from the Rx Map, Alpha blends it, and uploads to GPU
+    fn receiveAndMergeFragment(
+        self: *Self,
+        fragment_id: usize,
+        fragment_round: usize,
+        device_params: *[]IreeBackend.DeviceBuffer,
+    ) !void {
+        std.log.info("Worker {}: [t={}] Time to merge Fragment {} round {}...", .{
+            self.node_id.?, self.current_step, fragment_id, fragment_round,
+        });
+
+        const iree_impl: *IreeBackend = @ptrCast(@alignCast(self.backend.ptr));
+        const param_shapes = self.cached_parameter_shapes.?;
+        const desired_key = FragmentKey{
+            .fragment_id = fragment_id,
+            .fragment_round = fragment_round,
+        };
+
+        var maybe_msg: ?MessageEnvelope = null;
+        while (self.is_running and maybe_msg == null) {
+            self.rx_mutex.lock();
+            if (self.rx_map.fetchRemove(desired_key)) |stored| {
+                maybe_msg = stored.value;
+                self.rx_mutex.unlock();
+                break;
+            }
+            self.rx_mutex.unlock();
+
+            std.log.warn("Worker {}:[t={}] Waiting for Fragment {} round {}...", .{
+                self.node_id.?, self.current_step, fragment_id, fragment_round,
+            });
+
+            const receive_result = self.client.receive() catch |err| {
+                std.log.err("Worker {}: Streaming receive failed: {}", .{ self.node_id.?, err });
+                self.is_running = false;
+                return err;
+            };
+
+            const incoming = receive_result.parsed.value;
+            defer receive_result.parsed.deinit();
+            defer self.allocator.free(receive_result.buffer);
+
+            if (std.mem.eql(u8, incoming.msg_type, MessageType.SHUTDOWN)) {
+                self.handleShutdown(incoming);
+                break;
+            }
+
+            if (!std.mem.eql(u8, incoming.msg_type, MessageType.FRAGMENT_READY)) {
+                std.log.warn("Worker {}: Ignoring unexpected streaming message type {s}", .{
+                    self.node_id.?, incoming.msg_type,
+                });
+                continue;
+            }
+
+            const incoming_key = FragmentKey{
+                .fragment_id = @intCast(incoming.data.object.get("fragment_id").?.integer),
+                .fragment_round = @intCast(incoming.data.object.get("fragment_round").?.integer),
+            };
+
+            const incoming_clone = try incoming.clone(self.allocator);
+            if (std.meta.eql(incoming_key, desired_key)) {
+                maybe_msg = incoming_clone;
+                break;
+            }
+
+            self.rx_mutex.lock();
+            if (self.rx_map.fetchRemove(incoming_key)) |existing| {
+                var replaced = existing.value;
+                replaced.deinitClone(self.allocator);
+            }
+            try self.rx_map.put(incoming_key, incoming_clone);
+            self.rx_mutex.unlock();
+        }
+
+        if (maybe_msg == null) {
+            return error.WorkerStopped;
+        }
+
+        const msg = maybe_msg.?;
+
+        defer {
+            var msg_mut = msg;
+            msg_mut.deinitClone(self.allocator);
+        }
+
+        const merged_payload = msg.data.object;
+
+        // Extract and apply updates from merged_payload
+        const updates = merged_payload.get("updates").?.array;
+
+        for (updates.items) |update_value| {
+            const update = update_value.object;
+            const tensor_idx = @as(usize, @intCast(update.get("tensor_idx").?.integer));
+
+            // Decode the global weights from Shepherd
+            const data_b64 = update.get("data").?.string;
+            const decoded_size = try std.base64.standard.Decoder.calcSizeForSlice(data_b64);
+            const global_bytes = try self.allocator.alloc(u8, decoded_size);
+            defer self.allocator.free(global_bytes);
+            try std.base64.standard.Decoder.decode(global_bytes, data_b64);
+
+            // Download current weights from device (always f32)
+            const current_bytes = try iree_impl.readToHost(device_params.*[tensor_idx]);
+            defer self.allocator.free(current_bytes);
+
+            // Alpha blending: new = alpha * current + (1 - alpha) * global
+            const current_f32 = std.mem.bytesAsSlice(f32, current_bytes);
+            const global_f32 = std.mem.bytesAsSlice(f32, global_bytes);
+            const blended = try self.allocator.alloc(u8, current_bytes.len);
+            defer self.allocator.free(blended);
+            const blended_f32 = std.mem.bytesAsSlice(f32, blended);
+
+            for (0..current_f32.len) |idx| {
+                blended_f32[idx] = self.alpha * current_f32[idx] + (1.0 - self.alpha) * global_f32[idx];
+            }
+
+            // Upload blended weights back to device
+            device_params.*[tensor_idx].release();
+            device_params.*[tensor_idx] = try iree_impl.moveToDevice(blended, param_shapes[tensor_idx], .f32);
+
+            // Update snapshot for this tensor
+            @memcpy(self.tensor_snapshots.?[tensor_idx], blended);
+        }
+
+        std.log.info("Worker {}:[t={}] Fragment {} round {} merged successfully. Resuming compute.", .{
+            self.node_id.?, self.current_step, fragment_id, fragment_round,
+        });
+    }
+
+    fn initializeOptimizerStates(self: *Self, param_shapes: [][]i64) !void {
+        const num_params = param_shapes.len;
+        self.m_states = try self.allocator.alloc([]u8, num_params);
+        self.v_states = try self.allocator.alloc([]u8, num_params);
+
+        for (param_shapes, 0..) |shape, i| {
+            var elem_count: usize = 1;
+            for (shape) |dim| elem_count *= @intCast(dim);
+            const size = elem_count * 4; // f32
+
+            self.m_states.?[i] = try self.allocator.alloc(u8, size);
+            @memset(self.m_states.?[i], 0);
+
+            self.v_states.?[i] = try self.allocator.alloc(u8, size);
+            @memset(self.v_states.?[i], 0);
+        }
+    }
+
     /// Handle weight update from Shepherd
     fn handleUpdateWeights(self: *Self, msg: MessageEnvelope) !void {
         std.log.info("Worker {}: Receiving weight update...", .{self.node_id.?});
@@ -1594,6 +2319,8 @@ pub const Worker = struct {
         _ = msg;
         self.state = .shutting_down;
         self.is_running = false;
+        self.tx_cond.broadcast();
+        self.rx_cond.broadcast();
     }
     
     /// Send periodic heartbeat to Shepherd

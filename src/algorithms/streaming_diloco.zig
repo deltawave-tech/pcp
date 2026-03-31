@@ -19,6 +19,7 @@ const TrainingStatus = training_algorithm.TrainingStatus;
 const Shepherd = shepherd.Shepherd;
 const NesterovHost = nesterov_host.Nesterov;
 const Tensor = tensor.Tensor(void);
+const MessageContext = message.MessageContext;
 
 pub const StreamingDiLoCoConfig = struct {
     num_fragments: usize = 4,
@@ -84,6 +85,7 @@ pub const StreamingDiLoCo = struct {
 
     /// Array of fragment states[0 .. num_fragments - 1]
     fragments: []FragmentState,
+    session_request_id: message.RequestId,
 
     const Self = @This();
 
@@ -182,6 +184,7 @@ pub const StreamingDiLoCo = struct {
             .data_input_shapes = data_input_shapes,
             .mlir_source = mlir_source,
             .fragments = fragments,
+            .session_request_id = 0,
         };
     }
 
@@ -251,17 +254,14 @@ pub const StreamingDiLoCo = struct {
         const self: *Self = @ptrCast(@alignCast(ptr));
         self.status = .running;
 
-        try self.coordinator.ensureWorkersCompiled(
-            self.mlir_source,
-            self.parameter_shapes,
-            self.data_input_shapes
-        );
+        try self.coordinator.ensureWorkersCompiled(self.mlir_source, self.parameter_shapes, self.data_input_shapes);
 
         const initial_participants = try self.coordinator.snapshotWorkers();
         defer initial_participants.deinit();
 
         if (initial_participants.items.len == 0) return error.NoWorkersConnected;
 
+        self.session_request_id = self.coordinator.allocateRequestId();
         try self.broadcastStartStreaming(initial_participants.items);
 
         std.log.info("Starting Streaming DiLoCo Event Loop with {} fragments...", .{self.config.num_fragments});
@@ -278,7 +278,10 @@ pub const StreamingDiLoCo = struct {
 
             // 2. Poll for ANY incoming fragment update (Non-blocking or short timeout)
             // Note: We'll modify Shepherd to expose this queue shortly.
-            const msgs = try self.coordinator.collectFromWorkers(message.MessageType.FRAGMENT_UPDATE, 1);
+            const msgs = try self.coordinator.collectMatchingFromWorkers(.{
+                .msg_type = message.MessageType.FRAGMENT_UPDATE,
+                .request_id = self.session_request_id,
+            }, 1);
             defer {
                 for (msgs.items) |*msg| msg.deinitClone(self.allocator);
                 msgs.deinit();
@@ -315,7 +318,7 @@ pub const StreamingDiLoCo = struct {
             return;
         }
 
-        var frag_state = &self.fragments[fragment_id];
+        const frag_state = &self.fragments[fragment_id];
         if (fragment_round < frag_state.current_round) {
             std.log.debug("Ignoring stale fragment {} round {} from worker {}, current round is {}", .{
                 fragment_id, fragment_round, msg.sender_node, frag_state.current_round,
@@ -502,9 +505,7 @@ pub const StreamingDiLoCo = struct {
             // Convert bytes to f32 and accumulate
             const gradient_f32 = std.mem.bytesAsSlice(f32, decoded);
             if (gradient_f32.len != acc_buffer.len) {
-                std.log.warn("Gradient size mismatch for tensor {}: expected {}, got {}", .{
-                    tensor_idx, acc_buffer.len, gradient_f32.len
-                });
+                std.log.warn("Gradient size mismatch for tensor {}: expected {}, got {}", .{ tensor_idx, acc_buffer.len, gradient_f32.len });
                 continue;
             }
 
@@ -550,7 +551,11 @@ pub const StreamingDiLoCo = struct {
 
         try payload.put("updates", std.json.Value{ .array = updates });
 
-        try self.coordinator.broadcastToWorkers(message.MessageType.FRAGMENT_READY, .{ .object = payload });
+        try self.coordinator.broadcastToWorkersWithContext(message.MessageType.FRAGMENT_READY, .{ .object = payload }, MessageContext{
+            .request_id = self.session_request_id,
+            .round_id = @intCast(fragment_round + 1),
+            .task_id = @intCast(fragment_id + 1),
+        });
     }
 
     fn broadcastStartStreaming(self: *Self, workers: []const WorkerConnection) !void {
@@ -575,7 +580,9 @@ pub const StreamingDiLoCo = struct {
         if (use_chunked_transfer) {
             // For large models: broadcast raw parameter bytes via chunked transfer
             std.log.info("Using chunked transfer for {} byte payload (raw bytes)", .{total_param_bytes.items.len});
-            try self.coordinator.broadcastLargeData(total_param_bytes.items);
+            try self.coordinator.broadcastLargeDataWithContext(total_param_bytes.items, .{
+                .request_id = self.session_request_id,
+            });
         } else {
             // For small models: use base64 encoding directly
             const b64_len = std.base64.standard.Encoder.calcSize(total_param_bytes.items.len);
@@ -591,7 +598,8 @@ pub const StreamingDiLoCo = struct {
         for (workers) |worker| {
             const chunk = if (self.coordinator.data_manager) |*dm|
                 dm.assignNextChunk(worker.node_id)
-            else null;
+            else
+                null;
 
             if (chunk == null) {
                 std.log.warn("No data chunk available for worker {}", .{worker.node_id});
@@ -632,7 +640,9 @@ pub const StreamingDiLoCo = struct {
             }
             try payload.put("micro_batch", std.json.Value{ .integer = @intCast(micro_batch) });
 
-            try self.coordinator.sendToWorker(worker.node_id, message.MessageType.START_STREAMING_LOOP, .{ .object = payload });
+            try self.coordinator.sendToWorkerWithContext(worker.node_id, message.MessageType.START_STREAMING_LOOP, .{ .object = payload }, MessageContext{
+                .request_id = self.session_request_id,
+            });
         }
     }
 };

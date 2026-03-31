@@ -1,6 +1,5 @@
 /// Worker - Connects to Shepherd and performs distributed training
 /// This is the worker node that connects to the coordinator and runs local training
-
 const std = @import("std");
 const net = std.net;
 const Allocator = std.mem.Allocator;
@@ -24,9 +23,38 @@ const WorkerBackend = worker_backend.WorkerBackend;
 const Dataset = dataset_mod.Dataset;
 
 const FragmentKey = struct {
+    request_id: message.RequestId,
     fragment_id: usize,
     fragment_round: usize,
 };
+
+const WeightTransferState = struct {
+    buffer: std.ArrayList(u8),
+    expected_chunks: usize,
+    received_chunks: usize,
+    total_bytes: usize,
+
+    pub fn init(allocator: Allocator, total_bytes: usize, expected_chunks: usize) !WeightTransferState {
+        return .{
+            .buffer = try std.ArrayList(u8).initCapacity(allocator, total_bytes),
+            .expected_chunks = expected_chunks,
+            .received_chunks = 0,
+            .total_bytes = total_bytes,
+        };
+    }
+
+    pub fn deinit(self: *WeightTransferState) void {
+        self.buffer.deinit();
+    }
+};
+
+fn contextFromMessage(msg: MessageEnvelope) message.MessageContext {
+    return .{
+        .request_id = msg.request_id,
+        .round_id = msg.round_id,
+        .task_id = msg.task_id,
+    };
+}
 
 /// Worker state
 pub const WorkerState = enum {
@@ -69,22 +97,23 @@ pub const Worker = struct {
     supervisor_id: ?i64,
 
     // RL / Generation State
-    kv_cache: ?[][]u8,        // Persistent KV Cache buffers on Host (legacy, to be sent to device)
-    sampler: math.Sampler,    // Token sampler
-    weight_blob: ?[]u8,       // Flat weight buffer for RL generation (updated by Shepherd)
+    kv_cache: ?[][]u8, // Persistent KV Cache buffers on Host (legacy, to be sent to device)
+    sampler: math.Sampler, // Token sampler
+    weight_blob: ?[]u8, // Flat weight buffer for RL generation (updated by Shepherd)
 
     // Device Residency: Persistent GPU buffers to avoid PCIe transfers
-    device_weights: ?[]IreeBackend.DeviceBuffer,  // Weights on GPU (updated once per UPDATE_WEIGHTS)
+    device_weights: ?[]IreeBackend.DeviceBuffer, // Weights on GPU (updated once per UPDATE_WEIGHTS)
     device_kv_cache: ?[]IreeBackend.DeviceBuffer, // KV cache on GPU (pointer-swapped each step)
-    device_weights_dirty: bool,                    // True if weight_blob was updated, needs re-upload
+    device_weights_dirty: bool, // True if weight_blob was updated, needs re-upload
 
-    // Chunked Transfer: State for reassembling incoming weight chunks
-    incoming_weight_buffer: ?std.ArrayList(u8),
-    expected_chunks: usize,
-    received_chunks: usize,
+    // Chunked Transfer: Request-scoped state for reassembling incoming weight chunks
+    incoming_weight_transfers: std.AutoHashMap(message.RequestId, WeightTransferState),
+    completed_weight_blobs: std.AutoHashMap(message.RequestId, []u8),
+    active_weight_blob_request_id: ?message.RequestId,
 
     // Streaming DiLoCo State
     streaming_mode: bool,
+    streaming_request_id: message.RequestId,
     current_step: usize,
     num_fragments: usize,
     inner_steps: usize, // H
@@ -132,10 +161,11 @@ pub const Worker = struct {
             .device_weights = null,
             .device_kv_cache = null,
             .device_weights_dirty = false,
-            .incoming_weight_buffer = null,
-            .expected_chunks = 0,
-            .received_chunks = 0,
+            .incoming_weight_transfers = std.AutoHashMap(message.RequestId, WeightTransferState).init(allocator),
+            .completed_weight_blobs = std.AutoHashMap(message.RequestId, []u8).init(allocator),
+            .active_weight_blob_request_id = null,
             .streaming_mode = false,
+            .streaming_request_id = 0,
             .current_step = 0,
             .num_fragments = 4,
             .inner_steps = 100,
@@ -151,8 +181,7 @@ pub const Worker = struct {
             .rx_cond = std.Thread.Condition{},
         };
     }
-    
-    
+
     pub fn deinit(self: *Self) void {
         // Cleanup dataset if it exists
         if (self.dataset) |ds| {
@@ -196,10 +225,19 @@ pub const Worker = struct {
             self.allocator.free(blob);
         }
 
-        // Cleanup incoming weight buffer (chunked transfer)
-        if (self.incoming_weight_buffer) |*buf| {
-            buf.deinit();
+        // Cleanup completed request-scoped weight blobs
+        var completed_it = self.completed_weight_blobs.valueIterator();
+        while (completed_it.next()) |blob| {
+            self.allocator.free(blob.*);
         }
+        self.completed_weight_blobs.deinit();
+
+        // Cleanup in-flight request-scoped weight transfers
+        var transfer_it = self.incoming_weight_transfers.valueIterator();
+        while (transfer_it.next()) |transfer| {
+            transfer.deinit();
+        }
+        self.incoming_weight_transfers.deinit();
 
         // Cleanup tensor snapshots (streaming mode)
         if (self.tensor_snapshots) |snapshots| {
@@ -230,7 +268,34 @@ pub const Worker = struct {
         self.client.deinit();
         self.backend.deinit();
     }
-    
+
+    fn activateWeightBlobForRequest(self: *Self, request_id: message.RequestId) ![]const u8 {
+        if (self.active_weight_blob_request_id) |active_request_id| {
+            if (active_request_id == request_id) {
+                return self.weight_blob orelse error.WeightBlobNotReceived;
+            }
+        }
+
+        if (self.completed_weight_blobs.fetchRemove(request_id)) |kv| {
+            if (self.weight_blob) |old_blob| {
+                self.allocator.free(old_blob);
+            }
+            self.weight_blob = kv.value;
+            self.active_weight_blob_request_id = request_id;
+            return kv.value;
+        }
+
+        return error.WeightBlobNotReceived;
+    }
+
+    fn storeCompletedWeightBlob(self: *Self, request_id: message.RequestId, blob: []u8) !void {
+        if (self.completed_weight_blobs.fetchRemove(request_id)) |existing| {
+            self.allocator.free(existing.value);
+        }
+        errdefer self.allocator.free(blob);
+        try self.completed_weight_blobs.put(request_id, blob);
+    }
+
     /// Connect to the Shepherd coordinator
     pub fn connect(self: *Self, master_host: []const u8, master_port: u16, target_arch: ?[]const u8) !void {
         self.state = .connecting;
@@ -272,7 +337,7 @@ pub const Worker = struct {
         );
 
         try self.client.send(join_request);
-        
+
         // Wait for JoinAccept
         std.log.debug("Worker waiting for JoinAccept response from shepherd...", .{});
         const join_accept_result = self.client.receive() catch |err| {
@@ -282,18 +347,17 @@ pub const Worker = struct {
         defer join_accept_result.parsed.deinit();
         defer self.allocator.free(join_accept_result.buffer); // Free the buffer
         const join_accept = join_accept_result.parsed.value;
-        
+
         if (!std.mem.eql(u8, join_accept.msg_type, MessageType.JOIN_ACCEPT)) {
             return error.UnexpectedMessage;
         }
-        
+
         // Extract assigned node_id from response
         self.node_id = join_accept.recipient_node;
         self.state = .connected;
         self.is_running = true;
-        
     }
-    
+
     /// Main worker loop - listen for commands from Shepherd
     pub fn run(self: *Self) !void {
         if (self.state != .connected) {
@@ -383,19 +447,33 @@ pub const Worker = struct {
             else => return error.InvalidFormat,
         };
 
+        const request_id = msg.request_id;
         const chunk_index: usize = @intCast(payload.get("chunk_index").?.integer);
         const total_chunks: usize = @intCast(payload.get("total_chunks").?.integer);
+        const total_bytes: usize = @intCast(payload.get("total_bytes").?.integer);
         const b64_data = payload.get("data").?.string;
 
         // Initialize buffer on first chunk
         if (chunk_index == 0) {
-            if (self.incoming_weight_buffer) |*buf| buf.deinit();
-            const total_bytes: usize = @intCast(payload.get("total_bytes").?.integer);
-            self.incoming_weight_buffer = try std.ArrayList(u8).initCapacity(self.allocator, total_bytes);
-            self.expected_chunks = total_chunks;
-            self.received_chunks = 0;
-            std.log.info("Worker {}: Started receiving weights ({} bytes in {} chunks)", .{ self.node_id.?, total_bytes, total_chunks });
+            if (self.incoming_weight_transfers.fetchRemove(request_id)) |kv| {
+                var stale_transfer = kv.value;
+                stale_transfer.deinit();
+            }
+            if (self.completed_weight_blobs.fetchRemove(request_id)) |kv| {
+                self.allocator.free(kv.value);
+            }
+
+            const transfer = try WeightTransferState.init(self.allocator, total_bytes, total_chunks);
+            try self.incoming_weight_transfers.put(request_id, transfer);
+            std.log.info("Worker {}: Started receiving request-scoped weights for request {} ({} bytes in {} chunks)", .{
+                self.node_id.?,
+                request_id,
+                total_bytes,
+                total_chunks,
+            });
         }
+
+        const transfer = self.incoming_weight_transfers.getPtr(request_id) orelse return error.MissingChunkState;
 
         // Decode and append chunk
         const decoded_len = try std.base64.standard.Decoder.calcSizeForSlice(b64_data);
@@ -403,28 +481,33 @@ pub const Worker = struct {
         defer self.allocator.free(decoded);
         try std.base64.standard.Decoder.decode(decoded, b64_data);
 
-        try self.incoming_weight_buffer.?.appendSlice(decoded);
-        self.received_chunks += 1;
+        try transfer.buffer.appendSlice(decoded);
+        transfer.received_chunks += 1;
 
-        if (self.received_chunks % 10 == 0 or self.received_chunks == self.expected_chunks) {
-            std.log.info("Worker {}: Received chunk {}/{}", .{ self.node_id.?, self.received_chunks, self.expected_chunks });
+        if (transfer.received_chunks % 10 == 0 or transfer.received_chunks == transfer.expected_chunks) {
+            std.log.info("Worker {}: Received chunk {}/{} for request {}", .{
+                self.node_id.?,
+                transfer.received_chunks,
+                transfer.expected_chunks,
+                request_id,
+            });
         }
 
         // Finalize when all chunks received
-        if (self.received_chunks == self.expected_chunks) {
-            std.log.info("Worker {}: Reassembly complete. {} bytes received.", .{ self.node_id.?, self.incoming_weight_buffer.?.items.len });
-
-            // Move from ArrayList to weight_blob
-            if (self.weight_blob) |blob| self.allocator.free(blob);
-            self.weight_blob = try self.incoming_weight_buffer.?.toOwnedSlice();
-
-            // Clean up builder
-            self.incoming_weight_buffer = null;
-            self.received_chunks = 0;
-            self.expected_chunks = 0;
-
-            // Mark for GPU upload on next use
-            self.device_weights_dirty = true;
+        if (transfer.received_chunks == transfer.expected_chunks) {
+            if (self.incoming_weight_transfers.fetchRemove(request_id)) |kv| {
+                var completed_transfer = kv.value;
+                errdefer completed_transfer.deinit();
+                const blob = try completed_transfer.buffer.toOwnedSlice();
+                try self.storeCompletedWeightBlob(request_id, blob);
+                std.log.info("Worker {}: Reassembly complete for request {}. {} bytes received.", .{
+                    self.node_id.?,
+                    request_id,
+                    blob.len,
+                });
+            } else {
+                return error.MissingChunkState;
+            }
         }
     }
 
@@ -520,13 +603,13 @@ pub const Worker = struct {
             .array => |arr| arr,
             else => return error.InvalidShapesFormat,
         };
-        
+
         var shapes_list = std.ArrayList([]i64).init(self.allocator);
         errdefer {
             for (shapes_list.items) |s| self.allocator.free(s);
             shapes_list.deinit();
         }
-        
+
         for (shapes_array.items) |shape_val| {
             const dim_array = switch (shape_val) {
                 .array => |arr| arr,
@@ -555,15 +638,11 @@ pub const Worker = struct {
             errdefer dtypes_list.deinit();
 
             for (dtypes_array.items) |val| {
-                const s = switch (val) { .string => |str| str, else => "f32" };
-                const dtype: tensor.DType = if (std.mem.eql(u8, s, "i64")) .i64
-                    else if (std.mem.eql(u8, s, "i32")) .i32
-                    else if (std.mem.eql(u8, s, "f32")) .f32
-                    else if (std.mem.eql(u8, s, "f16")) .f16
-                    else if (std.mem.eql(u8, s, "f64")) .f64
-                    else if (std.mem.eql(u8, s, "bf16")) .bf16
-                    else if (std.mem.eql(u8, s, "bool")) .bool
-                    else .f32; // Default fallback
+                const s = switch (val) {
+                    .string => |str| str,
+                    else => "f32",
+                };
+                const dtype: tensor.DType = if (std.mem.eql(u8, s, "i64")) .i64 else if (std.mem.eql(u8, s, "i32")) .i32 else if (std.mem.eql(u8, s, "f32")) .f32 else if (std.mem.eql(u8, s, "f16")) .f16 else if (std.mem.eql(u8, s, "f64")) .f64 else if (std.mem.eql(u8, s, "bf16")) .bf16 else if (std.mem.eql(u8, s, "bool")) .bool else .f32; // Default fallback
                 try dtypes_list.append(dtype);
             }
             self.cached_data_input_dtypes = try dtypes_list.toOwnedSlice();
@@ -581,6 +660,7 @@ pub const Worker = struct {
             if (self.weight_blob) |old_blob| {
                 self.allocator.free(old_blob);
             }
+            self.active_weight_blob_request_id = null;
 
             const file = try std.fs.cwd().openFile(weights_path, .{ .mode = .read_only });
             defer file.close();
@@ -699,8 +779,7 @@ pub const Worker = struct {
         }
 
         if (nan_count > 0 or inf_count > 0) {
-            std.log.err("VALIDATION FAILED for {s}: {} NaNs, {} Infs (Max: {d:.4}, Avg: {d:.4})",
-                .{ name, nan_count, inf_count, max_val, sum_abs / @as(f64, @floatFromInt(num_elements)) });
+            std.log.err("VALIDATION FAILED for {s}: {} NaNs, {} Infs (Max: {d:.4}, Avg: {d:.4})", .{ name, nan_count, inf_count, max_val, sum_abs / @as(f64, @floatFromInt(num_elements)) });
             return error.NumericalInstabilityDetected;
         }
     }
@@ -857,20 +936,10 @@ pub const Worker = struct {
         defer arena.deinit();
 
         var initial_params_bytes_temp: []const u8 = undefined;
-        const using_chunked_transfer = self.weight_blob != null and payload.get("params") == null;
         const using_raw_params = if (payload.get("raw_params")) |v| v == .bool and v.bool else false;
 
-        if (using_chunked_transfer) {
-            if (using_raw_params) {
-                initial_params_bytes_temp = self.weight_blob.?;
-            } else {
-                const reader = try binary_protocol.WorkerPayload.Reader.init(self.weight_blob.?);
-                const params_from_reader = try reader.getParams();
-                const params_copy = try arena.allocator().alloc(u8, params_from_reader.len);
-                @memcpy(params_copy, params_from_reader);
-                initial_params_bytes_temp = params_copy;
-                reader.deinit();
-            }
+        if (using_raw_params) {
+            initial_params_bytes_temp = try self.activateWeightBlobForRequest(msg.request_id);
         } else {
             const b64_params = switch (payload.get("params") orelse return error.MissingParams) {
                 .string => |s| s,
@@ -1323,13 +1392,14 @@ pub const Worker = struct {
             try chunk_payload.put("loss", std.json.Value{ .float = final_loss });
             try chunk_payload.put("chunk_id", std.json.Value{ .integer = @intCast(self.current_chunk_id.?) });
 
-            const chunk_msg = tcp_stream.createMessage(
+            const chunk_msg = tcp_stream.createMessageWithContext(
                 self.node_id.?,
                 "worker",
                 0,
                 "shepherd",
                 MessageType.UPDATE_CHUNK,
-                msg.msg_id +% 1 +% @as(u8, @truncate(chunk_idx)),
+                msg.msg_id + 1 + @as(message.MessageId, @intCast(chunk_idx)),
+                contextFromMessage(msg),
                 std.json.Value{ .object = chunk_payload },
             );
 
@@ -1347,13 +1417,14 @@ pub const Worker = struct {
         try response_payload.put("loss", std.json.Value{ .float = final_loss });
         try response_payload.put("chunked", std.json.Value{ .bool = true });
 
-        const response = tcp_stream.createMessage(
+        const response = tcp_stream.createMessageWithContext(
             self.node_id.?,
             "worker",
             0,
             "shepherd",
             MessageType.INNER_LOOP_COMPLETE,
-            msg.msg_id +% 1 +% @as(u8, @truncate(total_chunks)),
+            msg.msg_id + 1 + @as(message.MessageId, @intCast(total_chunks)),
+            contextFromMessage(msg),
             std.json.Value{ .object = response_payload },
         );
 
@@ -1379,7 +1450,7 @@ pub const Worker = struct {
 
             // Send over TCP (Blocking I/O happens here, off the compute thread!)
             self.client.send(msg) catch |err| {
-                std.log.err("Worker {}: Tx Thread failed to send: {}", .{self.node_id.?, err});
+                std.log.err("Worker {}: Tx Thread failed to send: {}", .{ self.node_id.?, err });
             };
 
             // Free the cloned message now that it's sent
@@ -1394,7 +1465,7 @@ pub const Worker = struct {
         while (self.is_running) {
             const res = self.client.receive() catch |err| {
                 if (self.is_running) {
-                    std.log.err("Worker {}: Rx Thread failed to receive: {}", .{self.node_id.?, err});
+                    std.log.err("Worker {}: Rx Thread failed to receive: {}", .{ self.node_id.?, err });
                 }
                 self.is_running = false;
                 self.rx_cond.broadcast(); // Wake up compute thread if it's waiting
@@ -1407,6 +1478,7 @@ pub const Worker = struct {
                 const frag_id = @as(usize, @intCast(msg.data.object.get("fragment_id").?.integer));
                 const frag_round = @as(usize, @intCast(msg.data.object.get("fragment_round").?.integer));
                 const key = FragmentKey{
+                    .request_id = msg.request_id,
                     .fragment_id = frag_id,
                     .fragment_round = frag_round,
                 };
@@ -1415,7 +1487,7 @@ pub const Worker = struct {
                 if (msg.clone(self.allocator)) |msg_clone| {
                     self.rx_mutex.lock();
                     self.rx_map.put(key, msg_clone) catch |err| {
-                        std.log.err("Worker {}: Failed to put fragment in Rx Map: {}", .{self.node_id.?, err});
+                        std.log.err("Worker {}: Failed to put fragment in Rx Map: {}", .{ self.node_id.?, err });
                         var msg_clone_mut = msg_clone;
                         msg_clone_mut.deinitClone(self.allocator);
                     };
@@ -1426,7 +1498,7 @@ pub const Worker = struct {
                         self.node_id.?, frag_id, frag_round,
                     });
                 } else |err| {
-                    std.log.err("Worker {}: Failed to clone FRAGMENT_READY: {}", .{self.node_id.?, err});
+                    std.log.err("Worker {}: Failed to clone FRAGMENT_READY: {}", .{ self.node_id.?, err });
                 }
             } else {
                 // If it's a shutdown or other async command, handle it
@@ -1444,9 +1516,11 @@ pub const Worker = struct {
     fn handleStartStreamingLoop(self: *Self, msg: MessageEnvelope) !void {
         self.state = .training;
         self.streaming_mode = true;
+        self.streaming_request_id = msg.request_id;
         self.current_step = 0;
         errdefer {
             self.streaming_mode = false;
+            self.streaming_request_id = 0;
             if (self.state == .training) {
                 self.state = .connected;
             }
@@ -1494,9 +1568,7 @@ pub const Worker = struct {
             return error.UnknownTokenizer;
         }
 
-        std.log.info("Worker {}: Starting Continuous Streaming Loop. P={}, H={}, overlap={}", .{
-            self.node_id.?, self.num_fragments, self.inner_steps, self.overlap_tau
-        });
+        std.log.info("Worker {}: Starting Continuous Streaming Loop. P={}, H={}, overlap={}", .{ self.node_id.?, self.num_fragments, self.inner_steps, self.overlap_tau });
 
         if (self.tensor_snapshots) |snapshots| {
             for (snapshots) |snapshot| self.allocator.free(snapshot);
@@ -1510,16 +1582,20 @@ pub const Worker = struct {
         var should_free_decoded = false;
 
         if (use_raw_params.bool) {
-            // Parameters were sent via chunked transfer, use weight_blob
-            decoded = self.weight_blob orelse return error.WeightBlobNotReceived;
-            std.log.info("Worker {}: Using weight_blob with {} bytes", .{self.node_id.?, decoded.len});
+            // Parameters were sent via request-scoped chunked transfer
+            decoded = try self.activateWeightBlobForRequest(msg.request_id);
+            std.log.info("Worker {}: Using request-scoped weight blob for request {} with {} bytes", .{
+                self.node_id.?,
+                msg.request_id,
+                decoded.len,
+            });
         } else {
             // Parameters sent via base64 encoding
             const decoded_size = try std.base64.standard.Decoder.calcSizeForSlice(initial_params_b64.?);
             decoded = try self.allocator.alloc(u8, decoded_size);
             should_free_decoded = true;
             try std.base64.standard.Decoder.decode(decoded, initial_params_b64.?);
-            std.log.info("Worker {}: Decoded {} bytes from base64", .{self.node_id.?, decoded.len});
+            std.log.info("Worker {}: Decoded {} bytes from base64", .{ self.node_id.?, decoded.len });
         }
         defer if (should_free_decoded) self.allocator.free(decoded);
 
@@ -1532,7 +1608,7 @@ pub const Worker = struct {
         }
 
         // Upload initial parameters and create snapshots
-        std.log.info("Worker {}: Initializing {} parameters", .{self.node_id.?, param_shapes.len});
+        std.log.info("Worker {}: Initializing {} parameters", .{ self.node_id.?, param_shapes.len });
         self.tensor_snapshots = try self.allocator.alloc([]u8, param_shapes.len);
 
         // Determine the dtype size from the payload (default to f32 if not specified)
@@ -1555,9 +1631,7 @@ pub const Worker = struct {
 
             // Check if we have enough data remaining
             if (param_offset + size > decoded.len) {
-                std.log.err("Worker {}: Parameter {} requires {} bytes but only {} available (offset={})", .{
-                    self.node_id.?, i, size, decoded.len - param_offset, param_offset
-                });
+                std.log.err("Worker {}: Parameter {} requires {} bytes but only {} available (offset={})", .{ self.node_id.?, i, size, decoded.len - param_offset, param_offset });
                 return error.InsufficientParameterData;
             }
 
@@ -1597,7 +1671,7 @@ pub const Worker = struct {
 
         const block_size: usize = @intCast(data_shapes[0][1]);
         const data_shape = &[_]i64{ @intCast(micro_batch), @intCast(block_size) };
-        std.log.info("Worker {}: Data shape: [{}, {}]", .{self.node_id.?, micro_batch, block_size});
+        std.log.info("Worker {}: Data shape: [{}, {}]", .{ self.node_id.?, micro_batch, block_size });
 
         // Start the asynchronous Tx thread.
         std.log.info("Worker {}: Starting streaming Tx thread", .{self.node_id.?});
@@ -1620,7 +1694,7 @@ pub const Worker = struct {
             self.current_step += 1;
             const t = self.current_step;
 
-            std.log.info("Worker {}: Step {} starting", .{self.node_id.?, t});
+            std.log.info("Worker {}: Step {} starting", .{ self.node_id.?, t });
 
             // --- A. MERGE SCHEDULE (RECEIVE) ---
             for (0..self.num_fragments) |p| {
@@ -1629,14 +1703,14 @@ pub const Worker = struct {
                     if ((t - t_p - self.overlap_tau) % self.inner_steps == 0) {
                         const fragment_round = self.fragmentReceiveRound(p, t);
                         if (fragment_round >= max_rounds) continue;
-                        std.log.info("Worker {}: Step {} - Receiving fragment {}", .{self.node_id.?, t, p});
+                        std.log.info("Worker {}: Step {} - Receiving fragment {}", .{ self.node_id.?, t, p });
                         try self.receiveAndMergeFragment(p, fragment_round, &device_params);
                     }
                 }
             }
 
             // --- B. COMPUTE ONE STEP ---
-            std.log.info("Worker {}: Step {} - Executing training step", .{self.node_id.?, t});
+            std.log.info("Worker {}: Step {} - Executing training step", .{ self.node_id.?, t });
             try self.executeOneTrainingStep(vmfb, &device_params, micro_batch, block_size, data_shape);
 
             // --- C. SYNC SCHEDULE (SEND) ---
@@ -1645,7 +1719,7 @@ pub const Worker = struct {
                 if (t > t_p and (t - t_p) % self.inner_steps == 0) {
                     const fragment_round = self.fragmentSendRound(p, t);
                     if (fragment_round >= max_rounds) continue;
-                    std.log.info("Worker {}: Step {} - Sending fragment {}", .{self.node_id.?, t, p});
+                    std.log.info("Worker {}: Step {} - Sending fragment {}", .{ self.node_id.?, t, p });
                     try self.extractAndSendFragment(p, fragment_round, device_params);
                 }
             }
@@ -1654,7 +1728,8 @@ pub const Worker = struct {
         if (self.state == .training) {
             self.state = .connected;
         }
-        std.log.info("Worker {}: Streaming loop complete after {} steps", .{self.node_id.?, self.current_step});
+        self.streaming_request_id = 0;
+        std.log.info("Worker {}: Streaming loop complete after {} steps", .{ self.node_id.?, self.current_step });
     }
 
     /// Executes exactly one micro-batch step on the GPU
@@ -1770,7 +1845,7 @@ pub const Worker = struct {
         }
 
         if (self.current_step % 10 == 0) {
-            std.log.info("Worker {}: Step {}, loss: {d:.4}", .{self.node_id.?, self.current_step, loss});
+            std.log.info("Worker {}: Step {}, loss: {d:.4}", .{ self.node_id.?, self.current_step, loss });
         }
     }
 
@@ -1862,9 +1937,18 @@ pub const Worker = struct {
         try msg_data.put("fragment_round", std.json.Value{ .integer = @intCast(fragment_round) });
         try msg_data.put("updates", std.json.Value{ .array = updates });
 
-        const msg = tcp_stream.createMessage(
-            self.node_id.?, "worker", 0, "shepherd",
-            message.MessageType.FRAGMENT_UPDATE, @truncate(self.current_step),
+        const msg = tcp_stream.createMessageWithContext(
+            self.node_id.?,
+            "worker",
+            0,
+            "shepherd",
+            message.MessageType.FRAGMENT_UPDATE,
+            @intCast(self.current_step),
+            .{
+                .request_id = self.streaming_request_id,
+                .round_id = @intCast(fragment_round + 1),
+                .task_id = @intCast(fragment_id + 1),
+            },
             std.json.Value{ .object = msg_data },
         );
 
@@ -1894,6 +1978,7 @@ pub const Worker = struct {
         const iree_impl: *IreeBackend = @ptrCast(@alignCast(self.backend.ptr));
         const param_shapes = self.cached_parameter_shapes.?;
         const desired_key = FragmentKey{
+            .request_id = self.streaming_request_id,
             .fragment_id = fragment_id,
             .fragment_round = fragment_round,
         };
@@ -1935,6 +2020,7 @@ pub const Worker = struct {
             }
 
             const incoming_key = FragmentKey{
+                .request_id = incoming.request_id,
                 .fragment_id = @intCast(incoming.data.object.get("fragment_id").?.integer),
                 .fragment_round = @intCast(incoming.data.object.get("fragment_round").?.integer),
             };
@@ -2049,6 +2135,7 @@ pub const Worker = struct {
         if (self.weight_blob) |old_blob| {
             self.allocator.free(old_blob);
         }
+        self.active_weight_blob_request_id = null;
 
         // Allocate and decode new weights
         self.weight_blob = try self.allocator.alloc(u8, decoded_len);
@@ -2300,15 +2387,16 @@ pub const Worker = struct {
 
         try result_payload.put("completion", .{ .array = tokens_array });
 
-        const response = message.MessageEnvelope{
-            .recipient_node = 0,
-            .recipient_service = "shepherd",
-            .sender_node = self.node_id.?,
-            .sender_service = "worker",
-            .msg_type = MessageType.ROLLOUT_COMPLETE,
-            .msg_id = msg.msg_id + 1,
-            .data = .{ .object = result_payload },
-        };
+        const response = tcp_stream.createMessageWithContext(
+            self.node_id.?,
+            "worker",
+            0,
+            "shepherd",
+            MessageType.ROLLOUT_COMPLETE,
+            msg.msg_id + 1,
+            contextFromMessage(msg),
+            .{ .object = result_payload },
+        );
 
         try self.client.send(response);
         self.state = .connected;
@@ -2319,14 +2407,15 @@ pub const Worker = struct {
         _ = msg;
         self.state = .shutting_down;
         self.is_running = false;
+        self.streaming_request_id = 0;
         self.tx_cond.broadcast();
         self.rx_cond.broadcast();
     }
-    
+
     /// Send periodic heartbeat to Shepherd
     pub fn sendHeartbeat(self: *Self) !void {
         if (self.state != .connected) return;
-        
+
         const heartbeat = tcp_stream.createMessage(
             self.node_id.?, // our node_id
             "worker", // our service
@@ -2336,22 +2425,22 @@ pub const Worker = struct {
             0, // heartbeat message id
             std.json.Value{ .string = "alive" },
         );
-        
+
         self.client.send(heartbeat) catch |err| {
             std.log.err("Failed to send heartbeat: {}", .{err});
         };
     }
-    
+
     /// Get current worker state
     pub fn getState(self: Self) WorkerState {
         return self.state;
     }
-    
+
     /// Get assigned node ID
     pub fn getNodeId(self: Self) ?NodeId {
         return self.node_id;
     }
-    
+
     /// Disconnect from Shepherd
     pub fn disconnect(self: *Self) void {
         self.is_running = false;

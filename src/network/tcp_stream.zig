@@ -1,6 +1,5 @@
 /// TCP Stream Manager for sending and receiving MessageEnvelopes over TCP
 /// This implements proper message framing with length prefixes
-
 const std = @import("std");
 const net = std.net;
 const Allocator = std.mem.Allocator;
@@ -23,20 +22,20 @@ pub const TcpStreamManager = struct {
         // Serialize the envelope to JSON
         const json_buffer = try envelope.asJsonString(allocator);
         defer json_buffer.deinit();
-        
+
         const json_data = json_buffer.items;
-        
+
         std.log.debug("Worker is about to send JSON payload: {s}", .{json_data});
-        
+
         const data_length: u32 = @intCast(json_data.len);
-        
+
         // Send length prefix first (4 bytes for u32)
         const length_bytes = std.mem.asBytes(&data_length);
         try stream.writeAll(length_bytes);
-        
+
         // Send the actual JSON data
         try stream.writeAll(json_data);
-        
+
         std.log.debug("Sent message: type={s}, length={}, to_node={}, to_service={s}", .{
             envelope.msg_type,
             data_length,
@@ -56,48 +55,49 @@ pub const TcpStreamManager = struct {
         };
         std.log.debug("Successfully read {} bytes for length prefix", .{bytes_read});
         const data_length = std.mem.readInt(u32, &length_bytes, .little);
-        
+
         // Debug: Log raw bytes and parsed length (only for invalid messages)
         const MAX_MESSAGE_SIZE: u32 = 4000 * 1024 * 1024; // ~4GB for large model VMFBs (u32 limit)
         if (data_length > MAX_MESSAGE_SIZE) {
-            std.log.debug("Invalid length prefix bytes: {} {} {} {} -> parsed as {} bytes", .{
-                length_bytes[0], length_bytes[1], length_bytes[2], length_bytes[3], data_length
-            });
+            std.log.debug("Invalid length prefix bytes: {} {} {} {} -> parsed as {} bytes", .{ length_bytes[0], length_bytes[1], length_bytes[2], length_bytes[3], data_length });
         }
 
         if (data_length > MAX_MESSAGE_SIZE) {
-            std.log.err("Message exceeds size limit: {} MB (raw bytes: {} {} {} {})", .{
-                data_length / (1024 * 1024), length_bytes[0], length_bytes[1], length_bytes[2], length_bytes[3]
-            });
+            std.log.err("Message exceeds size limit: {} MB (raw bytes: {} {} {} {})", .{ data_length / (1024 * 1024), length_bytes[0], length_bytes[1], length_bytes[2], length_bytes[3] });
             return error.MessageTooLarge;
         }
-        
+
         // Log large messages for monitoring
         if (data_length > 10 * 1024 * 1024) {
             std.log.info("Large message detected: {} MB", .{data_length / (1024 * 1024)});
         }
-        
+
         // Read exactly data_length bytes
         const json_data = try allocator.alloc(u8, data_length);
         // DO NOT defer allocator.free(json_data) here; we are returning it.
-        
+
         _ = try stream.readAll(json_data);
-        
+
         const parsed = try std.json.parseFromSlice(MessageEnvelope, allocator, json_data, .{});
-        
+        if (parsed.value.protocol_version != message.current_protocol_version) {
+            parsed.deinit();
+            allocator.free(json_data);
+            return error.ProtocolVersionMismatch;
+        }
+
         std.log.debug("Received message: type={s}, length={}, from_node={}, from_service={s}", .{
             parsed.value.msg_type,
             data_length,
             parsed.value.sender_node,
             parsed.value.sender_service,
         });
-        
+
         // Return both the parsed object and the buffer
         return .{ .parsed = parsed, .buffer = json_data };
     }
-    
+
     /// Receive a MessageEnvelope with a timeout
-    pub fn receiveWithTimeout(stream: net.Stream, allocator: Allocator, timeout_ms: u64) !std.json.Parsed(MessageEnvelope) {
+    pub fn receiveWithTimeout(stream: net.Stream, allocator: Allocator, timeout_ms: u64) !ReceiveResult {
         // For now, just call receive - timeout implementation would require more complex handling
         _ = timeout_ms;
         return try receive(stream, allocator);
@@ -108,25 +108,25 @@ pub const TcpStreamManager = struct {
 pub const TcpServer = struct {
     listener: net.Server,
     allocator: Allocator,
-    
+
     const Self = @This();
-    
+
     pub fn init(allocator: Allocator, host: []const u8, port: u16) !Self {
         const address = try net.Address.parseIp(host, port);
         const listener = try address.listen(.{ .reuse_address = true });
-        
+
         std.log.info("TCP Server listening on {s}:{}", .{ host, port });
-        
+
         return Self{
             .listener = listener,
             .allocator = allocator,
         };
     }
-    
+
     pub fn deinit(self: *Self) void {
         self.listener.deinit();
     }
-    
+
     pub const Connection = struct {
         stream: net.Stream,
         address: net.Address,
@@ -141,7 +141,7 @@ pub const TcpServer = struct {
             .address = connection.address,
         };
     }
-    
+
     /// Accept connections and call handler for each one in a new thread
     pub fn acceptLoop(self: *Self, handler: *const fn (net.Stream, Allocator) anyerror!void) !void {
         while (true) {
@@ -158,16 +158,16 @@ pub const TcpServer = struct {
 pub const TcpClient = struct {
     stream: ?net.Stream,
     allocator: Allocator,
-    
+
     const Self = @This();
-    
+
     pub fn init(allocator: Allocator) Self {
         return Self{
             .stream = null,
             .allocator = allocator,
         };
     }
-    
+
     pub fn deinit(self: *Self) void {
         if (self.stream) |stream| {
             stream.close();
@@ -196,18 +196,18 @@ pub const TcpClient = struct {
 
         std.log.info("Connected to TCP server at {s}:{}", .{ host, port });
     }
-    
+
     /// Get the underlying stream (must be connected first)
     pub fn getStream(self: Self) !net.Stream {
         return self.stream orelse error.NotConnected;
     }
-    
+
     /// Send a message using the TcpStreamManager
     pub fn send(self: Self, envelope: MessageEnvelope) !void {
         const stream = try self.getStream();
         try TcpStreamManager.send(stream, envelope, self.allocator);
     }
-    
+
     /// Receive a message using the TcpStreamManager
     pub fn receive(self: Self) !ReceiveResult {
         const stream = try self.getStream();
@@ -221,16 +221,18 @@ pub const TcpError = error{
     NotConnected,
     ConnectionClosed,
     InvalidMessage,
+    ProtocolVersionMismatch,
 };
 
 /// Helper function to create a MessageEnvelope
-pub fn createMessage(
+pub fn createMessageWithContext(
     from_node: message.NodeId,
     from_service: message.ServiceId,
     to_node: message.NodeId,
     to_service: message.ServiceId,
     msg_type: []const u8,
     msg_id: message.MessageId,
+    context: message.MessageContext,
     data: std.json.Value,
 ) MessageEnvelope {
     return MessageEnvelope{
@@ -240,8 +242,34 @@ pub fn createMessage(
         .recipient_service = to_service,
         .msg_type = msg_type,
         .msg_id = msg_id,
+        .protocol_version = message.current_protocol_version,
+        .request_id = context.request_id,
+        .round_id = context.round_id,
+        .task_id = context.task_id,
         .data = data,
     };
+}
+
+/// Helper function to create a MessageEnvelope with default protocol context.
+pub fn createMessage(
+    from_node: message.NodeId,
+    from_service: message.ServiceId,
+    to_node: message.NodeId,
+    to_service: message.ServiceId,
+    msg_type: []const u8,
+    msg_id: message.MessageId,
+    data: std.json.Value,
+) MessageEnvelope {
+    return createMessageWithContext(
+        from_node,
+        from_service,
+        to_node,
+        to_service,
+        msg_type,
+        msg_id,
+        .{},
+        data,
+    );
 }
 
 /// Test helper to create a test message

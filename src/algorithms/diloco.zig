@@ -31,6 +31,7 @@ const TrainingMetrics = training_algorithm.TrainingMetrics;
 const Shepherd = shepherd.Shepherd;
 const WorkerConfig = shepherd.WorkerConfig;
 const MessageType = message.MessageType;
+const MessageContext = message.MessageContext;
 const NesterovMLIR = nesterov_mlir.NesterovMLIR(f32);
 const MLIRBuilder = ops.MLIRBuilder;
 const Tensor = tensor.Tensor(void);
@@ -39,6 +40,12 @@ const DataLoader = data_loader.DataLoader;
 const ModelSanitizer = @import("../compiler/sanitizer.zig").ModelSanitizer;
 
 const RECOVERY_FILENAME = "shepherd_state.bin";
+
+const RoundDispatch = struct {
+    request_id: message.RequestId,
+    round_id: message.RoundId,
+    workers_assigned: usize,
+};
 
 /// DiLoCo algorithm configuration
 pub const DiLoCoConfig = struct {
@@ -102,7 +109,7 @@ pub const DiLoCo = struct {
     master_parameters: ?[]Tensor,
     master_param_raw_data: ?[][]u8, // Authoritative raw byte storage (MLIR may not copy data)
     parameter_shapes: [][]i64, // Multiple parameter shapes for GPT-2
-    
+
     // NEW: Data input shapes for worker buffer creation
     data_input_shapes: [][]i64, // Shapes for input_ids, targets, etc.
 
@@ -406,15 +413,18 @@ pub const DiLoCo = struct {
             }
 
             // Broadcast to snapshot participants only (workers will load data locally)
-            const workers_assigned = try self.broadcastToSnapshot(participants.items);
+            const round_dispatch = try self.broadcastToSnapshot(
+                participants.items,
+                @intCast(step + 1),
+            );
 
-            if (workers_assigned == 0) {
+            if (round_dispatch.workers_assigned == 0) {
                 std.log.warn("Round {} failed: No workers assigned. Skipping update.", .{step});
                 continue;
             }
 
             // Streaming Accumulation: Collect and apply gradients on the fly
-            try self.accumulateAndApplyGradients(workers_assigned);
+            try self.accumulateAndApplyGradients(round_dispatch);
 
             // Save recovery state immediately after update
             try self.saveRecoveryState();
@@ -448,7 +458,7 @@ pub const DiLoCo = struct {
                 .loss = self.metrics.loss,
                 .min_worker_loss = self.metrics.loss, // Note: Individual worker losses not tracked in streaming mode
                 .max_worker_loss = self.metrics.loss, // Note: Individual worker losses not tracked in streaming mode
-                .active_workers = workers_assigned,
+                .active_workers = round_dispatch.workers_assigned,
                 .learning_rate = self.host_optimizer.config.learning_rate,
                 .epoch_time_ms = epoch_time_ms,
             });
@@ -540,7 +550,6 @@ pub const DiLoCo = struct {
     }
 
     /// Extract raw byte data from a tensor defined by a stablehlo.constant operation.
-
     /// Save current master parameters to a binary file
     fn saveCheckpoint(self: *Self, step: usize) !void {
         if (self.master_param_raw_data == null) return;
@@ -579,10 +588,9 @@ pub const DiLoCo = struct {
         std.log.info("✓ Checkpoint saved.", .{});
     }
 
-
     /// Broadcast to snapshot participants only
-    /// Returns the number of workers that were actually assigned chunks
-    fn broadcastToSnapshot(self: *Self, workers: []const shepherd.WorkerConnection) !usize {
+    /// Returns the request/round context plus the number of workers actually assigned chunks.
+    fn broadcastToSnapshot(self: *Self, workers: []const shepherd.WorkerConnection, round_id: message.RoundId) !RoundDispatch {
         if (self.master_param_raw_data == null) {
             return error.ParametersNotInitialized;
         }
@@ -648,6 +656,7 @@ pub const DiLoCo = struct {
         // Use chunked transfer for large models (> 50MB raw bytes), otherwise Cap'n Proto + base64
         const CHUNK_THRESHOLD = 50 * 1024 * 1024; // 50MB
         const use_chunked_transfer = raw_bytes.len > CHUNK_THRESHOLD;
+        const request_id = self.coordinator.allocateRequestId();
 
         var capnp_bytes: ?[]u8 = null;
         var b64_encoded_params: ?[]u8 = null;
@@ -657,7 +666,10 @@ pub const DiLoCo = struct {
             // For large models: broadcast raw parameter bytes via chunked transfer
             // This bypasses Cap'n Proto which has size limits
             std.log.info("Using chunked transfer for {} byte payload (raw bytes)", .{raw_bytes.len});
-            try self.coordinator.broadcastLargeData(raw_bytes);
+            try self.coordinator.broadcastLargeDataWithContext(raw_bytes, .{
+                .request_id = request_id,
+                .round_id = round_id,
+            });
         } else {
             // For small models: use Cap'n Proto serialization + base64
             const empty_slice: []const u8 = &[_]u8{};
@@ -721,9 +733,14 @@ pub const DiLoCo = struct {
             try payload_map.put("dtype", std.json.Value{ .string = dtype_str });
 
             const json_payload = std.json.Value{ .object = payload_map };
+            const task_id: message.TaskId = @intCast(chunk.?.id + 1);
 
-            self.coordinator.sendToWorker(worker.node_id, MessageType.START_INNER_LOOP, json_payload) catch |err| {
-                std.log.err("Failed to send task to worker {}: {}", .{worker.node_id, err});
+            self.coordinator.sendToWorkerWithContext(worker.node_id, MessageType.START_INNER_LOOP, json_payload, MessageContext{
+                .request_id = request_id,
+                .round_id = round_id,
+                .task_id = task_id,
+            }) catch |err| {
+                std.log.err("Failed to send task to worker {}: {}", .{ worker.node_id, err });
             };
 
             std.log.info("Assigned chunk {} (offset: {}, len: {}) to worker {}", .{
@@ -736,13 +753,17 @@ pub const DiLoCo = struct {
             workers_assigned += 1;
         }
 
-        return workers_assigned;
+        return .{
+            .request_id = request_id,
+            .round_id = round_id,
+            .workers_assigned = workers_assigned,
+        };
     }
 
     /// Collect results from workers, accumulate gradients on the fly, and apply update.
     /// This keeps memory usage constant O(ModelSize) regardless of worker count.
-    fn accumulateAndApplyGradients(self: *Self, expected_count: usize) !void {
-        if (expected_count == 0) return;
+    fn accumulateAndApplyGradients(self: *Self, dispatch: RoundDispatch) !void {
+        if (dispatch.workers_assigned == 0) return;
         if (self.master_parameters == null) return error.ParametersNotInitialized;
 
         // 1. Calculate sizes
@@ -765,12 +786,21 @@ pub const DiLoCo = struct {
         var collected_count: usize = 0;
         var total_loss: f32 = 0.0;
 
-        std.log.info("Streaming results from {} workers (Exp: {} bytes/worker)...", .{ expected_count, transmission_bytes });
+        std.log.info("Streaming results from {} workers for request {} round {} (Exp: {} bytes/worker)...", .{
+            dispatch.workers_assigned,
+            dispatch.request_id,
+            dispatch.round_id,
+            transmission_bytes,
+        });
 
         // 2. Collection Loop
-        while (collected_count < expected_count) {
+        while (collected_count < dispatch.workers_assigned) {
             // Fetch one message at a time
-            const responses = try self.coordinator.collectFromWorkers(MessageType.INNER_LOOP_COMPLETE, 1);
+            const responses = try self.coordinator.collectMatchingFromWorkers(.{
+                .msg_type = MessageType.INNER_LOOP_COMPLETE,
+                .request_id = dispatch.request_id,
+                .round_id = dispatch.round_id,
+            }, 1);
             defer {
                 for (responses.items) |*msg| msg.deinitClone(self.allocator);
                 responses.deinit();
@@ -805,10 +835,16 @@ pub const DiLoCo = struct {
                 false;
 
             if (is_chunked) {
-                const update_state = self.coordinator.getReassembledUpdate(response.sender_node) orelse {
-                    std.log.err("Worker {} sent chunked completion but no reassembled data found!", .{response.sender_node});
+                var update_state = self.coordinator.takeReassembledUpdateForMessage(response) orelse {
+                    std.log.err("Worker {} sent chunked completion for request {} round {} task {} but no reassembled data was found!", .{
+                        response.sender_node,
+                        response.request_id,
+                        response.round_id,
+                        response.task_id,
+                    });
                     return error.MissingReassembledData;
                 };
+                defer update_state.deinit();
                 delta_bytes = update_state.buffer.items;
                 loss_val = update_state.loss;
             } else {
@@ -863,10 +899,6 @@ pub const DiLoCo = struct {
 
             total_loss += loss_val;
             collected_count += 1;
-
-            if (is_chunked) {
-                self.coordinator.clearReassembledUpdate(response.sender_node);
-            }
         }
 
         // 4. Average the Accumulator
@@ -963,8 +995,6 @@ pub const DiLoCo = struct {
         self.metrics.loss = total_loss / divisor;
         std.log.info("Round complete. Avg Loss: {d:.4}", .{self.metrics.loss});
     }
-
-
 
     /// Save recovery state to disk for shepherd resilience
     fn saveRecoveryState(self: *Self) !void {

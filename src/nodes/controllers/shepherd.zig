@@ -1,6 +1,5 @@
 /// Shepherd Controller - Coordinates distributed training across worker nodes
 /// This is the main coordinator that manages the worker pool and orchestrates DiLoCo training
-
 const std = @import("std");
 const net = std.net;
 const Allocator = std.mem.Allocator;
@@ -19,15 +18,21 @@ const TcpServer = tcp_stream.TcpServer;
 const TcpStreamManager = tcp_stream.TcpStreamManager;
 const MessageEnvelope = message.MessageEnvelope;
 const MessageType = message.MessageType;
+const MessageFilter = message.MessageFilter;
+const MessageContext = message.MessageContext;
 const NodeId = message.NodeId;
+const MessageId = message.MessageId;
+const RequestId = message.RequestId;
+const RoundId = message.RoundId;
+const TaskId = message.TaskId;
 const Executor = execution.Executor;
 const Backend = backend_selection.Backend;
 
 /// Worker readiness status
 pub const WorkerStatus = enum {
-    Connected,        // Worker connected but not initialized
+    Connected, // Worker connected but not initialized
     GraphInitialized, // Worker has loaded VMFB and is ready for tensors
-    Training,         // Worker is actively training
+    Training, // Worker is actively training
 };
 
 /// Worker configuration identifier for compiled artifacts
@@ -71,8 +76,8 @@ pub const WorkerConnection = struct {
     last_heartbeat: i64, // timestamp
     backend: Backend,
     status: WorkerStatus,
-    address: net.Address,  // Worker's network address
-    target_arch: ?[]const u8,  // GPU target architecture (e.g., gfx942 for MI300X, sm_80 for A100)
+    address: net.Address, // Worker's network address
+    target_arch: ?[]const u8, // GPU target architecture (e.g., gfx942 for MI300X, sm_80 for A100)
 
     const Self = @This();
 
@@ -130,6 +135,13 @@ pub const UpdateChunkState = struct {
     }
 };
 
+const UpdateKey = struct {
+    worker_id: NodeId,
+    request_id: RequestId,
+    round_id: RoundId,
+    task_id: TaskId,
+};
+
 /// Shepherd coordinates distributed training across workers
 /// Now accepts an Executor to make algorithms backend-agnostic
 pub const Shepherd = struct {
@@ -138,6 +150,9 @@ pub const Shepherd = struct {
     worker_pool: ArrayList(WorkerConnection),
     worker_pool_mutex: std.Thread.Mutex, // Protect worker_pool from concurrent access
     next_node_id: NodeId,
+    next_message_id: MessageId,
+    next_request_id: RequestId,
+    protocol_id_mutex: std.Thread.Mutex,
     is_running: bool,
     algorithm: ?*training_algorithm.TrainingAlgorithm, // Training algorithm interface
     executor: ?Executor, // Generic execution backend for algorithms
@@ -148,8 +163,8 @@ pub const Shepherd = struct {
     // Data manager for chunk-based strict partitioning
     data_manager: ?data_manager.DataManager,
 
-    // Chunked Update Transfer: Map WorkerID -> reassembly state for incoming updates
-    incoming_updates: std.AutoHashMap(NodeId, UpdateChunkState),
+    // Chunked Update Transfer: Map worker/request/round/task -> reassembly state for incoming updates
+    incoming_updates: std.AutoHashMap(UpdateKey, UpdateChunkState),
     incoming_updates_mutex: std.Thread.Mutex,
 
     // Supervisor Pattern: Map SupervisorID -> TCP Stream
@@ -166,6 +181,9 @@ pub const Shepherd = struct {
             .worker_pool = ArrayList(WorkerConnection).init(allocator),
             .worker_pool_mutex = std.Thread.Mutex{},
             .next_node_id = 1, // Start from 1, 0 is reserved for coordinator
+            .next_message_id = 1,
+            .next_request_id = 1,
+            .protocol_id_mutex = std.Thread.Mutex{},
             .is_running = false,
             .algorithm = null,
             .executor = null,
@@ -173,13 +191,13 @@ pub const Shepherd = struct {
             .result_queue = ArrayList(MessageEnvelope).init(allocator),
             .result_queue_mutex = std.Thread.Mutex{},
             .data_manager = null, // Initialized when training starts
-            .incoming_updates = std.AutoHashMap(NodeId, UpdateChunkState).init(allocator),
+            .incoming_updates = std.AutoHashMap(UpdateKey, UpdateChunkState).init(allocator),
             .incoming_updates_mutex = std.Thread.Mutex{},
             .supervisors = std.AutoHashMap(i64, net.Stream).init(allocator),
             .worker_map = std.AutoHashMap(NodeId, i64).init(allocator),
         };
     }
-    
+
     pub fn deinit(self: *Self) void {
         if (self.server) |*server| {
             server.deinit();
@@ -230,14 +248,41 @@ pub const Shepherd = struct {
             dm.deinit();
         }
     }
-    
+
+    pub fn allocateMessageId(self: *Self) MessageId {
+        self.protocol_id_mutex.lock();
+        defer self.protocol_id_mutex.unlock();
+
+        const msg_id = self.next_message_id;
+        self.next_message_id += 1;
+        return msg_id;
+    }
+
+    pub fn allocateRequestId(self: *Self) RequestId {
+        self.protocol_id_mutex.lock();
+        defer self.protocol_id_mutex.unlock();
+
+        const request_id = self.next_request_id;
+        self.next_request_id += 1;
+        return request_id;
+    }
+
+    fn updateKeyForMessage(worker_id: NodeId, msg: MessageEnvelope) UpdateKey {
+        return .{
+            .worker_id = worker_id,
+            .request_id = msg.request_id,
+            .round_id = msg.round_id,
+            .task_id = msg.task_id,
+        };
+    }
+
     /// Start listening for worker connections
     pub fn listen(self: *Self, host: []const u8, port: u16) !void {
         self.server = try TcpServer.init(self.allocator, host, port);
         self.is_running = true;
-        
+
         std.log.info("Shepherd listening on {s}:{} for worker connections", .{ host, port });
-        
+
         // Start accepting connections
         while (self.is_running) {
             if (self.server) |*server| {
@@ -311,10 +356,7 @@ pub const Shepherd = struct {
         const data_obj = join_msg.data.object;
         const backend_str = data_obj.get("backend").?.string;
 
-        const worker_backend = if (std.mem.eql(u8, backend_str, "cuda")) backend_selection.Backend.cuda
-            else if (std.mem.eql(u8, backend_str, "rocm")) backend_selection.Backend.rocm
-            else if (std.mem.eql(u8, backend_str, "metal")) backend_selection.Backend.metal
-            else .cpu; // Default to cpu
+        const worker_backend = if (std.mem.eql(u8, backend_str, "cuda")) backend_selection.Backend.cuda else if (std.mem.eql(u8, backend_str, "rocm")) backend_selection.Backend.rocm else if (std.mem.eql(u8, backend_str, "metal")) backend_selection.Backend.metal else .cpu; // Default to cpu
 
         // Parse and duplicate target architecture string to own it
         var owned_target_arch: ?[]const u8 = null;
@@ -362,7 +404,7 @@ pub const Shepherd = struct {
         self.updateWorkerInfo();
 
         std.log.info("Worker {} connected", .{assigned_node_id});
-        
+
         // Send JoinAccept response
         const empty_obj = std.json.Value{ .object = std.json.ObjectMap.init(self.allocator) };
         const join_accept = tcp_stream.createMessage(
@@ -371,26 +413,25 @@ pub const Shepherd = struct {
             assigned_node_id, // worker node_id
             "worker", // worker service
             MessageType.JOIN_ACCEPT,
-            join_msg.msg_id + 1,
+            self.allocateMessageId(),
             empty_obj,
         );
-        
+
         const json_buffer = join_accept.asJsonString(self.allocator) catch |err| {
             std.log.err("Failed to serialize JOIN_ACCEPT: {}", .{err});
             return;
         };
         defer json_buffer.deinit();
-        
+
         TcpStreamManager.send(stream, join_accept, self.allocator) catch |err| {
             std.log.err("Failed to send join accept: {}", .{err});
             return;
         };
-        
-        
+
         // Enter worker message handling loop
         try self.handleWorkerMessages(assigned_node_id, stream);
     }
-    
+
     /// Handle ongoing messages from a worker
     fn handleWorkerMessages(self: *Self, worker_id: NodeId, stream: net.Stream) !void {
         while (self.is_running) {
@@ -404,9 +445,9 @@ pub const Shepherd = struct {
             };
             defer msg_result.parsed.deinit();
             defer self.allocator.free(msg_result.buffer);
-            
+
             const msg = msg_result.parsed.value;
-            
+
             // Handle different message types
             if (std.mem.eql(u8, msg.msg_type, MessageType.HEARTBEAT)) {
                 self.handleHeartbeat(worker_id);
@@ -438,7 +479,7 @@ pub const Shepherd = struct {
             }
         }
     }
-    
+
     /// Handle heartbeat from worker
     fn handleHeartbeat(self: *Self, worker_id: NodeId) void {
         for (self.worker_pool.items) |*worker| {
@@ -467,6 +508,7 @@ pub const Shepherd = struct {
             else => 0.0,
         };
         const chunk_id = payload.get("chunk_id").?.integer;
+        const update_key = updateKeyForMessage(worker_id, msg);
 
         self.incoming_updates_mutex.lock();
         defer self.incoming_updates_mutex.unlock();
@@ -474,18 +516,25 @@ pub const Shepherd = struct {
         // Initialize buffer on first chunk
         if (chunk_index == 0) {
             // Clean up any existing state for this worker
-            if (self.incoming_updates.getPtr(worker_id)) |existing| {
+            if (self.incoming_updates.getPtr(update_key)) |existing| {
                 existing.deinit();
             }
             var state = try UpdateChunkState.init(self.allocator, total_bytes, total_chunks);
             state.loss = loss;
             state.chunk_id = chunk_id;
-            try self.incoming_updates.put(worker_id, state);
-            std.log.info("Shepherd: Started receiving update from worker {} ({} bytes in {} chunks)", .{ worker_id, total_bytes, total_chunks });
+            try self.incoming_updates.put(update_key, state);
+            std.log.info("Shepherd: Started receiving update from worker {} request {} round {} task {} ({} bytes in {} chunks)", .{
+                worker_id,
+                msg.request_id,
+                msg.round_id,
+                msg.task_id,
+                total_bytes,
+                total_chunks,
+            });
         }
 
         // Get state (must exist after first chunk)
-        const state = self.incoming_updates.getPtr(worker_id) orelse return error.MissingChunkState;
+        const state = self.incoming_updates.getPtr(update_key) orelse return error.MissingChunkState;
 
         // Decode and append chunk
         const decoded_len = try std.base64.standard.Decoder.calcSizeForSlice(b64_data);
@@ -497,12 +546,25 @@ pub const Shepherd = struct {
         state.received_chunks += 1;
 
         if (state.received_chunks % 10 == 0 or state.received_chunks == state.expected_chunks) {
-            std.log.info("Shepherd: Received chunk {}/{} from worker {}", .{ state.received_chunks, state.expected_chunks, worker_id });
+            std.log.info("Shepherd: Received chunk {}/{} from worker {} request {} round {} task {}", .{
+                state.received_chunks,
+                state.expected_chunks,
+                worker_id,
+                msg.request_id,
+                msg.round_id,
+                msg.task_id,
+            });
         }
 
         // When all chunks received, queue a synthetic InnerLoopComplete message
         if (state.received_chunks == state.expected_chunks) {
-            std.log.info("Shepherd: Reassembly complete for worker {}. {} bytes received.", .{ worker_id, state.buffer.items.len });
+            std.log.info("Shepherd: Reassembly complete for worker {} request {} round {} task {}. {} bytes received.", .{
+                worker_id,
+                msg.request_id,
+                msg.round_id,
+                msg.task_id,
+                state.buffer.items.len,
+            });
 
             // Store the reassembled data - we'll reference it by worker_id in diloco
             // The InnerLoopComplete message will signal that data is ready
@@ -510,21 +572,14 @@ pub const Shepherd = struct {
         }
     }
 
-    /// Get reassembled update data for a worker (called by DiLoCo after InnerLoopComplete)
-    pub fn getReassembledUpdate(self: *Self, worker_id: NodeId) ?*UpdateChunkState {
+    /// Take reassembled update data for a worker response (called by DiLoCo after InnerLoopComplete)
+    pub fn takeReassembledUpdateForMessage(self: *Self, msg: MessageEnvelope) ?UpdateChunkState {
         self.incoming_updates_mutex.lock();
         defer self.incoming_updates_mutex.unlock();
-        return self.incoming_updates.getPtr(worker_id);
-    }
-
-    /// Clear reassembled update data for a worker after it's been consumed
-    pub fn clearReassembledUpdate(self: *Self, worker_id: NodeId) void {
-        self.incoming_updates_mutex.lock();
-        defer self.incoming_updates_mutex.unlock();
-        if (self.incoming_updates.fetchRemove(worker_id)) |kv| {
-            var state = kv.value;
-            state.deinit();
+        if (self.incoming_updates.fetchRemove(updateKeyForMessage(msg.sender_node, msg))) |kv| {
+            return kv.value;
         }
+        return null;
     }
 
     /// Handle inner loop completion from worker
@@ -543,7 +598,7 @@ pub const Shepherd = struct {
 
         std.log.info("Worker {} result successfully queued. Queue len: {}", .{ worker_id, self.result_queue.items.len });
     }
-    
+
     /// Remove a worker from the pool
     fn removeWorker(self: *Self, worker_id: NodeId) void {
         self.worker_pool_mutex.lock();
@@ -625,12 +680,12 @@ pub const Shepherd = struct {
     pub fn setAlgorithm(self: *Self, algorithm: *training_algorithm.TrainingAlgorithm) void {
         self.algorithm = algorithm;
     }
-    
+
     /// Set the executor for algorithms to use
     pub fn setExecutor(self: *Self, executor: Executor) void {
         self.executor = executor;
     }
-    
+
     /// Get the executor for algorithms to use
     pub fn getExecutor(self: *Self) ?Executor {
         return self.executor;
@@ -661,7 +716,7 @@ pub const Shepherd = struct {
         const worker_count = self.worker_pool.items.len;
         self.worker_pool_mutex.unlock();
         std.log.info("Got {} workers, starting training...", .{worker_count});
-        
+
         if (self.algorithm) |algo| {
             try algo.run();
             std.log.info("Training algorithm completed successfully", .{});
@@ -669,37 +724,43 @@ pub const Shepherd = struct {
             std.log.warn("No training algorithm set", .{});
         }
     }
-    
+
     /// Broadcast a message to all workers
     pub fn broadcastToWorkers(self: *Self, msg_type: []const u8, data: std.json.Value) !void {
-        var msg_id: u8 = 1;
+        return self.broadcastToWorkersWithContext(msg_type, data, .{});
+    }
 
+    pub fn broadcastToWorkersWithContext(self: *Self, msg_type: []const u8, data: std.json.Value, context: MessageContext) !void {
         self.worker_pool_mutex.lock();
         defer self.worker_pool_mutex.unlock();
 
         for (self.worker_pool.items) |worker| {
-            const msg = tcp_stream.createMessage(
+            const msg = tcp_stream.createMessageWithContext(
                 0, // coordinator node_id
                 "shepherd", // coordinator service
                 worker.node_id, // worker node_id
                 "worker", // worker service
                 msg_type,
-                msg_id,
+                self.allocateMessageId(),
+                context,
                 data,
             );
 
             TcpStreamManager.send(worker.stream, msg, self.allocator) catch |err| {
                 std.log.err("Failed to send message to worker {}: {}", .{ worker.node_id, err });
             };
-
-            msg_id += 1;
         }
-
     }
 
     /// Broadcast large binary data to all workers using chunked transfer protocol.
     /// Splits data into 10MB chunks to avoid Cap'n Proto message size limits.
     pub fn broadcastLargeData(self: *Self, data: []const u8) !void {
+        return self.broadcastLargeDataWithContext(data, .{});
+    }
+
+    /// Broadcast large binary data to all workers using chunked transfer protocol
+    /// while preserving request/round/task metadata for the transfer.
+    pub fn broadcastLargeDataWithContext(self: *Self, data: []const u8, context: MessageContext) !void {
         const CHUNK_SIZE = 10 * 1024 * 1024; // 10MB per chunk
         const total_size = data.len;
         const total_chunks = (total_size + CHUNK_SIZE - 1) / CHUNK_SIZE;
@@ -728,7 +789,7 @@ pub const Shepherd = struct {
             try payload.put("total_bytes", std.json.Value{ .integer = @intCast(total_size) });
 
             // Broadcast using existing method
-            try self.broadcastToWorkers(MessageType.WEIGHT_CHUNK, .{ .object = payload });
+            try self.broadcastToWorkersWithContext(MessageType.WEIGHT_CHUNK, .{ .object = payload }, context);
 
             offset = end;
 
@@ -740,16 +801,23 @@ pub const Shepherd = struct {
 
     /// Send a message to a specific worker by its NodeId
     pub fn sendToWorker(self: *Self, node_id: NodeId, msg_type: []const u8, data: std.json.Value) !void {
+        return self.sendToWorkerWithContext(node_id, msg_type, data, .{});
+    }
+
+    pub fn sendToWorkerWithContext(self: *Self, node_id: NodeId, msg_type: []const u8, data: std.json.Value, context: MessageContext) !void {
         self.worker_pool_mutex.lock();
         defer self.worker_pool_mutex.unlock();
 
         for (self.worker_pool.items) |worker| {
             if (worker.node_id == node_id) {
-                const msg = tcp_stream.createMessage(
-                    0, "shepherd",
-                    worker.node_id, "worker",
+                const msg = tcp_stream.createMessageWithContext(
+                    0,
+                    "shepherd",
+                    worker.node_id,
+                    "worker",
                     msg_type,
-                    1, // message id can be improved later
+                    self.allocateMessageId(),
+                    context,
                     data,
                 );
 
@@ -785,28 +853,48 @@ pub const Shepherd = struct {
             }
         }
     }
-    
+
+    fn countQueuedMatches(self: *Self, filter: MessageFilter) !usize {
+        var seen_senders = std.AutoHashMap(NodeId, void).init(self.allocator);
+        defer seen_senders.deinit();
+
+        self.result_queue_mutex.lock();
+        defer self.result_queue_mutex.unlock();
+
+        for (self.result_queue.items) |msg| {
+            if (!filter.matches(msg)) continue;
+            try seen_senders.put(msg.sender_node, {});
+        }
+
+        return seen_senders.count();
+    }
+
     /// Collect responses from a specific number of workers
     pub fn collectFromWorkers(self: *Self, expected_msg_type: []const u8, expected_count: usize) !ArrayList(MessageEnvelope) {
-        std.log.info("Collecting results (expecting {})...", .{expected_count});
+        return self.collectMatchingFromWorkers(.{
+            .msg_type = expected_msg_type,
+        }, expected_count);
+    }
+
+    pub fn collectMatchingFromWorkers(self: *Self, filter: MessageFilter, expected_count: usize) !ArrayList(MessageEnvelope) {
+        std.log.info("Collecting results for type '{s}' (expecting {})...", .{ filter.msg_type, expected_count });
 
         const max_wait_seconds: i64 = 14400; // 4 hours - accommodate large tau/models with long inner loops
         const start_time = std.time.timestamp();
 
         var loops: usize = 0;
         while (true) {
-            self.result_queue_mutex.lock();
-            const current_results = self.result_queue.items.len;
-            self.result_queue_mutex.unlock();
+            const matching_results = try self.countQueuedMatches(filter);
 
-            if (current_results >= expected_count) {
+            if (matching_results >= expected_count) {
                 break;
             }
 
             loops += 1;
             if (loops % 100 == 0) {
-                std.log.info("Still waiting for results. Queue has {}/{}, Elapsed: {}s", .{
-                    current_results,
+                std.log.info("Still waiting for results for type '{s}'. Matching queue has {}/{}, Elapsed: {}s", .{
+                    filter.msg_type,
+                    matching_results,
                     expected_count,
                     std.time.timestamp() - start_time,
                 });
@@ -814,8 +902,12 @@ pub const Shepherd = struct {
 
             const elapsed = std.time.timestamp() - start_time;
             if (elapsed > max_wait_seconds) {
-                if (current_results > 0) {
-                    std.log.warn("Timeout waiting for all results. Proceeding with {}/{}", .{current_results, expected_count});
+                if (matching_results > 0) {
+                    std.log.warn("Timeout waiting for all results for type '{s}'. Proceeding with {}/{}", .{
+                        filter.msg_type,
+                        matching_results,
+                        expected_count,
+                    });
                     break;
                 }
                 return error.CollectionTimeout;
@@ -829,17 +921,40 @@ pub const Shepherd = struct {
         defer self.result_queue_mutex.unlock();
 
         // Debug: log what's in the queue
-        std.log.info("collectFromWorkers: looking for '{s}', queue has {} items", .{ expected_msg_type, self.result_queue.items.len });
+        std.log.info("collectFromWorkers: looking for '{s}', queue has {} items", .{ filter.msg_type, self.result_queue.items.len });
         for (self.result_queue.items, 0..) |dbg_msg, dbg_i| {
-            std.log.info("  queue[{}]: msg_type='{s}'", .{ dbg_i, dbg_msg.msg_type });
+            std.log.info("  queue[{}]: msg_type='{s}' request={} round={} task={} sender={}", .{
+                dbg_i,
+                dbg_msg.msg_type,
+                dbg_msg.request_id,
+                dbg_msg.round_id,
+                dbg_msg.task_id,
+                dbg_msg.sender_node,
+            });
         }
 
         var responses = ArrayList(MessageEnvelope).init(self.allocator);
+        var seen_senders = std.AutoHashMap(NodeId, void).init(self.allocator);
+        defer seen_senders.deinit();
 
         var i: usize = 0;
         while (i < self.result_queue.items.len) {
             const msg = self.result_queue.items[i];
-            if (std.mem.eql(u8, msg.msg_type, expected_msg_type)) {
+            if (filter.matches(msg)) {
+                if (seen_senders.contains(msg.sender_node)) {
+                    var duplicate = self.result_queue.orderedRemove(i);
+                    duplicate.deinitClone(self.allocator);
+                    std.log.warn("Dropping duplicate queued message from worker {} for type '{s}' request {} round {} task {}", .{
+                        msg.sender_node,
+                        msg.msg_type,
+                        msg.request_id,
+                        msg.round_id,
+                        msg.task_id,
+                    });
+                    continue;
+                }
+
+                try seen_senders.put(msg.sender_node, {});
                 try responses.append(msg);
                 _ = self.result_queue.orderedRemove(i);
             } else {
@@ -1104,13 +1219,13 @@ pub const Shepherd = struct {
     /// Stop the coordinator
     pub fn stop(self: *Self) void {
         self.is_running = false;
-        
+
         // Send shutdown message to all workers
         const shutdown_data = std.json.Value{ .string = "shutdown" };
         self.broadcastToWorkers(MessageType.SHUTDOWN, shutdown_data) catch |err| {
             std.log.err("Failed to broadcast shutdown: {}", .{err});
         };
-        
+
         std.log.info("Shepherd stopped", .{});
     }
 };
@@ -1118,13 +1233,13 @@ pub const Shepherd = struct {
 /// Test function for the Shepherd
 pub fn testShepherd(allocator: Allocator) !void {
     std.log.info("Testing Shepherd coordinator...");
-    
+
     var shepherd = Shepherd.init(allocator);
     defer shepherd.deinit();
-    
+
     // Test basic initialization
     try std.testing.expectEqual(@as(usize, 0), shepherd.getWorkerCount());
     try std.testing.expectEqual(@as(NodeId, 1), shepherd.next_node_id);
-    
+
     std.log.info("✓ Shepherd test completed");
 }

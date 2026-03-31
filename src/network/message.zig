@@ -2,6 +2,46 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const json = std.json;
 
+pub const ProtocolVersion = u16;
+pub const current_protocol_version: ProtocolVersion = 1;
+
+/// A (possibly random) node id.
+pub const NodeId = u16;
+pub const ServiceId = []const u8;
+
+/// A (possibly random) message id.
+pub const MessageId = u64;
+pub const RequestId = u64;
+pub const RoundId = u64;
+pub const TaskId = u64;
+
+pub const MessageContext = struct {
+    request_id: RequestId = 0,
+    round_id: RoundId = 0,
+    task_id: TaskId = 0,
+};
+
+pub const MessageFilter = struct {
+    msg_type: []const u8,
+    request_id: ?RequestId = null,
+    round_id: ?RoundId = null,
+    task_id: ?TaskId = null,
+
+    pub fn matches(self: @This(), envelope: MessageEnvelope) bool {
+        if (!std.mem.eql(u8, self.msg_type, envelope.msg_type)) return false;
+        if (self.request_id) |request_id| {
+            if (envelope.request_id != request_id) return false;
+        }
+        if (self.round_id) |round_id| {
+            if (envelope.round_id != round_id) return false;
+        }
+        if (self.task_id) |task_id| {
+            if (envelope.task_id != task_id) return false;
+        }
+        return true;
+    }
+};
+
 pub const MessageEnvelope = struct {
     recipient_node: NodeId,
     recipient_service: ServiceId,
@@ -9,6 +49,10 @@ pub const MessageEnvelope = struct {
     sender_service: ServiceId,
     msg_type: []const u8,
     msg_id: MessageId,
+    protocol_version: ProtocolVersion = current_protocol_version,
+    request_id: RequestId = 0,
+    round_id: RoundId = 0,
+    task_id: TaskId = 0,
     data: std.json.Value,
 
     const Self = @This();
@@ -46,6 +90,10 @@ pub const MessageEnvelope = struct {
             .sender_service = sender_service_copy,
             .msg_type = msg_type_copy,
             .msg_id = self.msg_id,
+            .protocol_version = self.protocol_version,
+            .request_id = self.request_id,
+            .round_id = self.round_id,
+            .task_id = self.task_id,
             .data = data_copy,
         };
     }
@@ -115,7 +163,7 @@ pub const MessageEnvelope = struct {
             },
         }
     }
-    
+
     /// Create MessageEnvelope with binary data (Base64 encoded)
     pub fn createWithBinaryData(
         recipient_node: NodeId,
@@ -131,10 +179,10 @@ pub const MessageEnvelope = struct {
         const b64_len = std.base64.standard.Encoder.calcSize(binary_data.len);
         const b64_encoded = try allocator.alloc(u8, b64_len);
         defer allocator.free(b64_encoded);
-        
+
         const encoded_len = std.base64.standard.Encoder.encode(b64_encoded, binary_data).len;
         const final_encoded = try allocator.dupe(u8, b64_encoded[0..encoded_len]);
-        
+
         return Self{
             .recipient_node = recipient_node,
             .recipient_service = recipient_service,
@@ -142,31 +190,28 @@ pub const MessageEnvelope = struct {
             .sender_service = sender_service,
             .msg_type = msg_type,
             .msg_id = msg_id,
+            .protocol_version = current_protocol_version,
+            .request_id = 0,
+            .round_id = 0,
+            .task_id = 0,
             .data = std.json.Value{ .string = final_encoded },
         };
     }
-    
+
     /// Extract binary data from MessageEnvelope (Base64 decode)
     pub fn extractBinaryData(self: Self, allocator: Allocator) ![]u8 {
         const b64_string = switch (self.data) {
             .string => |s| s,
             else => return error.InvalidMessageFormat,
         };
-        
+
         const decoded_len = try std.base64.standard.Decoder.calcSizeForSlice(b64_string);
         const decoded = try allocator.alloc(u8, decoded_len);
-        
+
         try std.base64.standard.Decoder.decode(decoded, b64_string);
         return decoded;
     }
 };
-
-/// A (possibly random) node id.
-pub const NodeId = u8;
-pub const ServiceId = []const u8;
-
-/// A (possibly random) message id.
-pub const MessageId = u8;
 
 /// Message types for DiLoCo distributed training
 pub const MessageType = struct {
@@ -180,12 +225,12 @@ pub const MessageType = struct {
 
     // Supervisor Control Protocol
     pub const SUPERVISOR_HANDSHAKE = "SupervisorHandshake"; // Supervisor -> Shepherd (ID: u64)
-    pub const RESTART_WORKER = "RestartWorker";           // Shepherd -> Supervisor (Force restart)
+    pub const RESTART_WORKER = "RestartWorker"; // Shepherd -> Supervisor (Force restart)
 
     // RL / GRPO Protocol
-    pub const START_ROLLOUT = "StartRollout";       // Shepherd -> Worker: "Generate text for these prompts"
+    pub const START_ROLLOUT = "StartRollout"; // Shepherd -> Worker: "Generate text for these prompts"
     pub const ROLLOUT_COMPLETE = "RolloutComplete"; // Worker -> Shepherd: "Here are the token IDs and LogProbs"
-    pub const UPDATE_WEIGHTS = "UpdateWeights";     // Shepherd -> Worker: "Here are the new model weights"
+    pub const UPDATE_WEIGHTS = "UpdateWeights"; // Shepherd -> Worker: "Here are the new model weights"
 
     // Chunked Data Transfer Protocol (for large models > Cap'n Proto limits)
     pub const WEIGHT_CHUNK = "WeightChunk"; // Shepherd -> Worker: { chunk_index, total_chunks, total_bytes, data: "base64..." }
@@ -194,7 +239,7 @@ pub const MessageType = struct {
     // Streaming DiLoCo Protocol
     pub const START_STREAMING_LOOP = "StartStreamingLoop"; // Shepherd -> Worker: "Start continuous streaming mode"
     pub const FRAGMENT_UPDATE = "FragmentUpdate"; // Worker -> Shepherd: "Here is the gradient delta for fragment P"
-    pub const FRAGMENT_READY = "FragmentReady";   // Shepherd -> Worker: "Here are the merged global weights for fragment P"
+    pub const FRAGMENT_READY = "FragmentReady"; // Shepherd -> Worker: "Here are the merged global weights for fragment P"
 };
 
 pub const MessageHandler = *const fn (MessageEnvelope) anyerror!void;
@@ -230,6 +275,10 @@ pub fn expectEqualMessages(expected: MessageEnvelope, actual: MessageEnvelope) e
     try std.testing.expectEqualStrings(expected.sender_service, actual.sender_service);
     try std.testing.expectEqualStrings(expected.msg_type, actual.msg_type);
     try std.testing.expectEqual(expected.msg_id, actual.msg_id);
+    try std.testing.expectEqual(expected.protocol_version, actual.protocol_version);
+    try std.testing.expectEqual(expected.request_id, actual.request_id);
+    try std.testing.expectEqual(expected.round_id, actual.round_id);
+    try std.testing.expectEqual(expected.task_id, actual.task_id);
 
     try std.testing.expectEqual(@tagName(expected.data), @tagName(actual.data));
     switch (actual.data) {
@@ -252,6 +301,10 @@ test "MessageEnvelope round trip JSON" {
         .sender_service = "serviceB",
         .msg_type = "text",
         .msg_id = 3,
+        .protocol_version = current_protocol_version,
+        .request_id = 7,
+        .round_id = 11,
+        .task_id = 13,
         .data = std.json.Value{ .string = "foo" },
     };
 

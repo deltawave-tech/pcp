@@ -1729,7 +1729,23 @@ pub const Worker = struct {
         };
 
         const active_ptr = worker.active_generations.getPtr(task.request_id).?;
-        const iree_impl: *IreeBackend = @ptrCast(@alignCast(worker.backend.ptr));
+        const backend_type = worker.backend.getBackendType();
+        var local_backend: ?*IreeBackend = null;
+        defer if (local_backend) |b| b.deinit();
+        const iree_impl: *IreeBackend = blk: {
+            if (backend_type == .cuda or backend_type == .rocm) {
+                // Create a thread-local backend to ensure a valid GPU context.
+                local_backend = IreeBackend.init(worker.allocator, backend_type, 0) catch |err| {
+                    worker.sendGenerationError(task.request_id, @errorName(err));
+                    worker.inference_mutex.lock();
+                    _ = worker.active_generations.remove(task.request_id);
+                    worker.inference_mutex.unlock();
+                    return;
+                };
+                break :blk local_backend.?;
+            }
+            break :blk @ptrCast(@alignCast(worker.backend.ptr));
+        };
 
         worker.inference_mutex.unlock();
 

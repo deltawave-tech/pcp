@@ -35,7 +35,16 @@ NUM_LAYERS = config.num_hidden_layers
 NUM_HEADS = config.num_attention_heads
 
 # RoPE constants - pre-compute inv_freq as a FROZEN constant to avoid tracing issues
-ROPE_BASE = float(config.rope_theta)
+def get_rope_base(cfg):
+    # Qwen2 stores rope settings under rope_parameters in recent transformers
+    if hasattr(cfg, "rope_theta"):
+        return float(cfg.rope_theta)
+    params = getattr(cfg, "rope_parameters", None)
+    if isinstance(params, dict) and "rope_theta" in params:
+        return float(params["rope_theta"])
+    return 1000000.0
+
+ROPE_BASE = get_rope_base(config)
 
 # Pre-compute inv_freq as a Python LIST of floats (not a tensor)
 # This ensures torch_mlir treats it as a literal constant, not a captured tensor
@@ -246,11 +255,15 @@ for layer in model.model.layers:
 model.model.forward = types.MethodType(clean_inner_forward, model.model)
 model.forward = types.MethodType(clean_outer_forward, model)
 
-# DELETE the rotary_emb.inv_freq buffer to prevent FX from capturing it as an input
-# We use stateless_rope() instead which computes inv_freq from a Python list constant
-if hasattr(model.model, 'rotary_emb') and hasattr(model.model.rotary_emb, 'inv_freq'):
-    delattr(model.model.rotary_emb, 'inv_freq')
-    print("Deleted model.model.rotary_emb.inv_freq buffer")
+# DELETE rotary_emb buffers to prevent FX from capturing them as inputs.
+# We use stateless_rope() instead which computes inv_freq from a Python list constant.
+if hasattr(model.model, "rotary_emb"):
+    if hasattr(model.model.rotary_emb, "inv_freq"):
+        delattr(model.model.rotary_emb, "inv_freq")
+        print("Deleted model.model.rotary_emb.inv_freq buffer")
+    if hasattr(model.model.rotary_emb, "original_inv_freq"):
+        delattr(model.model.rotary_emb, "original_inv_freq")
+        print("Deleted model.model.rotary_emb.original_inv_freq buffer")
 
 
 # --- 7. Functional Wrapper & Export ---

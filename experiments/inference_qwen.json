@@ -1,0 +1,18 @@
+{
+  "model_id": "qwen2.5-0.5b-instruct",
+  "pool_name": "default",
+  "generation_vmfb_path": "models/qwen_rl_generation.vmfb",
+  "generation_mlir_path": "models/qwen_rl_generation.mlir",
+  "weights_path": "checkpoints/initial_weights/qwen_flat.bin",
+  "tokenizer_source": "byte",
+  "tokenizer_path": null,
+  "num_gen_data_inputs": 50,
+  "max_context_tokens": 1024,
+  "default_max_output_tokens": 128,
+  "eos_token": 0,
+  "session_ttl_seconds": 600,
+  "request_timeout_seconds": 60,
+  "worker_backend": "cuda",
+  "worker_target_arch": "sm_80",
+  "api_token_env": "PCP_API_TOKEN"
+}

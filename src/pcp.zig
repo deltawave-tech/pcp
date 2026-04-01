@@ -1,6 +1,5 @@
 /// Main entry point for distributed training
 /// This file handles command-line arguments and launches either Shepherd or Worker
-
 const std = @import("std");
 const print = std.debug.print;
 const ArrayList = std.ArrayList;
@@ -82,7 +81,7 @@ const ExperimentConfig = struct {
 const ConfigResult = struct {
     config: ExperimentConfig,
     parsed: ?std.json.Parsed(ExperimentConfig),
-    json_data: ?[]u8,  // Keep the raw JSON buffer alive
+    json_data: ?[]u8, // Keep the raw JSON buffer alive
     allocator: Allocator,
 
     pub fn deinit(self: *@This()) void {
@@ -253,7 +252,7 @@ const Args = struct {
                     const connect_str = args[i];
                     if (std.mem.indexOf(u8, connect_str, ":")) |colon_idx| {
                         host = connect_str[0..colon_idx];
-                        port = std.fmt.parseInt(u16, connect_str[colon_idx + 1..], 10) catch 8080;
+                        port = std.fmt.parseInt(u16, connect_str[colon_idx + 1 ..], 10) catch 8080;
                     } else {
                         host = connect_str;
                     }
@@ -495,12 +494,18 @@ fn runInferenceController(allocator: Allocator, args: Args) !void {
     };
     defer allocator.free(api_token);
 
-    var controller = inference_shepherd.InferenceShepherd.init(allocator);
+    var controller = try inference_shepherd.InferenceShepherd.init(allocator, config, api_token);
+    controller.attachHooks();
     defer controller.deinit();
 
     const listen_thread = try std.Thread.spawn(.{}, inferenceListenThread, .{ &controller, args.control_host, args.control_port });
     defer controller.base.stop();
     defer listen_thread.join();
+
+    try controller.startMaintenance();
+
+    const api_thread = try std.Thread.spawn(.{}, inferenceApiThread, .{ &controller, args.api_host, args.api_port });
+    defer api_thread.join();
 
     print("🚀 Starting Inference Controller (phase 1 bootstrap)\n", .{});
     print("   Model ID: {s}\n", .{config.model_id});
@@ -519,14 +524,16 @@ fn runInferenceController(allocator: Allocator, args: Args) !void {
     }
     print("   Stop Token: EOS only\n", .{});
 
-    // Phase 1 bootstrap only: keep process alive until controller is implemented.
-    while (true) {
-        std.time.sleep(1 * std.time.ns_per_s);
-    }
+    // Block forever to keep controller alive.
+    while (true) std.time.sleep(1 * std.time.ns_per_s);
 }
 
 fn inferenceListenThread(controller: *inference_shepherd.InferenceShepherd, host: []const u8, port: u16) !void {
     try controller.listen(host, port);
+}
+
+fn inferenceApiThread(controller: *inference_shepherd.InferenceShepherd, host: []const u8, port: u16) !void {
+    try controller.startApi(host, port);
 }
 
 /// RL Shepherd listening thread
@@ -549,7 +556,7 @@ fn runShepherd(allocator: Allocator, args: Args) !void {
     if (args.should_resume) {
         // Attempt to read the ID of the run we are resuming
         const f = std.fs.cwd().openFile(LATEST_RUN_FILE, .{}) catch |err| {
-            print("Cannot resume: failed to open {s} to retrieve Run ID: {}\n", .{LATEST_RUN_FILE, err});
+            print("Cannot resume: failed to open {s} to retrieve Run ID: {}\n", .{ LATEST_RUN_FILE, err });
             return err;
         };
         defer f.close();
@@ -596,10 +603,7 @@ fn runShepherd(allocator: Allocator, args: Args) !void {
     print("   Backend: {s}\n", .{backend.toString()});
 
     // Initialize system
-    var system = try backend_selection.DistributedTrainingSystem.init(
-        allocator,
-        backend
-    );
+    var system = try backend_selection.DistributedTrainingSystem.init(allocator, backend);
     defer system.deinit();
 
     // Get the shared MLIR context from the executor
@@ -695,12 +699,7 @@ fn runShepherd(allocator: Allocator, args: Args) !void {
             .dtype = diloco_config.dtype,
         };
 
-        streaming_algo = try @import("algorithms/streaming_diloco.zig").StreamingDiLoCo.init(
-            allocator,
-            shepherd_controller,
-            stream_config,
-            &mlir_builder
-        );
+        streaming_algo = try @import("algorithms/streaming_diloco.zig").StreamingDiLoCo.init(allocator, shepherd_controller, stream_config, &mlir_builder);
         training_algo = streaming_algo.asTrainingAlgorithm();
         print("🌊 StreamingDiLoCo initialized successfully\n", .{});
     } else {

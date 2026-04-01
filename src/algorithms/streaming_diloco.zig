@@ -358,7 +358,7 @@ pub const StreamingDiLoCo = struct {
         frag_state: *FragmentState,
         msg: message.MessageEnvelope,
         expected_workers: usize,
-    ) !void {
+    ) anyerror!void {
         // Skip if this worker already submitted for this round (prevent double counting)
         if (frag_state.received_from.contains(msg.sender_node)) return;
 
@@ -380,7 +380,7 @@ pub const StreamingDiLoCo = struct {
         }
     }
 
-    fn processPendingMessages(self: *Self, frag_state: *FragmentState, expected_workers: usize) !void {
+    fn processPendingMessages(self: *Self, frag_state: *FragmentState, expected_workers: usize) anyerror!void {
         while (frag_state.current_round < self.config.max_epochs) {
             var progressed = false;
             var i: usize = 0;

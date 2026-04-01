@@ -112,6 +112,7 @@ pub const TcpStreamManager = struct {
         filter: MessageFilter,
         expected_sender: ?message.NodeId,
         max_messages: usize,
+        unmatched: ?*std.ArrayList(ReceiveResult),
     ) !ReceiveResult {
         var remaining = max_messages;
         while (remaining > 0) : (remaining -= 1) {
@@ -121,8 +122,12 @@ pub const TcpStreamManager = struct {
                     return result;
                 }
             }
-            result.parsed.deinit();
-            allocator.free(result.buffer);
+            if (unmatched) |list| {
+                try list.append(result);
+            } else {
+                result.parsed.deinit();
+                allocator.free(result.buffer);
+            }
         }
         return error.NoMatchingMessage;
     }

@@ -13,6 +13,7 @@ pub const InferenceConfig = struct {
     num_gen_data_inputs: usize,
     max_context_tokens: usize,
     default_max_output_tokens: usize,
+    eos_token: i64 = 0,
     session_ttl_seconds: u64,
     request_timeout_seconds: u64,
     worker_backend: []const u8,

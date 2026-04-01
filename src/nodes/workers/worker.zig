@@ -108,6 +108,10 @@ pub const Worker = struct {
     session_kv: std.StringHashMap(generation_engine.GenerationSession),
     active_generations: std.AutoHashMap(message.RequestId, generation_engine.ActiveGenerationState),
 
+    // Inference concurrency
+    inference_mutex: std.Thread.Mutex,
+    inference_send_mutex: std.Thread.Mutex,
+
     // Chunked Transfer: Request-scoped state for reassembling incoming weight chunks
     incoming_weight_transfers: std.AutoHashMap(message.RequestId, WeightTransferState),
     completed_weight_blobs: std.AutoHashMap(message.RequestId, []u8),
@@ -164,6 +168,8 @@ pub const Worker = struct {
             .loaded_models = std.StringHashMap(generation_engine.LoadedInferenceModel).init(allocator),
             .session_kv = std.StringHashMap(generation_engine.GenerationSession).init(allocator),
             .active_generations = std.AutoHashMap(message.RequestId, generation_engine.ActiveGenerationState).init(allocator),
+            .inference_mutex = std.Thread.Mutex{},
+            .inference_send_mutex = std.Thread.Mutex{},
             .incoming_weight_transfers = std.AutoHashMap(message.RequestId, WeightTransferState).init(allocator),
             .completed_weight_blobs = std.AutoHashMap(message.RequestId, []u8).init(allocator),
             .active_weight_blob_request_id = null,
@@ -249,7 +255,16 @@ pub const Worker = struct {
         }
 
         self.gen_engine.deinit();
+        var model_it = self.loaded_models.iterator();
+        while (model_it.next()) |entry| {
+            self.freeLoadedModel(entry.value_ptr.*);
+        }
         self.loaded_models.deinit();
+
+        var session_it = self.session_kv.iterator();
+        while (session_it.next()) |entry| {
+            self.freeGenerationSession(entry.value_ptr.*);
+        }
         self.session_kv.deinit();
         self.active_generations.deinit();
 
@@ -292,6 +307,32 @@ pub const Worker = struct {
         }
         errdefer self.allocator.free(blob);
         try self.completed_weight_blobs.put(request_id, blob);
+    }
+
+    fn freeLoadedModel(self: *Self, model: generation_engine.LoadedInferenceModel) void {
+        self.allocator.free(model.model_id);
+        self.allocator.free(model.cached_vmfb);
+        self.allocator.free(model.weights_blob);
+        for (model.param_shapes) |shape| self.allocator.free(shape);
+        self.allocator.free(model.param_shapes);
+        for (model.data_shapes) |shape| self.allocator.free(shape);
+        self.allocator.free(model.data_shapes);
+        if (model.data_dtypes) |dtypes| self.allocator.free(dtypes);
+    }
+
+    fn freeGenerationSession(self: *Self, session: generation_engine.GenerationSession) void {
+        self.allocator.free(session.session_id);
+        self.allocator.free(session.model_id);
+        if (session.kv_cache_host) |cache| {
+            for (cache) |buf| self.allocator.free(buf);
+            self.allocator.free(cache);
+        }
+    }
+
+    fn sendInferenceMessage(self: *Self, msg: MessageEnvelope) !void {
+        self.inference_send_mutex.lock();
+        defer self.inference_send_mutex.unlock();
+        try self.client.send(msg);
     }
 
     /// Connect to the Shepherd coordinator
@@ -388,6 +429,14 @@ pub const Worker = struct {
                 try self.handleStartRollout(msg);
             } else if (std.mem.eql(u8, msg.msg_type, MessageType.UPDATE_WEIGHTS)) {
                 try self.handleUpdateWeights(msg);
+            } else if (std.mem.eql(u8, msg.msg_type, MessageType.LOAD_MODEL)) {
+                try self.handleLoadModel(msg);
+            } else if (std.mem.eql(u8, msg.msg_type, MessageType.START_GENERATION)) {
+                try self.handleStartGeneration(msg);
+            } else if (std.mem.eql(u8, msg.msg_type, MessageType.CANCEL_GENERATION)) {
+                self.handleCancelGeneration(msg);
+            } else if (std.mem.eql(u8, msg.msg_type, MessageType.FLUSH_SESSION)) {
+                self.handleFlushSession(msg);
             } else if (std.mem.eql(u8, msg.msg_type, MessageType.SHUTDOWN)) {
                 self.handleShutdown(msg);
                 break;
@@ -1430,6 +1479,454 @@ pub const Worker = struct {
         self.state = .connected;
     }
 
+    /// Handle LoadModel command for inference workers.
+    fn handleLoadModel(self: *Self, msg: MessageEnvelope) !void {
+        const payload = switch (msg.data) {
+            .object => |obj| obj,
+            else => return error.InvalidMessageFormat,
+        };
+
+        const model_id = switch (payload.get("model_id") orelse return error.MissingModelId) {
+            .string => |s| s,
+            else => return error.InvalidModelId,
+        };
+        const vmfb_path = switch (payload.get("vmfb_path") orelse return error.MissingVmfbField) {
+            .string => |s| s,
+            else => return error.InvalidVmfbPathFormat,
+        };
+        const weights_path = switch (payload.get("weights_path") orelse return error.MissingWeightsPath) {
+            .string => |s| s,
+            else => return error.InvalidWeightsPath,
+        };
+
+        const max_context_tokens = switch (payload.get("max_context_tokens") orelse std.json.Value{ .integer = 0 }) {
+            .integer => |i| @as(usize, @intCast(i)),
+            else => 0,
+        };
+
+        const param_shapes_val = payload.get("parameter_shapes") orelse return error.MissingParameterShapesField;
+        const data_shapes_val = payload.get("data_input_shapes") orelse return error.MissingShapesField;
+        const data_dtypes_val = payload.get("data_input_dtypes");
+
+        const param_shapes = try self.parseShapeArray(param_shapes_val);
+        errdefer self.freeShapeArray(param_shapes);
+        const data_shapes = try self.parseShapeArray(data_shapes_val);
+        errdefer self.freeShapeArray(data_shapes);
+        const data_dtypes = if (data_dtypes_val) |val|
+            try self.parseDTypes(val)
+        else
+            null;
+        errdefer if (data_dtypes) |dtypes| self.allocator.free(dtypes);
+
+        const vmfb_bytes = try std.fs.cwd().readFileAlloc(
+            self.allocator,
+            vmfb_path,
+            10 * 1024 * 1024 * 1024,
+        );
+        errdefer self.allocator.free(vmfb_bytes);
+
+        const weights_bytes = try std.fs.cwd().readFileAlloc(
+            self.allocator,
+            weights_path,
+            10 * 1024 * 1024 * 1024,
+        );
+        errdefer self.allocator.free(weights_bytes);
+
+        const record = generation_engine.LoadedInferenceModel{
+            .model_id = try self.allocator.dupe(u8, model_id),
+            .cached_vmfb = vmfb_bytes,
+            .weights_blob = weights_bytes,
+            .param_shapes = param_shapes,
+            .data_shapes = data_shapes,
+            .data_dtypes = data_dtypes,
+            .max_context_tokens = max_context_tokens,
+        };
+
+        self.inference_mutex.lock();
+        defer self.inference_mutex.unlock();
+
+        if (self.loaded_models.fetchRemove(record.model_id)) |kv| {
+            self.freeLoadedModel(kv.value);
+        }
+        try self.loaded_models.put(record.model_id, record);
+
+        var ready_payload = std.json.ObjectMap.init(self.allocator);
+        defer ready_payload.deinit();
+        try ready_payload.put("model_id", .{ .string = model_id });
+        try ready_payload.put("ok", .{ .bool = true });
+
+        const response = tcp_stream.createMessageWithContext(
+            self.node_id.?,
+            "worker",
+            0,
+            "shepherd",
+            MessageType.MODEL_READY,
+            msg.msg_id + 1,
+            contextFromMessage(msg),
+            .{ .object = ready_payload },
+        );
+
+        try self.sendInferenceMessage(response);
+    }
+
+    const GenerationTask = struct {
+        worker: *Worker,
+        request_id: message.RequestId,
+        task_id: message.TaskId,
+        model_id: []const u8,
+        session_id: []const u8,
+        prompt_tokens: []i64,
+        max_new_tokens: usize,
+        eos_token: i64,
+        temperature: f32,
+        reuse_session: bool,
+        prompt_start_pos: i64,
+    };
+
+    /// Handle StartGeneration by spawning a decoding thread.
+    fn handleStartGeneration(self: *Self, msg: MessageEnvelope) !void {
+        const payload = switch (msg.data) {
+            .object => |obj| obj,
+            else => return error.InvalidMessageFormat,
+        };
+
+        const model_id = switch (payload.get("model_id") orelse return error.MissingModelId) {
+            .string => |s| s,
+            else => return error.InvalidModelId,
+        };
+        const session_id = switch (payload.get("session_id") orelse return error.MissingSessionId) {
+            .string => |s| s,
+            else => return error.InvalidSessionId,
+        };
+
+        const max_new_tokens = switch (payload.get("max_new_tokens") orelse return error.MissingMaxNewTokens) {
+            .integer => |i| @as(usize, @intCast(i)),
+            else => return error.InvalidMaxNewTokens,
+        };
+        const eos_token = switch (payload.get("eos_token") orelse std.json.Value{ .integer = 0 }) {
+            .integer => |i| i,
+            else => 0,
+        };
+        const temperature = switch (payload.get("temperature") orelse std.json.Value{ .float = 0.7 }) {
+            .float => |f| @as(f32, @floatCast(f)),
+            .integer => |i| @as(f32, @floatFromInt(i)),
+            else => 0.7,
+        };
+        const reuse_session = switch (payload.get("reuse_session") orelse std.json.Value{ .bool = false }) {
+            .bool => |b| b,
+            else => false,
+        };
+        const prompt_start_pos = switch (payload.get("prompt_start_pos") orelse std.json.Value{ .integer = 0 }) {
+            .integer => |i| i,
+            else => 0,
+        };
+
+        const prompt_json = payload.get("prompt_tokens") orelse return error.MissingPrompt;
+        var prompt_list = std.ArrayList(i64).init(self.allocator);
+        errdefer prompt_list.deinit();
+        switch (prompt_json) {
+            .array => |arr| {
+                for (arr.items) |item| {
+                    try prompt_list.append(item.integer);
+                }
+            },
+            else => return error.InvalidPromptFormat,
+        }
+
+        const task = try self.allocator.create(GenerationTask);
+        errdefer self.allocator.destroy(task);
+        task.* = .{
+            .worker = self,
+            .request_id = msg.request_id,
+            .task_id = msg.task_id,
+            .model_id = try self.allocator.dupe(u8, model_id),
+            .session_id = try self.allocator.dupe(u8, session_id),
+            .prompt_tokens = try prompt_list.toOwnedSlice(),
+            .max_new_tokens = max_new_tokens,
+            .eos_token = eos_token,
+            .temperature = temperature,
+            .reuse_session = reuse_session,
+            .prompt_start_pos = prompt_start_pos,
+        };
+
+        const thread = try std.Thread.spawn(.{}, runGenerationTask, .{task});
+        thread.detach();
+    }
+
+    fn runGenerationTask(task: *GenerationTask) void {
+        const worker = task.worker;
+        defer {
+            worker.allocator.free(task.model_id);
+            worker.allocator.free(task.session_id);
+            worker.allocator.free(task.prompt_tokens);
+            worker.allocator.destroy(task);
+        }
+
+        var model: generation_engine.LoadedInferenceModel = undefined;
+        var kv_cache_opt: ?[][]u8 = null;
+
+        worker.inference_mutex.lock();
+
+        if (worker.loaded_models.get(task.model_id)) |m| {
+            model = m;
+        } else {
+            worker.inference_mutex.unlock();
+            worker.sendGenerationError(task.request_id, "model_not_loaded");
+            return;
+        }
+
+        if (worker.session_kv.getPtr(task.session_id)) |session| {
+            if (task.reuse_session) {
+                kv_cache_opt = session.kv_cache_host;
+            } else if (session.kv_cache_host) |cache| {
+                for (cache) |buf| worker.allocator.free(buf);
+                worker.allocator.free(cache);
+                session.kv_cache_host = null;
+            }
+        } else {
+            const session_id = worker.allocator.dupe(u8, task.session_id) catch |err| {
+                worker.inference_mutex.unlock();
+                worker.sendGenerationError(task.request_id, @errorName(err));
+                return;
+            };
+            const model_id = worker.allocator.dupe(u8, task.model_id) catch |err| {
+                worker.allocator.free(session_id);
+                worker.inference_mutex.unlock();
+                worker.sendGenerationError(task.request_id, @errorName(err));
+                return;
+            };
+            const new_session = generation_engine.GenerationSession{
+                .session_id = session_id,
+                .model_id = model_id,
+                .kv_cache_host = null,
+                .last_pos = 0,
+            };
+            worker.session_kv.put(task.session_id, new_session) catch |err| {
+                worker.allocator.free(session_id);
+                worker.allocator.free(model_id);
+                worker.inference_mutex.unlock();
+                worker.sendGenerationError(task.request_id, @errorName(err));
+                return;
+            };
+        }
+
+        const active_state = generation_engine.ActiveGenerationState{
+            .request_id = task.request_id,
+            .task_id = task.task_id,
+            .model_id = task.model_id,
+            .session_id = task.session_id,
+            .prompt_tokens = task.prompt_tokens.len,
+            .completion_tokens = 0,
+            .cancelled = std.atomic.Value(u8).init(0),
+        };
+        if (worker.active_generations.fetchRemove(task.request_id)) |kv| {
+            _ = kv;
+        }
+        worker.active_generations.put(task.request_id, active_state) catch |err| {
+            worker.inference_mutex.unlock();
+            worker.sendGenerationError(task.request_id, @errorName(err));
+            return;
+        };
+
+        const active_ptr = worker.active_generations.getPtr(task.request_id).?;
+        const iree_impl: *IreeBackend = @ptrCast(@alignCast(worker.backend.ptr));
+
+        worker.inference_mutex.unlock();
+
+        const callback = struct {
+            fn emitToken(token: i64, ctx: *anyopaque) !void {
+                const task_ptr: *GenerationTask = @ptrCast(@alignCast(ctx));
+                try task_ptr.worker.sendGenerationChunk(task_ptr.request_id, token);
+            }
+        }.emitToken;
+
+        const result = worker.gen_engine.generateRolloutStreaming(
+            iree_impl,
+            &worker.sampler,
+            model.cached_vmfb,
+            model.param_shapes,
+            model.data_shapes,
+            model.weights_blob,
+            task.prompt_tokens,
+            task.max_new_tokens,
+            task.eos_token,
+            task.temperature,
+            &kv_cache_opt,
+            task.prompt_start_pos,
+            task.reuse_session,
+            callback,
+            @ptrCast(task),
+            &active_ptr.cancelled,
+        ) catch |err| {
+            worker.sendGenerationError(task.request_id, @errorName(err));
+            worker.inference_mutex.lock();
+            _ = worker.active_generations.remove(task.request_id);
+            worker.inference_mutex.unlock();
+            return;
+        };
+        defer worker.allocator.free(result.tokens);
+
+        worker.inference_mutex.lock();
+        if (worker.session_kv.getPtr(task.session_id)) |session| {
+            session.kv_cache_host = kv_cache_opt;
+            session.last_pos = task.prompt_start_pos + @as(i64, @intCast(task.prompt_tokens.len + result.tokens.len));
+        }
+        _ = worker.active_generations.remove(task.request_id);
+        worker.inference_mutex.unlock();
+
+        worker.sendGenerationComplete(task.request_id, result.finish_reason, task.prompt_tokens.len, result.tokens.len);
+    }
+
+    fn sendGenerationChunk(self: *Self, request_id: message.RequestId, token: i64) !void {
+        var payload = std.json.ObjectMap.init(self.allocator);
+        defer payload.deinit();
+
+        var tokens = std.json.Array.init(self.allocator);
+        defer tokens.deinit();
+        try tokens.append(.{ .integer = token });
+
+        try payload.put("tokens", .{ .array = tokens });
+        const response = tcp_stream.createMessageWithContext(
+            self.node_id.?,
+            "worker",
+            0,
+            "shepherd",
+            MessageType.GENERATION_CHUNK,
+            0,
+            .{ .request_id = request_id },
+            .{ .object = payload },
+        );
+        try self.sendInferenceMessage(response);
+    }
+
+    fn sendGenerationComplete(self: *Self, request_id: message.RequestId, reason: []const u8, prompt_tokens: usize, completion_tokens: usize) void {
+        var payload = std.json.ObjectMap.init(self.allocator);
+        defer payload.deinit();
+        payload.put("finish_reason", .{ .string = reason }) catch {};
+        payload.put("prompt_tokens", .{ .integer = @intCast(prompt_tokens) }) catch {};
+        payload.put("completion_tokens", .{ .integer = @intCast(completion_tokens) }) catch {};
+
+        const response = tcp_stream.createMessageWithContext(
+            self.node_id.?,
+            "worker",
+            0,
+            "shepherd",
+            MessageType.GENERATION_COMPLETE,
+            0,
+            .{ .request_id = request_id },
+            .{ .object = payload },
+        );
+        self.sendInferenceMessage(response) catch {};
+    }
+
+    fn sendGenerationError(self: *Self, request_id: message.RequestId, err: []const u8) void {
+        var payload = std.json.ObjectMap.init(self.allocator);
+        defer payload.deinit();
+        payload.put("error", .{ .string = err }) catch {};
+
+        const response = tcp_stream.createMessageWithContext(
+            self.node_id.?,
+            "worker",
+            0,
+            "shepherd",
+            MessageType.GENERATION_ERROR,
+            0,
+            .{ .request_id = request_id },
+            .{ .object = payload },
+        );
+        self.sendInferenceMessage(response) catch {};
+    }
+
+    fn handleCancelGeneration(self: *Self, msg: MessageEnvelope) void {
+        self.inference_mutex.lock();
+        defer self.inference_mutex.unlock();
+
+        if (self.active_generations.getPtr(msg.request_id)) |state| {
+            state.cancelled.store(1, .release);
+        }
+    }
+
+    fn handleFlushSession(self: *Self, msg: MessageEnvelope) void {
+        const payload = switch (msg.data) {
+            .object => |obj| obj,
+            else => return,
+        };
+        const session_id = switch (payload.get("session_id") orelse return) {
+            .string => |s| s,
+            else => return,
+        };
+
+        self.inference_mutex.lock();
+        defer self.inference_mutex.unlock();
+
+        if (self.session_kv.fetchRemove(session_id)) |kv| {
+            self.freeGenerationSession(kv.value);
+        }
+    }
+
+    fn parseShapeArray(self: *Self, value: std.json.Value) ![][]i64 {
+        const shapes_array = switch (value) {
+            .array => |arr| arr,
+            else => return error.InvalidShapesFormat,
+        };
+
+        var shapes_list = std.ArrayList([]i64).init(self.allocator);
+        errdefer {
+            for (shapes_list.items) |s| self.allocator.free(s);
+            shapes_list.deinit();
+        }
+
+        for (shapes_array.items) |shape_val| {
+            const dim_array = switch (shape_val) {
+                .array => |arr| arr,
+                else => return error.InvalidShapeFormat,
+            };
+            var dim_list = std.ArrayList(i64).init(self.allocator);
+            for (dim_array.items) |dim_val| {
+                const dim = switch (dim_val) {
+                    .integer => |i| i,
+                    else => return error.InvalidDimensionFormat,
+                };
+                try dim_list.append(dim);
+            }
+            try shapes_list.append(try dim_list.toOwnedSlice());
+        }
+        return shapes_list.toOwnedSlice();
+    }
+
+    fn freeShapeArray(self: *Self, shapes: [][]i64) void {
+        for (shapes) |s| self.allocator.free(s);
+        self.allocator.free(shapes);
+    }
+
+    fn parseDTypes(self: *Self, value: std.json.Value) ![]tensor.DType {
+        const dtypes_array = switch (value) {
+            .array => |arr| arr,
+            else => return error.InvalidDTypesFormat,
+        };
+
+        var dtypes_list = std.ArrayList(tensor.DType).init(self.allocator);
+        errdefer dtypes_list.deinit();
+
+        for (dtypes_array.items) |val| {
+            const s = switch (val) {
+                .string => |str| str,
+                else => return error.InvalidDTypeFormat,
+            };
+            const dtype = if (std.mem.eql(u8, s, "f32"))
+                tensor.DType.f32
+            else if (std.mem.eql(u8, s, "bf16"))
+                tensor.DType.bf16
+            else if (std.mem.eql(u8, s, "f16"))
+                tensor.DType.f16
+            else
+                return error.InvalidDTypeFormat;
+            try dtypes_list.append(dtype);
+        }
+
+        return dtypes_list.toOwnedSlice();
+    }
+
     /// Background Thread: Empties the Tx Queue and sends to Shepherd
     fn txLoop(self: *Self) void {
         std.log.info("Worker {}: Tx Thread started.", .{self.node_id.?});
@@ -1576,7 +2073,8 @@ pub const Worker = struct {
         self.clearReceivedFragments();
 
         // Get initial parameters (either from base64 or weight_blob)
-        var decoded: []u8 = undefined;
+        var decoded: []const u8 = undefined;
+        var decoded_buf: ?[]u8 = null;
         var should_free_decoded = false;
 
         if (use_raw_params.bool) {
@@ -1590,12 +2088,14 @@ pub const Worker = struct {
         } else {
             // Parameters sent via base64 encoding
             const decoded_size = try std.base64.standard.Decoder.calcSizeForSlice(initial_params_b64.?);
-            decoded = try self.allocator.alloc(u8, decoded_size);
+            const mutable = try self.allocator.alloc(u8, decoded_size);
+            decoded_buf = mutable;
+            decoded = mutable;
             should_free_decoded = true;
-            try std.base64.standard.Decoder.decode(decoded, initial_params_b64.?);
+            try std.base64.standard.Decoder.decode(mutable, initial_params_b64.?);
             std.log.info("Worker {}: Decoded {} bytes from base64", .{ self.node_id.?, decoded.len });
         }
-        defer if (should_free_decoded) self.allocator.free(decoded);
+        defer if (should_free_decoded) self.allocator.free(decoded_buf.?);
 
         // Initialize device parameters
         const iree_impl: *IreeBackend = @ptrCast(@alignCast(self.backend.ptr));

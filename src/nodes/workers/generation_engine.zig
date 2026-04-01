@@ -9,6 +9,7 @@ const Allocator = std.mem.Allocator;
 pub const LoadedInferenceModel = struct {
     model_id: []const u8,
     cached_vmfb: []const u8,
+    weights_blob: []const u8,
     param_shapes: []const []const i64,
     data_shapes: []const []const i64,
     data_dtypes: ?[]tensor.DType,
@@ -18,7 +19,7 @@ pub const LoadedInferenceModel = struct {
 pub const GenerationSession = struct {
     session_id: []const u8,
     model_id: []const u8,
-    kv_cache_host: [][]u8,
+    kv_cache_host: ?[][]u8,
     last_pos: i64,
 };
 
@@ -29,7 +30,7 @@ pub const ActiveGenerationState = struct {
     session_id: []const u8,
     prompt_tokens: usize,
     completion_tokens: usize,
-    cancelled: bool,
+    cancelled: std.atomic.Value(u8),
 };
 
 pub const GenerationResult = struct {
@@ -44,6 +45,8 @@ pub const GenerationEngine = struct {
     device_weights: ?[]IreeBackend.DeviceBuffer,
     device_kv_cache: ?[]IreeBackend.DeviceBuffer,
     device_weights_dirty: bool,
+    current_weight_blob_ptr: ?[*]const u8,
+    current_weight_blob_len: usize,
 
     const Self = @This();
 
@@ -53,6 +56,8 @@ pub const GenerationEngine = struct {
             .device_weights = null,
             .device_kv_cache = null,
             .device_weights_dirty = false,
+            .current_weight_blob_ptr = null,
+            .current_weight_blob_len = 0,
         };
     }
 
@@ -77,7 +82,14 @@ pub const GenerationEngine = struct {
         weight_blob: []const u8,
         param_shapes: []const []const i64,
     ) !void {
-        if (self.device_weights != null and !self.device_weights_dirty) return;
+        if (self.device_weights != null and
+            !self.device_weights_dirty and
+            self.current_weight_blob_ptr != null and
+            self.current_weight_blob_ptr.? == weight_blob.ptr and
+            self.current_weight_blob_len == weight_blob.len)
+        {
+            return;
+        }
 
         if (self.device_weights) |old_weights| {
             for (old_weights) |buf| buf.release();
@@ -105,13 +117,14 @@ pub const GenerationEngine = struct {
 
         self.device_weights = try dev_weights.toOwnedSlice();
         self.device_weights_dirty = false;
+        self.current_weight_blob_ptr = weight_blob.ptr;
+        self.current_weight_blob_len = weight_blob.len;
     }
 
     pub fn initKvCacheHost(
         self: *Self,
         data_shapes: []const []const i64,
     ) ![][]u8 {
-        _ = self;
         const kv_shapes = data_shapes[2..];
         const kv_buffers = try self.allocator.alloc([]u8, kv_shapes.len);
         for (kv_shapes, 0..) |shape, i| {
@@ -136,25 +149,79 @@ pub const GenerationEngine = struct {
         eos_token: i64,
         kv_cache: *?[][]u8,
     ) !GenerationResult {
+        return try self.generateRolloutStreaming(
+            backend,
+            sampler,
+            vmfb,
+            param_shapes,
+            data_shapes,
+            weight_blob,
+            prompt_tokens,
+            max_new_tokens,
+            eos_token,
+            0.7,
+            kv_cache,
+            0,
+            false,
+            null,
+            null,
+            null,
+        );
+    }
+
+    pub const TokenCallback = *const fn (token: i64, ctx: *anyopaque) anyerror!void;
+
+    pub fn generateRolloutStreaming(
+        self: *Self,
+        backend: *IreeBackend,
+        sampler: *math.Sampler,
+        vmfb: []const u8,
+        param_shapes: []const []const i64,
+        data_shapes: []const []const i64,
+        weight_blob: []const u8,
+        prompt_tokens: []const i64,
+        max_new_tokens: usize,
+        eos_token: i64,
+        temperature: f32,
+        kv_cache: *?[][]u8,
+        start_pos: i64,
+        reuse_cache: bool,
+        on_token: ?TokenCallback,
+        on_token_ctx: ?*anyopaque,
+        cancelled: ?*std.atomic.Value(u8),
+    ) !GenerationResult {
         try self.ensureDeviceWeights(backend, weight_blob, param_shapes);
 
-        if (kv_cache.*) |old_cache| {
-            for (old_cache) |buf| self.allocator.free(buf);
-            self.allocator.free(old_cache);
+        if (!reuse_cache or kv_cache.* == null) {
+            if (kv_cache.*) |old_cache| {
+                for (old_cache) |buf| self.allocator.free(buf);
+                self.allocator.free(old_cache);
+            }
+            kv_cache.* = try self.initKvCacheHost(data_shapes);
         }
-        kv_cache.* = try self.initKvCacheHost(data_shapes);
 
         var generated_tokens = std.ArrayList(i64).init(self.allocator);
         errdefer generated_tokens.deinit();
 
-        var current_pos: i64 = 0;
-        const total_len = prompt_tokens.len + max_new_tokens;
+        var current_pos: i64 = start_pos;
+        const total_len = start_pos + @as(i64, @intCast(prompt_tokens.len + max_new_tokens));
         const kv_shapes = data_shapes[2..];
 
         while (current_pos < total_len) {
+            if (cancelled) |flag| {
+                if (flag.load(.acquire) == 1) {
+                    return GenerationResult{
+                        .tokens = try generated_tokens.toOwnedSlice(),
+                        .finish_reason = "cancelled",
+                        .prompt_tokens = prompt_tokens.len,
+                        .completion_tokens = generated_tokens.items.len,
+                    };
+                }
+            }
             var input_token: i64 = 0;
-            if (current_pos < prompt_tokens.len) {
-                input_token = prompt_tokens[@intCast(current_pos)];
+            if (current_pos < start_pos + @as(i64, @intCast(prompt_tokens.len))) {
+                const idx = @as(usize, @intCast(current_pos - start_pos));
+                input_token = prompt_tokens[idx];
             } else if (generated_tokens.items.len > 0) {
                 input_token = generated_tokens.items[generated_tokens.items.len - 1];
             }
@@ -191,13 +258,22 @@ pub const GenerationEngine = struct {
 
             const logits_f32 = @as([]const f32, @alignCast(std.mem.bytesAsSlice(f32, logits_bytes)));
 
-            const is_last_prompt_token = (current_pos == prompt_tokens.len - 1);
-            const is_generating = (current_pos >= prompt_tokens.len);
+            const prompt_len_i64 = @as(i64, @intCast(prompt_tokens.len));
+            const prompt_end_pos = if (prompt_len_i64 > 0) start_pos + prompt_len_i64 - 1 else start_pos - 1;
+            const is_last_prompt_token = (prompt_len_i64 > 0 and current_pos == prompt_end_pos);
+            const is_generating = (current_pos >= start_pos + prompt_len_i64);
 
             var finish_reason: ?[]const u8 = null;
             if ((is_last_prompt_token and prompt_tokens.len > 0) or is_generating) {
-                const next_token = sampler.sample(logits_f32, 0.7);
+                const next_token = sampler.sample(logits_f32, temperature);
                 try generated_tokens.append(next_token);
+                if (on_token) |cb| {
+                    if (on_token_ctx) |ctx| {
+                        try cb(next_token, ctx);
+                    } else {
+                        try cb(next_token, undefined);
+                    }
+                }
 
                 if (next_token == eos_token) {
                     finish_reason = "stop";

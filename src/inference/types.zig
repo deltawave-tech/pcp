@@ -29,6 +29,7 @@ pub const SessionRecord = struct {
     bound_worker: ?NodeId,
     next_round_id: RoundId,
     last_prompt_hash: u64,
+    last_prompt_tokens: ?[]i64,
     last_access_ts: i64,
     expires_at: i64,
     state: SessionState,

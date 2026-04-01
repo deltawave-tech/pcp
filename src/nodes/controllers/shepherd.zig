@@ -109,6 +109,17 @@ pub const WorkerConnection = struct {
     }
 };
 
+pub const WorkerMessageHook = struct {
+    ctx: *anyopaque,
+    handler: *const fn (ctx: *anyopaque, worker_id: NodeId, msg: MessageEnvelope) anyerror!bool,
+};
+
+pub const WorkerConnectionHook = struct {
+    ctx: *anyopaque,
+    on_connect: *const fn (ctx: *anyopaque, worker_id: NodeId) anyerror!void,
+    on_disconnect: ?*const fn (ctx: *anyopaque, worker_id: NodeId) void,
+};
+
 /// State for reassembling chunked updates from a worker
 pub const UpdateChunkState = struct {
     buffer: std.ArrayList(u8),
@@ -171,6 +182,8 @@ pub const Shepherd = struct {
     supervisors: std.AutoHashMap(i64, net.Stream),
     // Supervisor Pattern: Map Worker NodeID -> SupervisorID
     worker_map: std.AutoHashMap(NodeId, i64),
+    message_hook: ?WorkerMessageHook,
+    connection_hook: ?WorkerConnectionHook,
 
     const Self = @This();
 
@@ -195,6 +208,8 @@ pub const Shepherd = struct {
             .incoming_updates_mutex = std.Thread.Mutex{},
             .supervisors = std.AutoHashMap(i64, net.Stream).init(allocator),
             .worker_map = std.AutoHashMap(NodeId, i64).init(allocator),
+            .message_hook = null,
+            .connection_hook = null,
         };
     }
 
@@ -313,6 +328,14 @@ pub const Shepherd = struct {
                 thread.detach();
             }
         }
+    }
+
+    pub fn setMessageHook(self: *Self, hook: ?WorkerMessageHook) void {
+        self.message_hook = hook;
+    }
+
+    pub fn setConnectionHook(self: *Self, hook: ?WorkerConnectionHook) void {
+        self.connection_hook = hook;
     }
 
     /// Handle a new worker connection
@@ -441,6 +464,12 @@ pub const Shepherd = struct {
             return;
         };
 
+        if (self.connection_hook) |hook| {
+            hook.on_connect(hook.ctx, assigned_node_id) catch |err| {
+                std.log.err("Worker {} connect hook failed: {}", .{ assigned_node_id, err });
+            };
+        }
+
         // Enter worker message handling loop
         try self.handleWorkerMessages(assigned_node_id, stream);
     }
@@ -462,6 +491,15 @@ pub const Shepherd = struct {
             const msg = msg_result.parsed.value;
 
             // Handle different message types
+            if (self.message_hook) |hook| {
+                const handled = hook.handler(hook.ctx, worker_id, msg) catch |err| blk: {
+                    std.log.err("Worker {} message hook failed: {}", .{ worker_id, err });
+                    break :blk false;
+                };
+                if (handled) {
+                    continue;
+                }
+            }
             if (std.mem.eql(u8, msg.msg_type, MessageType.HEARTBEAT)) {
                 self.handleHeartbeat(worker_id);
             } else if (std.mem.eql(u8, msg.msg_type, MessageType.UPDATE_CHUNK)) {
@@ -625,6 +663,11 @@ pub const Shepherd = struct {
                 // Update monitoring after worker removal
                 monitoring.setWorkerCount(self.worker_pool.items.len);
                 self.updateWorkerInfoUnlocked();
+                if (self.connection_hook) |hook| {
+                    if (hook.on_disconnect) |cb| {
+                        cb(hook.ctx, worker_id);
+                    }
+                }
                 return;
             }
         }

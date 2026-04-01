@@ -12,12 +12,14 @@ const worker = @import("nodes/workers/worker.zig");
 const diloco = @import("algorithms/diloco.zig");
 const grpo = @import("algorithms/grpo.zig");
 const rl_shepherd = @import("nodes/controllers/rl_shepherd.zig");
+const inference_shepherd = @import("nodes/controllers/inference_shepherd.zig");
 const training_algorithm = @import("algorithms/training_algorithm.zig");
 const backend_selection = @import("backends/selection.zig");
 const ops = @import("core/ops.zig");
 const mlir = @import("mlir/wrapper.zig");
 const autodiff = @import("autodiff/engine.zig");
 const dashboard = @import("ui/dashboard.zig");
+const inference_config = @import("inference/config.zig");
 
 const Shepherd = shepherd.Shepherd;
 const Worker = worker.Worker;
@@ -100,6 +102,7 @@ const Args = struct {
     port: u16,
     workers: usize,
     config_path: ?[]const u8,
+    inference_config_path: ?[]const u8,
     model_path: ?[]const u8,
     backend: ?backend_selection.Backend,
     target_arch: ?[]const u8,
@@ -112,12 +115,18 @@ const Args = struct {
     no_dashboard: bool,
     terminate: bool,
     streaming_mode: bool,
+    api_host: []const u8,
+    api_port: u16,
+    control_host: []const u8,
+    control_port: u16,
+    api_token_env: ?[]const u8,
     child_args: std.ArrayList([]const u8),
 
     const Mode = enum {
         shepherd,
         worker,
         node_manager,
+        inference,
     };
 
     pub fn parse(allocator: Allocator, args: [][:0]u8) !Args {
@@ -130,6 +139,7 @@ const Args = struct {
                 .port = 8080,
                 .workers = 2,
                 .config_path = null,
+                .inference_config_path = null,
                 .model_path = null,
                 .backend = null,
                 .target_arch = null,
@@ -142,6 +152,11 @@ const Args = struct {
                 .no_dashboard = false,
                 .terminate = false,
                 .streaming_mode = false,
+                .api_host = "127.0.0.1",
+                .api_port = 8000,
+                .control_host = "127.0.0.1",
+                .control_port = 8080,
+                .api_token_env = null,
                 .child_args = child_args_list,
             };
         }
@@ -151,6 +166,7 @@ const Args = struct {
         var port: u16 = 8080;
         var workers: usize = 2;
         var config_path: ?[]const u8 = null;
+        var inference_config_path: ?[]const u8 = null;
         var model_path: ?[]const u8 = null;
         var backend: ?backend_selection.Backend = null;
         var target_arch: ?[]const u8 = null;
@@ -163,6 +179,11 @@ const Args = struct {
         var no_dashboard: bool = false;
         var terminate: bool = false;
         var streaming_mode: bool = false;
+        var api_host: []const u8 = "127.0.0.1";
+        var api_port: u16 = 8000;
+        var control_host: []const u8 = "127.0.0.1";
+        var control_port: u16 = 8080;
+        var api_token_env: ?[]const u8 = null;
 
         var i: usize = 1;
         while (i < args.len) {
@@ -172,10 +193,17 @@ const Args = struct {
                 mode = .shepherd;
             } else if (std.mem.eql(u8, args[i], "--node-manager")) {
                 mode = .node_manager;
+            } else if (std.mem.eql(u8, args[i], "--inference")) {
+                mode = .inference;
             } else if (std.mem.eql(u8, args[i], "--config")) {
                 i += 1;
                 if (i < args.len) {
                     config_path = args[i];
+                }
+            } else if (std.mem.eql(u8, args[i], "--inference-config")) {
+                i += 1;
+                if (i < args.len) {
+                    inference_config_path = args[i];
                 }
             } else if (std.mem.eql(u8, args[i], "--host")) {
                 i += 1;
@@ -186,6 +214,31 @@ const Args = struct {
                 i += 1;
                 if (i < args.len) {
                     port = std.fmt.parseInt(u16, args[i], 10) catch 8080;
+                }
+            } else if (std.mem.eql(u8, args[i], "--api-host")) {
+                i += 1;
+                if (i < args.len) {
+                    api_host = args[i];
+                }
+            } else if (std.mem.eql(u8, args[i], "--api-port")) {
+                i += 1;
+                if (i < args.len) {
+                    api_port = std.fmt.parseInt(u16, args[i], 10) catch 8000;
+                }
+            } else if (std.mem.eql(u8, args[i], "--control-host")) {
+                i += 1;
+                if (i < args.len) {
+                    control_host = args[i];
+                }
+            } else if (std.mem.eql(u8, args[i], "--control-port")) {
+                i += 1;
+                if (i < args.len) {
+                    control_port = std.fmt.parseInt(u16, args[i], 10) catch 8080;
+                }
+            } else if (std.mem.eql(u8, args[i], "--api-token-env")) {
+                i += 1;
+                if (i < args.len) {
+                    api_token_env = args[i];
                 }
             } else if (std.mem.eql(u8, args[i], "--workers")) {
                 i += 1;
@@ -276,6 +329,7 @@ const Args = struct {
             .port = port,
             .workers = workers,
             .config_path = config_path,
+            .inference_config_path = inference_config_path,
             .model_path = model_path,
             .backend = backend,
             .target_arch = target_arch,
@@ -288,6 +342,11 @@ const Args = struct {
             .no_dashboard = no_dashboard,
             .terminate = terminate,
             .streaming_mode = streaming_mode,
+            .api_host = api_host,
+            .api_port = api_port,
+            .control_host = control_host,
+            .control_port = control_port,
+            .api_token_env = api_token_env,
             .child_args = child_args_list,
         };
     }
@@ -298,11 +357,18 @@ const Args = struct {
         print("  --shepherd           Run as Shepherd coordinator (default)\n", .{});
         print("  --worker             Run as Worker\n", .{});
         print("  --node-manager       Run as Node Manager (spawns multiple supervised workers)\n", .{});
+        print("  --inference          Run inference controller (OpenAI-compatible API)\n", .{});
         print("  --supervise -- <child_args>  Run with supervision (spawns child with args after --)\n", .{});
         print("  --config <path>      Path to experiment JSON config file (Shepherd only)\n", .{});
+        print("  --inference-config <path>  Path to inference JSON config file (Inference only)\n", .{});
         print("  --connect <host:port> Connect to Shepherd at host:port\n", .{});
         print("  --host <host>        Host to bind/connect to (default: 127.0.0.1)\n", .{});
         print("  --port <port>        Port to bind/connect to (default: 8080)\n", .{});
+        print("  --api-host <host>    API host to bind (Inference only, default: 127.0.0.1)\n", .{});
+        print("  --api-port <port>    API port to bind (Inference only, default: 8000)\n", .{});
+        print("  --control-host <host> Control host to bind (Inference only, default: 127.0.0.1)\n", .{});
+        print("  --control-port <port> Control port to bind (Inference only, default: 8080)\n", .{});
+        print("  --api-token-env <ENV> API token env var name override (Inference only)\n", .{});
         print("  --workers <count>    Number of workers to wait for (default: 2)\n", .{});
         print("  --model <path>       Path to MLIR model file (Shepherd only, overrides config)\n", .{});
         print("  --resume             Resume from previous training state\n", .{});
@@ -325,6 +391,8 @@ const Args = struct {
         print("  for i in {{0..7}}; do ./pcp --worker --device-id $i & done\n", .{});
         print("\n  # Run node manager with 8 supervised workers:\n", .{});
         print("  ./pcp --node-manager --scale 8 --backend cuda\n", .{});
+        print("\n  # Run inference controller:\n", .{});
+        print("  ./pcp --inference --inference-config inference.json --api-host 0.0.0.0 --api-port 8000\n", .{});
     }
 };
 
@@ -405,6 +473,60 @@ fn runRLShepherd(allocator: Allocator, args: Args) !void {
         print("--terminate flag set, exiting...\n", .{});
         std.process.exit(0);
     }
+}
+
+fn runInferenceController(allocator: Allocator, args: Args) !void {
+    const config_path = args.inference_config_path orelse {
+        print("Error: --inference-config is required for inference mode\n", .{});
+        return error.ConfigFileRequired;
+    };
+
+    var config_result = try inference_config.loadInferenceConfig(allocator, config_path);
+    defer config_result.deinit();
+    var config = config_result.config;
+
+    if (args.api_token_env) |override_env| {
+        config.api_token_env = override_env;
+    }
+
+    const api_token = std.process.getEnvVarOwned(allocator, config.api_token_env) catch |err| {
+        print("Error: missing required API token env var {s}: {}\n", .{ config.api_token_env, err });
+        return error.MissingApiToken;
+    };
+    defer allocator.free(api_token);
+
+    var controller = inference_shepherd.InferenceShepherd.init(allocator);
+    defer controller.deinit();
+
+    const listen_thread = try std.Thread.spawn(.{}, inferenceListenThread, .{ &controller, args.control_host, args.control_port });
+    defer controller.base.stop();
+    defer listen_thread.join();
+
+    print("🚀 Starting Inference Controller (phase 1 bootstrap)\n", .{});
+    print("   Model ID: {s}\n", .{config.model_id});
+    print("   Pool: {s}\n", .{config.pool_name});
+    print("   API: {s}:{d}\n", .{ args.api_host, args.api_port });
+    print("   Control: {s}:{d}\n", .{ args.control_host, args.control_port });
+    print("   Max Context Tokens: {d}\n", .{config.max_context_tokens});
+    print("   Default Max Output Tokens: {d}\n", .{config.default_max_output_tokens});
+    print("   Session TTL Seconds: {d}\n", .{config.session_ttl_seconds});
+    print("   Request Timeout Seconds: {d}\n", .{config.request_timeout_seconds});
+    print("   Worker Backend: {s}\n", .{config.worker_backend});
+    print("   Worker Target Arch: {s}\n", .{config.worker_target_arch});
+    print("   Tokenizer Source: {s}\n", .{config.tokenizer_source});
+    if (config.tokenizer_path) |path| {
+        print("   Tokenizer Path: {s}\n", .{path});
+    }
+    print("   Stop Token: EOS only\n", .{});
+
+    // Phase 1 bootstrap only: keep process alive until controller is implemented.
+    while (true) {
+        std.time.sleep(1 * std.time.ns_per_s);
+    }
+}
+
+fn inferenceListenThread(controller: *inference_shepherd.InferenceShepherd, host: []const u8, port: u16) !void {
+    try controller.listen(host, port);
 }
 
 /// RL Shepherd listening thread
@@ -737,6 +859,7 @@ pub fn main() !void {
         .shepherd => try runShepherd(allocator, args),
         .worker => try runWorker(allocator, args),
         .node_manager => try runNodeManager(allocator, args),
+        .inference => try runInferenceController(allocator, args),
     }
 }
 

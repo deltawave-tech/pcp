@@ -267,6 +267,19 @@ pub const Shepherd = struct {
         return request_id;
     }
 
+    /// Snapshot current worker IDs for routing decisions.
+    pub fn snapshotWorkerIds(self: *Self, allocator: Allocator) ![]NodeId {
+        self.worker_pool_mutex.lock();
+        defer self.worker_pool_mutex.unlock();
+
+        const count = self.worker_pool.items.len;
+        var ids = try allocator.alloc(NodeId, count);
+        for (self.worker_pool.items, 0..) |worker, idx| {
+            ids[idx] = worker.node_id;
+        }
+        return ids;
+    }
+
     fn updateKeyForMessage(worker_id: NodeId, msg: MessageEnvelope) UpdateKey {
         return .{
             .worker_id = worker_id,

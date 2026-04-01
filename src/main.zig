@@ -20,6 +20,7 @@ pub const data_loader = @import("data/loader.zig");
 pub const controllers = struct {
     pub const shepherd = @import("nodes/controllers/shepherd.zig");
 };
+pub const inference = @import("inference/config.zig");
 pub const worker = @import("nodes/workers/worker.zig");
 pub const algorithms = struct {
     pub const diloco = @import("algorithms/diloco.zig");

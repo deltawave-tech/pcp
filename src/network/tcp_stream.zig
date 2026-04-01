@@ -11,6 +11,7 @@ pub const ReceiveResult = struct {
 };
 const message = @import("message.zig");
 const MessageEnvelope = message.MessageEnvelope;
+const MessageFilter = message.MessageFilter;
 
 /// TCP Stream Manager handles reading and writing MessageEnvelopes over TCP streams
 pub const TcpStreamManager = struct {
@@ -101,6 +102,29 @@ pub const TcpStreamManager = struct {
         // For now, just call receive - timeout implementation would require more complex handling
         _ = timeout_ms;
         return try receive(stream, allocator);
+    }
+
+    /// Receive until a message matches the filter and optional sender.
+    /// Non-matching messages are discarded.
+    pub fn receiveFiltered(
+        stream: net.Stream,
+        allocator: Allocator,
+        filter: MessageFilter,
+        expected_sender: ?message.NodeId,
+        max_messages: usize,
+    ) !ReceiveResult {
+        var remaining = max_messages;
+        while (remaining > 0) : (remaining -= 1) {
+            const result = try receive(stream, allocator);
+            if (filter.matches(result.parsed.value)) {
+                if (expected_sender == null or result.parsed.value.sender_node == expected_sender.?) {
+                    return result;
+                }
+            }
+            result.parsed.deinit();
+            allocator.free(result.buffer);
+        }
+        return error.NoMatchingMessage;
     }
 };
 
@@ -222,6 +246,7 @@ pub const TcpError = error{
     ConnectionClosed,
     InvalidMessage,
     ProtocolVersionMismatch,
+    NoMatchingMessage,
 };
 
 /// Helper function to create a MessageEnvelope

@@ -240,6 +240,16 @@ pub const MessageType = struct {
     pub const START_STREAMING_LOOP = "StartStreamingLoop"; // Shepherd -> Worker: "Start continuous streaming mode"
     pub const FRAGMENT_UPDATE = "FragmentUpdate"; // Worker -> Shepherd: "Here is the gradient delta for fragment P"
     pub const FRAGMENT_READY = "FragmentReady"; // Shepherd -> Worker: "Here are the merged global weights for fragment P"
+
+    // Inference Protocol
+    pub const LOAD_MODEL = "LoadModel"; // Controller -> Worker: load model artifacts
+    pub const MODEL_READY = "ModelReady"; // Worker -> Controller: model loaded
+    pub const START_GENERATION = "StartGeneration"; // Controller -> Worker: begin decoding
+    pub const GENERATION_CHUNK = "GenerationChunk"; // Worker -> Controller: one token or chunk
+    pub const GENERATION_COMPLETE = "GenerationComplete"; // Worker -> Controller: generation finished
+    pub const GENERATION_ERROR = "GenerationError"; // Worker -> Controller: error during generation
+    pub const CANCEL_GENERATION = "CancelGeneration"; // Controller -> Worker: cancel active generation
+    pub const FLUSH_SESSION = "FlushSession"; // Controller -> Worker: drop session KV
 };
 
 pub const MessageHandler = *const fn (MessageEnvelope) anyerror!void;

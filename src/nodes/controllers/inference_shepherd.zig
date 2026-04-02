@@ -260,6 +260,7 @@ pub const InferenceShepherd = struct {
         if (std.mem.eql(u8, source, "byte")) return .byte;
         if (std.mem.eql(u8, source, "char")) return .char;
         if (std.mem.eql(u8, source, "u16")) return .u16;
+        if (std.mem.eql(u8, source, "qwen")) return .qwen;
         return error.UnknownTokenizerSource;
     }
 

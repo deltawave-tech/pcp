@@ -1,0 +1,7 @@
+{
+  "gateway_id": "lab-alpha-gateway",
+  "lab_id": "lab-alpha",
+  "graph_backend": "memory",
+  "global_controller_endpoint": null,
+  "api_token_env": "PCP_GATEWAY_API_TOKEN"
+}

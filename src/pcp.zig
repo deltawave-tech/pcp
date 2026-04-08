@@ -21,6 +21,9 @@ const dashboard = @import("ui/dashboard.zig");
 const inference_config = @import("inference/config.zig");
 const control_api = @import("control_plane/api.zig");
 const control_state = @import("control_plane/state.zig");
+const gateway = @import("gateway/gateway.zig");
+const gateway_api = @import("gateway/api.zig");
+const gateway_config = @import("gateway/config.zig");
 
 const Shepherd = shepherd.Shepherd;
 const Worker = worker.Worker;
@@ -104,6 +107,7 @@ const Args = struct {
     workers: usize,
     config_path: ?[]const u8,
     inference_config_path: ?[]const u8,
+    gateway_config_path: ?[]const u8,
     model_path: ?[]const u8,
     backend: ?backend_selection.Backend,
     target_arch: ?[]const u8,
@@ -129,6 +133,7 @@ const Args = struct {
         worker,
         node_manager,
         inference,
+        gateway,
     };
 
     pub fn parse(allocator: Allocator, args: [][:0]u8) !Args {
@@ -142,6 +147,7 @@ const Args = struct {
                 .workers = 2,
                 .config_path = null,
                 .inference_config_path = null,
+                .gateway_config_path = null,
                 .model_path = null,
                 .backend = null,
                 .target_arch = null,
@@ -170,6 +176,7 @@ const Args = struct {
         var workers: usize = 2;
         var config_path: ?[]const u8 = null;
         var inference_config_path: ?[]const u8 = null;
+        var gateway_config_path: ?[]const u8 = null;
         var model_path: ?[]const u8 = null;
         var backend: ?backend_selection.Backend = null;
         var target_arch: ?[]const u8 = null;
@@ -200,6 +207,9 @@ const Args = struct {
             } else if (std.mem.eql(u8, args[i], "--inference")) {
                 mode = .inference;
                 enable_api = true;
+            } else if (std.mem.eql(u8, args[i], "--gateway")) {
+                mode = .gateway;
+                enable_api = true;
             } else if (std.mem.eql(u8, args[i], "--config")) {
                 i += 1;
                 if (i < args.len) {
@@ -209,6 +219,11 @@ const Args = struct {
                 i += 1;
                 if (i < args.len) {
                     inference_config_path = args[i];
+                }
+            } else if (std.mem.eql(u8, args[i], "--gateway-config")) {
+                i += 1;
+                if (i < args.len) {
+                    gateway_config_path = args[i];
                 }
             } else if (std.mem.eql(u8, args[i], "--host")) {
                 i += 1;
@@ -231,6 +246,18 @@ const Args = struct {
                 i += 1;
                 if (i < args.len) {
                     api_port = std.fmt.parseInt(u16, args[i], 10) catch 8000;
+                }
+            } else if (std.mem.eql(u8, args[i], "--gateway-host")) {
+                enable_api = true;
+                i += 1;
+                if (i < args.len) {
+                    api_host = args[i];
+                }
+            } else if (std.mem.eql(u8, args[i], "--gateway-port")) {
+                enable_api = true;
+                i += 1;
+                if (i < args.len) {
+                    api_port = std.fmt.parseInt(u16, args[i], 10) catch 18010;
                 }
             } else if (std.mem.eql(u8, args[i], "--control-host")) {
                 i += 1;
@@ -338,6 +365,7 @@ const Args = struct {
             .workers = workers,
             .config_path = config_path,
             .inference_config_path = inference_config_path,
+            .gateway_config_path = gateway_config_path,
             .model_path = model_path,
             .backend = backend,
             .target_arch = target_arch,
@@ -367,14 +395,18 @@ const Args = struct {
         print("  --worker             Run as Worker\n", .{});
         print("  --node-manager       Run as Node Manager (spawns multiple supervised workers)\n", .{});
         print("  --inference          Run inference controller (OpenAI-compatible API)\n", .{});
+        print("  --gateway            Run gateway controller (local gateway API)\n", .{});
         print("  --supervise -- <child_args>  Run with supervision (spawns child with args after --)\n", .{});
         print("  --config <path>      Path to experiment JSON config file (Shepherd only)\n", .{});
         print("  --inference-config <path>  Path to inference JSON config file (Inference only)\n", .{});
+        print("  --gateway-config <path>  Path to gateway JSON config file (Gateway only)\n", .{});
         print("  --connect <host:port> Connect to Shepherd at host:port\n", .{});
         print("  --host <host>        Host to bind/connect to (default: 127.0.0.1)\n", .{});
         print("  --port <port>        Port to bind/connect to (default: 8080)\n", .{});
         print("  --api-host <host>    API host to bind for controller/operator APIs (default: 127.0.0.1)\n", .{});
         print("  --api-port <port>    API port to bind for controller/operator APIs (default: 8000)\n", .{});
+        print("  --gateway-host <host> Gateway API host to bind (Gateway only, default: 127.0.0.1)\n", .{});
+        print("  --gateway-port <port> Gateway API port to bind (Gateway only, default: 18010)\n", .{});
         print("  --control-host <host> Control host to bind (Inference only, default: 127.0.0.1)\n", .{});
         print("  --control-port <port> Control port to bind (Inference only, default: 8080)\n", .{});
         print("  --api-token-env <ENV> API token env var name for controller/operator auth\n", .{});
@@ -402,6 +434,8 @@ const Args = struct {
         print("  ./pcp --node-manager --scale 8 --backend cuda\n", .{});
         print("\n  # Run inference controller:\n", .{});
         print("  ./pcp --inference --inference-config inference.json --api-host 0.0.0.0 --api-port 8000\n", .{});
+        print("\n  # Run gateway:\n", .{});
+        print("  ./pcp --gateway --gateway-config experiments/gateway_local.json --gateway-host 127.0.0.1 --gateway-port 18010\n", .{});
     }
 };
 
@@ -620,6 +654,10 @@ fn inferenceApiThread(controller: *inference_shepherd.InferenceShepherd, host: [
     try controller.startApi(host, port);
 }
 
+fn gatewayApiThread(server: *gateway_api.GatewayApiServer, host: []const u8, port: u16) !void {
+    try server.start(host, port);
+}
+
 fn controlApiThread(server: *control_api.ControlApiServer, host: []const u8, port: u16) !void {
     try server.start(host, port);
 }
@@ -637,6 +675,51 @@ fn maybeLoadApiToken(allocator: Allocator, args: Args) !?[]u8 {
         print("Error: missing required API token env var {s}: {}\n", .{ env_name, err });
         return error.MissingApiToken;
     };
+}
+
+fn maybeLoadApiTokenByEnv(allocator: Allocator, env_name: ?[]const u8) !?[]u8 {
+    const name = env_name orelse return null;
+    return std.process.getEnvVarOwned(allocator, name) catch |err| {
+        print("Error: missing required API token env var {s}: {}\n", .{ name, err });
+        return error.MissingApiToken;
+    };
+}
+
+fn runGateway(allocator: Allocator, args: Args) !void {
+    const config_path = args.gateway_config_path orelse {
+        print("Error: --gateway-config is required for gateway mode\n", .{});
+        return error.ConfigFileRequired;
+    };
+
+    var config_result = try gateway_config.loadGatewayConfig(allocator, config_path);
+    defer config_result.deinit();
+    var config = config_result.config;
+
+    if (args.api_token_env) |override_env| {
+        config.api_token_env = override_env;
+    }
+
+    const api_token = try maybeLoadApiTokenByEnv(allocator, config.api_token_env);
+    defer if (api_token) |token| allocator.free(token);
+
+    var gateway_instance = gateway.Gateway.init(allocator, config);
+    defer gateway_instance.deinit();
+
+    var api_server = gateway_api.GatewayApiServer.init(allocator, &gateway_instance, api_token);
+
+    print("🌉 Starting Gateway\n", .{});
+    print("   Gateway ID: {s}\n", .{config.gateway_id});
+    print("   Lab ID: {s}\n", .{config.lab_id});
+    print("   Graph Backend: {s}\n", .{config.graph_backend});
+    print("   API: {s}:{d}\n", .{ args.api_host, args.api_port });
+    if (config.global_controller_endpoint) |endpoint| {
+        print("   Global Controller: {s}\n", .{endpoint});
+    } else {
+        print("   Global Controller: not configured\n", .{});
+    }
+    print("   Federation: stubbed\n", .{});
+
+    try gatewayApiThread(&api_server, args.api_host, args.api_port);
 }
 
 /// RL Shepherd listening thread
@@ -1017,6 +1100,7 @@ pub fn main() !void {
         .worker => try runWorker(allocator, args),
         .node_manager => try runNodeManager(allocator, args),
         .inference => try runInferenceController(allocator, args),
+        .gateway => try runGateway(allocator, args),
     }
 }
 

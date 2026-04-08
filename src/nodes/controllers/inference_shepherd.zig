@@ -625,7 +625,10 @@ pub const InferenceShepherd = struct {
             else => return error.InvalidMessages,
         };
 
-        const prompt_text = try renderPrompt(self.base.allocator, messages);
+        const prompt_text = if (std.mem.eql(u8, self.config.tokenizer_source, "qwen"))
+            try renderQwenPrompt(self.base.allocator, messages)
+        else
+            try renderPrompt(self.base.allocator, messages);
         defer self.base.allocator.free(prompt_text);
         const prompt_tokens = try self.tokenizer.encode(prompt_text);
         defer self.base.allocator.free(prompt_tokens);
@@ -1056,6 +1059,36 @@ pub const InferenceShepherd = struct {
             }
         }
         try buf.appendSlice("Assistant: ");
+        return buf.toOwnedSlice();
+    }
+
+    fn renderQwenPrompt(allocator: Allocator, messages: std.json.Array) ![]u8 {
+        var buf = ArrayList(u8).init(allocator);
+        errdefer buf.deinit();
+
+        for (messages.items) |msg| {
+            const obj = switch (msg) {
+                .object => |o| o,
+                else => return error.InvalidMessage,
+            };
+            const role_val = obj.get("role") orelse return error.MissingRole;
+            const content_val = obj.get("content") orelse return error.MissingContent;
+            const role = role_val.string;
+            const content = content_val.string;
+
+            if (std.mem.eql(u8, role, "system") or
+                std.mem.eql(u8, role, "user") or
+                std.mem.eql(u8, role, "assistant"))
+            {
+                try buf.appendSlice("<|im_start|>");
+                try buf.appendSlice(role);
+                try buf.append('\n');
+                try buf.appendSlice(content);
+                try buf.appendSlice("<|im_end|>\n");
+            }
+        }
+
+        try buf.appendSlice("<|im_start|>assistant\n");
         return buf.toOwnedSlice();
     }
 

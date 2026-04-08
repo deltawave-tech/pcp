@@ -5,18 +5,18 @@ const Allocator = std.mem.Allocator;
 const EncodeResponse = struct {
     ok: bool,
     tokens: ?[]i64 = null,
-    error: ?[]const u8 = null,
+    @"error": ?[]const u8 = null,
 };
 
 const DecodeResponse = struct {
     ok: bool,
     text: ?[]const u8 = null,
-    error: ?[]const u8 = null,
+    @"error": ?[]const u8 = null,
 };
 
 pub const QwenTokenizer = struct {
     allocator: Allocator,
-    child: std.ChildProcess,
+    child: std.process.Child,
     stdin: std.fs.File.Writer,
     stdout_reader: std.io.BufferedReader(4096, std.fs.File.Reader),
     mutex: std.Thread.Mutex,
@@ -34,7 +34,7 @@ pub const QwenTokenizer = struct {
             tokenizer_path,
         });
 
-        var child = std.ChildProcess.init(args.items, allocator);
+        var child = std.process.Child.init(args.items, allocator);
         child.stdin_behavior = .Pipe;
         child.stdout_behavior = .Pipe;
         child.stderr_behavior = .Inherit;
@@ -61,12 +61,10 @@ pub const QwenTokenizer = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
 
-        var payload = std.json.ObjectMap.init(self.allocator);
-        defer payload.deinit();
-        try payload.put("op", .{ .string = "encode" });
-        try payload.put("text", .{ .string = text });
-
-        const response_line = try self.sendAndReadLine(payload);
+        const response_line = try self.sendAndReadLine(.{
+            .op = "encode",
+            .text = text,
+        });
         defer self.allocator.free(response_line);
 
         var parsed = try std.json.parseFromSlice(EncodeResponse, self.allocator, response_line, .{ .ignore_unknown_fields = true });
@@ -85,18 +83,10 @@ pub const QwenTokenizer = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
 
-        var payload = std.json.ObjectMap.init(self.allocator);
-        defer payload.deinit();
-        try payload.put("op", .{ .string = "decode" });
-
-        var token_array = std.json.Array.init(self.allocator);
-        defer token_array.deinit();
-        for (tokens) |t| {
-            try token_array.append(.{ .integer = t });
-        }
-        try payload.put("tokens", .{ .array = token_array });
-
-        const response_line = try self.sendAndReadLine(payload);
+        const response_line = try self.sendAndReadLine(.{
+            .op = "decode",
+            .tokens = tokens,
+        });
         defer self.allocator.free(response_line);
 
         var parsed = try std.json.parseFromSlice(DecodeResponse, self.allocator, response_line, .{ .ignore_unknown_fields = true });
@@ -109,10 +99,10 @@ pub const QwenTokenizer = struct {
         return try self.allocator.dupe(u8, text);
     }
 
-    fn sendAndReadLine(self: *Self, payload: std.json.ObjectMap) ![]u8 {
+    fn sendAndReadLine(self: *Self, payload: anytype) ![]u8 {
         var buffer = std.ArrayList(u8).init(self.allocator);
         defer buffer.deinit();
-        try std.json.stringify(.{ .object = payload }, .{}, buffer.writer());
+        try std.json.stringify(payload, .{}, buffer.writer());
         try buffer.append('\n');
         try self.stdin.writeAll(buffer.items);
 

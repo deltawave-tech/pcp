@@ -7,6 +7,7 @@ This directory contains experiment configurations for distributed training with 
 - [NanoGPT Small](#nanogpt-small)
 - [NanoGPT Medium](#nanogpt-medium)
 - [NanoGPT Large](#nanogpt-large)
+- [Qwen Inference API](#qwen-inference-api)
 - [Qwen RL Test](#qwen-rl-test)
 
 ## NanoGPT Small
@@ -128,6 +129,62 @@ After setup, the file will be available at `data/enwik8.txt`, matching the `data
 ## NanoGPT Large
 
 TODO
+
+## Qwen Inference API
+
+### Overview
+
+PCP can serve Qwen 2.5 0.5B Instruct behind an OpenAI-compatible inference API. The inference controller accepts chat requests over HTTP, tokenizes prompts, routes them to ready workers, and decodes generated token IDs back to text. Workers run the exported Qwen generation VMFB on CUDA and stream tokens back to the controller.
+
+### Components
+
+| Component | Role |
+|-----------|------|
+| `experiments/inference_qwen.json` | Inference controller configuration |
+| `models/qwen_rl_generation.vmfb` | CUDA generation module used by workers |
+| `models/qwen_rl_generation.mlir` | Source MLIR used for metadata extraction |
+| `checkpoints/initial_weights/qwen_flat.bin` | Flattened Qwen parameter blob |
+| `tokenizers/qwen2.5-0.5b-instruct/` | Local tokenizer assets |
+| `tools/qwen_tokenizer_server.py` | Python tokenizer subprocess used by the controller |
+| `run_qwen_inference_smoke.sh` | Fixed end-to-end smoke test with cleanup |
+
+### Request Format
+
+The API implements `POST /v1/chat/completions` with OpenAI-style `messages`. For Qwen models, PCP renders messages into Qwen's instruct prompt format before tokenization:
+
+```text
+<|im_start|>system
+You are concise and factual.
+<|im_end|>
+<|im_start|>user
+Describe the Moon in one English adjective.
+<|im_end|>
+<|im_start|>assistant
+```
+
+This formatting matters for Qwen instruct checkpoints. PCP now uses the Qwen chat template structure rather than a generic `System:` / `User:` prompt.
+
+### Controller Endpoints
+
+- `GET /healthz` returns `ok` once the HTTP process is serving.
+- `GET /readyz` reports how many workers are ready for the configured model plus basic request metrics.
+- `POST /v1/chat/completions` accepts chat requests with `model`, `messages`, `max_tokens`, `temperature`, `stream`, and optional `session_id`.
+
+### Smoke Test
+
+Run the fixed smoke test on a machine with CUDA access:
+
+```bash
+./run_qwen_inference_smoke.sh
+```
+
+The script:
+1. Kills stale `pcp --inference` and `pcp --worker` processes for the test ports.
+2. Starts a fresh controller and worker using `experiments/inference_qwen.json`.
+3. Waits for `healthz` and `readyz`.
+4. Sends a constrained chat completion request.
+5. Fails if the decoded response looks like token garbage.
+6. Cleans up controller and worker processes on exit.
 
 ## Qwen RL Test
 

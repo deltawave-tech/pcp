@@ -419,6 +419,37 @@ If you need to debug a specific worker process without the supervisor layer, you
 pcp --worker --device-id 0 --connect <SHEPHERD_IP>:8080 --backend cuda
 ```
 
+### Inference API
+
+PCP also supports an inference mode that exposes an OpenAI-compatible `/v1/chat/completions` API. In this mode, the inference controller owns request routing, sessions, prompt tokenization, and HTTP endpoints, while standard PCP workers execute autoregressive decoding on the configured backend.
+
+For Qwen inference, the controller uses the Qwen tokenizer files from `tokenizers/qwen2.5-0.5b-instruct`, spawns `tools/qwen_tokenizer_server.py` for encode/decode, and renders prompts in Qwen's instruct chat format:
+
+```text
+<|im_start|>system
+...
+<|im_end|>
+<|im_start|>user
+...
+<|im_end|>
+<|im_start|>assistant
+```
+
+The controller exposes:
+- `GET /healthz`: process health
+- `GET /readyz`: reports ready workers and basic request metrics
+- `POST /v1/chat/completions`: non-streaming and SSE streaming chat completions
+
+Use `experiments/inference_qwen.json` as the reference config for Qwen 2.5 0.5B instruct inference. It binds the generation VMFB/MLIR, flattened weight file, tokenizer source/path, context length, EOS token, worker backend, and API token environment variable.
+
+For a clean end-to-end validation on a CUDA machine, use the fixed smoke runner:
+
+```sh
+./run_qwen_inference_smoke.sh
+```
+
+The script kills stale PCP inference processes, starts a fresh controller and worker on fixed localhost ports, waits for `healthz` and `readyz`, sends one constrained chat completion request, prints the decoded text, and tears everything down on exit so the next run starts clean.
+
 ### Example: Heterogeneous Multi-Node Cluster
 
 You can run workers with different hardware backends in the same training session.

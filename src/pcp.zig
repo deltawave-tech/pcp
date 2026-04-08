@@ -19,6 +19,8 @@ const mlir = @import("mlir/wrapper.zig");
 const autodiff = @import("autodiff/engine.zig");
 const dashboard = @import("ui/dashboard.zig");
 const inference_config = @import("inference/config.zig");
+const control_api = @import("control_plane/api.zig");
+const control_state = @import("control_plane/state.zig");
 
 const Shepherd = shepherd.Shepherd;
 const Worker = worker.Worker;
@@ -119,6 +121,7 @@ const Args = struct {
     control_host: []const u8,
     control_port: u16,
     api_token_env: ?[]const u8,
+    enable_api: bool,
     child_args: std.ArrayList([]const u8),
 
     const Mode = enum {
@@ -156,6 +159,7 @@ const Args = struct {
                 .control_host = "127.0.0.1",
                 .control_port = 8080,
                 .api_token_env = null,
+                .enable_api = false,
                 .child_args = child_args_list,
             };
         }
@@ -183,6 +187,7 @@ const Args = struct {
         var control_host: []const u8 = "127.0.0.1";
         var control_port: u16 = 8080;
         var api_token_env: ?[]const u8 = null;
+        var enable_api: bool = false;
 
         var i: usize = 1;
         while (i < args.len) {
@@ -194,6 +199,7 @@ const Args = struct {
                 mode = .node_manager;
             } else if (std.mem.eql(u8, args[i], "--inference")) {
                 mode = .inference;
+                enable_api = true;
             } else if (std.mem.eql(u8, args[i], "--config")) {
                 i += 1;
                 if (i < args.len) {
@@ -215,11 +221,13 @@ const Args = struct {
                     port = std.fmt.parseInt(u16, args[i], 10) catch 8080;
                 }
             } else if (std.mem.eql(u8, args[i], "--api-host")) {
+                enable_api = true;
                 i += 1;
                 if (i < args.len) {
                     api_host = args[i];
                 }
             } else if (std.mem.eql(u8, args[i], "--api-port")) {
+                enable_api = true;
                 i += 1;
                 if (i < args.len) {
                     api_port = std.fmt.parseInt(u16, args[i], 10) catch 8000;
@@ -235,6 +243,7 @@ const Args = struct {
                     control_port = std.fmt.parseInt(u16, args[i], 10) catch 8080;
                 }
             } else if (std.mem.eql(u8, args[i], "--api-token-env")) {
+                enable_api = true;
                 i += 1;
                 if (i < args.len) {
                     api_token_env = args[i];
@@ -346,6 +355,7 @@ const Args = struct {
             .control_host = control_host,
             .control_port = control_port,
             .api_token_env = api_token_env,
+            .enable_api = enable_api,
             .child_args = child_args_list,
         };
     }
@@ -363,11 +373,11 @@ const Args = struct {
         print("  --connect <host:port> Connect to Shepherd at host:port\n", .{});
         print("  --host <host>        Host to bind/connect to (default: 127.0.0.1)\n", .{});
         print("  --port <port>        Port to bind/connect to (default: 8080)\n", .{});
-        print("  --api-host <host>    API host to bind (Inference only, default: 127.0.0.1)\n", .{});
-        print("  --api-port <port>    API port to bind (Inference only, default: 8000)\n", .{});
+        print("  --api-host <host>    API host to bind for controller/operator APIs (default: 127.0.0.1)\n", .{});
+        print("  --api-port <port>    API port to bind for controller/operator APIs (default: 8000)\n", .{});
         print("  --control-host <host> Control host to bind (Inference only, default: 127.0.0.1)\n", .{});
         print("  --control-port <port> Control port to bind (Inference only, default: 8080)\n", .{});
-        print("  --api-token-env <ENV> API token env var name override (Inference only)\n", .{});
+        print("  --api-token-env <ENV> API token env var name for controller/operator auth\n", .{});
         print("  --workers <count>    Number of workers to wait for (default: 2)\n", .{});
         print("  --model <path>       Path to MLIR model file (Shepherd only, overrides config)\n", .{});
         print("  --resume             Resume from previous training state\n", .{});
@@ -433,6 +443,19 @@ fn runRLShepherd(allocator: Allocator, args: Args) !void {
         return error.GRPOConfigRequired;
     };
 
+    var operator_state = try control_state.ControllerState.init(
+        allocator,
+        .rl,
+        .rl,
+        args.config_path,
+        null,
+        exp_config.model_path,
+        false,
+        args.workers,
+    );
+    defer operator_state.deinit();
+    operator_state.setStatus(.starting);
+
     var rl_shepherd_controller = rl_shepherd.RLShepherd.init(allocator);
     defer rl_shepherd_controller.deinit();
 
@@ -444,6 +467,34 @@ fn runRLShepherd(allocator: Allocator, args: Args) !void {
     defer rl_shepherd_controller.base.stop();
     defer listen_thread.join();
 
+    var owned_api_token: ?[]u8 = null;
+    defer if (owned_api_token) |token| allocator.free(token);
+
+    var api_server = control_api.ControlApiServer.init(
+        allocator,
+        &operator_state,
+        &rl_shepherd_controller.base,
+        null,
+        null,
+        null,
+        .{
+            .ctx = &rl_shepherd_controller.base,
+            .cancel = cancelShepherd,
+        },
+    );
+    var api_thread: ?std.Thread = null;
+    if (args.enable_api) {
+        owned_api_token = try maybeLoadApiToken(allocator, args);
+        api_server.api_token = owned_api_token;
+        api_thread = try std.Thread.spawn(.{}, controlApiThread, .{ &api_server, args.api_host, args.api_port });
+    }
+    defer {
+        if (api_thread) |thread| {
+            api_server.stop();
+            thread.join();
+        }
+    }
+
     std.time.sleep(500 * std.time.ns_per_ms);
 
     const grpo_config = grpo.GRPOConfig{
@@ -451,6 +502,7 @@ fn runRLShepherd(allocator: Allocator, args: Args) !void {
         .group_size = json_grpo.group_size,
         .learning_rate = json_grpo.learning_rate,
         .beta = json_grpo.beta,
+        .required_workers = args.workers,
         .prompt_file = json_grpo.prompt_file,
         .num_prompts = json_grpo.num_prompts,
         .weights_path = json_grpo.weights_path,
@@ -461,12 +513,26 @@ fn runRLShepherd(allocator: Allocator, args: Args) !void {
     };
 
     var grpo_algo = grpo.GRPO.init(allocator, &rl_shepherd_controller, grpo_config);
+    grpo_algo.setControlState(&operator_state);
     var training_algo = grpo_algo.asTrainingAlgorithm();
 
     print("Starting GRPO training...\n", .{});
-    try training_algo.run();
+    training_algo.run() catch |err| {
+        if (err == error.Cancelled) {
+            operator_state.setCancelled();
+            print("GRPO training cancelled.\n", .{});
+            return;
+        }
+        try operator_state.setFailed(@errorName(err));
+        return err;
+    };
 
     print("GRPO training completed!\n", .{});
+    if (operator_state.isCancellationRequested()) {
+        operator_state.setCancelled();
+    } else {
+        operator_state.setStatus(.completed);
+    }
 
     if (args.terminate) {
         print("--terminate flag set, exiting...\n", .{});
@@ -494,13 +560,26 @@ fn runInferenceController(allocator: Allocator, args: Args) !void {
     };
     defer allocator.free(api_token);
 
-    var controller = try inference_shepherd.InferenceShepherd.init(allocator, config, api_token);
+    var operator_state = try control_state.ControllerState.init(
+        allocator,
+        .inference,
+        .inference,
+        config_path,
+        null,
+        config.model_id,
+        false,
+        1,
+    );
+    defer operator_state.deinit();
+    operator_state.setStatus(.running);
+
+    var controller = try inference_shepherd.InferenceShepherd.init(allocator, config, api_token, &operator_state);
     controller.attachHooks();
     defer controller.deinit();
 
     const listen_thread = try std.Thread.spawn(.{}, inferenceListenThread, .{ &controller, args.control_host, args.control_port });
-    defer controller.base.stop();
-    defer listen_thread.join();
+    listen_thread.detach();
+    defer controller.requestShutdown();
 
     try controller.startMaintenance();
 
@@ -524,8 +603,13 @@ fn runInferenceController(allocator: Allocator, args: Args) !void {
     }
     print("   Stop Token: EOS only\n", .{});
 
-    // Block forever to keep controller alive.
-    while (true) std.time.sleep(1 * std.time.ns_per_s);
+    while (!controller.isShutdownRequested()) {
+        std.time.sleep(1 * std.time.ns_per_s);
+    }
+
+    if (operator_state.isCancellationRequested()) {
+        operator_state.setCancelled();
+    }
 }
 
 fn inferenceListenThread(controller: *inference_shepherd.InferenceShepherd, host: []const u8, port: u16) !void {
@@ -534,6 +618,25 @@ fn inferenceListenThread(controller: *inference_shepherd.InferenceShepherd, host
 
 fn inferenceApiThread(controller: *inference_shepherd.InferenceShepherd, host: []const u8, port: u16) !void {
     try controller.startApi(host, port);
+}
+
+fn controlApiThread(server: *control_api.ControlApiServer, host: []const u8, port: u16) !void {
+    try server.start(host, port);
+}
+
+fn noOpCancel(_: *anyopaque) void {}
+
+fn cancelShepherd(ctx: *anyopaque) void {
+    const shepherd_controller: *Shepherd = @ptrCast(@alignCast(ctx));
+    shepherd_controller.stop();
+}
+
+fn maybeLoadApiToken(allocator: Allocator, args: Args) !?[]u8 {
+    const env_name = args.api_token_env orelse return null;
+    return std.process.getEnvVarOwned(allocator, env_name) catch |err| {
+        print("Error: missing required API token env var {s}: {}\n", .{ env_name, err });
+        return error.MissingApiToken;
+    };
 }
 
 /// RL Shepherd listening thread
@@ -602,6 +705,20 @@ fn runShepherd(allocator: Allocator, args: Args) !void {
     const backend = backend_selection.Backend.selectDefault();
     print("   Backend: {s}\n", .{backend.toString()});
 
+    var operator_state = try control_state.ControllerState.init(
+        allocator,
+        .training,
+        .training,
+        args.config_path,
+        run_id,
+        exp_config.model_path,
+        args.should_resume,
+        args.workers,
+    );
+    defer operator_state.deinit();
+    operator_state.setTrainingProgress(0, 0, exp_config.outer_loop_steps, 0.0, exp_config.learning_rate);
+    operator_state.setStatus(.starting);
+
     // Initialize system
     var system = try backend_selection.DistributedTrainingSystem.init(allocator, backend);
     defer system.deinit();
@@ -615,6 +732,34 @@ fn runShepherd(allocator: Allocator, args: Args) !void {
 
     // Now use system.shepherd instead of a local variable
     const shepherd_controller = &system.shepherd;
+
+    var owned_api_token: ?[]u8 = null;
+    defer if (owned_api_token) |token| allocator.free(token);
+
+    var api_server = control_api.ControlApiServer.init(
+        allocator,
+        &operator_state,
+        shepherd_controller,
+        null,
+        null,
+        null,
+        .{
+            .ctx = shepherd_controller,
+            .cancel = cancelShepherd,
+        },
+    );
+    var api_thread: ?std.Thread = null;
+    if (args.enable_api) {
+        owned_api_token = try maybeLoadApiToken(allocator, args);
+        api_server.api_token = owned_api_token;
+        api_thread = try std.Thread.spawn(.{}, controlApiThread, .{ &api_server, args.api_host, args.api_port });
+    }
+    defer {
+        if (api_thread) |thread| {
+            api_server.stop();
+            thread.join();
+        }
+    }
 
     // 2. Initialize DataManager for chunk-based data partitioning
     print("Initializing DataManager for dataset: {s}...\n", .{exp_config.data_path});
@@ -705,6 +850,7 @@ fn runShepherd(allocator: Allocator, args: Args) !void {
     } else {
         print("Initializing Standard DiLoCo algorithm...\n", .{});
         diloco_algo = try DiLoCo.init(allocator, shepherd_controller, diloco_config, system.executor, &mlir_builder);
+        diloco_algo.setControlState(&operator_state);
         training_algo = diloco_algo.asTrainingAlgorithm();
         print("🌙 DiLoCo algorithm initialized successfully\n", .{});
     }
@@ -732,12 +878,24 @@ fn runShepherd(allocator: Allocator, args: Args) !void {
 
     // Wait for workers and start training
     print("Waiting for workers to connect...\n", .{});
+    operator_state.setStatus(.waiting_for_workers);
     shepherd_controller.startTraining(args.workers) catch |err| {
+        if (err == error.Cancelled) {
+            operator_state.setCancelled();
+            print("🛑 Training cancelled.\n", .{});
+            return;
+        }
+        operator_state.setFailed(@errorName(err)) catch {};
         print("💣 Training failed with error: {}\n", .{err});
         return err;
     };
 
     print("🌑 Training completed successfully!\n", .{});
+    if (operator_state.isCancellationRequested()) {
+        operator_state.setCancelled();
+    } else {
+        operator_state.setStatus(.completed);
+    }
 
     if (args.terminate) {
         print("--terminate flag set, exiting...\n", .{});

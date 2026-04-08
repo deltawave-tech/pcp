@@ -158,6 +158,8 @@ const UpdateKey = struct {
 pub const Shepherd = struct {
     allocator: Allocator,
     server: ?TcpServer,
+    listen_host: ?[]const u8,
+    listen_port: u16,
     worker_pool: ArrayList(WorkerConnection),
     worker_pool_mutex: std.Thread.Mutex, // Protect worker_pool from concurrent access
     next_node_id: NodeId,
@@ -165,6 +167,7 @@ pub const Shepherd = struct {
     next_request_id: RequestId,
     protocol_id_mutex: std.Thread.Mutex,
     is_running: bool,
+    stop_requested: std.atomic.Value(u8),
     algorithm: ?*training_algorithm.TrainingAlgorithm, // Training algorithm interface
     executor: ?Executor, // Generic execution backend for algorithms
     compiled_artifacts: std.HashMap(WorkerConfig, []const u8, WorkerConfigContext, std.hash_map.default_max_load_percentage),
@@ -191,6 +194,8 @@ pub const Shepherd = struct {
         return Self{
             .allocator = allocator,
             .server = null,
+            .listen_host = null,
+            .listen_port = 0,
             .worker_pool = ArrayList(WorkerConnection).init(allocator),
             .worker_pool_mutex = std.Thread.Mutex{},
             .next_node_id = 1, // Start from 1, 0 is reserved for coordinator
@@ -198,6 +203,7 @@ pub const Shepherd = struct {
             .next_request_id = 1,
             .protocol_id_mutex = std.Thread.Mutex{},
             .is_running = false,
+            .stop_requested = std.atomic.Value(u8).init(0),
             .algorithm = null,
             .executor = null,
             .compiled_artifacts = std.HashMap(WorkerConfig, []const u8, WorkerConfigContext, std.hash_map.default_max_load_percentage).init(allocator),
@@ -306,6 +312,8 @@ pub const Shepherd = struct {
 
     /// Start listening for worker connections
     pub fn listen(self: *Self, host: []const u8, port: u16) !void {
+        self.listen_host = host;
+        self.listen_port = port;
         self.server = try TcpServer.init(self.allocator, host, port);
         self.is_running = true;
 
@@ -315,9 +323,15 @@ pub const Shepherd = struct {
         while (self.is_running) {
             if (self.server) |*server| {
                 const connection = server.accept() catch |err| {
+                    if (!self.is_running) break;
                     std.log.err("Failed to accept connection: {}", .{err});
                     continue;
                 };
+
+                if (!self.is_running) {
+                    connection.stream.close();
+                    break;
+                }
 
                 // Handle connection in a new thread, passing both stream and address
                 const thread = std.Thread.spawn(.{}, handleWorkerConnection, .{ self, connection.stream, connection.address }) catch |err| {
@@ -327,6 +341,11 @@ pub const Shepherd = struct {
                 };
                 thread.detach();
             }
+        }
+
+        if (self.server) |*server| {
+            server.deinit();
+            self.server = null;
         }
     }
 
@@ -760,6 +779,8 @@ pub const Shepherd = struct {
 
         // Wait for enough workers (check under mutex)
         while (true) {
+            if (self.stop_requested.load(.acquire) == 1) return error.Cancelled;
+
             self.worker_pool_mutex.lock();
             const current_count = self.worker_pool.items.len;
             self.worker_pool_mutex.unlock();
@@ -772,6 +793,8 @@ pub const Shepherd = struct {
         const worker_count = self.worker_pool.items.len;
         self.worker_pool_mutex.unlock();
         std.log.info("Got {} workers, starting training...", .{worker_count});
+
+        if (self.stop_requested.load(.acquire) == 1) return error.Cancelled;
 
         if (self.algorithm) |algo| {
             try algo.run();
@@ -1275,12 +1298,19 @@ pub const Shepherd = struct {
     /// Stop the coordinator
     pub fn stop(self: *Self) void {
         self.is_running = false;
+        self.stop_requested.store(1, .release);
 
         // Send shutdown message to all workers
         const shutdown_data = std.json.Value{ .string = "shutdown" };
         self.broadcastToWorkers(MessageType.SHUTDOWN, shutdown_data) catch |err| {
             std.log.err("Failed to broadcast shutdown: {}", .{err});
         };
+
+        if (self.listen_host) |host| {
+            const address = net.Address.parseIp(host, self.listen_port) catch return;
+            const stream = net.tcpConnectToAddress(address) catch return;
+            stream.close();
+        }
 
         std.log.info("Shepherd stopped", .{});
     }

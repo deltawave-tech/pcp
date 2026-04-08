@@ -23,6 +23,7 @@ const monitoring = @import("../ui/monitoring.zig");
 const data_loader = @import("../data/loader.zig");
 const backend_selection = @import("../backends/selection.zig");
 const wandb = @import("../ui/wandb.zig");
+const control_state_mod = @import("../control_plane/state.zig");
 
 const TrainingAlgorithm = training_algorithm.TrainingAlgorithm;
 const TrainingStatus = training_algorithm.TrainingStatus;
@@ -124,6 +125,7 @@ pub const DiLoCo = struct {
 
     // WandB logging
     wandb_logger: wandb.WandBLogger,
+    control_state: ?*control_state_mod.ControllerState,
 
     const Self = @This();
 
@@ -297,6 +299,7 @@ pub const DiLoCo = struct {
             .worker_graph_mlir_source = graph, // Store the MLIR source
             .data_loader = undefined, // No longer used - workers load data locally
             .wandb_logger = logger,
+            .control_state = null,
         };
     }
 
@@ -342,6 +345,10 @@ pub const DiLoCo = struct {
     }
 
     /// Get TrainingAlgorithm interface
+    pub fn setControlState(self: *Self, state: *control_state_mod.ControllerState) void {
+        self.control_state = state;
+    }
+
     pub fn asTrainingAlgorithm(self: *Self) TrainingAlgorithm {
         return TrainingAlgorithm{
             .ptr = self,
@@ -360,6 +367,9 @@ pub const DiLoCo = struct {
 
         self.status = .initializing;
         monitoring.setStatus(.initializing);
+        if (self.control_state) |state| {
+            state.setStatus(.initializing);
+        }
 
         // Calculate total parameter count from introspected shapes
         var total_param_count: usize = 0;
@@ -390,6 +400,9 @@ pub const DiLoCo = struct {
 
         self.status = .running;
         monitoring.setStatus(.running);
+        if (self.control_state) |state| {
+            state.setStatus(.running);
+        }
 
         // Main outer loop with snapshot-based dynamic topology
         for (0..self.config.base_config.outer_loop_steps) |step| {
@@ -450,6 +463,15 @@ pub const DiLoCo = struct {
             const epoch_time_ms: u64 = @intCast(end_time - start_time);
             monitoring.setEpochTime(epoch_time_ms);
             monitoring.setMetrics(self.current_epoch, self.metrics.loss, self.coordinator.getWorkerCount());
+            if (self.control_state) |state| {
+                state.setTrainingProgress(
+                    self.current_epoch,
+                    self.metrics.outer_loop_count,
+                    self.config.base_config.outer_loop_steps,
+                    self.metrics.loss,
+                    self.host_optimizer.config.learning_rate,
+                );
+            }
 
             // Log to WandB
             self.wandb_logger.log(.{
@@ -471,6 +493,13 @@ pub const DiLoCo = struct {
 
         self.status = .completed;
         monitoring.setStatus(.completed);
+        if (self.control_state) |state| {
+            if (state.isCancellationRequested()) {
+                state.setCancelled();
+            } else {
+                state.setStatus(.completed);
+            }
+        }
     }
 
     /// Initialize master parameters using MLIR for the loaded model
@@ -1121,6 +1150,13 @@ pub const DiLoCo = struct {
 
     /// Check if training should stop
     fn shouldStop(self: *Self) bool {
+        if (self.control_state) |state| {
+            if (state.isCancellationRequested()) {
+                std.log.info("Stopping: cancel requested via control API", .{});
+                return true;
+            }
+        }
+
         // Stop if we've reached the configured outer loop steps limit
         // (Note: We keep this to allow "train for X steps", but if user wants
         // pure epoch-based training, they set outer_loop_steps very high)

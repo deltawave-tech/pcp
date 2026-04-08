@@ -4,6 +4,7 @@ const ArrayList = std.ArrayList;
 const TrainingAlgorithm = @import("training_algorithm.zig").TrainingAlgorithm;
 const TrainingStatus = @import("training_algorithm.zig").TrainingStatus;
 const backend_selection = @import("../backends/selection.zig");
+const control_state_mod = @import("../control_plane/state.zig");
 
 // Forward declaration - RLShepherd will be defined in src/nodes/controllers/rl_shepherd.zig
 pub const RLShepherd = @import("../nodes/controllers/rl_shepherd.zig").RLShepherd;
@@ -14,6 +15,7 @@ pub const GRPOConfig = struct {
     group_size: usize,
     learning_rate: f32,
     beta: f32,
+    required_workers: usize,
     prompt_file: []const u8,
     num_prompts: usize,
     // Model paths
@@ -31,6 +33,7 @@ pub const GRPO = struct {
     config: GRPOConfig,
     status: TrainingStatus,
     prompts: ArrayList([]const i64),
+    control_state: ?*control_state_mod.ControllerState,
 
     const Self = @This();
 
@@ -41,7 +44,12 @@ pub const GRPO = struct {
             .config = config,
             .status = .not_started,
             .prompts = ArrayList([]const i64).init(allocator),
+            .control_state = null,
         };
+    }
+
+    pub fn setControlState(self: *Self, state: *control_state_mod.ControllerState) void {
+        self.control_state = state;
     }
 
     /// Load prompts from binary file (created by tools/prepare_rl_dataset.py)
@@ -90,6 +98,10 @@ pub const GRPO = struct {
     fn run(ptr: *anyopaque) anyerror!void {
         const self: *Self = @ptrCast(@alignCast(ptr));
         self.status = .running;
+        if (self.control_state) |state| {
+            state.setStatus(.initializing);
+            state.setRLProgress(0, self.config.num_iterations, 0, 0, 0.0);
+        }
 
         std.log.info("Starting GRPO Training Loop...", .{});
 
@@ -101,6 +113,31 @@ pub const GRPO = struct {
         if (self.prompts.items.len == 0) {
             std.log.err("No prompts loaded! Cannot start training.", .{});
             return error.NoPromptsLoaded;
+        }
+
+        // 3. Wait for workers before doing expensive backend/model initialization.
+        std.log.info("Waiting for workers to connect...", .{});
+        if (self.control_state) |state| {
+            state.setStatus(.waiting_for_workers);
+        }
+        while (true) {
+            if (self.control_state) |state| {
+                if (state.isCancellationRequested()) {
+                    self.status = .completed;
+                    state.setCancelled();
+                    return;
+                }
+            }
+            const current_count = self.controller.base.getWorkerCount();
+            if (current_count >= self.config.required_workers) {
+                std.log.info("✓ {} workers connected", .{current_count});
+                break;
+            }
+            std.time.sleep(100 * std.time.ns_per_ms); // 100ms polling
+        }
+
+        if (self.control_state) |state| {
+            state.setStatus(.initializing);
         }
 
         if (self.controller.training_backend == null) {
@@ -118,6 +155,14 @@ pub const GRPO = struct {
                 3, // num_data_inputs
             );
 
+            if (self.control_state) |state| {
+                if (state.isCancellationRequested()) {
+                    self.status = .completed;
+                    state.setCancelled();
+                    return;
+                }
+            }
+
             // Load initial weights after initializing backend
             if (self.controller.parameter_shapes) |shapes| {
                 std.log.info("Loading initial weights from {s}...", .{self.config.weights_path});
@@ -133,25 +178,13 @@ pub const GRPO = struct {
             }
         }
 
-        // 3. Initialize Generation Backend (Distributed to Workers)
+        // 4. Initialize Generation Backend (Distributed to Workers)
         if (self.controller.generation_vmfb == null) {
             try self.controller.initGenerationBackend(
                 self.config.generation_vmfb_path,
                 self.config.generation_mlir_path,
                 self.config.num_gen_data_inputs,
             );
-        }
-
-        // 4. Wait for at least 1 worker to connect before initializing
-        std.log.info("Waiting for workers to connect...", .{});
-        const required_workers: usize = 1;
-        while (true) {
-            const current_count = self.controller.base.getWorkerCount();
-            if (current_count >= required_workers) {
-                std.log.info("✓ {} workers connected", .{current_count});
-                break;
-            }
-            std.time.sleep(100 * std.time.ns_per_ms); // 100ms polling
         }
 
         // 5. Ensure Workers are Ready - send VMFB path and weights path for local loading
@@ -167,9 +200,20 @@ pub const GRPO = struct {
         // Give workers a moment to load the VMFB, weights, and allocate the KV cache
         std.time.sleep(2 * std.time.ns_per_s);
         std.log.info("Workers initialized. Starting training loop...", .{});
+        if (self.control_state) |state| {
+            state.setStatus(.running);
+        }
 
         // 5. Training Loop
         for (0..self.config.num_iterations) |iter| {
+            if (self.control_state) |state| {
+                if (state.isCancellationRequested()) {
+                    self.status = .completed;
+                    state.setCancelled();
+                    return;
+                }
+                state.setRLProgress(iter, self.config.num_iterations, 0, 0, 0.0);
+            }
             std.log.info("=== GRPO Iteration {}/{} ===", .{ iter + 1, self.config.num_iterations });
 
             // A. Use Loaded Prompts
@@ -185,11 +229,17 @@ pub const GRPO = struct {
                     total_requests += 1;
                 }
             }
+            if (self.control_state) |state| {
+                state.setRLProgress(iter + 1, self.config.num_iterations, total_requests, 0, 0.0);
+            }
 
             // C. Collect Experience
             std.log.info("Waiting for {} rollouts...", .{total_requests});
             var rollouts = try self.controller.collectRollouts(total_requests);
             defer rollouts.deinit();
+            if (self.control_state) |state| {
+                state.setRLProgress(iter + 1, self.config.num_iterations, total_requests, total_requests, 0.0);
+            }
 
             // D. Compute Rewards (Format Check + Quality Heuristics)
             var rewards = std.ArrayList(f32).init(self.allocator);
@@ -267,6 +317,9 @@ pub const GRPO = struct {
                 reward_var += (r - reward_mean) * (r - reward_mean);
             }
             const reward_std = std.math.sqrt(reward_var / @as(f32, @floatFromInt(rewards.items.len)));
+            if (self.control_state) |state| {
+                state.setRLProgress(iter + 1, self.config.num_iterations, total_requests, total_requests, reward_mean);
+            }
             std.log.info("=== Iteration {} Summary ===", .{iter + 1});
             std.log.info("  Rewards: mean={d:.3}, std={d:.3}, min={d:.3}, max={d:.3}", .{ reward_mean, reward_std, reward_min, reward_max });
 
@@ -277,6 +330,13 @@ pub const GRPO = struct {
         }
 
         self.status = .completed;
+        if (self.control_state) |state| {
+            if (state.isCancellationRequested()) {
+                state.setCancelled();
+            } else {
+                state.setStatus(.completed);
+            }
+        }
         std.log.info("GRPO Training Completed.", .{});
     }
 

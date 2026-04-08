@@ -12,6 +12,8 @@ const session_manager = @import("../../inference/session_manager.zig");
 const router = @import("../../inference/router.zig");
 const tokenizer_mod = @import("../../inference/tokenizer.zig");
 const http_server = @import("../../inference/http_server.zig");
+const control_api = @import("../../control_plane/api.zig");
+const control_state = @import("../../control_plane/state.zig");
 const tcp_stream = @import("../../network/tcp_stream.zig");
 const message = @import("../../network/message.zig");
 const model_introspection = @import("../../mlir/model_introspection.zig");
@@ -116,7 +118,7 @@ const RequestState = struct {
     }
 };
 
-const Metrics = struct {
+pub const Metrics = struct {
     total_requests: u64 = 0,
     active_requests: u64 = 0,
     queued_requests: u64 = 0,
@@ -144,10 +146,16 @@ pub const InferenceShepherd = struct {
     state_mutex: std.Thread.Mutex,
     metrics: Metrics,
     metrics_mutex: std.Thread.Mutex,
+    operator_state: ?*control_state.ControllerState,
+    api_server: ?TcpServer,
+    api_host: ?[]const u8,
+    api_port: u16,
+    api_running: std.atomic.Value(u8),
+    shutdown_requested: std.atomic.Value(u8),
 
     const Self = @This();
 
-    pub fn init(allocator: Allocator, cfg: inference_config.InferenceConfig, api_token: []const u8) !Self {
+    pub fn init(allocator: Allocator, cfg: inference_config.InferenceConfig, api_token: []const u8, operator_state: ?*control_state.ControllerState) !Self {
         const tok_kind = parseTokenizerKind(cfg.tokenizer_source) catch |err| return err;
         var tokenizer = try tokenizer_mod.Tokenizer.init(allocator, tok_kind, cfg.tokenizer_path);
         errdefer tokenizer.deinit();
@@ -166,6 +174,12 @@ pub const InferenceShepherd = struct {
             .state_mutex = std.Thread.Mutex{},
             .metrics = Metrics{},
             .metrics_mutex = std.Thread.Mutex{},
+            .operator_state = operator_state,
+            .api_server = null,
+            .api_host = null,
+            .api_port = 0,
+            .api_running = std.atomic.Value(u8).init(0),
+            .shutdown_requested = std.atomic.Value(u8).init(0),
         };
 
         try controller.loadModelsFromConfig();
@@ -199,26 +213,80 @@ pub const InferenceShepherd = struct {
         try self.base.listen(host, port);
     }
 
+    pub fn getReadyWorkerCount(self: *Self) usize {
+        self.state_mutex.lock();
+        defer self.state_mutex.unlock();
+        if (self.ready_by_model.getPtr(self.config.model_id)) |set| {
+            return set.set.count();
+        }
+        return 0;
+    }
+
+    pub fn snapshotMetrics(self: *Self) Metrics {
+        self.metrics_mutex.lock();
+        defer self.metrics_mutex.unlock();
+        return self.metrics;
+    }
+
     pub fn attachHooks(self: *Self) void {
         self.base.setMessageHook(.{ .ctx = self, .handler = handleWorkerMessageHook });
         self.base.setConnectionHook(.{ .ctx = self, .on_connect = handleWorkerConnectHook, .on_disconnect = handleWorkerDisconnectHook });
     }
 
     pub fn startApi(self: *Self, host: []const u8, port: u16) !void {
-        var server = try TcpServer.init(self.base.allocator, host, port);
-        defer server.deinit();
+        self.api_host = host;
+        self.api_port = port;
+        self.api_server = try TcpServer.init(self.base.allocator, host, port);
+        self.api_running.store(1, .release);
         std.log.info("Inference API listening on {s}:{}", .{ host, port });
 
-        while (true) {
-            const connection = try server.accept();
+        while (self.api_running.load(.acquire) == 1) {
+            const connection = if (self.api_server) |*server|
+                server.accept() catch |err| {
+                    if (self.api_running.load(.acquire) == 0) break;
+                    std.log.err("Inference API accept failed: {}", .{err});
+                    continue;
+                }
+            else
+                break;
+
+            if (self.api_running.load(.acquire) == 0) {
+                connection.stream.close();
+                break;
+            }
+
             const thread = try std.Thread.spawn(.{}, handleApiConnection, .{ self, connection.stream });
             thread.detach();
+        }
+
+        if (self.api_server) |*server| {
+            server.deinit();
+            self.api_server = null;
         }
     }
 
     pub fn startMaintenance(self: *Self) !void {
         const thread = try std.Thread.spawn(.{}, maintenanceLoop, .{self});
         thread.detach();
+    }
+
+    pub fn requestShutdown(self: *Self) void {
+        self.shutdown_requested.store(1, .release);
+        self.base.stop();
+        self.stopApi();
+    }
+
+    pub fn isShutdownRequested(self: *Self) bool {
+        return self.shutdown_requested.load(.acquire) == 1;
+    }
+
+    fn stopApi(self: *Self) void {
+        self.api_running.store(0, .release);
+        if (self.api_host) |host| {
+            const address = net.Address.parseIp(host, self.api_port) catch return;
+            const stream = net.tcpConnectToAddress(address) catch return;
+            stream.close();
+        }
     }
 
     fn allocatorFreeConfig(self: *Self) void {
@@ -457,7 +525,7 @@ pub const InferenceShepherd = struct {
     }
 
     fn maintenanceLoop(self: *Self) void {
-        while (true) {
+        while (!self.isShutdownRequested()) {
             std.time.sleep(1 * std.time.ns_per_s);
             const now = std.time.timestamp();
 
@@ -498,6 +566,30 @@ pub const InferenceShepherd = struct {
             defer self.base.allocator.free(body);
             try http_server.writeResponse(stream, "200 OK", &.{"Content-Type: application/json"}, body);
             return;
+        }
+
+        if (self.operator_state) |state| {
+            var operator_api = control_api.ControlApiServer.init(
+                self.base.allocator,
+                state,
+                &self.base,
+                self.api_token,
+                .{
+                    .ctx = self,
+                    .render = renderOperatorReady,
+                },
+                .{
+                    .ctx = self,
+                    .render = renderOperatorMetrics,
+                },
+                .{
+                    .ctx = self,
+                    .cancel = cancelInference,
+                },
+            );
+            if (try operator_api.handleRequest(stream, req)) {
+                return;
+            }
         }
 
         if (std.mem.eql(u8, req.path, "/v1/chat/completions")) {
@@ -587,6 +679,46 @@ pub const InferenceShepherd = struct {
         );
 
         return buf.toOwnedSlice();
+    }
+
+    fn renderOperatorReady(ctx: *anyopaque, allocator: Allocator, state: *control_state.ControllerState, connected_workers: usize) !control_api.ReadyResult {
+        _ = connected_workers;
+        const self: *Self = @ptrCast(@alignCast(ctx));
+        const ready = self.isReady();
+        const body = try self.renderReadyzJson();
+        if (state.mode == .inference) {
+            state.setInferenceMetrics(toControlPlaneMetrics(self.snapshotMetrics()));
+        }
+        _ = allocator;
+        return .{ .ready = ready, .body = body };
+    }
+
+    fn renderOperatorMetrics(ctx: *anyopaque, allocator: Allocator, state: *control_state.ControllerState, connected_workers: usize) ![]u8 {
+        const self: *Self = @ptrCast(@alignCast(ctx));
+        const metrics = self.snapshotMetrics();
+        state.setInferenceMetrics(toControlPlaneMetrics(metrics));
+        return state.renderMetricsJson(allocator, connected_workers);
+    }
+
+    fn cancelInference(ctx: *anyopaque) void {
+        const self: *Self = @ptrCast(@alignCast(ctx));
+        self.requestShutdown();
+    }
+
+    fn toControlPlaneMetrics(metrics: Metrics) control_state.InferenceMetrics {
+        return .{
+            .total_requests = metrics.total_requests,
+            .active_requests = metrics.active_requests,
+            .queued_requests = metrics.queued_requests,
+            .completed_requests = metrics.completed_requests,
+            .failed_requests = metrics.failed_requests,
+            .tokens_generated = metrics.tokens_generated,
+            .prompt_tokens = metrics.prompt_tokens,
+            .ttft_total_ms = metrics.ttft_total_ms,
+            .ttft_count = metrics.ttft_count,
+            .cache_hits = metrics.cache_hits,
+            .cache_misses = metrics.cache_misses,
+        };
     }
 
     fn handleChatCompletions(self: *Self, stream: net.Stream, req: *http_server.HttpRequest) !void {

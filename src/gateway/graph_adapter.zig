@@ -1,6 +1,7 @@
 const std = @import("std");
 
 const Allocator = std.mem.Allocator;
+const gateway_config = @import("config.zig");
 const graph_store = @import("../graph/store.zig");
 const graph_types = @import("../graph/types.zig");
 
@@ -9,8 +10,21 @@ pub const GatewayGraph = struct {
 
     const Self = @This();
 
-    pub fn init(allocator: Allocator, graph_backend: []const u8, gateway_id: []const u8, lab_id: []const u8) !Self {
-        return .{ .store = try graph_store.GraphStore.init(allocator, graph_backend, gateway_id, lab_id) };
+    pub fn init(allocator: Allocator, config: gateway_config.GatewayConfig) !Self {
+        return .{ .store = try graph_store.GraphStore.init(allocator, .{
+            .backend = config.graph_backend,
+            .gateway_id = config.gateway_id,
+            .lab_id = config.lab_id,
+            .neo4j = if (config.neo4j) |neo4j| .{
+                .uri = neo4j.uri,
+                .http_uri = neo4j.http_uri,
+                .user = neo4j.user,
+                .password_env = neo4j.password_env,
+                .database = neo4j.database,
+                .query_timeout_ms = neo4j.query_timeout_ms,
+                .bootstrap_on_connect = neo4j.bootstrap_on_connect,
+            } else null,
+        }) };
     }
 
     pub fn deinit(self: *Self) void {

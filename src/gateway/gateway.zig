@@ -19,7 +19,7 @@ pub const Gateway = struct {
             .allocator = allocator,
             .config = config,
             .service_registry = service_registry.ServiceRegistry.init(allocator),
-            .graph = graph_adapter.GatewayGraph.init(allocator, config.graph_backend, config.gateway_id, config.lab_id) catch @panic("failed to initialize graph store"),
+            .graph = graph_adapter.GatewayGraph.init(allocator, config) catch @panic("failed to initialize graph store"),
             .started_at = std.time.timestamp(),
         };
     }
@@ -51,7 +51,7 @@ pub const Gateway = struct {
             .started_at = self.started_at,
             .auth_enabled = auth_enabled,
             .registered_services = self.service_registry.count(),
-            .global_controller_endpoint = self.config.global_controller_endpoint,
+            .global_controller_endpoint = self.config.resolvedGlobalControllerEndpoint(),
         }, .{});
     }
 
@@ -87,7 +87,7 @@ pub const Gateway = struct {
             .lab_id = self.config.lab_id,
             .connected = false,
             .mode = "stub",
-            .global_controller_endpoint = self.config.global_controller_endpoint,
+            .global_controller_endpoint = self.config.resolvedGlobalControllerEndpoint(),
             .replication_enabled = false,
         }, .{});
     }

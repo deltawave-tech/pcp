@@ -22,20 +22,27 @@ pub const GraphStore = struct {
 
     const Self = @This();
 
-    pub fn init(allocator: Allocator, backend: []const u8, gateway_id: []const u8, lab_id: []const u8) !Self {
-        const backend_store: BackendStore = if (std.mem.eql(u8, backend, "memory"))
+    pub const InitOptions = struct {
+        backend: []const u8,
+        gateway_id: []const u8,
+        lab_id: []const u8,
+        neo4j: ?store_neo4j.Config = null,
+    };
+
+    pub fn init(allocator: Allocator, options: InitOptions) !Self {
+        const backend_store: BackendStore = if (std.mem.eql(u8, options.backend, "memory"))
             .{ .memory = store_memory.MemoryGraphStore.init(allocator) }
-        else if (std.mem.eql(u8, backend, "neo4j"))
-            .{ .neo4j = try store_neo4j.Neo4jGraphStore.init(allocator, backend, gateway_id, lab_id) }
+        else if (std.mem.eql(u8, options.backend, "neo4j"))
+            .{ .neo4j = try store_neo4j.Neo4jGraphStore.init(allocator, options.neo4j orelse return error.Neo4jConfigRequired) }
         else
             return error.UnsupportedGraphBackend;
 
         return .{
             .allocator = allocator,
             .mutex = .{},
-            .backend = try allocator.dupe(u8, backend),
-            .gateway_id = try allocator.dupe(u8, gateway_id),
-            .lab_id = try allocator.dupe(u8, lab_id),
+            .backend = try allocator.dupe(u8, options.backend),
+            .gateway_id = try allocator.dupe(u8, options.gateway_id),
+            .lab_id = try allocator.dupe(u8, options.lab_id),
             .backend_store = backend_store,
             .mutation_store = mutation_log.GraphMutationStore.init(allocator),
         };

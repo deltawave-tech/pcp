@@ -696,10 +696,14 @@ fn runGateway(allocator: Allocator, args: Args) !void {
     var config = config_result.config;
 
     if (args.api_token_env) |override_env| {
-        config.api_token_env = override_env;
+        if (config.api) |*api| {
+            api.token_env = override_env;
+        } else {
+            config.api_token_env = override_env;
+        }
     }
 
-    const api_token = try maybeLoadApiTokenByEnv(allocator, config.api_token_env);
+    const api_token = try maybeLoadApiTokenByEnv(allocator, config.resolvedApiTokenEnv());
     defer if (api_token) |token| allocator.free(token);
 
     var gateway_instance = gateway.Gateway.init(allocator, config);
@@ -711,8 +715,15 @@ fn runGateway(allocator: Allocator, args: Args) !void {
     print("   Gateway ID: {s}\n", .{config.gateway_id});
     print("   Lab ID: {s}\n", .{config.lab_id});
     print("   Graph Backend: {s}\n", .{config.graph_backend});
+    if (config.neo4j) |neo4j| {
+        print("   Neo4j URI: {s}\n", .{neo4j.uri});
+        print("   Neo4j User: {s}\n", .{neo4j.user});
+        if (neo4j.database) |database| {
+            print("   Neo4j Database: {s}\n", .{database});
+        }
+    }
     print("   API: {s}:{d}\n", .{ args.api_host, args.api_port });
-    if (config.global_controller_endpoint) |endpoint| {
+    if (config.resolvedGlobalControllerEndpoint()) |endpoint| {
         print("   Global Controller: {s}\n", .{endpoint});
     } else {
         print("   Global Controller: not configured\n", .{});

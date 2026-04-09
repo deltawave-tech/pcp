@@ -9,7 +9,7 @@ pub const Gateway = struct {
     allocator: Allocator,
     config: gateway_config.GatewayConfig,
     service_registry: service_registry.ServiceRegistry,
-    graph: graph_adapter.MemoryGraph,
+    graph: graph_adapter.GatewayGraph,
     started_at: i64,
 
     const Self = @This();
@@ -19,7 +19,7 @@ pub const Gateway = struct {
             .allocator = allocator,
             .config = config,
             .service_registry = service_registry.ServiceRegistry.init(allocator),
-            .graph = graph_adapter.MemoryGraph.init(allocator, config.graph_backend, config.gateway_id, config.lab_id) catch @panic("failed to initialize graph store"),
+            .graph = graph_adapter.GatewayGraph.init(allocator, config.graph_backend, config.gateway_id, config.lab_id) catch @panic("failed to initialize graph store"),
             .started_at = std.time.timestamp(),
         };
     }

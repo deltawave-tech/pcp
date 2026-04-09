@@ -47,7 +47,7 @@ pub const AppendResult = struct {
     duplicate: bool,
 };
 
-pub const MutationLog = struct {
+pub const MemoryMutationStore = struct {
     allocator: Allocator,
     records: std.ArrayList(MutationRecord),
     next_sequence_no: u64,
@@ -132,5 +132,51 @@ pub const MutationLog = struct {
     pub fn lastSequence(self: *Self) u64 {
         if (self.next_sequence_no == 1) return 0;
         return self.next_sequence_no - 1;
+    }
+};
+
+pub const GraphMutationStore = union(enum) {
+    memory: MemoryMutationStore,
+
+    const Self = @This();
+
+    pub fn init(allocator: Allocator) Self {
+        return .{ .memory = MemoryMutationStore.init(allocator) };
+    }
+
+    pub fn deinit(self: *Self) void {
+        switch (self.*) {
+            .memory => |*store| store.deinit(),
+        }
+    }
+
+    pub fn append(self: *Self, gateway_id: []const u8, lab_id: []const u8, request: AppendRequest) !AppendResult {
+        return switch (self.*) {
+            .memory => |*store| store.append(gateway_id, lab_id, request),
+        };
+    }
+
+    pub fn count(self: *Self) usize {
+        return switch (self.*) {
+            .memory => |*store| store.count(),
+        };
+    }
+
+    pub fn countPending(self: *Self) usize {
+        return switch (self.*) {
+            .memory => |*store| store.countPending(),
+        };
+    }
+
+    pub fn lastSequence(self: *Self) u64 {
+        return switch (self.*) {
+            .memory => |*store| store.lastSequence(),
+        };
+    }
+
+    pub fn lastReplicatedSequence(self: *Self) u64 {
+        return switch (self.*) {
+            .memory => |*store| store.last_replicated_sequence,
+        };
     }
 };

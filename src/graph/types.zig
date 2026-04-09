@@ -80,6 +80,13 @@ pub const QueryRequest = struct {
     limit: ?usize = null,
 };
 
+pub const GraphCounts = struct {
+    namespaces: usize = 0,
+    entities: usize = 0,
+    relations: usize = 0,
+    observations: usize = 0,
+};
+
 pub const GraphNamespace = struct {
     namespace_id: []u8,
     owner_gateway_id: []u8,

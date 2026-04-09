@@ -4,13 +4,13 @@ const Allocator = std.mem.Allocator;
 const graph_store = @import("../graph/store.zig");
 const graph_types = @import("../graph/types.zig");
 
-pub const MemoryGraph = struct {
-    store: graph_store.MemoryGraphStore,
+pub const GatewayGraph = struct {
+    store: graph_store.GraphStore,
 
     const Self = @This();
 
     pub fn init(allocator: Allocator, graph_backend: []const u8, gateway_id: []const u8, lab_id: []const u8) !Self {
-        return .{ .store = try graph_store.MemoryGraphStore.init(allocator, graph_backend, gateway_id, lab_id) };
+        return .{ .store = try graph_store.GraphStore.init(allocator, graph_backend, gateway_id, lab_id) };
     }
 
     pub fn deinit(self: *Self) void {

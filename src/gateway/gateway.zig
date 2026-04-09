@@ -19,12 +19,13 @@ pub const Gateway = struct {
             .allocator = allocator,
             .config = config,
             .service_registry = service_registry.ServiceRegistry.init(allocator),
-            .graph = graph_adapter.MemoryGraph.init(allocator, config.graph_backend),
+            .graph = graph_adapter.MemoryGraph.init(allocator, config.graph_backend, config.gateway_id, config.lab_id) catch @panic("failed to initialize graph store"),
             .started_at = std.time.timestamp(),
         };
     }
 
     pub fn deinit(self: *Self) void {
+        self.graph.deinit();
         self.service_registry.deinit();
     }
 
@@ -61,8 +62,8 @@ pub const Gateway = struct {
             .service_registry = true,
             .graph_status = true,
             .federation_status = true,
-            .graph_query = false,
-            .graph_mutation = false,
+            .graph_query = true,
+            .graph_mutation = true,
             .federation_replication = false,
             .supported_service_types = &[_][]const u8{ "inference", "rl", "training" },
             .endpoints = &[_][]const u8{
@@ -74,6 +75,8 @@ pub const Gateway = struct {
                 "/v1/services/register",
                 "/v1/federation/status",
                 "/v1/graph/status",
+                "/v1/graph/mutate",
+                "/v1/graph/query",
             },
         }, .{});
     }

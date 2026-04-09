@@ -4,6 +4,7 @@ const net = std.net;
 const Allocator = std.mem.Allocator;
 const TcpServer = @import("../network/tcp_stream.zig").TcpServer;
 const http_server = @import("../inference/http_server.zig");
+const graph_types = @import("../graph/types.zig");
 const service_registry = @import("service_registry.zig");
 const gateway_mod = @import("gateway.zig");
 
@@ -176,6 +177,42 @@ pub const GatewayApiServer = struct {
 
         if (std.mem.eql(u8, req.method, "GET") and std.mem.eql(u8, req.path, "/v1/graph/status")) {
             const body = try self.gateway.graph.renderStatusJson(self.allocator);
+            defer self.allocator.free(body);
+            try http_server.writeResponse(stream, "200 OK", &.{"Content-Type: application/json"}, body);
+            return true;
+        }
+
+        if (std.mem.eql(u8, req.method, "POST") and std.mem.eql(u8, req.path, "/v1/graph/mutate")) {
+            if (req.body.len == 0) {
+                try http_server.writeResponse(stream, "400 Bad Request", &.{"Content-Type: text/plain"}, "missing_body");
+                return true;
+            }
+
+            var parsed = try std.json.parseFromSlice(graph_types.MutateRequest, self.allocator, req.body, .{ .ignore_unknown_fields = true });
+            defer parsed.deinit();
+
+            const body = self.gateway.graph.applyMutationsJson(self.allocator, parsed.value) catch |err| switch (err) {
+                error.InvalidMutationType, error.InvalidPayload, error.InvalidVisibility => {
+                    try http_server.writeResponse(stream, "400 Bad Request", &.{"Content-Type: text/plain"}, @errorName(err));
+                    return true;
+                },
+                else => return err,
+            };
+            defer self.allocator.free(body);
+            try http_server.writeResponse(stream, "200 OK", &.{"Content-Type: application/json"}, body);
+            return true;
+        }
+
+        if (std.mem.eql(u8, req.method, "POST") and std.mem.eql(u8, req.path, "/v1/graph/query")) {
+            if (req.body.len == 0) {
+                try http_server.writeResponse(stream, "400 Bad Request", &.{"Content-Type: text/plain"}, "missing_body");
+                return true;
+            }
+
+            var parsed = try std.json.parseFromSlice(graph_types.QueryRequest, self.allocator, req.body, .{ .ignore_unknown_fields = true });
+            defer parsed.deinit();
+
+            const body = try self.gateway.graph.renderQueryJson(self.allocator, parsed.value);
             defer self.allocator.free(body);
             try http_server.writeResponse(stream, "200 OK", &.{"Content-Type: application/json"}, body);
             return true;

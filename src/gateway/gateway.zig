@@ -14,6 +14,8 @@ pub const FederationPeer = struct {
     graph_backend: []u8,
     status: []u8,
     registered_services: usize,
+    last_sequence_no: u64,
+    last_replicated_sequence: u64,
     connected_at: i64,
     last_seen_at: i64,
 
@@ -34,6 +36,9 @@ pub const FederationState = struct {
     status_text: []u8,
     last_sync_at: ?i64,
     last_error: ?[]u8,
+    last_sequence_no: u64,
+    last_replicated_sequence: u64,
+    pending_mutations: usize,
     peers: std.ArrayList(FederationPeer),
 
     const Self = @This();
@@ -47,6 +52,9 @@ pub const FederationState = struct {
             .status_text = allocator.dupe(u8, "disconnected") catch @panic("oom"),
             .last_sync_at = null,
             .last_error = null,
+            .last_sequence_no = 0,
+            .last_replicated_sequence = 0,
+            .pending_mutations = 0,
             .peers = std.ArrayList(FederationPeer).init(allocator),
         };
     }
@@ -94,6 +102,8 @@ pub const FederationState = struct {
                 .graph_backend = try allocator.dupe(u8, stringField(object, "graph_backend") orelse return error.InvalidFederationResponse),
                 .status = try allocator.dupe(u8, stringField(object, "status") orelse return error.InvalidFederationResponse),
                 .registered_services = usizeField(object, "registered_services") orelse 0,
+                .last_sequence_no = u64Field(object, "last_sequence_no") orelse 0,
+                .last_replicated_sequence = u64Field(object, "last_replicated_sequence") orelse 0,
                 .connected_at = intField(object, "connected_at") orelse std.time.timestamp(),
                 .last_seen_at = intField(object, "last_seen_at") orelse std.time.timestamp(),
             });
@@ -123,6 +133,14 @@ pub const FederationState = struct {
         self.last_error = self.allocator.dupe(u8, @errorName(err)) catch null;
     }
 
+    pub fn updateReplicationState(self: *Self, last_sequence_no: u64, last_replicated_sequence: u64, pending_mutations: usize) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.last_sequence_no = last_sequence_no;
+        self.last_replicated_sequence = last_replicated_sequence;
+        self.pending_mutations = pending_mutations;
+    }
+
     pub fn renderStatusJson(self: *Self, allocator: Allocator, gateway_id: []const u8, lab_id: []const u8, configured_endpoint: ?[]const u8) ![]u8 {
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -137,6 +155,9 @@ pub const FederationState = struct {
             .last_error = self.last_error,
             .global_controller_endpoint = self.upstream_endpoint orelse configured_endpoint,
             .replication_enabled = false,
+            .last_sequence_no = self.last_sequence_no,
+            .last_replicated_sequence = self.last_replicated_sequence,
+            .pending_mutations = self.pending_mutations,
         }, .{});
     }
 
@@ -151,6 +172,8 @@ pub const FederationState = struct {
             graph_backend: []const u8,
             status: []const u8,
             registered_services: usize,
+            last_sequence_no: u64,
+            last_replicated_sequence: u64,
             connected_at: i64,
             last_seen_at: i64,
         };
@@ -165,6 +188,8 @@ pub const FederationState = struct {
                 .graph_backend = peer.graph_backend,
                 .status = peer.status,
                 .registered_services = peer.registered_services,
+                .last_sequence_no = peer.last_sequence_no,
+                .last_replicated_sequence = peer.last_replicated_sequence,
                 .connected_at = peer.connected_at,
                 .last_seen_at = peer.last_seen_at,
             });
@@ -269,6 +294,11 @@ pub const Gateway = struct {
     }
 
     pub fn renderFederationStatusJson(self: *Self, allocator: Allocator) ![]u8 {
+        self.federation.updateReplicationState(
+            self.graph.lastSequence(),
+            self.graph.lastReplicatedSequence(),
+            self.graph.countPendingReplications(),
+        );
         return self.federation.renderStatusJson(
             allocator,
             self.config.gateway_id,
@@ -309,6 +339,14 @@ fn intField(object: std.json.ObjectMap, key: []const u8) ?i64 {
 }
 
 fn usizeField(object: std.json.ObjectMap, key: []const u8) ?usize {
+    const value = object.get(key) orelse return null;
+    return switch (value) {
+        .integer => |inner| @intCast(inner),
+        else => null,
+    };
+}
+
+fn u64Field(object: std.json.ObjectMap, key: []const u8) ?u64 {
     const value = object.get(key) orelse return null;
     return switch (value) {
         .integer => |inner| @intCast(inner),

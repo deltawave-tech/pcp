@@ -2,10 +2,12 @@ const std = @import("std");
 const net = std.net;
 
 const Allocator = std.mem.Allocator;
+const federation_types = @import("../federation/types.zig");
 const TcpServer = @import("../network/tcp_stream.zig").TcpServer;
 const http_server = @import("../inference/http_server.zig");
 const controller_mod = @import("controller.zig");
 const gateway_registry = @import("gateway_registry.zig");
+const graph_types = @import("../graph/types.zig");
 
 pub const GlobalControllerApiServer = struct {
     allocator: Allocator,
@@ -163,6 +165,44 @@ pub const GlobalControllerApiServer = struct {
 
         if (std.mem.eql(u8, req.method, "GET") and std.mem.eql(u8, req.path, "/v1/global-graph/status")) {
             const body = try self.controller.renderGlobalGraphStatusJson(self.allocator);
+            defer self.allocator.free(body);
+            try http_server.writeResponse(stream, "200 OK", &.{"Content-Type: application/json"}, body);
+            return true;
+        }
+
+        if (std.mem.eql(u8, req.method, "POST") and std.mem.eql(u8, req.path, "/v1/global-graph/query")) {
+            if (req.body.len == 0) {
+                try http_server.writeResponse(stream, "400 Bad Request", &.{"Content-Type: text/plain"}, "missing_body");
+                return true;
+            }
+
+            var parsed = try std.json.parseFromSlice(graph_types.QueryRequest, self.allocator, req.body, .{ .ignore_unknown_fields = true });
+            defer parsed.deinit();
+
+            const body = try self.controller.renderGlobalGraphQueryJson(self.allocator, parsed.value);
+            defer self.allocator.free(body);
+            try http_server.writeResponse(stream, "200 OK", &.{"Content-Type: application/json"}, body);
+            return true;
+        }
+
+        if (std.mem.eql(u8, req.method, "POST") and std.mem.eql(u8, req.path, "/v1/federation/mutations")) {
+            if (req.body.len == 0) {
+                try http_server.writeResponse(stream, "400 Bad Request", &.{"Content-Type: text/plain"}, "missing_body");
+                return true;
+            }
+
+            var parsed = try std.json.parseFromSlice(federation_types.MutationBatchRequest, self.allocator, req.body, .{ .ignore_unknown_fields = true });
+            defer parsed.deinit();
+
+            const ack = self.controller.applyMutationBatch(self.allocator, parsed.value) catch |err| switch (err) {
+                error.UnknownGateway, error.InvalidMutationType, error.InvalidVisibility => {
+                    try http_server.writeResponse(stream, "400 Bad Request", &.{"Content-Type: text/plain"}, @errorName(err));
+                    return true;
+                },
+                else => return err,
+            };
+
+            const body = try std.json.stringifyAlloc(self.allocator, ack, .{});
             defer self.allocator.free(body);
             try http_server.writeResponse(stream, "200 OK", &.{"Content-Type: application/json"}, body);
             return true;

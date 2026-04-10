@@ -8,6 +8,8 @@ pub const ConnectRequest = struct {
     base_url: []const u8,
     graph_backend: []const u8,
     registered_services: usize = 0,
+    last_sequence_no: u64 = 0,
+    last_replicated_sequence: u64 = 0,
     status: ?[]const u8 = null,
 };
 
@@ -18,6 +20,8 @@ pub const RegisteredGateway = struct {
     graph_backend: []u8,
     status: []u8,
     registered_services: usize,
+    last_sequence_no: u64,
+    last_replicated_sequence: u64,
     connected_at: i64,
     last_seen_at: i64,
 
@@ -64,6 +68,8 @@ pub const GatewayRegistry = struct {
             try replaceString(self.allocator, &gateway.graph_backend, request.graph_backend);
             try replaceString(self.allocator, &gateway.status, request.status orelse "connected");
             gateway.registered_services = request.registered_services;
+            gateway.last_sequence_no = request.last_sequence_no;
+            gateway.last_replicated_sequence = @max(gateway.last_replicated_sequence, request.last_replicated_sequence);
             gateway.last_seen_at = now;
             return try cloneGateway(self.allocator, gateway.*);
         }
@@ -75,6 +81,8 @@ pub const GatewayRegistry = struct {
             .graph_backend = try self.allocator.dupe(u8, request.graph_backend),
             .status = try self.allocator.dupe(u8, request.status orelse "connected"),
             .registered_services = request.registered_services,
+            .last_sequence_no = request.last_sequence_no,
+            .last_replicated_sequence = request.last_replicated_sequence,
             .connected_at = now,
             .last_seen_at = now,
         };
@@ -118,6 +126,8 @@ pub const GatewayRegistry = struct {
             graph_backend: []const u8,
             status: []const u8,
             registered_services: usize,
+            last_sequence_no: u64,
+            last_replicated_sequence: u64,
             connected_at: i64,
             last_seen_at: i64,
         };
@@ -132,6 +142,8 @@ pub const GatewayRegistry = struct {
                 .graph_backend = gateway.graph_backend,
                 .status = gateway.status,
                 .registered_services = gateway.registered_services,
+                .last_sequence_no = gateway.last_sequence_no,
+                .last_replicated_sequence = gateway.last_replicated_sequence,
                 .connected_at = gateway.connected_at,
                 .last_seen_at = gateway.last_seen_at,
             });
@@ -140,6 +152,32 @@ pub const GatewayRegistry = struct {
         return std.json.stringifyAlloc(allocator, .{
             .gateways = response_gateways.items,
         }, .{});
+    }
+
+    pub fn markReplicated(self: *Self, gateway_id: []const u8, acked_sequence_no: u64, last_sequence_no: u64) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        for (self.gateways.items) |*gateway| {
+            if (!std.mem.eql(u8, gateway.gateway_id, gateway_id)) continue;
+            gateway.last_replicated_sequence = @max(gateway.last_replicated_sequence, acked_sequence_no);
+            gateway.last_sequence_no = @max(gateway.last_sequence_no, last_sequence_no);
+            gateway.last_seen_at = std.time.timestamp();
+            return true;
+        }
+        return false;
+    }
+
+    pub fn maxReplicationLag(self: *Self) u64 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        var max_lag: u64 = 0;
+        for (self.gateways.items) |gateway| {
+            const lag = gateway.last_sequence_no -| gateway.last_replicated_sequence;
+            max_lag = @max(max_lag, lag);
+        }
+        return max_lag;
     }
 };
 
@@ -151,6 +189,8 @@ fn cloneGateway(allocator: Allocator, gateway: RegisteredGateway) !RegisteredGat
         .graph_backend = try allocator.dupe(u8, gateway.graph_backend),
         .status = try allocator.dupe(u8, gateway.status),
         .registered_services = gateway.registered_services,
+        .last_sequence_no = gateway.last_sequence_no,
+        .last_replicated_sequence = gateway.last_replicated_sequence,
         .connected_at = gateway.connected_at,
         .last_seen_at = gateway.last_seen_at,
     };

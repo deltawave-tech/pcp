@@ -29,6 +29,23 @@ pub const MutationRecord = struct {
     }
 };
 
+pub fn cloneRecord(allocator: Allocator, record: MutationRecord) !MutationRecord {
+    return .{
+        .mutation_id = try allocator.dupe(u8, record.mutation_id),
+        .gateway_id = try allocator.dupe(u8, record.gateway_id),
+        .lab_id = try allocator.dupe(u8, record.lab_id),
+        .namespace_id = try allocator.dupe(u8, record.namespace_id),
+        .mutation_type = record.mutation_type,
+        .target_type = try allocator.dupe(u8, record.target_type),
+        .target_id = try allocator.dupe(u8, record.target_id),
+        .payload_json = try allocator.dupe(u8, record.payload_json),
+        .visibility = record.visibility,
+        .provenance_json = try allocator.dupe(u8, record.provenance_json),
+        .timestamp = record.timestamp,
+        .sequence_no = record.sequence_no,
+    };
+}
+
 pub const AppendRequest = struct {
     mutation_id: ?[]const u8 = null,
     namespace_id: []const u8,
@@ -123,6 +140,13 @@ pub const MemoryMutationStore = struct {
         return self.records.items.len;
     }
 
+    pub fn containsMutationId(self: *Self, mutation_id: []const u8) bool {
+        for (self.records.items) |record| {
+            if (std.mem.eql(u8, record.mutation_id, mutation_id)) return true;
+        }
+        return false;
+    }
+
     pub fn countPending(self: *Self) usize {
         const replicated = @as(usize, @intCast(self.last_replicated_sequence));
         if (replicated >= self.records.items.len) return 0;
@@ -132,6 +156,28 @@ pub const MemoryMutationStore = struct {
     pub fn lastSequence(self: *Self) u64 {
         if (self.next_sequence_no == 1) return 0;
         return self.next_sequence_no - 1;
+    }
+
+    pub fn markReplicatedThrough(self: *Self, sequence_no: u64) void {
+        if (sequence_no > self.last_replicated_sequence) {
+            self.last_replicated_sequence = @min(sequence_no, self.lastSequence());
+        }
+    }
+
+    pub fn snapshotFrom(self: *Self, allocator: Allocator, after_sequence_no: u64, max_items: usize) ![]MutationRecord {
+        var matches = std.ArrayList(MutationRecord).init(allocator);
+        errdefer {
+            for (matches.items) |*record| record.deinit(allocator);
+            matches.deinit();
+        }
+
+        for (self.records.items) |record| {
+            if (record.sequence_no <= after_sequence_no) continue;
+            try matches.append(try cloneRecord(allocator, record));
+            if (matches.items.len >= max_items) break;
+        }
+
+        return matches.toOwnedSlice();
     }
 };
 
@@ -168,6 +214,12 @@ pub const GraphMutationStore = union(enum) {
         };
     }
 
+    pub fn containsMutationId(self: *Self, mutation_id: []const u8) bool {
+        return switch (self.*) {
+            .memory => |*store| store.containsMutationId(mutation_id),
+        };
+    }
+
     pub fn lastSequence(self: *Self) u64 {
         return switch (self.*) {
             .memory => |*store| store.lastSequence(),
@@ -177,6 +229,18 @@ pub const GraphMutationStore = union(enum) {
     pub fn lastReplicatedSequence(self: *Self) u64 {
         return switch (self.*) {
             .memory => |*store| store.last_replicated_sequence,
+        };
+    }
+
+    pub fn markReplicatedThrough(self: *Self, sequence_no: u64) void {
+        switch (self.*) {
+            .memory => |*store| store.markReplicatedThrough(sequence_no),
+        }
+    }
+
+    pub fn snapshotFrom(self: *Self, allocator: Allocator, after_sequence_no: u64, max_items: usize) ![]MutationRecord {
+        return switch (self.*) {
+            .memory => |*store| store.snapshotFrom(allocator, after_sequence_no, max_items),
         };
     }
 };

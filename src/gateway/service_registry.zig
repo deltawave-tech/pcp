@@ -203,6 +203,68 @@ pub const ServiceRegistry = struct {
         return null;
     }
 
+    pub fn findService(self: *Self, allocator: Allocator, service_id: []const u8) !?RegisteredService {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        for (self.services.items) |service| {
+            if (std.mem.eql(u8, service.service_id, service_id)) {
+                return try cloneService(allocator, service);
+            }
+        }
+
+        return null;
+    }
+
+    pub fn selectServiceByType(self: *Self, allocator: Allocator, service_type: ServiceType, preferred_service_id: ?[]const u8) !?RegisteredService {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        if (preferred_service_id) |service_id| {
+            for (self.services.items) |service| {
+                if (service.service_type != service_type) continue;
+                if (!std.mem.eql(u8, service.service_id, service_id)) continue;
+                return try cloneService(allocator, service);
+            }
+            return null;
+        }
+
+        var best_index: ?usize = null;
+        for (self.services.items, 0..) |service, idx| {
+            if (service.service_type != service_type) continue;
+            if (best_index == null or isBetterCandidate(service, self.services.items[best_index.?])) {
+                best_index = idx;
+            }
+        }
+
+        if (best_index) |idx| {
+            return try cloneService(allocator, self.services.items[idx]);
+        }
+
+        return null;
+    }
+
+    pub fn listServices(self: *Self, allocator: Allocator) ![]RegisteredService {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        const services = try allocator.alloc(RegisteredService, self.services.items.len);
+        errdefer allocator.free(services);
+
+        for (self.services.items, 0..) |service, idx| {
+            services[idx] = try cloneService(allocator, service);
+        }
+
+        return services;
+    }
+
+    pub fn deinitServiceList(allocator: Allocator, services: []RegisteredService) void {
+        for (services) |*service| {
+            service.deinit(allocator);
+        }
+        allocator.free(services);
+    }
+
     fn cloneService(allocator: Allocator, service: RegisteredService) !RegisteredService {
         var capabilities = std.ArrayList([]u8).init(allocator);
         errdefer {
@@ -246,5 +308,17 @@ pub const ServiceRegistry = struct {
         for (items) |capability| {
             try capabilities.append(try allocator.dupe(u8, capability));
         }
+    }
+
+    fn isBetterCandidate(candidate: RegisteredService, current: RegisteredService) bool {
+        const candidate_ok = std.mem.eql(u8, candidate.health_status, "ok");
+        const current_ok = std.mem.eql(u8, current.health_status, "ok");
+        if (candidate_ok != current_ok) return candidate_ok;
+
+        if (candidate.ready_worker_count != current.ready_worker_count) {
+            return candidate.ready_worker_count > current.ready_worker_count;
+        }
+
+        return candidate.updated_at > current.updated_at;
     }
 };

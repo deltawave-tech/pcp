@@ -9,6 +9,15 @@ const service_registry = @import("service_registry.zig");
 const gateway_mod = @import("gateway.zig");
 const event_ingest = @import("event_ingest.zig");
 
+const ProxySelectionRequest = struct {
+    service_id: ?[]const u8 = null,
+};
+
+const DownstreamResponse = struct {
+    status: std.http.Status,
+    body: []u8,
+};
+
 pub const GatewayApiServer = struct {
     allocator: Allocator,
     gateway: *gateway_mod.Gateway,
@@ -206,6 +215,62 @@ pub const GatewayApiServer = struct {
             return true;
         }
 
+        if (std.mem.eql(u8, req.method, "POST") and std.mem.eql(u8, req.path, "/v1/inference/chat/completions")) {
+            var service = self.requireServiceByType(.inference, req.header("x-pcp-service-id")) catch |err| {
+                try writeProxyErrorResponse(stream, err);
+                return true;
+            };
+            defer service.deinit(self.allocator);
+
+            const downstream = self.forwardToService(service, req, "/v1/chat/completions") catch |err| {
+                try writeProxyErrorResponse(stream, err);
+                return true;
+            };
+            defer self.allocator.free(downstream.body);
+            try http_server.writeResponse(stream, statusText(downstream.status), &.{"Content-Type: application/json"}, downstream.body);
+            return true;
+        }
+
+        if (std.mem.eql(u8, req.method, "POST") and std.mem.eql(u8, req.path, "/v1/rl/jobs")) {
+            self.handleJobSubmit(stream, req, .rl) catch |err| {
+                try writeProxyErrorResponse(stream, err);
+            };
+            return true;
+        }
+
+        if (std.mem.eql(u8, req.method, "POST") and std.mem.eql(u8, req.path, "/v1/training/jobs")) {
+            self.handleJobSubmit(stream, req, .training) catch |err| {
+                try writeProxyErrorResponse(stream, err);
+            };
+            return true;
+        }
+
+        if (std.mem.eql(u8, req.method, "GET") and std.mem.eql(u8, req.path, "/v1/jobs")) {
+            const body = self.renderJobsJson(req) catch |err| {
+                try writeProxyErrorResponse(stream, err);
+                return true;
+            };
+            defer self.allocator.free(body);
+            try http_server.writeResponse(stream, "200 OK", &.{"Content-Type: application/json"}, body);
+            return true;
+        }
+
+        if (std.mem.eql(u8, req.method, "POST") and std.mem.startsWith(u8, req.path, "/v1/jobs/") and std.mem.endsWith(u8, req.path, "/cancel")) {
+            const job_id = req.path["/v1/jobs/".len .. req.path.len - "/cancel".len];
+            self.handleJobCancel(stream, req, job_id) catch |err| {
+                try writeProxyErrorResponse(stream, err);
+            };
+            return true;
+        }
+
+        if (std.mem.eql(u8, req.method, "GET") and std.mem.startsWith(u8, req.path, "/v1/jobs/")) {
+            const job_id = req.path["/v1/jobs/".len..];
+            self.handleJobLookup(stream, req, job_id) catch |err| {
+                try writeProxyErrorResponse(stream, err);
+            };
+            return true;
+        }
+
         if (std.mem.eql(u8, req.method, "GET") and std.mem.eql(u8, req.path, "/v1/federation/status")) {
             const body = try self.gateway.renderFederationStatusJson(self.allocator);
             defer self.allocator.free(body);
@@ -275,4 +340,265 @@ pub const GatewayApiServer = struct {
         }
         return self.authorize(req);
     }
+
+    fn handleJobSubmit(self: *Self, stream: net.Stream, req: *http_server.HttpRequest, service_type: service_registry.ServiceType) !void {
+        const selection = try parseProxySelection(self.allocator, req.body);
+        defer if (selection) |parsed| parsed.deinit();
+
+        var service = try self.requireServiceByType(service_type, if (selection) |parsed| parsed.value.service_id else null);
+        defer service.deinit(self.allocator);
+
+        const downstream = try self.forwardRaw(service, req.method, req.header("authorization"), "/v1/job", "", null);
+        defer self.allocator.free(downstream.body);
+
+        const job_id = try gatewayJobId(self.allocator, service.service_type, service.service_id);
+        defer self.allocator.free(job_id);
+
+        const body = try wrapJobJson(self.allocator, job_id, service, downstream.body);
+        defer self.allocator.free(body);
+
+        try http_server.writeResponse(stream, "202 Accepted", &.{"Content-Type: application/json"}, body);
+    }
+
+    fn handleJobLookup(self: *Self, stream: net.Stream, req: *http_server.HttpRequest, job_id: []const u8) !void {
+        var service = try self.requireJobService(job_id);
+        defer service.deinit(self.allocator);
+
+        const downstream = try self.forwardRaw(service, "GET", req.header("authorization"), "/v1/job", "", null);
+        defer self.allocator.free(downstream.body);
+
+        const canonical_job_id = try gatewayJobId(self.allocator, service.service_type, service.service_id);
+        defer self.allocator.free(canonical_job_id);
+
+        const body = try wrapJobJson(self.allocator, canonical_job_id, service, downstream.body);
+        defer self.allocator.free(body);
+
+        try http_server.writeResponse(stream, statusText(downstream.status), &.{"Content-Type: application/json"}, body);
+    }
+
+    fn handleJobCancel(self: *Self, stream: net.Stream, req: *http_server.HttpRequest, job_id: []const u8) !void {
+        var service = try self.requireJobService(job_id);
+        defer service.deinit(self.allocator);
+
+        const downstream = try self.forwardRaw(service, "POST", req.header("authorization"), "/v1/job/cancel", req.body, req.header("content-type"));
+        defer self.allocator.free(downstream.body);
+
+        const canonical_job_id = try gatewayJobId(self.allocator, service.service_type, service.service_id);
+        defer self.allocator.free(canonical_job_id);
+
+        const body = try wrapCancelJson(self.allocator, canonical_job_id, service, downstream.body);
+        defer self.allocator.free(body);
+
+        try http_server.writeResponse(stream, statusText(downstream.status), &.{"Content-Type: application/json"}, body);
+    }
+
+    fn renderJobsJson(self: *Self, req: *http_server.HttpRequest) ![]u8 {
+        const services = try self.gateway.service_registry.listServices(self.allocator);
+        defer service_registry.ServiceRegistry.deinitServiceList(self.allocator, services);
+
+        var body = std.ArrayList(u8).init(self.allocator);
+        errdefer body.deinit();
+        var writer = body.writer();
+        try writer.writeAll("{\"jobs\":[");
+        var emitted: usize = 0;
+
+        for (services) |service| {
+            const downstream = self.forwardRaw(service, "GET", req.header("authorization"), "/v1/job", "", null) catch |err| switch (err) {
+                error.ServiceProxyFailed,
+                => continue,
+                else => return err,
+            };
+            defer self.allocator.free(downstream.body);
+
+            const job_id = try gatewayJobId(self.allocator, service.service_type, service.service_id);
+            defer self.allocator.free(job_id);
+
+            const wrapped = try wrapJobJson(self.allocator, job_id, service, downstream.body);
+            defer self.allocator.free(wrapped);
+
+            if (emitted > 0) try writer.writeByte(',');
+            try writer.writeAll(wrapped);
+            emitted += 1;
+        }
+
+        try writer.writeAll("]}");
+        return body.toOwnedSlice();
+    }
+
+    fn requireServiceByType(self: *Self, service_type: service_registry.ServiceType, preferred_service_id: ?[]const u8) !service_registry.RegisteredService {
+        return try self.gateway.service_registry.selectServiceByType(self.allocator, service_type, preferred_service_id) orelse error.ServiceUnavailable;
+    }
+
+    fn requireJobService(self: *Self, job_id: []const u8) !service_registry.RegisteredService {
+        if (std.mem.indexOfScalar(u8, job_id, ':')) |sep| {
+            const service_type = service_registry.ServiceType.parse(job_id[0..sep]) orelse return error.InvalidJobId;
+            const service_id = job_id[sep + 1 ..];
+            var service = try self.gateway.service_registry.findService(self.allocator, service_id) orelse return error.ServiceUnavailable;
+            errdefer service.deinit(self.allocator);
+            if (service.service_type != service_type) return error.InvalidJobId;
+            return service;
+        }
+
+        return try self.gateway.service_registry.findService(self.allocator, job_id) orelse error.ServiceUnavailable;
+    }
+
+    fn forwardToService(self: *Self, service: service_registry.RegisteredService, req: *http_server.HttpRequest, path: []const u8) !DownstreamResponse {
+        return self.forwardRaw(service, req.method, req.header("authorization"), path, req.body, req.header("content-type"));
+    }
+
+    fn forwardRaw(
+        self: *Self,
+        service: service_registry.RegisteredService,
+        method: []const u8,
+        auth_header: ?[]const u8,
+        path: []const u8,
+        body: []const u8,
+        content_type: ?[]const u8,
+    ) !DownstreamResponse {
+        var client = std.http.Client{ .allocator = self.allocator };
+        defer client.deinit();
+
+        const url = try std.fmt.allocPrint(self.allocator, "{s}{s}", .{ std.mem.trimRight(u8, service.base_url, "/"), path });
+        defer self.allocator.free(url);
+
+        var headers = std.ArrayList(std.http.Header).init(self.allocator);
+        defer headers.deinit();
+        try headers.append(.{ .name = "accept", .value = "application/json" });
+        if (content_type) |value| {
+            try headers.append(.{ .name = "content-type", .value = value });
+        }
+        if (auth_header) |value| {
+            try headers.append(.{ .name = "authorization", .value = value });
+        }
+
+        var response_body = std.ArrayList(u8).init(self.allocator);
+        errdefer response_body.deinit();
+
+        const result = client.fetch(.{
+            .location = .{ .url = url },
+            .method = try parseHttpMethod(method),
+            .payload = if (body.len > 0) body else null,
+            .extra_headers = headers.items,
+            .response_storage = .{ .dynamic = &response_body },
+        }) catch return error.ServiceProxyFailed;
+
+        return .{
+            .status = result.status,
+            .body = try response_body.toOwnedSlice(),
+        };
+    }
 };
+
+fn parseProxySelection(allocator: Allocator, body: []const u8) !?std.json.Parsed(ProxySelectionRequest) {
+    if (body.len == 0) return null;
+    return try std.json.parseFromSlice(ProxySelectionRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+fn gatewayJobId(allocator: Allocator, service_type: service_registry.ServiceType, service_id: []const u8) ![]u8 {
+    _ = service_type;
+    return allocator.dupe(u8, service_id);
+}
+
+fn wrapJobJson(allocator: Allocator, job_id: []const u8, service: service_registry.RegisteredService, downstream_body: []const u8) ![]u8 {
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, downstream_body, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidDownstreamResponse;
+
+    const job_id_json = try std.json.stringifyAlloc(allocator, job_id, .{});
+    defer allocator.free(job_id_json);
+    const service_id_json = try std.json.stringifyAlloc(allocator, service.service_id, .{});
+    defer allocator.free(service_id_json);
+    const service_type_json = try std.json.stringifyAlloc(allocator, service.service_type.asString(), .{});
+    defer allocator.free(service_type_json);
+    const base_url_json = try std.json.stringifyAlloc(allocator, service.base_url, .{});
+    defer allocator.free(base_url_json);
+
+    var body = std.ArrayList(u8).init(allocator);
+    errdefer body.deinit();
+    var writer = body.writer();
+    try writer.writeAll("{\"job_id\":");
+    try writer.writeAll(job_id_json);
+    try writer.writeAll(",\"service_id\":");
+    try writer.writeAll(service_id_json);
+    try writer.writeAll(",\"service_type\":");
+    try writer.writeAll(service_type_json);
+    try writer.writeAll(",\"base_url\":");
+    try writer.writeAll(base_url_json);
+    try writer.writeAll(",\"job\":");
+    try writer.writeAll(downstream_body);
+    try writer.writeByte('}');
+    return body.toOwnedSlice();
+}
+
+fn wrapCancelJson(allocator: Allocator, job_id: []const u8, service: service_registry.RegisteredService, downstream_body: []const u8) ![]u8 {
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, downstream_body, .{});
+    defer parsed.deinit();
+
+    const root = switch (parsed.value) {
+        .object => |object| object,
+        else => return error.InvalidDownstreamResponse,
+    };
+
+    const accepted = if (root.get("accepted")) |value|
+        switch (value) {
+            .bool => |inner| inner,
+            else => false,
+        }
+    else
+        false;
+    const status = if (root.get("status")) |value|
+        switch (value) {
+            .string => |inner| inner,
+            else => "unknown",
+        }
+    else
+        "unknown";
+
+    return std.json.stringifyAlloc(allocator, .{
+        .accepted = accepted,
+        .status = status,
+        .job_id = job_id,
+        .service_id = service.service_id,
+        .service_type = service.service_type.asString(),
+    }, .{});
+}
+
+fn parseHttpMethod(method: []const u8) !std.http.Method {
+    if (std.mem.eql(u8, method, "GET")) return .GET;
+    if (std.mem.eql(u8, method, "POST")) return .POST;
+    if (std.mem.eql(u8, method, "PUT")) return .PUT;
+    if (std.mem.eql(u8, method, "DELETE")) return .DELETE;
+    return error.UnsupportedMethod;
+}
+
+fn statusText(status: std.http.Status) []const u8 {
+    return switch (status) {
+        .ok => "200 OK",
+        .created => "201 Created",
+        .accepted => "202 Accepted",
+        .bad_request => "400 Bad Request",
+        .unauthorized => "401 Unauthorized",
+        .forbidden => "403 Forbidden",
+        .not_found => "404 Not Found",
+        .method_not_allowed => "405 Method Not Allowed",
+        .conflict => "409 Conflict",
+        .unprocessable_entity => "422 Unprocessable Entity",
+        .too_many_requests => "429 Too Many Requests",
+        .internal_server_error => "500 Internal Server Error",
+        .bad_gateway => "502 Bad Gateway",
+        .service_unavailable => "503 Service Unavailable",
+        .gateway_timeout => "504 Gateway Timeout",
+        else => "500 Internal Server Error",
+    };
+}
+
+fn writeProxyErrorResponse(stream: net.Stream, err: anyerror) !void {
+    const status = switch (err) {
+        error.InvalidJobId, error.InvalidDownstreamResponse => "400 Bad Request",
+        error.ServiceUnavailable => "404 Not Found",
+        error.ServiceProxyFailed => "502 Bad Gateway",
+        error.UnsupportedMethod => "405 Method Not Allowed",
+        else => "500 Internal Server Error",
+    };
+    try http_server.writeResponse(stream, status, &.{"Content-Type: text/plain"}, @errorName(err));
+}

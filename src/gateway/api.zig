@@ -46,7 +46,11 @@ pub const GatewayApiServer = struct {
     pub fn start(self: *Self, host: []const u8, port: u16) !void {
         self.listen_host = host;
         self.listen_port = port;
-        self.server = try TcpServer.init(self.allocator, host, port);
+        std.log.info("Starting gateway API server on {s}:{d}", .{ host, port });
+        self.server = TcpServer.init(self.allocator, host, port) catch |err| {
+            std.log.err("Gateway API listen failed on {s}:{d}: {}", .{ host, port, err });
+            return err;
+        };
         self.is_running.store(1, .release);
 
         while (self.is_running.load(.acquire) == 1) {
@@ -275,6 +279,25 @@ pub const GatewayApiServer = struct {
             const body = try self.gateway.renderFederationStatusJson(self.allocator);
             defer self.allocator.free(body);
             try http_server.writeResponse(stream, "200 OK", &.{"Content-Type: application/json"}, body);
+            return true;
+        }
+
+        if (std.mem.eql(u8, req.method, "GET") and std.mem.eql(u8, req.path, "/v1/federation/peers")) {
+            const body = try self.gateway.federation.renderPeersJson(self.allocator);
+            defer self.allocator.free(body);
+            try http_server.writeResponse(stream, "200 OK", &.{"Content-Type: application/json"}, body);
+            return true;
+        }
+
+        if (std.mem.eql(u8, req.method, "POST") and std.mem.eql(u8, req.path, "/v1/federation/connect")) {
+            if (self.gateway.config.resolvedGlobalControllerEndpoint() == null) {
+                try http_server.writeResponse(stream, "400 Bad Request", &.{"Content-Type: text/plain"}, "global_controller_not_configured");
+                return true;
+            }
+
+            const body = try self.gateway.renderFederationStatusJson(self.allocator);
+            defer self.allocator.free(body);
+            try http_server.writeResponse(stream, "202 Accepted", &.{"Content-Type: application/json"}, body);
             return true;
         }
 

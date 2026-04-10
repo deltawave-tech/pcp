@@ -3,6 +3,12 @@
   "lab_id": "lab-alpha",
   "graph_backend": "memory",
   "global_controller_endpoint": null,
+  "federation": {
+    "enabled": false,
+    "upstream": null,
+    "token_env": "PCP_GLOBAL_CONTROLLER_TOKEN",
+    "heartbeat_interval_ms": 5000
+  },
   "api_token_env": "PCP_GATEWAY_API_TOKEN",
   "internal_api_token_env": "PCP_GATEWAY_INTERNAL_TOKEN"
 }

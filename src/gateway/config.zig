@@ -22,6 +22,8 @@ pub const ApiConfig = struct {
 pub const FederationConfig = struct {
     enabled: bool = false,
     upstream: ?[]const u8 = null,
+    token_env: ?[]const u8 = null,
+    heartbeat_interval_ms: u64 = 5_000,
 };
 
 pub const SharingDefaults = struct {
@@ -54,6 +56,18 @@ pub const GatewayConfig = struct {
         return self.global_controller_endpoint;
     }
 
+    pub fn resolvedFederationTokenEnv(self: GatewayConfig) ?[]const u8 {
+        if (self.federation) |federation| {
+            if (federation.token_env) |token_env| return token_env;
+        }
+        return null;
+    }
+
+    pub fn resolvedHeartbeatIntervalMs(self: GatewayConfig) u64 {
+        if (self.federation) |federation| return federation.heartbeat_interval_ms;
+        return 5_000;
+    }
+
     pub fn resolvedInternalApiTokenEnv(self: GatewayConfig) ?[]const u8 {
         if (self.api) |api| {
             if (api.internal_token_env) |token_env| return token_env;
@@ -82,6 +96,12 @@ pub const GatewayConfig = struct {
             !std.mem.eql(u8, default_visibility, "global"))
         {
             return error.InvalidDefaultVisibility;
+        }
+
+        if (self.federation) |federation| {
+            if (federation.enabled and self.resolvedGlobalControllerEndpoint() == null) {
+                return error.GlobalControllerEndpointRequired;
+            }
         }
     }
 };

@@ -24,7 +24,10 @@ const control_state = @import("control_plane/state.zig");
 const gateway = @import("gateway/gateway.zig");
 const gateway_api = @import("gateway/api.zig");
 const gateway_config = @import("gateway/config.zig");
+const gateway_federation_client = @import("gateway/federation_client.zig");
 const gateway_service_client = @import("gateway/service_client.zig");
+const global_controller = @import("global_controller/controller.zig");
+const global_controller_api = @import("global_controller/api.zig");
 
 const Shepherd = shepherd.Shepherd;
 const Worker = worker.Worker;
@@ -135,6 +138,7 @@ const Args = struct {
         node_manager,
         inference,
         gateway,
+        global_controller,
     };
 
     pub fn parse(allocator: Allocator, args: [][:0]u8) !Args {
@@ -210,6 +214,9 @@ const Args = struct {
                 enable_api = true;
             } else if (std.mem.eql(u8, args[i], "--gateway")) {
                 mode = .gateway;
+                enable_api = true;
+            } else if (std.mem.eql(u8, args[i], "--global-controller")) {
+                mode = .global_controller;
                 enable_api = true;
             } else if (std.mem.eql(u8, args[i], "--config")) {
                 i += 1;
@@ -397,6 +404,7 @@ const Args = struct {
         print("  --node-manager       Run as Node Manager (spawns multiple supervised workers)\n", .{});
         print("  --inference          Run inference controller (OpenAI-compatible API)\n", .{});
         print("  --gateway            Run gateway controller (local gateway API)\n", .{});
+        print("  --global-controller  Run global controller (gateway federation registry)\n", .{});
         print("  --supervise -- <child_args>  Run with supervision (spawns child with args after --)\n", .{});
         print("  --config <path>      Path to experiment JSON config file (Shepherd only)\n", .{});
         print("  --inference-config <path>  Path to inference JSON config file (Inference only)\n", .{});
@@ -437,6 +445,8 @@ const Args = struct {
         print("  ./pcp --inference --inference-config inference.json --api-host 0.0.0.0 --api-port 8000\n", .{});
         print("\n  # Run gateway:\n", .{});
         print("  ./pcp --gateway --gateway-config experiments/gateway_local.json --gateway-host 127.0.0.1 --gateway-port 18010\n", .{});
+        print("\n  # Run global controller:\n", .{});
+        print("  ./pcp --global-controller --api-host 127.0.0.1 --api-port 19010\n", .{});
     }
 };
 
@@ -686,6 +696,10 @@ fn gatewayApiThread(server: *gateway_api.GatewayApiServer, host: []const u8, por
     try server.start(host, port);
 }
 
+fn globalControllerApiThread(server: *global_controller_api.GlobalControllerApiServer, host: []const u8, port: u16) !void {
+    try server.start(host, port);
+}
+
 fn controlApiThread(server: *control_api.ControlApiServer, host: []const u8, port: u16) !void {
     try server.start(host, port);
 }
@@ -766,11 +780,39 @@ fn runGateway(allocator: Allocator, args: Args) !void {
     defer if (api_token) |token| allocator.free(token);
     const internal_api_token = try maybeLoadApiTokenByEnv(allocator, config.resolvedInternalApiTokenEnv());
     defer if (internal_api_token) |token| allocator.free(token);
+    const federation_token = if (config.resolvedGlobalControllerEndpoint() != null)
+        try maybeLoadApiTokenByEnv(allocator, config.resolvedFederationTokenEnv())
+    else
+        null;
+    defer if (federation_token) |token| allocator.free(token);
 
     var gateway_instance = gateway.Gateway.init(allocator, config);
     defer gateway_instance.deinit();
 
     var api_server = gateway_api.GatewayApiServer.init(allocator, &gateway_instance, api_token, internal_api_token);
+
+    var federation_client: ?gateway_federation_client.FederationClient = null;
+    var federation_thread: ?std.Thread = null;
+    if (config.resolvedGlobalControllerEndpoint()) |endpoint| {
+        const gateway_base_url = try std.fmt.allocPrint(allocator, "http://{s}:{d}", .{ args.api_host, args.api_port });
+        defer allocator.free(gateway_base_url);
+        federation_client = try gateway_federation_client.FederationClient.init(
+            allocator,
+            &gateway_instance,
+            endpoint,
+            federation_token,
+            gateway_base_url,
+            config.resolvedHeartbeatIntervalMs(),
+        );
+        federation_thread = try std.Thread.spawn(.{}, federationClientThread, .{&federation_client.?});
+    }
+    defer {
+        if (federation_thread) |thread| {
+            federation_client.?.stop();
+            thread.join();
+            federation_client.?.deinit();
+        }
+    }
 
     print("🌉 Starting Gateway\n", .{});
     print("   Gateway ID: {s}\n", .{config.gateway_id});
@@ -792,9 +834,29 @@ fn runGateway(allocator: Allocator, args: Args) !void {
     } else {
         print("   Global Controller: not configured\n", .{});
     }
-    print("   Federation: stubbed\n", .{});
+    print("   Federation: handshake enabled\n", .{});
 
     try gatewayApiThread(&api_server, args.api_host, args.api_port);
+}
+
+fn federationClientThread(client: *gateway_federation_client.FederationClient) !void {
+    try client.run();
+}
+
+fn runGlobalController(allocator: Allocator, args: Args) !void {
+    var owned_api_token: ?[]u8 = null;
+    defer if (owned_api_token) |token| allocator.free(token);
+    owned_api_token = try maybeLoadApiToken(allocator, args);
+
+    var controller = global_controller.GlobalController.init(allocator);
+    defer controller.deinit();
+
+    var api_server = global_controller_api.GlobalControllerApiServer.init(allocator, &controller, owned_api_token);
+
+    print("🌐 Starting Global Controller\n", .{});
+    print("   API: {s}:{d}\n", .{ args.api_host, args.api_port });
+
+    try globalControllerApiThread(&api_server, args.api_host, args.api_port);
 }
 
 /// RL Shepherd listening thread
@@ -1192,6 +1254,7 @@ pub fn main() !void {
         .node_manager => try runNodeManager(allocator, args),
         .inference => try runInferenceController(allocator, args),
         .gateway => try runGateway(allocator, args),
+        .global_controller => try runGlobalController(allocator, args),
     }
 }
 

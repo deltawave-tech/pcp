@@ -24,6 +24,7 @@ const control_state = @import("control_plane/state.zig");
 const gateway = @import("gateway/gateway.zig");
 const gateway_api = @import("gateway/api.zig");
 const gateway_config = @import("gateway/config.zig");
+const gateway_service_client = @import("gateway/service_client.zig");
 
 const Shepherd = shepherd.Shepherd;
 const Worker = worker.Worker;
@@ -529,6 +530,20 @@ fn runRLShepherd(allocator: Allocator, args: Args) !void {
         }
     }
 
+    var gateway_client = try gateway_service_client.GatewayClient.initFromEnv(allocator, "rl-main");
+    defer if (gateway_client) |*client| client.deinit();
+    registerGatewayServiceIfConfigured(
+        if (gateway_client) |*client| client else null,
+        "rl",
+        args.api_host,
+        args.api_port,
+        &[_][]const u8{ "controller.status", "job.current", "job.cancel" },
+        0,
+        0,
+        "starting",
+        "ok",
+    );
+
     std.time.sleep(500 * std.time.ns_per_ms);
 
     const grpo_config = grpo.GRPOConfig{
@@ -548,6 +563,7 @@ fn runRLShepherd(allocator: Allocator, args: Args) !void {
 
     var grpo_algo = grpo.GRPO.init(allocator, &rl_shepherd_controller, grpo_config);
     grpo_algo.setControlState(&operator_state);
+    grpo_algo.setGatewayClient(if (gateway_client) |*client| client else null);
     var training_algo = grpo_algo.asTrainingAlgorithm();
 
     print("Starting GRPO training...\n", .{});
@@ -607,7 +623,16 @@ fn runInferenceController(allocator: Allocator, args: Args) !void {
     defer operator_state.deinit();
     operator_state.setStatus(.running);
 
-    var controller = try inference_shepherd.InferenceShepherd.init(allocator, config, api_token, &operator_state);
+    var gateway_client = try gateway_service_client.GatewayClient.initFromEnv(allocator, "inference-main");
+    defer if (gateway_client) |*client| client.deinit();
+
+    var controller = try inference_shepherd.InferenceShepherd.init(
+        allocator,
+        config,
+        api_token,
+        &operator_state,
+        if (gateway_client) |*client| client else null,
+    );
     controller.attachHooks();
     defer controller.deinit();
 
@@ -636,6 +661,9 @@ fn runInferenceController(allocator: Allocator, args: Args) !void {
         print("   Tokenizer Path: {s}\n", .{path});
     }
     print("   Stop Token: EOS only\n", .{});
+    controller.registerGatewayService(args.api_host, args.api_port) catch |err| {
+        std.log.warn("Failed to register inference service with gateway: {}", .{err});
+    };
 
     while (!controller.isShutdownRequested()) {
         std.time.sleep(1 * std.time.ns_per_s);
@@ -685,6 +713,37 @@ fn maybeLoadApiTokenByEnv(allocator: Allocator, env_name: ?[]const u8) !?[]u8 {
     };
 }
 
+fn registerGatewayServiceIfConfigured(
+    client: ?*gateway_service_client.GatewayClient,
+    service_type: []const u8,
+    host: []const u8,
+    port: u16,
+    capabilities: []const []const u8,
+    worker_count: usize,
+    ready_worker_count: usize,
+    job_status: []const u8,
+    health_status: []const u8,
+) void {
+    const gateway_client = client orelse return;
+    const base_url = std.fmt.allocPrint(gateway_client.allocator, "http://{s}:{d}", .{ host, port }) catch |err| {
+        std.log.warn("Failed to build gateway registration URL: {}", .{err});
+        return;
+    };
+    defer gateway_client.allocator.free(base_url);
+
+    gateway_client.registerService(
+        service_type,
+        base_url,
+        capabilities,
+        worker_count,
+        ready_worker_count,
+        job_status,
+        health_status,
+    ) catch |err| {
+        std.log.warn("Gateway service registration failed: {}", .{err});
+    };
+}
+
 fn runGateway(allocator: Allocator, args: Args) !void {
     const config_path = args.gateway_config_path orelse {
         print("Error: --gateway-config is required for gateway mode\n", .{});
@@ -705,11 +764,13 @@ fn runGateway(allocator: Allocator, args: Args) !void {
 
     const api_token = try maybeLoadApiTokenByEnv(allocator, config.resolvedApiTokenEnv());
     defer if (api_token) |token| allocator.free(token);
+    const internal_api_token = try maybeLoadApiTokenByEnv(allocator, config.resolvedInternalApiTokenEnv());
+    defer if (internal_api_token) |token| allocator.free(token);
 
     var gateway_instance = gateway.Gateway.init(allocator, config);
     defer gateway_instance.deinit();
 
-    var api_server = gateway_api.GatewayApiServer.init(allocator, &gateway_instance, api_token);
+    var api_server = gateway_api.GatewayApiServer.init(allocator, &gateway_instance, api_token, internal_api_token);
 
     print("🌉 Starting Gateway\n", .{});
     print("   Gateway ID: {s}\n", .{config.gateway_id});
@@ -723,6 +784,9 @@ fn runGateway(allocator: Allocator, args: Args) !void {
         }
     }
     print("   API: {s}:{d}\n", .{ args.api_host, args.api_port });
+    if (config.resolvedInternalApiTokenEnv()) |env_name| {
+        print("   Internal Event Token Env: {s}\n", .{env_name});
+    }
     if (config.resolvedGlobalControllerEndpoint()) |endpoint| {
         print("   Global Controller: {s}\n", .{endpoint});
     } else {
@@ -813,6 +877,9 @@ fn runShepherd(allocator: Allocator, args: Args) !void {
     operator_state.setTrainingProgress(0, 0, exp_config.outer_loop_steps, 0.0, exp_config.learning_rate);
     operator_state.setStatus(.starting);
 
+    var gateway_client = try gateway_service_client.GatewayClient.initFromEnv(allocator, "training-main");
+    defer if (gateway_client) |*client| client.deinit();
+
     // Initialize system
     var system = try backend_selection.DistributedTrainingSystem.init(allocator, backend);
     defer system.deinit();
@@ -854,6 +921,18 @@ fn runShepherd(allocator: Allocator, args: Args) !void {
             thread.join();
         }
     }
+
+    registerGatewayServiceIfConfigured(
+        if (gateway_client) |*client| client else null,
+        "training",
+        args.api_host,
+        args.api_port,
+        &[_][]const u8{ "controller.status", "job.current", "job.cancel" },
+        0,
+        0,
+        "starting",
+        "ok",
+    );
 
     // 2. Initialize DataManager for chunk-based data partitioning
     print("Initializing DataManager for dataset: {s}...\n", .{exp_config.data_path});
@@ -945,6 +1024,7 @@ fn runShepherd(allocator: Allocator, args: Args) !void {
         print("Initializing Standard DiLoCo algorithm...\n", .{});
         diloco_algo = try DiLoCo.init(allocator, shepherd_controller, diloco_config, system.executor, &mlir_builder);
         diloco_algo.setControlState(&operator_state);
+        diloco_algo.setGatewayClient(if (gateway_client) |*client| client else null);
         training_algo = diloco_algo.asTrainingAlgorithm();
         print("🌙 DiLoCo algorithm initialized successfully\n", .{});
     }

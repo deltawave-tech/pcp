@@ -5,6 +5,7 @@ const TrainingAlgorithm = @import("training_algorithm.zig").TrainingAlgorithm;
 const TrainingStatus = @import("training_algorithm.zig").TrainingStatus;
 const backend_selection = @import("../backends/selection.zig");
 const control_state_mod = @import("../control_plane/state.zig");
+const gateway_service_client = @import("../gateway/service_client.zig");
 
 // Forward declaration - RLShepherd will be defined in src/nodes/controllers/rl_shepherd.zig
 pub const RLShepherd = @import("../nodes/controllers/rl_shepherd.zig").RLShepherd;
@@ -34,6 +35,7 @@ pub const GRPO = struct {
     status: TrainingStatus,
     prompts: ArrayList([]const i64),
     control_state: ?*control_state_mod.ControllerState,
+    gateway_client: ?*gateway_service_client.GatewayClient,
 
     const Self = @This();
 
@@ -45,11 +47,16 @@ pub const GRPO = struct {
             .status = .not_started,
             .prompts = ArrayList([]const i64).init(allocator),
             .control_state = null,
+            .gateway_client = null,
         };
     }
 
     pub fn setControlState(self: *Self, state: *control_state_mod.ControllerState) void {
         self.control_state = state;
+    }
+
+    pub fn setGatewayClient(self: *Self, client: ?*gateway_service_client.GatewayClient) void {
+        self.gateway_client = client;
     }
 
     /// Load prompts from binary file (created by tools/prepare_rl_dataset.py)
@@ -322,6 +329,9 @@ pub const GRPO = struct {
             }
             std.log.info("=== Iteration {} Summary ===", .{iter + 1});
             std.log.info("  Rewards: mean={d:.3}, std={d:.3}, min={d:.3}, max={d:.3}", .{ reward_mean, reward_std, reward_min, reward_max });
+            self.emitRewardEvent(iter + 1, total_requests, reward_mean, reward_min, reward_max, reward_std) catch |err| {
+                std.log.warn("Failed to emit RL reward gateway event: {}", .{err});
+            };
 
             try self.controller.trainStep(rollouts, rewards, self.config.group_size);
 
@@ -357,5 +367,29 @@ pub const GRPO = struct {
     fn getStatus(ptr: *anyopaque) TrainingStatus {
         const self: *Self = @ptrCast(@alignCast(ptr));
         return self.status;
+    }
+
+    fn emitRewardEvent(self: *Self, iteration: usize, rollouts_completed: usize, reward_mean: f32, reward_min: f32, reward_max: f32, reward_std: f32) !void {
+        const client = self.gateway_client orelse return;
+        const payload_json = try std.json.stringifyAlloc(self.allocator, .{
+            .iteration = iteration,
+            .rollouts_completed = rollouts_completed,
+            .reward_mean = reward_mean,
+            .reward_min = reward_min,
+            .reward_max = reward_max,
+            .reward_std = reward_std,
+        }, .{});
+        defer self.allocator.free(payload_json);
+
+        const provenance_json = try std.json.stringifyAlloc(self.allocator, .{
+            .actor_id = "pcp-rl-controller",
+        }, .{});
+        defer self.allocator.free(provenance_json);
+
+        const event_id = try std.fmt.allocPrint(self.allocator, "rl_reward_{d}", .{iteration});
+        defer self.allocator.free(event_id);
+        const job_id = try std.fmt.allocPrint(self.allocator, "grpo-{d}", .{iteration});
+        defer self.allocator.free(job_id);
+        try client.emitEvent(event_id, "rl.reward_evaluated", job_id, payload_json, provenance_json);
     }
 };

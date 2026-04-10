@@ -4,12 +4,15 @@ const Allocator = std.mem.Allocator;
 const gateway_config = @import("config.zig");
 const service_registry = @import("service_registry.zig");
 const graph_adapter = @import("graph_adapter.zig");
+const event_ingest = @import("event_ingest.zig");
+const graph_types = @import("../graph/types.zig");
 
 pub const Gateway = struct {
     allocator: Allocator,
     config: gateway_config.GatewayConfig,
     service_registry: service_registry.ServiceRegistry,
     graph: graph_adapter.GatewayGraph,
+    event_ingester: event_ingest.EventIngester,
     started_at: i64,
 
     const Self = @This();
@@ -20,6 +23,14 @@ pub const Gateway = struct {
             .config = config,
             .service_registry = service_registry.ServiceRegistry.init(allocator),
             .graph = graph_adapter.GatewayGraph.init(allocator, config) catch @panic("failed to initialize graph store"),
+            .event_ingester = event_ingest.EventIngester.init(allocator, .{
+                .gateway_id = config.gateway_id,
+                .lab_id = config.lab_id,
+                .default_visibility = if (config.sharing_defaults) |sharing|
+                    graphVisibility(sharing.default_visibility)
+                else
+                    .local,
+            }),
             .started_at = std.time.timestamp(),
         };
     }
@@ -56,27 +67,18 @@ pub const Gateway = struct {
     }
 
     pub fn renderCapabilitiesJson(self: *Self, allocator: Allocator) ![]u8 {
-        _ = self;
         return std.json.stringifyAlloc(allocator, .{
-            .mode = "gateway",
-            .service_registry = true,
-            .graph_status = true,
-            .federation_status = true,
-            .graph_query = true,
-            .graph_mutation = true,
-            .federation_replication = false,
-            .supported_service_types = &[_][]const u8{ "inference", "rl", "training" },
-            .endpoints = &[_][]const u8{
-                "/healthz",
-                "/readyz",
-                "/v1/controller",
-                "/v1/capabilities",
-                "/v1/services",
-                "/v1/services/register",
-                "/v1/federation/status",
-                "/v1/graph/status",
-                "/v1/graph/mutate",
-                "/v1/graph/query",
+            .gateway_id = self.config.gateway_id,
+            .lab_id = self.config.lab_id,
+            .capabilities = &[_][]const u8{
+                "graph.query",
+                "graph.mutate",
+                "service.registry",
+                "service.inference.proxy",
+                "service.rl.control",
+                "service.training.control",
+                "federation.status",
+                "events.ingest",
             },
         }, .{});
     }
@@ -92,3 +94,7 @@ pub const Gateway = struct {
         }, .{});
     }
 };
+
+fn graphVisibility(raw: []const u8) graph_types.Visibility {
+    return graph_types.Visibility.parse(raw) orelse .local;
+}

@@ -7,11 +7,13 @@ const http_server = @import("../inference/http_server.zig");
 const graph_types = @import("../graph/types.zig");
 const service_registry = @import("service_registry.zig");
 const gateway_mod = @import("gateway.zig");
+const event_ingest = @import("event_ingest.zig");
 
 pub const GatewayApiServer = struct {
     allocator: Allocator,
     gateway: *gateway_mod.Gateway,
     api_token: ?[]const u8,
+    internal_api_token: ?[]const u8,
     server: ?TcpServer,
     listen_host: ?[]const u8,
     listen_port: u16,
@@ -19,11 +21,12 @@ pub const GatewayApiServer = struct {
 
     const Self = @This();
 
-    pub fn init(allocator: Allocator, gateway: *gateway_mod.Gateway, api_token: ?[]const u8) Self {
+    pub fn init(allocator: Allocator, gateway: *gateway_mod.Gateway, api_token: ?[]const u8, internal_api_token: ?[]const u8) Self {
         return .{
             .allocator = allocator,
             .gateway = gateway,
             .api_token = api_token,
+            .internal_api_token = internal_api_token,
             .server = null,
             .listen_host = null,
             .listen_port = 0,
@@ -104,6 +107,26 @@ pub const GatewayApiServer = struct {
             return true;
         }
 
+        if (std.mem.eql(u8, req.method, "POST") and std.mem.eql(u8, req.path, "/v1/internal/events")) {
+            if (!self.authorizeInternal(req)) {
+                try http_server.writeResponse(stream, "401 Unauthorized", &.{"Content-Type: text/plain"}, "unauthorized");
+                return true;
+            }
+
+            if (req.body.len == 0) {
+                try http_server.writeResponse(stream, "400 Bad Request", &.{"Content-Type: text/plain"}, "missing_body");
+                return true;
+            }
+
+            var parsed = try std.json.parseFromSlice(event_ingest.InternalEventsRequest, self.allocator, req.body, .{ .ignore_unknown_fields = true });
+            defer parsed.deinit();
+
+            const body = try self.gateway.event_ingester.ingestJson(self.allocator, &self.gateway.graph, parsed.value);
+            defer self.allocator.free(body);
+            try http_server.writeResponse(stream, "200 OK", &.{"Content-Type: application/json"}, body);
+            return true;
+        }
+
         if (!std.mem.startsWith(u8, req.path, "/v1/")) return false;
 
         if (!self.authorize(req)) {
@@ -132,6 +155,18 @@ pub const GatewayApiServer = struct {
             return true;
         }
 
+        if (std.mem.eql(u8, req.method, "GET") and std.mem.startsWith(u8, req.path, "/v1/services/")) {
+            const service_id = req.path["/v1/services/".len..];
+            const body = try self.gateway.service_registry.renderServiceJson(self.allocator, service_id);
+            if (body) |json| {
+                defer self.allocator.free(json);
+                try http_server.writeResponse(stream, "200 OK", &.{"Content-Type: application/json"}, json);
+            } else {
+                try http_server.writeResponse(stream, "404 Not Found", &.{"Content-Type: text/plain"}, "service_not_found");
+            }
+            return true;
+        }
+
         if (std.mem.eql(u8, req.method, "POST") and std.mem.eql(u8, req.path, "/v1/services/register")) {
             if (req.body.len == 0) {
                 try http_server.writeResponse(stream, "400 Bad Request", &.{"Content-Type: text/plain"}, "missing_body");
@@ -155,9 +190,12 @@ pub const GatewayApiServer = struct {
                 .service = .{
                     .service_id = service.service_id,
                     .service_type = service.service_type.asString(),
-                    .endpoint = service.endpoint,
-                    .status = service.status,
+                    .base_url = service.base_url,
+                    .auth_mode = service.auth_mode,
+                    .health_status = service.health_status,
+                    .job_status = service.job_status,
                     .worker_count = service.worker_count,
+                    .ready_worker_count = service.ready_worker_count,
                     .capabilities = service.capabilities.items,
                     .registered_at = service.registered_at,
                     .updated_at = service.updated_at,
@@ -227,5 +265,14 @@ pub const GatewayApiServer = struct {
         const header = req.header("authorization") orelse return false;
         if (!std.mem.startsWith(u8, header, "Bearer ")) return false;
         return std.mem.eql(u8, header["Bearer ".len..], self.api_token.?);
+    }
+
+    fn authorizeInternal(self: *Self, req: *http_server.HttpRequest) bool {
+        if (self.internal_api_token) |token| {
+            const header = req.header("authorization") orelse return false;
+            if (!std.mem.startsWith(u8, header, "Bearer ")) return false;
+            return std.mem.eql(u8, header["Bearer ".len..], token);
+        }
+        return self.authorize(req);
     }
 };

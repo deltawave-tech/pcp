@@ -16,6 +16,7 @@ pub const ApiConfig = struct {
     host: ?[]const u8 = null,
     port: ?u16 = null,
     token_env: ?[]const u8 = null,
+    internal_token_env: ?[]const u8 = null,
 };
 
 pub const FederationConfig = struct {
@@ -37,6 +38,7 @@ pub const GatewayConfig = struct {
     sharing_defaults: ?SharingDefaults = null,
     global_controller_endpoint: ?[]const u8 = null,
     api_token_env: ?[]const u8 = null,
+    internal_api_token_env: ?[]const u8 = null,
 
     pub fn resolvedApiTokenEnv(self: GatewayConfig) ?[]const u8 {
         if (self.api) |api| {
@@ -50,6 +52,13 @@ pub const GatewayConfig = struct {
             if (federation.upstream) |upstream| return upstream;
         }
         return self.global_controller_endpoint;
+    }
+
+    pub fn resolvedInternalApiTokenEnv(self: GatewayConfig) ?[]const u8 {
+        if (self.api) |api| {
+            if (api.internal_token_env) |token_env| return token_env;
+        }
+        return self.internal_api_token_env;
     }
 
     pub fn validate(self: GatewayConfig) !void {

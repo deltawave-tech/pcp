@@ -24,6 +24,7 @@ const data_loader = @import("../data/loader.zig");
 const backend_selection = @import("../backends/selection.zig");
 const wandb = @import("../ui/wandb.zig");
 const control_state_mod = @import("../control_plane/state.zig");
+const gateway_service_client = @import("../gateway/service_client.zig");
 
 const TrainingAlgorithm = training_algorithm.TrainingAlgorithm;
 const TrainingStatus = training_algorithm.TrainingStatus;
@@ -126,6 +127,7 @@ pub const DiLoCo = struct {
     // WandB logging
     wandb_logger: wandb.WandBLogger,
     control_state: ?*control_state_mod.ControllerState,
+    gateway_client: ?*gateway_service_client.GatewayClient,
 
     const Self = @This();
 
@@ -300,6 +302,7 @@ pub const DiLoCo = struct {
             .data_loader = undefined, // No longer used - workers load data locally
             .wandb_logger = logger,
             .control_state = null,
+            .gateway_client = null,
         };
     }
 
@@ -347,6 +350,10 @@ pub const DiLoCo = struct {
     /// Get TrainingAlgorithm interface
     pub fn setControlState(self: *Self, state: *control_state_mod.ControllerState) void {
         self.control_state = state;
+    }
+
+    pub fn setGatewayClient(self: *Self, client: ?*gateway_service_client.GatewayClient) void {
+        self.gateway_client = client;
     }
 
     pub fn asTrainingAlgorithm(self: *Self) TrainingAlgorithm {
@@ -615,6 +622,33 @@ pub const DiLoCo = struct {
             try writer.writeAll(bytes);
         }
         std.log.info("✓ Checkpoint saved.", .{});
+        self.emitCheckpointEvent(step, full_path) catch |err| {
+            std.log.warn("Failed to emit training checkpoint gateway event: {}", .{err});
+        };
+    }
+
+    fn emitCheckpointEvent(self: *Self, step: usize, checkpoint_path: []const u8) !void {
+        const client = self.gateway_client orelse return;
+        const payload_json = try std.json.stringifyAlloc(self.allocator, .{
+            .step = step,
+            .checkpoint_path = checkpoint_path,
+            .epoch = self.current_epoch,
+            .loss = self.metrics.loss,
+        }, .{});
+        defer self.allocator.free(payload_json);
+
+        const provenance_json = try std.json.stringifyAlloc(self.allocator, .{
+            .actor_id = "pcp-training-controller",
+        }, .{});
+        defer self.allocator.free(provenance_json);
+
+        const event_id = try std.fmt.allocPrint(self.allocator, "training_checkpoint_{d}", .{step});
+        defer self.allocator.free(event_id);
+        const job_id = if (self.control_state) |state|
+            state.run_id orelse "training"
+        else
+            "training";
+        try client.emitEvent(event_id, "training.checkpoint_created", job_id, payload_json, provenance_json);
     }
 
     /// Broadcast to snapshot participants only

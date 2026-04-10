@@ -14,6 +14,7 @@ const tokenizer_mod = @import("../../inference/tokenizer.zig");
 const http_server = @import("../../inference/http_server.zig");
 const control_api = @import("../../control_plane/api.zig");
 const control_state = @import("../../control_plane/state.zig");
+const gateway_service_client = @import("../../gateway/service_client.zig");
 const tcp_stream = @import("../../network/tcp_stream.zig");
 const message = @import("../../network/message.zig");
 const model_introspection = @import("../../mlir/model_introspection.zig");
@@ -147,6 +148,7 @@ pub const InferenceShepherd = struct {
     metrics: Metrics,
     metrics_mutex: std.Thread.Mutex,
     operator_state: ?*control_state.ControllerState,
+    gateway_client: ?*gateway_service_client.GatewayClient,
     api_server: ?TcpServer,
     api_host: ?[]const u8,
     api_port: u16,
@@ -155,7 +157,13 @@ pub const InferenceShepherd = struct {
 
     const Self = @This();
 
-    pub fn init(allocator: Allocator, cfg: inference_config.InferenceConfig, api_token: []const u8, operator_state: ?*control_state.ControllerState) !Self {
+    pub fn init(
+        allocator: Allocator,
+        cfg: inference_config.InferenceConfig,
+        api_token: []const u8,
+        operator_state: ?*control_state.ControllerState,
+        gateway_client: ?*gateway_service_client.GatewayClient,
+    ) !Self {
         const tok_kind = parseTokenizerKind(cfg.tokenizer_source) catch |err| return err;
         var tokenizer = try tokenizer_mod.Tokenizer.init(allocator, tok_kind, cfg.tokenizer_path);
         errdefer tokenizer.deinit();
@@ -175,6 +183,7 @@ pub const InferenceShepherd = struct {
             .metrics = Metrics{},
             .metrics_mutex = std.Thread.Mutex{},
             .operator_state = operator_state,
+            .gateway_client = gateway_client,
             .api_server = null,
             .api_host = null,
             .api_port = 0,
@@ -840,10 +849,33 @@ pub const InferenceShepherd = struct {
                 const body_json = try self.renderCompletionResponse(request_state);
                 defer self.base.allocator.free(body_json);
                 try http_server.writeResponse(stream, "200 OK", &.{"Content-Type: application/json"}, body_json);
+                self.emitGatewayCompletionEvent(request_state, body_json) catch |err| {
+                    std.log.warn("Failed to emit inference completion gateway event: {}", .{err});
+                };
             }
+        } else if (request_state.error_message == null) {
+            self.emitGatewayCompletionEvent(request_state, null) catch |err| {
+                std.log.warn("Failed to emit streamed inference completion gateway event: {}", .{err});
+            };
         }
 
         request_state.deinit();
+    }
+
+    pub fn registerGatewayService(self: *Self, host: []const u8, port: u16) !void {
+        const client = self.gateway_client orelse return;
+        const base_url = try std.fmt.allocPrint(self.base.allocator, "http://{s}:{d}", .{ host, port });
+        defer self.base.allocator.free(base_url);
+        const ready_workers = self.getReadyWorkerCount();
+        try client.registerService(
+            "inference",
+            base_url,
+            &[_][]const u8{ "chat.completions", "models.list", "controller.status" },
+            self.base.getWorkerCount(),
+            ready_workers,
+            "running",
+            if (ready_workers > 0) "ok" else "starting",
+        );
     }
 
     fn dispatchRequest(self: *Self, state: *RequestState) !bool {
@@ -1131,6 +1163,32 @@ pub const InferenceShepherd = struct {
         try root.put("session_id", .{ .string = try self.base.allocator.dupe(u8, state.session_id) });
 
         return try jsonStringify(self.base.allocator, .{ .object = root });
+    }
+
+    fn emitGatewayCompletionEvent(self: *Self, state: *RequestState, response_json: ?[]const u8) !void {
+        const client = self.gateway_client orelse return;
+        const payload_json = if (response_json) |json|
+            try self.base.allocator.dupe(u8, json)
+        else
+            try std.json.stringifyAlloc(self.base.allocator, .{
+                .model = state.model_id,
+                .session_id = state.session_id,
+                .content = state.response.items,
+                .finish_reason = state.finish_reason orelse "stop",
+                .prompt_tokens = state.prompt_tokens,
+                .completion_tokens = state.completion_tokens,
+                .stream = state.stream,
+            }, .{});
+        defer self.base.allocator.free(payload_json);
+
+        const provenance_json = try std.json.stringifyAlloc(self.base.allocator, .{
+            .actor_id = "pcp-inference-controller",
+        }, .{});
+        defer self.base.allocator.free(provenance_json);
+
+        const event_id = try std.fmt.allocPrint(self.base.allocator, "inference_completion_{d}", .{state.request_id});
+        defer self.base.allocator.free(event_id);
+        try client.emitEvent(event_id, "inference.completion", state.session_id, payload_json, provenance_json);
     }
 
     fn renderStreamChunk(self: *Self, state: *RequestState, content: []const u8, finish_reason: ?[]const u8) ![]u8 {

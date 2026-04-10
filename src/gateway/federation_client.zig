@@ -3,6 +3,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const federation_types = @import("../federation/types.zig");
 const mutation_log = @import("../graph/mutation_log.zig");
+const graph_policy_store = @import("../graph/policy_store.zig");
 const gateway_mod = @import("gateway.zig");
 
 pub const FederationClient = struct {
@@ -124,11 +125,21 @@ pub const FederationClient = struct {
 
             var batch = std.ArrayList(federation_types.MutationBatchItem).init(self.allocator);
             defer batch.deinit();
+            var policies = std.ArrayList(federation_types.NamespacePolicySnapshot).init(self.allocator);
+            defer policies.deinit();
 
             var highest_processed = last_replicated;
             for (records) |record| {
                 highest_processed = record.sequence_no;
                 if (record.visibility == .local) continue;
+                const policy = self.gateway.policy_store.getSnapshot(record.namespace_id, gateway_mod.defaultPolicyVisibility(self.gateway.config));
+                if (!self.gateway.policy_store.allowsReplication(
+                    record.namespace_id,
+                    gateway_mod.defaultPolicyVisibility(self.gateway.config),
+                    record.visibility,
+                    record.mutation_type == .append_observation,
+                )) continue;
+                try appendPolicyIfMissing(&policies, policy);
                 try batch.append(.{
                     .sequence_no = record.sequence_no,
                     .mutation_id = record.mutation_id,
@@ -154,6 +165,7 @@ pub const FederationClient = struct {
                 .lab_id = self.gateway.config.lab_id,
                 .last_sequence_no = self.gateway.graph.lastSequence(),
                 .last_replicated_sequence = last_replicated,
+                .namespace_policies = policies.items,
                 .mutations = batch.items,
             });
             if (!ack.accepted) return error.InvalidFederationAck;
@@ -218,4 +230,17 @@ pub const FederationClient = struct {
 fn deinitRecords(allocator: Allocator, records: []mutation_log.MutationRecord) void {
     for (records) |*record| record.deinit(allocator);
     allocator.free(records);
+}
+
+fn appendPolicyIfMissing(list: *std.ArrayList(federation_types.NamespacePolicySnapshot), policy: graph_policy_store.NamespacePolicySnapshot) !void {
+    for (list.items) |existing| {
+        if (std.mem.eql(u8, existing.namespace_id, policy.namespace_id)) return;
+    }
+    try list.append(.{
+        .namespace_id = policy.namespace_id,
+        .default_visibility = policy.default_visibility,
+        .allow_global_replication = policy.allow_global_replication,
+        .allow_raw_payload_export = policy.allow_raw_payload_export,
+        .updated_at = policy.updated_at,
+    });
 }

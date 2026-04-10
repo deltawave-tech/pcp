@@ -5,6 +5,7 @@ const gateway_config = @import("config.zig");
 const service_registry = @import("service_registry.zig");
 const graph_adapter = @import("graph_adapter.zig");
 const event_ingest = @import("event_ingest.zig");
+const policy_store = @import("../graph/policy_store.zig");
 const graph_types = @import("../graph/types.zig");
 
 pub const FederationPeer = struct {
@@ -219,6 +220,7 @@ pub const Gateway = struct {
     config: gateway_config.GatewayConfig,
     service_registry: service_registry.ServiceRegistry,
     graph: graph_adapter.GatewayGraph,
+    policy_store: policy_store.GraphPolicyStore,
     event_ingester: event_ingest.EventIngester,
     federation: FederationState,
     started_at: i64,
@@ -231,6 +233,7 @@ pub const Gateway = struct {
             .config = config,
             .service_registry = service_registry.ServiceRegistry.init(allocator),
             .graph = graph_adapter.GatewayGraph.init(allocator, config) catch @panic("failed to initialize graph store"),
+            .policy_store = policy_store.GraphPolicyStore.init(allocator, config.policy_store_path) catch @panic("failed to initialize policy store"),
             .event_ingester = event_ingest.EventIngester.init(allocator, .{
                 .gateway_id = config.gateway_id,
                 .lab_id = config.lab_id,
@@ -246,6 +249,7 @@ pub const Gateway = struct {
 
     pub fn deinit(self: *Self) void {
         self.graph.deinit();
+        self.policy_store.deinit();
         self.service_registry.deinit();
         self.federation.deinit();
     }
@@ -310,6 +314,13 @@ pub const Gateway = struct {
 
 fn graphVisibility(raw: []const u8) graph_types.Visibility {
     return graph_types.Visibility.parse(raw) orelse .local;
+}
+
+pub fn defaultPolicyVisibility(config: gateway_config.GatewayConfig) graph_types.Visibility {
+    return if (config.sharing_defaults) |sharing|
+        graphVisibility(sharing.default_visibility)
+    else
+        .local;
 }
 
 fn replaceStringLocked(state: *FederationState, target: *[]u8, value: []const u8) !void {

@@ -170,6 +170,13 @@ pub const GlobalControllerApiServer = struct {
             return true;
         }
 
+        if (std.mem.eql(u8, req.method, "GET") and std.mem.eql(u8, req.path, "/v1/graph/policies")) {
+            const body = try self.controller.renderPoliciesJson(self.allocator);
+            defer self.allocator.free(body);
+            try http_server.writeResponse(stream, "200 OK", &.{"Content-Type: application/json"}, body);
+            return true;
+        }
+
         if (std.mem.eql(u8, req.method, "POST") and std.mem.eql(u8, req.path, "/v1/global-graph/query")) {
             if (req.body.len == 0) {
                 try http_server.writeResponse(stream, "400 Bad Request", &.{"Content-Type: text/plain"}, "missing_body");
@@ -195,7 +202,7 @@ pub const GlobalControllerApiServer = struct {
             defer parsed.deinit();
 
             const ack = self.controller.applyMutationBatch(self.allocator, parsed.value) catch |err| switch (err) {
-                error.UnknownGateway, error.InvalidMutationType, error.InvalidVisibility => {
+                error.UnknownGateway, error.InvalidMutationType, error.InvalidVisibility, error.PolicyRejected => {
                     try http_server.writeResponse(stream, "400 Bad Request", &.{"Content-Type: text/plain"}, @errorName(err));
                     return true;
                 },

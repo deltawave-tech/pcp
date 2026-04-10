@@ -4,12 +4,14 @@ const Allocator = std.mem.Allocator;
 const federation_types = @import("../federation/types.zig");
 const gateway_registry = @import("gateway_registry.zig");
 const graph_store = @import("../graph/store.zig");
+const policy_store = @import("../graph/policy_store.zig");
 const graph_types = @import("../graph/types.zig");
 
 pub const GlobalController = struct {
     allocator: Allocator,
     registry: gateway_registry.GatewayRegistry,
     graph: graph_store.GraphStore,
+    policy_store: policy_store.GraphPolicyStore,
     started_at: i64,
 
     const Self = @This();
@@ -24,12 +26,14 @@ pub const GlobalController = struct {
                 .lab_id = "global",
                 .neo4j = null,
             }) catch @panic("failed to initialize global graph store"),
+            .policy_store = policy_store.GraphPolicyStore.init(allocator, null) catch @panic("failed to initialize global policy store"),
             .started_at = std.time.timestamp(),
         };
     }
 
     pub fn deinit(self: *Self) void {
         self.graph.deinit();
+        self.policy_store.deinit();
         self.registry.deinit();
     }
 
@@ -72,7 +76,33 @@ pub const GlobalController = struct {
         return self.graph.renderQueryJson(allocator, request);
     }
 
+    pub fn renderPoliciesJson(self: *Self, allocator: Allocator) ![]u8 {
+        return self.policy_store.renderJson(allocator);
+    }
+
     pub fn applyMutationBatch(self: *Self, allocator: Allocator, request: federation_types.MutationBatchRequest) !federation_types.MutationBatchAck {
+        for (request.namespace_policies) |snapshot| {
+            try self.policy_store.applySnapshot(.{
+                .namespace_id = snapshot.namespace_id,
+                .default_visibility = snapshot.default_visibility,
+                .allow_global_replication = snapshot.allow_global_replication,
+                .allow_raw_payload_export = snapshot.allow_raw_payload_export,
+                .updated_at = snapshot.updated_at,
+            });
+        }
+
+        for (request.mutations) |mutation| {
+            const visibility = graph_types.Visibility.parse(mutation.visibility) orelse return error.InvalidVisibility;
+            if (!self.policy_store.allowsIncoming(
+                mutation.namespace_id,
+                .local,
+                visibility,
+                std.mem.eql(u8, mutation.mutation_type, "append_observation"),
+            )) {
+                return error.PolicyRejected;
+            }
+        }
+
         const ack = try self.graph.applyReplicatedBatch(allocator, request.gateway_id, request.lab_id, request.mutations);
         if (!self.registry.markReplicated(request.gateway_id, ack.acked_sequence_no, request.last_sequence_no)) {
             return error.UnknownGateway;

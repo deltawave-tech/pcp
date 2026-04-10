@@ -4,6 +4,7 @@ const net = std.net;
 const Allocator = std.mem.Allocator;
 const TcpServer = @import("../network/tcp_stream.zig").TcpServer;
 const http_server = @import("../inference/http_server.zig");
+const graph_policy_store = @import("../graph/policy_store.zig");
 const graph_types = @import("../graph/types.zig");
 const service_registry = @import("service_registry.zig");
 const gateway_mod = @import("gateway.zig");
@@ -303,6 +304,37 @@ pub const GatewayApiServer = struct {
 
         if (std.mem.eql(u8, req.method, "GET") and std.mem.eql(u8, req.path, "/v1/graph/status")) {
             const body = try self.gateway.graph.renderStatusJson(self.allocator);
+            defer self.allocator.free(body);
+            try http_server.writeResponse(stream, "200 OK", &.{"Content-Type: application/json"}, body);
+            return true;
+        }
+
+        if (std.mem.eql(u8, req.method, "GET") and std.mem.eql(u8, req.path, "/v1/graph/policies")) {
+            const body = try self.gateway.policy_store.renderJson(self.allocator);
+            defer self.allocator.free(body);
+            try http_server.writeResponse(stream, "200 OK", &.{"Content-Type: application/json"}, body);
+            return true;
+        }
+
+        if (std.mem.eql(u8, req.method, "PUT") and std.mem.startsWith(u8, req.path, "/v1/graph/policies/")) {
+            if (req.body.len == 0) {
+                try http_server.writeResponse(stream, "400 Bad Request", &.{"Content-Type: text/plain"}, "missing_body");
+                return true;
+            }
+
+            const namespace_id = req.path["/v1/graph/policies/".len..];
+            var parsed = try std.json.parseFromSlice(graph_policy_store.PolicyUpdateRequest, self.allocator, req.body, .{ .ignore_unknown_fields = true });
+            defer parsed.deinit();
+
+            const updated = self.gateway.policy_store.upsert(namespace_id, parsed.value, gateway_mod.defaultPolicyVisibility(self.gateway.config)) catch |err| switch (err) {
+                error.InvalidVisibility => {
+                    try http_server.writeResponse(stream, "400 Bad Request", &.{"Content-Type: text/plain"}, "InvalidVisibility");
+                    return true;
+                },
+                else => return err,
+            };
+
+            const body = try std.json.stringifyAlloc(self.allocator, .{ .accepted = true, .policy = updated }, .{});
             defer self.allocator.free(body);
             try http_server.writeResponse(stream, "200 OK", &.{"Content-Type: application/json"}, body);
             return true;

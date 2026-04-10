@@ -34,6 +34,7 @@ pub const GatewayConfig = struct {
     gateway_id: []const u8,
     lab_id: []const u8,
     graph_backend: []const u8 = "memory",
+    policy_store_path: ?[]const u8 = null,
     neo4j: ?Neo4jConfig = null,
     api: ?ApiConfig = null,
     federation: ?FederationConfig = null,

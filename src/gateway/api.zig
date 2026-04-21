@@ -15,6 +15,11 @@ const ProxySelectionRequest = struct {
     service_id: ?[]const u8 = null,
 };
 
+const QueryThenInferRequest = struct {
+    graph_query: graph_types.QueryRequest,
+    inference: std.json.Value,
+};
+
 const DownstreamResponse = struct {
     status: std.http.Status,
     body: []u8,
@@ -245,6 +250,28 @@ pub const GatewayApiServer = struct {
             return true;
         }
 
+        if (std.mem.eql(u8, req.method, "POST") and std.mem.eql(u8, req.path, "/v1/inference/query/chat/completions")) {
+            self.handleQueryThenInfer(stream, req) catch |err| switch (err) {
+                error.InvalidQueryMode,
+                error.GlobalControllerNotConfigured,
+                error.MissingMessages,
+                error.InvalidMessages,
+                error.InvalidInferenceRequest,
+                error.StreamingNotSupported,
+                => try http_server.writeResponse(stream, "400 Bad Request", &.{"Content-Type: text/plain"}, @errorName(err)),
+                error.GlobalControllerQueryFailed,
+                error.InvalidGlobalControllerResponse,
+                error.InvalidDownstreamResponse,
+                => try http_server.writeResponse(stream, "502 Bad Gateway", &.{"Content-Type: text/plain"}, @errorName(err)),
+                error.ServiceUnavailable,
+                error.ServiceProxyFailed,
+                error.UnsupportedMethod,
+                => try writeProxyErrorResponse(stream, err),
+                else => return err,
+            };
+            return true;
+        }
+
         if (std.mem.eql(u8, req.method, "POST") and std.mem.eql(u8, req.path, "/v1/rl/jobs")) {
             self.handleJobSubmit(stream, req, .rl) catch |err| {
                 try writeProxyErrorResponse(stream, err);
@@ -472,6 +499,55 @@ pub const GatewayApiServer = struct {
         try http_server.writeResponse(stream, statusText(downstream.status), &.{"Content-Type: application/json"}, body);
     }
 
+    fn handleQueryThenInfer(self: *Self, stream: net.Stream, req: *http_server.HttpRequest) !void {
+        if (req.body.len == 0) return error.InvalidInferenceRequest;
+
+        var parsed = try std.json.parseFromSlice(QueryThenInferRequest, self.allocator, req.body, .{ .ignore_unknown_fields = true });
+        defer parsed.deinit();
+
+        const graph_body = try renderFederatedGraphQueryJson(
+            self.allocator,
+            &self.gateway.graph,
+            self.gateway.config.resolvedGlobalControllerEndpoint(),
+            self.global_controller_token,
+            parsed.value.graph_query,
+        );
+        defer self.allocator.free(graph_body);
+
+        const graph_context_prompt = try buildGraphContextPrompt(self.allocator, graph_body);
+        defer self.allocator.free(graph_context_prompt);
+
+        const forward_body = try buildQueryThenInferBody(self.allocator, parsed.value.inference, graph_context_prompt);
+        defer self.allocator.free(forward_body);
+
+        var service = try self.requireServiceByType(.inference, req.header("x-pcp-service-id"));
+        defer service.deinit(self.allocator);
+
+        const downstream = try self.forwardRaw(
+            service,
+            "POST",
+            req.header("authorization"),
+            "/v1/chat/completions",
+            forward_body,
+            "application/json",
+        );
+        defer self.allocator.free(downstream.body);
+
+        if (downstream.status != .ok and downstream.status != .accepted and downstream.status != .created) {
+            try http_server.writeResponse(stream, statusText(downstream.status), &.{"Content-Type: application/json"}, downstream.body);
+            return;
+        }
+
+        const body = try wrapQueryThenInferResponse(
+            self.allocator,
+            graph_body,
+            graph_context_prompt,
+            downstream.body,
+        );
+        defer self.allocator.free(body);
+        try http_server.writeResponse(stream, "200 OK", &.{"Content-Type: application/json"}, body);
+    }
+
     fn renderJobsJson(self: *Self, req: *http_server.HttpRequest) ![]u8 {
         const services = try self.gateway.service_registry.listServices(self.allocator);
         defer service_registry.ServiceRegistry.deinitServiceList(self.allocator, services);
@@ -681,6 +757,88 @@ fn writeProxyErrorResponse(stream: net.Stream, err: anyerror) !void {
         else => "500 Internal Server Error",
     };
     try http_server.writeResponse(stream, status, &.{"Content-Type: text/plain"}, @errorName(err));
+}
+
+fn buildGraphContextPrompt(allocator: Allocator, graph_body: []const u8) ![]u8 {
+    return std.fmt.allocPrint(
+        allocator,
+        "Use the following graph context when it is relevant. Do not invent facts that are not present in it.\nGraph context JSON:\n{s}",
+        .{graph_body},
+    );
+}
+
+fn buildQueryThenInferBody(allocator: Allocator, inference_value: std.json.Value, graph_context_prompt: []const u8) ![]u8 {
+    const inference_object = switch (inference_value) {
+        .object => |object| object,
+        else => return error.InvalidInferenceRequest,
+    };
+
+    const messages_value = inference_object.get("messages") orelse return error.MissingMessages;
+    const original_messages = switch (messages_value) {
+        .array => |array| array,
+        else => return error.InvalidMessages,
+    };
+
+    if (inference_object.get("stream")) |stream_value| {
+        switch (stream_value) {
+            .bool => |enabled| if (enabled) return error.StreamingNotSupported,
+            else => return error.InvalidInferenceRequest,
+        }
+    }
+
+    var forward_object = std.json.ObjectMap.init(allocator);
+    defer forward_object.deinit();
+
+    var it = inference_object.iterator();
+    while (it.next()) |entry| {
+        if (std.mem.eql(u8, entry.key_ptr.*, "messages")) continue;
+        try forward_object.put(entry.key_ptr.*, entry.value_ptr.*);
+    }
+
+    var messages = std.json.Array.init(allocator);
+    defer messages.deinit();
+
+    var system_message = std.json.ObjectMap.init(allocator);
+    defer system_message.deinit();
+    try system_message.put("role", .{ .string = "system" });
+    try system_message.put("content", .{ .string = graph_context_prompt });
+    try messages.append(.{ .object = system_message });
+
+    for (original_messages.items) |message| {
+        try messages.append(message);
+    }
+
+    try forward_object.put("messages", .{ .array = messages });
+    return jsonStringifyValue(allocator, .{ .object = forward_object });
+}
+
+fn wrapQueryThenInferResponse(
+    allocator: Allocator,
+    graph_body: []const u8,
+    graph_context_prompt: []const u8,
+    completion_body: []const u8,
+) ![]u8 {
+    var graph_parsed = try std.json.parseFromSlice(std.json.Value, allocator, graph_body, .{});
+    defer graph_parsed.deinit();
+    var completion_parsed = try std.json.parseFromSlice(std.json.Value, allocator, completion_body, .{});
+    defer completion_parsed.deinit();
+
+    if (graph_parsed.value != .object) return error.InvalidGlobalControllerResponse;
+    if (completion_parsed.value != .object) return error.InvalidDownstreamResponse;
+
+    var root = std.json.ObjectMap.init(allocator);
+    defer root.deinit();
+    try root.put("graph_query", graph_parsed.value);
+    try root.put("graph_context_prompt", .{ .string = graph_context_prompt });
+    try root.put("completion", completion_parsed.value);
+    return jsonStringifyValue(allocator, .{ .object = root });
+}
+
+fn jsonStringifyValue(allocator: Allocator, value: std.json.Value) ![]u8 {
+    var buf = std.ArrayList(u8).init(allocator);
+    errdefer buf.deinit();
+    try std.json.stringify(value, .{}, buf.writer());
+    return buf.toOwnedSlice();
 }
 
 fn renderFederatedGraphQueryJson(

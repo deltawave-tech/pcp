@@ -289,6 +289,7 @@ pub const Gateway = struct {
                 "graph.mutate",
                 "service.registry",
                 "service.inference.proxy",
+                "service.inference.query_then_infer",
                 "service.rl.proxy",
                 "service.training.proxy",
                 "federation.status",

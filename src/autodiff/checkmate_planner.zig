@@ -474,12 +474,66 @@ pub fn solvePlanningProblemExact(
     allocator: Allocator,
     problem: *const PlanningProblem,
 ) !ExactPlanResult {
-    return solveExactSmallGraph(
-        allocator,
-        problem.candidates,
-        problem.base_stage_bytes,
-        problem.budget,
-    );
+    if (problem.base_stage_bytes.len == 0) {
+        const keep_mask = try allocator.alloc(bool, problem.candidates.len);
+        @memset(keep_mask, false);
+        return .{
+            .keep_mask = keep_mask,
+            .total_retained_bytes = 0,
+            .peak_stage_bytes = 0,
+            .total_recompute_cost = 0.0,
+        };
+    }
+
+    if (problem.candidates.len > MAX_EXACT_CANDIDATES) {
+        return error.CheckmateGraphTooLarge;
+    }
+
+    for (problem.base_stage_bytes) |stage_bytes| {
+        if (stage_bytes > problem.budget) {
+            return error.NoFeasibleRematPlan;
+        }
+    }
+
+    var best_mask: u64 = 0;
+    var best_cost: f64 = std.math.inf(f64);
+    var best_peak: u64 = std.math.maxInt(u64);
+    var found: bool = false;
+
+    const subset_count: u64 = @as(u64, 1) << @intCast(problem.candidates.len);
+    var mask: u64 = 0;
+    while (mask < subset_count) : (mask += 1) {
+        const stage_eval = evaluateProblemMask(problem, mask);
+        if (stage_eval.peak_stage_bytes > problem.budget) continue;
+
+        if (!found or stage_eval.total_recompute_cost < best_cost or
+            (stage_eval.total_recompute_cost == best_cost and stage_eval.peak_stage_bytes < best_peak) or
+            (stage_eval.total_recompute_cost == best_cost and stage_eval.peak_stage_bytes == best_peak and
+            stageWeightedKeepSum(problem.candidates, mask) > stageWeightedKeepSum(problem.candidates, best_mask)))
+        {
+            found = true;
+            best_mask = mask;
+            best_cost = stage_eval.total_recompute_cost;
+            best_peak = stage_eval.peak_stage_bytes;
+        }
+    }
+
+    if (!found) {
+        return error.NoFeasibleRematPlan;
+    }
+
+    const keep_mask = try allocator.alloc(bool, problem.candidates.len);
+    for (problem.candidates, 0..) |_, candidate_idx| {
+        keep_mask[candidate_idx] = ((best_mask >> @intCast(candidate_idx)) & 1) == 1;
+    }
+
+    const final_eval = evaluateProblemMask(problem, best_mask);
+    return .{
+        .keep_mask = keep_mask,
+        .total_retained_bytes = final_eval.total_retained_bytes,
+        .peak_stage_bytes = final_eval.peak_stage_bytes,
+        .total_recompute_cost = final_eval.total_recompute_cost,
+    };
 }
 
 pub fn solvePlanningProblem(
@@ -698,7 +752,7 @@ pub fn solvePlanningProblemMilpExternal(
 
     const keep_mask = try parseExternalMilpSolution(allocator, problem, solution_path);
     errdefer allocator.free(keep_mask);
-    const final_eval = evaluateKeepMask(problem.candidates, problem.base_stage_bytes, keep_mask);
+    const final_eval = evaluateKeepPlan(problem, keep_mask);
 
     if (!options.keep_artifacts and options.lp_path == null) {
         std.fs.deleteFileAbsolute(lp_path) catch {};
@@ -749,12 +803,12 @@ pub fn solvePlanningProblemGreedy(
     std.sort.block(usize, candidate_order, problem.candidates, compareGreedyDropScore);
 
     for (candidate_order) |candidate_idx| {
-        const current_eval = evaluateKeepMask(problem.candidates, problem.base_stage_bytes, keep_mask);
+        const current_eval = evaluateKeepPlan(problem, keep_mask);
         if (current_eval.peak_stage_bytes <= problem.budget) break;
         keep_mask[candidate_idx] = false;
     }
 
-    const final_eval = evaluateKeepMask(problem.candidates, problem.base_stage_bytes, keep_mask);
+    const final_eval = evaluateKeepPlan(problem, keep_mask);
     if (final_eval.peak_stage_bytes > problem.budget) {
         return error.NoFeasibleRematPlan;
     }
@@ -824,6 +878,70 @@ fn evaluateKeepMask(candidates: []const Candidate, base_stage_bytes: []const u64
         stage_bytes = base_bytes;
         for (candidates, 0..) |candidate, candidate_idx| {
             if (keep_mask[candidate_idx] and candidate.op_index <= stage_idx and candidate.last_forward_use_index >= stage_idx) {
+                stage_bytes += candidate.bytes;
+            }
+        }
+        peak_stage_bytes = @max(peak_stage_bytes, stage_bytes);
+    }
+
+    return .{
+        .total_retained_bytes = total_retained_bytes,
+        .peak_stage_bytes = peak_stage_bytes,
+        .total_recompute_cost = total_recompute_cost,
+    };
+}
+
+fn evaluateKeepPlan(problem: *const PlanningProblem, keep_mask: []const bool) StageEval {
+    var stage_bytes: u64 = problem.base_stage_bytes[0];
+    var peak_stage_bytes: u64 = stage_bytes;
+    var total_recompute_cost: f64 = 0.0;
+    var total_retained_bytes: u64 = 0;
+
+    for (problem.candidates, 0..) |candidate, candidate_idx| {
+        if (keep_mask[candidate_idx]) {
+            total_retained_bytes += candidate.bytes;
+        } else {
+            total_recompute_cost += candidate.weighted_recompute_cost;
+        }
+    }
+
+    for (problem.base_stage_bytes, 0..) |base_bytes, stage_idx| {
+        stage_bytes = base_bytes;
+        for (problem.candidates, 0..) |candidate, candidate_idx| {
+            if (keep_mask[candidate_idx] and candidateKeptAtStage(candidate, stage_idx, problem.forward_stage_count)) {
+                stage_bytes += candidate.bytes;
+            }
+        }
+        peak_stage_bytes = @max(peak_stage_bytes, stage_bytes);
+    }
+
+    return .{
+        .total_retained_bytes = total_retained_bytes,
+        .peak_stage_bytes = peak_stage_bytes,
+        .total_recompute_cost = total_recompute_cost,
+    };
+}
+
+fn evaluateProblemMask(problem: *const PlanningProblem, mask: u64) StageEval {
+    var stage_bytes: u64 = problem.base_stage_bytes[0];
+    var peak_stage_bytes: u64 = stage_bytes;
+    var total_recompute_cost: f64 = 0.0;
+    var total_retained_bytes: u64 = 0;
+
+    for (problem.candidates, 0..) |candidate, candidate_idx| {
+        const keep = ((mask >> @intCast(candidate_idx)) & 1) == 1;
+        if (keep) {
+            total_retained_bytes += candidate.bytes;
+        } else {
+            total_recompute_cost += candidate.weighted_recompute_cost;
+        }
+    }
+
+    for (problem.base_stage_bytes, 0..) |base_bytes, stage_idx| {
+        stage_bytes = base_bytes;
+        for (problem.candidates, 0..) |candidate, candidate_idx| {
+            const keep = ((mask >> @intCast(candidate_idx)) & 1) == 1;
+            if (keep and candidateKeptAtStage(candidate, stage_idx, problem.forward_stage_count)) {
                 stage_bytes += candidate.bytes;
             }
         }
@@ -1420,5 +1538,54 @@ test "glpk backend matches exact bounded solver on small problem" {
     defer glpk_result.deinit(allocator);
 
     try std.testing.expectEqualSlices(bool, exact.keep_mask, glpk_result.keep_mask);
+    try std.testing.expectEqual(exact.peak_stage_bytes, glpk_result.peak_stage_bytes);
+}
+
+test "exact and glpk honor backward-stage checkpoint pressure" {
+    const allocator = std.testing.allocator;
+
+    const candidates = [_]Candidate{
+        .{
+            .bytes = 8,
+            .weighted_recompute_cost = 10.0,
+            .op_index = 0,
+            .last_forward_use_index = 0,
+            .producer_candidate_indices = &.{},
+            .user_candidate_indices = &.{},
+            .use_stage_indices = &.{0},
+            .backward_use_stage_indices = &.{1},
+        },
+        .{
+            .bytes = 8,
+            .weighted_recompute_cost = 2.0,
+            .op_index = 0,
+            .last_forward_use_index = 0,
+            .producer_candidate_indices = &.{},
+            .user_candidate_indices = &.{},
+            .use_stage_indices = &.{0},
+            .backward_use_stage_indices = &.{1},
+        },
+    };
+    var problem = PlanningProblem{
+        .allocator = allocator,
+        .candidates = try dupCandidates(allocator, &candidates),
+        .candidate_metadata_indices = try allocator.dupe(usize, &.{ 0, 1 }),
+        .base_stage_bytes = try allocator.dupe(u64, &.{ 0, 0 }),
+        .base_retained_bytes = 0,
+        .total_retained_bytes_before = 16,
+        .budget = 8,
+        .forward_stage_count = 1,
+        .backward_stage_count = 1,
+    };
+    defer problem.deinit();
+
+    var exact = try solvePlanningProblem(allocator, &problem, .{ .backend = .exact_bounded });
+    defer exact.deinit(allocator);
+    var glpk_result = try solvePlanningProblem(allocator, &problem, .{ .backend = .milp_glpk });
+    defer glpk_result.deinit(allocator);
+
+    try std.testing.expectEqualSlices(bool, &.{ true, false }, exact.keep_mask);
+    try std.testing.expectEqualSlices(bool, exact.keep_mask, glpk_result.keep_mask);
+    try std.testing.expectEqual(@as(u64, 8), exact.peak_stage_bytes);
     try std.testing.expectEqual(exact.peak_stage_bytes, glpk_result.peak_stage_bytes);
 }

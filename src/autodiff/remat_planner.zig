@@ -280,62 +280,131 @@ fn buildBudgetGreedyPlan(
 
 fn buildCheckmateExactPlan(allocator: Allocator, plan: *RematPlan, graph_metadata: *const GraphMetadata, config: RematPlannerConfig) !void {
     const metadata = graph_metadata.op_metadata;
-    var total_retained_before: u64 = 0;
-    var base_retained_bytes: u64 = 0;
-    var candidate_indices = std.ArrayList(usize).init(allocator);
-    defer candidate_indices.deinit();
-    var exact_candidates = std.ArrayList(checkmate_planner.Candidate).init(allocator);
-    defer exact_candidates.deinit();
-    var base_stage_bytes = try allocator.dupe(u64, graph_metadata.base_stage_bytes);
-    defer allocator.free(base_stage_bytes);
+    var problem = try buildCheckmatePlanningProblem(allocator, graph_metadata, config);
+    defer problem.deinit();
 
-    for (metadata, 0..) |entry, idx| {
-        total_retained_before += entry.result_bytes;
+    for (metadata) |entry| {
         try plan.should_keep.put(entry.op, true);
-        if (entry.candidate) {
-            try candidate_indices.append(idx);
-            try exact_candidates.append(.{
-                .bytes = entry.result_bytes,
-                .weighted_recompute_cost = entry.weighted_recompute_cost,
-                .op_index = entry.op_index,
-                .last_forward_use_index = entry.last_forward_use_index,
-            });
-            for (entry.op_index..entry.last_forward_use_index + 1) |stage_idx| {
-                base_stage_bytes[stage_idx] -|= entry.result_bytes;
-            }
-        } else {
-            base_retained_bytes += entry.result_bytes;
-        }
     }
 
-    plan.stats.estimated_retained_bytes_before = total_retained_before;
+    plan.stats.estimated_retained_bytes_before = problem.total_retained_bytes_before;
 
     if (config.activation_memory_budget_bytes == null) {
-        plan.stats.kept_candidate_ops = candidate_indices.items.len;
+        plan.stats.kept_candidate_ops = problem.candidates.len;
         plan.stats.rematerialized_candidate_ops = 0;
-        plan.stats.estimated_retained_bytes_after = total_retained_before;
+        plan.stats.estimated_retained_bytes_after = problem.total_retained_bytes_before;
         return;
     }
 
-    var exact_result = try checkmate_planner.solveExactSmallGraph(
-        allocator,
-        exact_candidates.items,
-        base_stage_bytes,
-        config.activation_memory_budget_bytes.?,
-    );
+    var exact_result = try checkmate_planner.solvePlanningProblem(allocator, &problem, .exact_bounded);
     defer exact_result.deinit(allocator);
 
     var kept_candidates: usize = 0;
-    for (candidate_indices.items, 0..) |metadata_idx, candidate_idx| {
+    for (problem.candidate_metadata_indices, 0..) |metadata_idx, candidate_idx| {
         const keep = exact_result.keep_mask[candidate_idx];
         try plan.should_keep.put(metadata[metadata_idx].op, keep);
         if (keep) kept_candidates += 1;
     }
 
     plan.stats.kept_candidate_ops = kept_candidates;
-    plan.stats.rematerialized_candidate_ops = candidate_indices.items.len - kept_candidates;
-    plan.stats.estimated_retained_bytes_after = base_retained_bytes + exact_result.total_retained_bytes;
+    plan.stats.rematerialized_candidate_ops = problem.candidates.len - kept_candidates;
+    plan.stats.estimated_retained_bytes_after = problem.base_retained_bytes + exact_result.total_retained_bytes;
     plan.stats.estimated_peak_stage_bytes_after = exact_result.peak_stage_bytes;
+}
+
+fn buildCheckmatePlanningProblem(
+    allocator: Allocator,
+    graph_metadata: *const GraphMetadata,
+    config: RematPlannerConfig,
+) !checkmate_planner.PlanningProblem {
+    const metadata = graph_metadata.op_metadata;
+    const budget = config.activation_memory_budget_bytes orelse std.math.maxInt(u64);
+
+    var total_retained_before: u64 = 0;
+    var base_retained_bytes: u64 = 0;
+    var candidate_metadata_indices = std.ArrayList(usize).init(allocator);
+    defer candidate_metadata_indices.deinit();
+    var candidates = std.ArrayList(checkmate_planner.Candidate).init(allocator);
+    errdefer {
+        for (candidates.items) |candidate| {
+            allocator.free(candidate.producer_candidate_indices);
+            allocator.free(candidate.user_candidate_indices);
+        }
+        candidates.deinit();
+    }
+    var base_stage_bytes = try allocator.dupe(u64, graph_metadata.base_stage_bytes);
+    errdefer allocator.free(base_stage_bytes);
+    var candidate_index_by_metadata = try allocator.alloc(?usize, metadata.len);
+    defer allocator.free(candidate_index_by_metadata);
+
+    for (candidate_index_by_metadata) |*entry| {
+        entry.* = null;
+    }
+
+    for (metadata, 0..) |entry, idx| {
+        total_retained_before += entry.result_bytes;
+        if (!entry.candidate) {
+            base_retained_bytes += entry.result_bytes;
+            continue;
+        }
+
+        candidate_index_by_metadata[idx] = candidates.items.len;
+        try candidate_metadata_indices.append(idx);
+        try candidates.append(.{
+            .bytes = entry.result_bytes,
+            .weighted_recompute_cost = entry.weighted_recompute_cost,
+            .op_index = entry.op_index,
+            .last_forward_use_index = entry.last_forward_use_index,
+            .producer_candidate_indices = try allocator.alloc(usize, 0),
+            .user_candidate_indices = try allocator.alloc(usize, 0),
+        });
+        for (entry.op_index..entry.last_forward_use_index + 1) |stage_idx| {
+            base_stage_bytes[stage_idx] -|= entry.result_bytes;
+        }
+    }
+
+    for (candidate_metadata_indices.items, 0..) |metadata_idx, candidate_idx| {
+        const entry = metadata[metadata_idx];
+        allocator.free(candidates.items[candidate_idx].producer_candidate_indices);
+        candidates.items[candidate_idx].producer_candidate_indices = try collectCandidateNeighborIndices(
+            allocator,
+            entry.producer_indices,
+            candidate_index_by_metadata,
+        );
+        allocator.free(candidates.items[candidate_idx].user_candidate_indices);
+        candidates.items[candidate_idx].user_candidate_indices = try collectCandidateNeighborIndices(
+            allocator,
+            entry.user_indices,
+            candidate_index_by_metadata,
+        );
+    }
+
+    return .{
+        .allocator = allocator,
+        .candidates = try candidates.toOwnedSlice(),
+        .candidate_metadata_indices = try candidate_metadata_indices.toOwnedSlice(),
+        .base_stage_bytes = base_stage_bytes,
+        .base_retained_bytes = base_retained_bytes,
+        .total_retained_bytes_before = total_retained_before,
+        .budget = budget,
+    };
+}
+
+fn collectCandidateNeighborIndices(
+    allocator: Allocator,
+    metadata_indices: []const usize,
+    candidate_index_by_metadata: []const ?usize,
+) ![]usize {
+    var neighbors = std.ArrayList(usize).init(allocator);
+    defer neighbors.deinit();
+
+    for (metadata_indices) |metadata_idx| {
+        if (candidate_index_by_metadata[metadata_idx]) |candidate_idx| {
+            try neighbors.append(candidate_idx);
+        }
+    }
+
+    return neighbors.toOwnedSlice();
 }
 
 fn compareCandidateScore(metadata: []const OpMetadata, lhs_idx: usize, rhs_idx: usize) bool {
@@ -484,6 +553,84 @@ test "result bytes handles scalar and dynamic shapes conservatively" {
     const dynamic_type = mlir.Type.rankedTensorType(ctx, &.{ -1, 32 }, mlir.Type.f32Type(ctx));
     const dynamic_ranked = dynamic_type.as(mlir.RankedTensorType).?;
     try std.testing.expectEqual(@as(u64, 0), computeTypeBytes(dynamic_ranked));
+}
+
+test "checkmate planning problem preserves candidate edges and base stages" {
+    const allocator = std.testing.allocator;
+
+    var op_metadata = try allocator.alloc(OpMetadata, 3);
+    errdefer allocator.free(op_metadata);
+    const ops_in_forward_order = try allocator.alloc(mlir.Operation, 0);
+    errdefer allocator.free(ops_in_forward_order);
+    const base_stage_bytes = try allocator.dupe(u64, &.{ 8, 16, 12, 8 });
+    errdefer allocator.free(base_stage_bytes);
+
+    op_metadata[0] = .{
+        .op = undefined,
+        .op_index = 0,
+        .result_bytes = 8,
+        .fanout = 2,
+        .dependency_penalty = 1.0,
+        .recompute_cost = 10.0,
+        .weighted_recompute_cost = 10.0,
+        .remat_legal = true,
+        .candidate = true,
+        .cost_class = .moderate,
+        .producer_indices = try allocator.dupe(usize, &.{}),
+        .user_indices = try allocator.dupe(usize, &.{ 1, 2 }),
+        .last_forward_use_index = 3,
+    };
+    op_metadata[1] = .{
+        .op = undefined,
+        .op_index = 1,
+        .result_bytes = 8,
+        .fanout = 0,
+        .dependency_penalty = 1.0,
+        .recompute_cost = 2.0,
+        .weighted_recompute_cost = 2.0,
+        .remat_legal = true,
+        .candidate = true,
+        .cost_class = .cheap,
+        .producer_indices = try allocator.dupe(usize, &.{0}),
+        .user_indices = try allocator.dupe(usize, &.{}),
+        .last_forward_use_index = 1,
+    };
+    op_metadata[2] = .{
+        .op = undefined,
+        .op_index = 2,
+        .result_bytes = 4,
+        .fanout = 0,
+        .dependency_penalty = 1.0,
+        .recompute_cost = 1.0,
+        .weighted_recompute_cost = 1.0,
+        .remat_legal = true,
+        .candidate = false,
+        .cost_class = .cheap,
+        .producer_indices = try allocator.dupe(usize, &.{0}),
+        .user_indices = try allocator.dupe(usize, &.{}),
+        .last_forward_use_index = 2,
+    };
+
+    var graph_metadata = GraphMetadata{
+        .allocator = allocator,
+        .ops_in_forward_order = ops_in_forward_order,
+        .op_metadata = op_metadata,
+        .base_stage_bytes = base_stage_bytes,
+    };
+    defer graph_metadata.deinit();
+
+    var problem = try buildCheckmatePlanningProblem(allocator, &graph_metadata, .{
+        .policy = .checkmate_optimal,
+        .activation_memory_budget_bytes = 8,
+    });
+    defer problem.deinit();
+
+    try std.testing.expectEqual(@as(u64, 20), problem.total_retained_bytes_before);
+    try std.testing.expectEqual(@as(u64, 4), problem.base_retained_bytes);
+    try std.testing.expectEqualSlices(u64, &.{ 0, 0, 4, 0 }, problem.base_stage_bytes);
+    try std.testing.expectEqualSlices(usize, &.{ 0, 1 }, problem.candidate_metadata_indices);
+    try std.testing.expectEqualSlices(usize, &.{1}, problem.candidates[0].user_candidate_indices);
+    try std.testing.expectEqualSlices(usize, &.{0}, problem.candidates[1].producer_candidate_indices);
 }
 
 fn computeTypeBytes(ranked_type: mlir.RankedTensorType) u64 {

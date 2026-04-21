@@ -170,6 +170,8 @@ wait_for_url "http://${HOST}:${GATEWAY_PORT}/healthz"
 wait_for_url "http://${HOST}:${INF_API_PORT}/readyz"
 wait_for_json_match "http://${HOST}:${GATEWAY_PORT}/v1/federation/status" "$GATEWAY_TOKEN" '"connected":true' "$SERVICES_JSON"
 wait_for_json_match "http://${HOST}:${GATEWAY_PORT}/v1/services" "$GATEWAY_TOKEN" '"service_id":"inference-main"' "$SERVICES_JSON"
+wait_for_json_match "http://${HOST}:${GATEWAY_PORT}/v1/services" "$GATEWAY_TOKEN" '"health_status":"ok"' "$SERVICES_JSON"
+wait_for_json_match "http://${HOST}:${GATEWAY_PORT}/v1/services" "$GATEWAY_TOKEN" '"ready_worker_count":1' "$SERVICES_JSON"
 
 curl -sf \
   -X PUT \

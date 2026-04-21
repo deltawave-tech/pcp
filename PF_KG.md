@@ -122,10 +122,10 @@ This should remain separate from the core gateway/global-controller graph work u
 4. add graph-linked RL/training launch flows on top of the same job and graph conventions
 5. only then expand broader inference parity and autoresearch scope
 
-## Known Issue
+## Recent Fix
 
-- gateway service registration freshness is not fully right yet for inference: the composed query-then-infer smoke passed, but `/v1/services` still showed the inference service as `health_status:"starting"` with `ready_worker_count:0` even after a ready worker was connected and serving requests
-- this appears to be a service-registration refresh/update problem rather than a failure of the composed endpoint itself
+- inference service registration freshness at the gateway is now correct for the composed query-then-infer flow
+- the smoke now verifies that `/v1/services` reports the inference service as `health_status:"ok"` with `ready_worker_count:1` once the CUDA worker is ready
 
 ## Suggested Remaining Repo Areas
 

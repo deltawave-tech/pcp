@@ -396,7 +396,6 @@ pub const InferenceShepherd = struct {
     fn handleWorkerDisconnectHook(ctx: *anyopaque, worker_id: NodeId) void {
         const self: *Self = @ptrCast(@alignCast(ctx));
         self.state_mutex.lock();
-        defer self.state_mutex.unlock();
 
         var it = self.ready_by_model.iterator();
         while (it.next()) |entry| {
@@ -410,6 +409,11 @@ pub const InferenceShepherd = struct {
                 self.failRequestLocked(entry.value_ptr.*, "worker_disconnected");
             }
         }
+        self.state_mutex.unlock();
+
+        self.refreshGatewayServiceRegistration() catch |err| {
+            std.log.warn("Failed to refresh gateway inference service registration after disconnect: {}", .{err});
+        };
     }
 
     fn handleWorkerMessageHook(ctx: *anyopaque, worker_id: NodeId, msg: message.MessageEnvelope) anyerror!bool {
@@ -424,6 +428,9 @@ pub const InferenceShepherd = struct {
             }
             self.state_mutex.unlock();
             self.dispatchPending(model_id);
+            self.refreshGatewayServiceRegistration() catch |err| {
+                std.log.warn("Failed to refresh gateway inference service registration after model ready: {}", .{err});
+            };
             return true;
         }
 
@@ -863,7 +870,15 @@ pub const InferenceShepherd = struct {
     }
 
     pub fn registerGatewayService(self: *Self, host: []const u8, port: u16) !void {
+        self.api_host = host;
+        self.api_port = port;
+        try self.refreshGatewayServiceRegistration();
+    }
+
+    fn refreshGatewayServiceRegistration(self: *Self) !void {
         const client = self.gateway_client orelse return;
+        const host = self.api_host orelse return;
+        const port = self.api_port;
         const base_url = try std.fmt.allocPrint(self.base.allocator, "http://{s}:{d}", .{ host, port });
         defer self.base.allocator.free(base_url);
         const ready_workers = self.getReadyWorkerCount();

@@ -229,13 +229,12 @@ Current State
   3. Add a new unified control-plane API for training, RL, and inference deployments.
   4. Make all controllers report into the same job/status/event model.
 
-  Current issue to note:
+  Current status to note:
 
-  - inference service registration freshness is not fully correct at the gateway yet
-  - in the composed query-then-infer smoke, the request succeeded through a ready CUDA
-    worker, but `/v1/services` still showed the inference service as
-    `health_status:"starting"` and `ready_worker_count:0`
-  - that suggests registration is not being refreshed after worker readiness changes
+  - inference service registration freshness at the gateway is now correct for the
+    composed query-then-infer flow
+  - the smoke verifies that `/v1/services` reports the inference service as
+    `health_status:"ok"` with `ready_worker_count:1` after the CUDA worker becomes ready
 
   If you want, I can turn this into a concrete design proposal next:
 

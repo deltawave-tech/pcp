@@ -34,6 +34,7 @@ fn countRematerialized(plan: *const remat_planner.RematPlan, ops_forward: []cons
 
 pub fn main() !void {
     const allocator = std.heap.page_allocator;
+    const budget_bytes = 4 * 1024 * 1024;
 
     var full_ctx = try mlir_ctx.MLIRContext.init(allocator);
     defer full_ctx.deinit();
@@ -67,7 +68,7 @@ pub fn main() !void {
 
     var greedy_plan = try remat_planner.buildRematPlan(allocator, ops_forward, .{
         .policy = .budget_greedy,
-        .activation_memory_budget_bytes = 8 * 1024 * 1024,
+        .activation_memory_budget_bytes = budget_bytes,
         .cost_model = .static_heuristic,
         .remat_allow_expensive_ops = true,
     });
@@ -75,7 +76,7 @@ pub fn main() !void {
 
     var checkmate_plan = try remat_planner.buildRematPlan(allocator, ops_forward, .{
         .policy = .checkmate_optimal,
-        .activation_memory_budget_bytes = 8 * 1024 * 1024,
+        .activation_memory_budget_bytes = budget_bytes,
         .cost_model = .static_heuristic,
         .remat_allow_expensive_ops = true,
     });
@@ -88,8 +89,15 @@ pub fn main() !void {
     try std.testing.expectEqual(@as(usize, 0), legacy_remat);
     try std.testing.expect(greedy_remat >= 1);
     try std.testing.expect(checkmate_remat >= 1);
-    try std.testing.expect(greedy_plan.stats.estimated_retained_bytes_after <= 8 * 1024 * 1024);
-    try std.testing.expect(checkmate_plan.stats.estimated_retained_bytes_after <= 8 * 1024 * 1024);
+    try std.testing.expect(greedy_plan.stats.estimated_retained_bytes_after <= budget_bytes);
+    try std.testing.expect(checkmate_plan.stats.estimated_peak_stage_bytes_after <= budget_bytes);
+
+    const checkmate_engine_config: autodiff.RematPlannerConfig = .{
+        .policy = .checkmate_optimal,
+        .activation_memory_budget_bytes = budget_bytes,
+        .cost_model = .static_heuristic,
+        .remat_allow_expensive_ops = true,
+    };
 
     _ = try autodiff.buildGradientGraphWithConfig(
         allocator,
@@ -97,16 +105,11 @@ pub fn main() !void {
         fwd_result.func_op,
         -100.0,
         100.0,
-        .{
-            .policy = .budget_greedy,
-            .activation_memory_budget_bytes = 8 * 1024 * 1024,
-            .cost_model = .static_heuristic,
-            .remat_allow_expensive_ops = true,
-        },
+        checkmate_engine_config,
     );
 
     std.debug.print(
-        "legacy_remat={} greedy_remat={} checkmate_remat={} retained_before={} greedy_after={} checkmate_after={}\n",
+        "legacy_remat={} greedy_remat={} checkmate_remat={} retained_before={} greedy_after={} checkmate_after={} checkmate_peak={}\n",
         .{
             legacy_remat,
             greedy_remat,
@@ -114,6 +117,7 @@ pub fn main() !void {
             greedy_plan.stats.estimated_retained_bytes_before,
             greedy_plan.stats.estimated_retained_bytes_after,
             checkmate_plan.stats.estimated_retained_bytes_after,
+            checkmate_plan.stats.estimated_peak_stage_bytes_after,
         },
     );
 }

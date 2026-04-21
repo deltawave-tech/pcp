@@ -49,6 +49,7 @@ pub const PlanStats = struct {
     activation_memory_budget_bytes: ?u64 = null,
     estimated_retained_bytes_before: u64 = 0,
     estimated_retained_bytes_after: u64 = 0,
+    estimated_peak_stage_bytes_after: u64 = 0,
     kept_candidate_ops: usize = 0,
     rematerialized_candidate_ops: usize = 0,
 };
@@ -79,6 +80,7 @@ pub const GraphMetadata = struct {
     allocator: Allocator,
     ops_in_forward_order: []mlir.Operation,
     op_metadata: []OpMetadata,
+    base_stage_bytes: []u64,
 
     pub fn deinit(self: *GraphMetadata) void {
         for (self.op_metadata) |entry| {
@@ -87,6 +89,7 @@ pub const GraphMetadata = struct {
         }
         self.allocator.free(self.op_metadata);
         self.allocator.free(self.ops_in_forward_order);
+        self.allocator.free(self.base_stage_bytes);
     }
 };
 
@@ -107,7 +110,7 @@ pub fn buildRematPlan(
     switch (config.policy) {
         .legacy_threshold => try buildLegacyThresholdPlan(&plan, graph_metadata.op_metadata),
         .budget_greedy => try buildBudgetGreedyPlan(allocator, &plan, graph_metadata.op_metadata, config),
-        .checkmate_optimal => try buildCheckmateExactPlan(allocator, &plan, graph_metadata.op_metadata, config),
+        .checkmate_optimal => try buildCheckmateExactPlan(allocator, &plan, &graph_metadata, config),
     }
 
     return plan;
@@ -123,16 +126,19 @@ pub fn collectGraphMetadata(
 
     var op_metadata = try allocator.alloc(OpMetadata, owned_ops.len);
     errdefer allocator.free(op_metadata);
+    var base_stage_bytes = try allocator.alloc(u64, owned_ops.len);
+    errdefer allocator.free(base_stage_bytes);
 
     var op_to_index = std.AutoHashMap(mlir.Operation, usize).init(allocator);
     defer op_to_index.deinit();
 
     for (owned_ops, 0..) |op, i| {
         try op_to_index.put(op, i);
+        const result_bytes = computeResultBytes(op);
         op_metadata[i] = .{
             .op = op,
             .op_index = i,
-            .result_bytes = computeResultBytes(op),
+            .result_bytes = result_bytes,
             .fanout = 0,
             .dependency_penalty = 1.0,
             .recompute_cost = 0.0,
@@ -144,6 +150,7 @@ pub fn collectGraphMetadata(
             .user_indices = try allocator.alloc(usize, 0),
             .last_forward_use_index = i,
         };
+        base_stage_bytes[i] = 0;
     }
 
     for (owned_ops, 0..) |op, op_idx| {
@@ -191,10 +198,18 @@ pub fn collectGraphMetadata(
         entry.weighted_recompute_cost = entry.recompute_cost * fanout_penalty * entry.dependency_penalty;
     }
 
+    for (op_metadata) |entry| {
+        if (entry.result_bytes == 0) continue;
+        for (entry.op_index..entry.last_forward_use_index + 1) |stage_idx| {
+            base_stage_bytes[stage_idx] += entry.result_bytes;
+        }
+    }
+
     return .{
         .allocator = allocator,
         .ops_in_forward_order = owned_ops,
         .op_metadata = op_metadata,
+        .base_stage_bytes = base_stage_bytes,
     };
 }
 
@@ -263,18 +278,16 @@ fn buildBudgetGreedyPlan(
     plan.stats.rematerialized_candidate_ops = candidate_indices.items.len - kept_candidates;
 }
 
-fn buildCheckmateExactPlan(
-    allocator: Allocator,
-    plan: *RematPlan,
-    metadata: []const OpMetadata,
-    config: RematPlannerConfig,
-) !void {
+fn buildCheckmateExactPlan(allocator: Allocator, plan: *RematPlan, graph_metadata: *const GraphMetadata, config: RematPlannerConfig) !void {
+    const metadata = graph_metadata.op_metadata;
     var total_retained_before: u64 = 0;
-    var base_retained: u64 = 0;
+    var base_retained_bytes: u64 = 0;
     var candidate_indices = std.ArrayList(usize).init(allocator);
     defer candidate_indices.deinit();
     var exact_candidates = std.ArrayList(checkmate_planner.Candidate).init(allocator);
     defer exact_candidates.deinit();
+    var base_stage_bytes = try allocator.dupe(u64, graph_metadata.base_stage_bytes);
+    defer allocator.free(base_stage_bytes);
 
     for (metadata, 0..) |entry, idx| {
         total_retained_before += entry.result_bytes;
@@ -284,10 +297,14 @@ fn buildCheckmateExactPlan(
             try exact_candidates.append(.{
                 .bytes = entry.result_bytes,
                 .weighted_recompute_cost = entry.weighted_recompute_cost,
+                .op_index = entry.op_index,
                 .last_forward_use_index = entry.last_forward_use_index,
             });
+            for (entry.op_index..entry.last_forward_use_index + 1) |stage_idx| {
+                base_stage_bytes[stage_idx] -|= entry.result_bytes;
+            }
         } else {
-            base_retained += entry.result_bytes;
+            base_retained_bytes += entry.result_bytes;
         }
     }
 
@@ -303,7 +320,7 @@ fn buildCheckmateExactPlan(
     var exact_result = try checkmate_planner.solveExactSmallGraph(
         allocator,
         exact_candidates.items,
-        base_retained,
+        base_stage_bytes,
         config.activation_memory_budget_bytes.?,
     );
     defer exact_result.deinit(allocator);
@@ -317,7 +334,8 @@ fn buildCheckmateExactPlan(
 
     plan.stats.kept_candidate_ops = kept_candidates;
     plan.stats.rematerialized_candidate_ops = candidate_indices.items.len - kept_candidates;
-    plan.stats.estimated_retained_bytes_after = exact_result.total_retained_bytes;
+    plan.stats.estimated_retained_bytes_after = base_retained_bytes + exact_result.total_retained_bytes;
+    plan.stats.estimated_peak_stage_bytes_after = exact_result.peak_stage_bytes;
 }
 
 fn compareCandidateScore(metadata: []const OpMetadata, lhs_idx: usize, rhs_idx: usize) bool {

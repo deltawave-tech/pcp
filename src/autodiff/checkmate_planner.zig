@@ -36,6 +36,96 @@ pub const PlanningProblem = struct {
     }
 };
 
+pub const DependencyEdge = struct {
+    producer_var_index: usize,
+    user_var_index: usize,
+};
+
+pub const LinearTerm = struct {
+    variable_index: usize,
+    coefficient: f64,
+};
+
+pub const LinearConstraint = struct {
+    allocator: Allocator,
+    name: []const u8,
+    terms: []LinearTerm,
+    rhs: f64,
+
+    pub fn deinit(self: *LinearConstraint) void {
+        self.allocator.free(self.name);
+        self.allocator.free(self.terms);
+    }
+};
+
+pub const MilpModel = struct {
+    allocator: Allocator,
+    variable_names: [][]const u8,
+    objective_coefficients: []f64,
+    objective_constant: f64,
+    stage_constraints: []LinearConstraint,
+    dependency_edges: []DependencyEdge,
+
+    pub fn deinit(self: *MilpModel) void {
+        for (self.variable_names) |name| {
+            self.allocator.free(name);
+        }
+        self.allocator.free(self.variable_names);
+        self.allocator.free(self.objective_coefficients);
+        for (self.stage_constraints) |*constraint| {
+            constraint.deinit();
+        }
+        self.allocator.free(self.stage_constraints);
+        self.allocator.free(self.dependency_edges);
+    }
+
+    pub fn writeLp(self: *const MilpModel, writer: anytype) !void {
+        try writer.writeAll("Minimize\n");
+        try writer.writeAll(" obj:");
+        var first_term = true;
+        for (self.objective_coefficients, 0..) |coefficient, variable_idx| {
+            if (coefficient == 0.0) continue;
+            if (!first_term) {
+                try writer.writeAll(" ");
+            } else {
+                try writer.writeAll(" ");
+                first_term = false;
+            }
+            try writeSignedTerm(writer, coefficient, self.variable_names[variable_idx]);
+        }
+        if (first_term) {
+            try writer.writeAll(" 0");
+        }
+        try writer.writeAll("\nSubject To\n");
+        for (self.stage_constraints) |constraint| {
+            try writer.print(" {s}:", .{constraint.name});
+            if (constraint.terms.len == 0) {
+                try writer.writeAll(" 0");
+            } else {
+                for (constraint.terms, 0..) |term, term_idx| {
+                    if (term_idx > 0) try writer.writeAll(" ");
+                    try writeSignedTerm(writer, term.coefficient, self.variable_names[term.variable_index]);
+                }
+            }
+            try writer.print(" <= {d:.6}\n", .{constraint.rhs});
+        }
+        if (self.dependency_edges.len > 0) {
+            try writer.writeAll("\\ Dependency edges for future precedence constraints:\n");
+            for (self.dependency_edges) |edge| {
+                try writer.print(
+                    "\\ keep_{d} depends_on keep_{d}\n",
+                    .{ edge.user_var_index, edge.producer_var_index },
+                );
+            }
+        }
+        try writer.writeAll("Binary\n");
+        for (self.variable_names) |name| {
+            try writer.print(" {s}\n", .{name});
+        }
+        try writer.writeAll("End\n");
+    }
+};
+
 pub const ExactPlanResult = struct {
     keep_mask: []bool,
     total_retained_bytes: u64,
@@ -48,6 +138,75 @@ pub const ExactPlanResult = struct {
 };
 
 const MAX_EXACT_CANDIDATES: usize = 24;
+
+pub fn buildMilpModel(allocator: Allocator, problem: *const PlanningProblem) !MilpModel {
+    var variable_names = try allocator.alloc([]const u8, problem.candidates.len);
+    errdefer allocator.free(variable_names);
+    for (problem.candidates, 0..) |_, candidate_idx| {
+        variable_names[candidate_idx] = try std.fmt.allocPrint(allocator, "keep_{d}", .{candidate_idx});
+    }
+    errdefer {
+        for (variable_names) |name| {
+            allocator.free(name);
+        }
+    }
+
+    const objective_coefficients = try allocator.alloc(f64, problem.candidates.len);
+    errdefer allocator.free(objective_coefficients);
+    var objective_constant: f64 = 0.0;
+    for (problem.candidates, 0..) |candidate, candidate_idx| {
+        objective_constant += candidate.weighted_recompute_cost;
+        objective_coefficients[candidate_idx] = -candidate.weighted_recompute_cost;
+    }
+
+    var stage_constraints = std.ArrayList(LinearConstraint).init(allocator);
+    errdefer {
+        for (stage_constraints.items) |*constraint| {
+            constraint.deinit();
+        }
+        stage_constraints.deinit();
+    }
+
+    for (problem.base_stage_bytes, 0..) |base_bytes, stage_idx| {
+        var terms = std.ArrayList(LinearTerm).init(allocator);
+        errdefer terms.deinit();
+        for (problem.candidates, 0..) |candidate, candidate_idx| {
+            if (candidate.op_index <= stage_idx and candidate.last_forward_use_index >= stage_idx) {
+                try terms.append(.{
+                    .variable_index = candidate_idx,
+                    .coefficient = @floatFromInt(candidate.bytes),
+                });
+            }
+        }
+        const rhs = @as(f64, @floatFromInt(problem.budget)) - @as(f64, @floatFromInt(base_bytes));
+        try stage_constraints.append(.{
+            .allocator = allocator,
+            .name = try std.fmt.allocPrint(allocator, "stage_{d}", .{stage_idx}),
+            .terms = try terms.toOwnedSlice(),
+            .rhs = rhs,
+        });
+    }
+
+    var dependency_edges = std.ArrayList(DependencyEdge).init(allocator);
+    defer dependency_edges.deinit();
+    for (problem.candidates, 0..) |candidate, user_idx| {
+        for (candidate.producer_candidate_indices) |producer_idx| {
+            try dependency_edges.append(.{
+                .producer_var_index = producer_idx,
+                .user_var_index = user_idx,
+            });
+        }
+    }
+
+    return .{
+        .allocator = allocator,
+        .variable_names = variable_names,
+        .objective_coefficients = objective_coefficients,
+        .objective_constant = objective_constant,
+        .stage_constraints = try stage_constraints.toOwnedSlice(),
+        .dependency_edges = try dependency_edges.toOwnedSlice(),
+    };
+}
 
 pub fn solveExactSmallGraph(
     allocator: Allocator,
@@ -165,7 +324,7 @@ pub fn solvePlanningProblemGreedy(
     errdefer allocator.free(keep_mask);
     @memset(keep_mask, true);
 
-    var candidate_order = try allocator.alloc(usize, problem.candidates.len);
+    const candidate_order = try allocator.alloc(usize, problem.candidates.len);
     defer allocator.free(candidate_order);
     for (candidate_order, 0..) |*entry, idx| {
         entry.* = idx;
@@ -289,6 +448,32 @@ fn greedyDropScore(candidate: Candidate) f64 {
     return bytes_saved / candidate.weighted_recompute_cost;
 }
 
+fn writeSignedTerm(writer: anytype, coefficient: f64, variable_name: []const u8) !void {
+    if (coefficient < 0.0) {
+        try writer.print("- {d:.6} {s}", .{ -coefficient, variable_name });
+    } else {
+        try writer.print("+ {d:.6} {s}", .{ coefficient, variable_name });
+    }
+}
+
+fn dupCandidates(allocator: Allocator, candidates: []const Candidate) ![]Candidate {
+    var owned = try allocator.alloc(Candidate, candidates.len);
+    errdefer allocator.free(owned);
+
+    for (candidates, 0..) |candidate, idx| {
+        owned[idx] = .{
+            .bytes = candidate.bytes,
+            .weighted_recompute_cost = candidate.weighted_recompute_cost,
+            .op_index = candidate.op_index,
+            .last_forward_use_index = candidate.last_forward_use_index,
+            .producer_candidate_indices = try allocator.dupe(usize, candidate.producer_candidate_indices),
+            .user_candidate_indices = try allocator.dupe(usize, candidate.user_candidate_indices),
+        };
+    }
+
+    return owned;
+}
+
 test "stage-aware exact planner prefers keeping long-lived expensive candidate" {
     const allocator = std.testing.allocator;
 
@@ -336,6 +521,87 @@ test "stage-aware exact planner rejects infeasible base stage" {
     );
 }
 
+test "milp model captures stage constraints and dependency edges" {
+    const allocator = std.testing.allocator;
+
+    const candidates = [_]Candidate{
+        .{
+            .bytes = 8,
+            .weighted_recompute_cost = 10.0,
+            .op_index = 0,
+            .last_forward_use_index = 2,
+            .producer_candidate_indices = &.{},
+            .user_candidate_indices = &.{1},
+        },
+        .{
+            .bytes = 4,
+            .weighted_recompute_cost = 3.0,
+            .op_index = 1,
+            .last_forward_use_index = 1,
+            .producer_candidate_indices = &.{0},
+            .user_candidate_indices = &.{},
+        },
+    };
+    var problem = PlanningProblem{
+        .allocator = allocator,
+        .candidates = try dupCandidates(allocator, &candidates),
+        .candidate_metadata_indices = try allocator.dupe(usize, &.{ 0, 1 }),
+        .base_stage_bytes = try allocator.dupe(u64, &.{ 0, 2, 2 }),
+        .base_retained_bytes = 0,
+        .total_retained_bytes_before = 14,
+        .budget = 8,
+    };
+    defer problem.deinit();
+
+    var model = try buildMilpModel(allocator, &problem);
+    defer model.deinit();
+
+    try std.testing.expectEqual(@as(f64, 13.0), model.objective_constant);
+    try std.testing.expectEqual(@as(usize, 2), model.variable_names.len);
+    try std.testing.expectEqual(@as(usize, 3), model.stage_constraints.len);
+    try std.testing.expectEqual(@as(usize, 1), model.dependency_edges.len);
+    try std.testing.expectEqual(@as(usize, 2), model.stage_constraints[1].terms.len);
+    try std.testing.expectEqual(@as(f64, 6.0), model.stage_constraints[0].rhs);
+    try std.testing.expectEqualStrings("keep_0", model.variable_names[0]);
+}
+
+test "milp model writes lp scaffold" {
+    const allocator = std.testing.allocator;
+
+    const candidates = [_]Candidate{
+        .{
+            .bytes = 8,
+            .weighted_recompute_cost = 5.0,
+            .op_index = 0,
+            .last_forward_use_index = 0,
+            .producer_candidate_indices = &.{},
+            .user_candidate_indices = &.{},
+        },
+    };
+    var problem = PlanningProblem{
+        .allocator = allocator,
+        .candidates = try dupCandidates(allocator, &candidates),
+        .candidate_metadata_indices = try allocator.dupe(usize, &.{0}),
+        .base_stage_bytes = try allocator.dupe(u64, &.{0}),
+        .base_retained_bytes = 0,
+        .total_retained_bytes_before = 8,
+        .budget = 8,
+    };
+    defer problem.deinit();
+
+    var model = try buildMilpModel(allocator, &problem);
+    defer model.deinit();
+
+    var buffer = std.ArrayList(u8).init(allocator);
+    defer buffer.deinit();
+    try model.writeLp(buffer.writer());
+
+    try std.testing.expect(std.mem.indexOf(u8, buffer.items, "Minimize") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buffer.items, "stage_0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buffer.items, "Binary") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buffer.items, "keep_0") != null);
+}
+
 test "planning problem exact solver handles branching lifetime tradeoff" {
     const allocator = std.testing.allocator;
 
@@ -367,7 +633,7 @@ test "planning problem exact solver handles branching lifetime tradeoff" {
     };
     var problem = PlanningProblem{
         .allocator = allocator,
-        .candidates = try allocator.dupe(Candidate, &candidates),
+        .candidates = try dupCandidates(allocator, &candidates),
         .candidate_metadata_indices = try allocator.dupe(usize, &.{ 0, 1, 2 }),
         .base_stage_bytes = try allocator.dupe(u64, &.{ 0, 0, 0, 0 }),
         .base_retained_bytes = 0,
@@ -414,7 +680,7 @@ test "exact backend beats greedy on overlapping intervals" {
     };
     var problem = PlanningProblem{
         .allocator = allocator,
-        .candidates = try allocator.dupe(Candidate, &candidates),
+        .candidates = try dupCandidates(allocator, &candidates),
         .candidate_metadata_indices = try allocator.dupe(usize, &.{ 0, 1, 2 }),
         .base_stage_bytes = try allocator.dupe(u64, &.{ 0, 0, 0 }),
         .base_retained_bytes = 0,

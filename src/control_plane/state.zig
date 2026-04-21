@@ -64,7 +64,7 @@ pub const ControllerState = struct {
     config_path: ?[]u8,
     run_id: ?[]u8,
     model_id: ?[]u8,
-    resume: bool,
+    resume_requested: bool,
     required_workers: ?usize,
     started_at: i64,
     finished_at: ?i64,
@@ -83,7 +83,7 @@ pub const ControllerState = struct {
         config_path: ?[]const u8,
         run_id: ?[]const u8,
         model_id: ?[]const u8,
-        resume: bool,
+        resume_requested: bool,
         required_workers: ?usize,
     ) !Self {
         return Self{
@@ -95,7 +95,7 @@ pub const ControllerState = struct {
             .config_path = if (config_path) |path| try allocator.dupe(u8, path) else null,
             .run_id = if (run_id) |id| try allocator.dupe(u8, id) else null,
             .model_id = if (model_id) |id| try allocator.dupe(u8, id) else null,
-            .resume = resume,
+            .resume_requested = resume_requested,
             .required_workers = required_workers,
             .started_at = std.time.timestamp(),
             .finished_at = null,
@@ -191,7 +191,7 @@ pub const ControllerState = struct {
             config_path: ?[]const u8,
             run_id: ?[]const u8,
             model_id: ?[]const u8,
-            resume: bool,
+            @"resume": bool,
             started_at: i64,
             finished_at: ?i64,
             workers_connected: usize,
@@ -209,7 +209,7 @@ pub const ControllerState = struct {
             .config_path = self.config_path,
             .run_id = self.run_id,
             .model_id = self.model_id,
-            .resume = self.resume,
+            .@"resume" = self.resume_requested,
             .started_at = self.started_at,
             .finished_at = self.finished_at,
             .workers_connected = connected_workers,
@@ -229,7 +229,7 @@ pub const ControllerState = struct {
             config_path: ?[]const u8,
             run_id: ?[]const u8,
             model_id: ?[]const u8,
-            resume: bool,
+            @"resume": bool,
             started_at: i64,
             finished_at: ?i64,
             workers_connected: usize,
@@ -244,7 +244,7 @@ pub const ControllerState = struct {
             .config_path = self.config_path,
             .run_id = self.run_id,
             .model_id = self.model_id,
-            .resume = self.resume,
+            .@"resume" = self.resume_requested,
             .started_at = self.started_at,
             .finished_at = self.finished_at,
             .workers_connected = connected_workers,
@@ -311,4 +311,3 @@ pub const ControllerState = struct {
         };
     }
 };
-

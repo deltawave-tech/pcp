@@ -345,6 +345,8 @@ fn addIreeDependencies(target: *std.Build.Step.Compile, b: *std.Build, iree_conf
     // MLIR libraries needed for the dialect registration in pass_anchors
     target.linkSystemLibrary("MLIRFuncDialect");
     target.linkSystemLibrary("MLIRArithDialect");
+    target.linkSystemLibrary("MLIRSCFDialect");
+    target.linkSystemLibrary("MLIRTensorDialect");
     target.linkSystemLibrary("StablehloOps");
 
     // IREE HAL driver initialization (enables use_all_available_drivers)

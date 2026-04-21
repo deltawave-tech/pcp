@@ -37,6 +37,8 @@ pub const ControlApiServer = struct {
     metrics_renderer: ?MetricsRenderer,
     cancel_hook: ?CancelHook,
     server: ?TcpServer,
+    listen_host: ?[]const u8,
+    listen_port: u16,
     is_running: std.atomic.Value(u8),
 
     const Self = @This();
@@ -59,11 +61,15 @@ pub const ControlApiServer = struct {
             .metrics_renderer = metrics_renderer,
             .cancel_hook = cancel_hook,
             .server = null,
+            .listen_host = null,
+            .listen_port = 0,
             .is_running = std.atomic.Value(u8).init(0),
         };
     }
 
     pub fn start(self: *Self, host: []const u8, port: u16) !void {
+        self.listen_host = host;
+        self.listen_port = port;
         self.server = try TcpServer.init(self.allocator, host, port);
         self.is_running.store(1, .release);
 
@@ -77,6 +83,11 @@ pub const ControlApiServer = struct {
             else
                 break;
 
+            if (self.is_running.load(.acquire) == 0) {
+                connection.stream.close();
+                break;
+            }
+
             const thread = std.Thread.spawn(.{}, handleConnection, .{ self, connection.stream }) catch |err| {
                 std.log.err("Failed to spawn control API handler thread: {}", .{err});
                 connection.stream.close();
@@ -84,13 +95,19 @@ pub const ControlApiServer = struct {
             };
             thread.detach();
         }
+
+        if (self.server) |*server| {
+            server.deinit();
+            self.server = null;
+        }
     }
 
     pub fn stop(self: *Self) void {
         self.is_running.store(0, .release);
-        if (self.server) |*server| {
-            server.deinit();
-            self.server = null;
+        if (self.listen_host) |host| {
+            const address = net.Address.parseIp(host, self.listen_port) catch return;
+            const stream = net.tcpConnectToAddress(address) catch return;
+            stream.close();
         }
     }
 
@@ -103,7 +120,7 @@ pub const ControlApiServer = struct {
         }
 
         if (std.mem.eql(u8, req.path, "/readyz")) {
-            var ready_result = if (self.ready_renderer) |renderer|
+            const ready_result = if (self.ready_renderer) |renderer|
                 try renderer.render(renderer.ctx, self.allocator, self.state, connected_workers)
             else
                 try self.renderDefaultReady(connected_workers);
@@ -194,9 +211,10 @@ pub const ControlApiServer = struct {
         };
         defer req.deinit();
 
-        self.handleRequest(stream, &req) catch |err| {
+        _ = self.handleRequest(stream, &req) catch |err| {
             std.log.err("Control API route failed: {}", .{err});
             _ = http_server.writeResponse(stream, "500 Internal Server Error", &.{"Content-Type: text/plain"}, "error") catch {};
+            return;
         };
     }
 
@@ -208,7 +226,7 @@ pub const ControlApiServer = struct {
     }
 
     fn isReady(self: *Self, connected_workers: usize) !bool {
-        var ready_result = if (self.ready_renderer) |renderer|
+        const ready_result = if (self.ready_renderer) |renderer|
             try renderer.render(renderer.ctx, self.allocator, self.state, connected_workers)
         else
             try self.renderDefaultReady(connected_workers);

@@ -442,14 +442,6 @@ The controller exposes:
 
 Use `experiments/inference_qwen.json` as the reference config for Qwen 2.5 0.5B instruct inference. It binds the generation VMFB/MLIR, flattened weight file, tokenizer source/path, context length, EOS token, worker backend, and API token environment variable.
 
-For a clean end-to-end validation on a CUDA machine, use the fixed smoke runner:
-
-```sh
-./run_qwen_inference_smoke.sh
-```
-
-The script kills stale PCP inference processes, starts a fresh controller and worker on fixed localhost ports, waits for `healthz` and `readyz`, sends one constrained chat completion request, prints the decoded text, and tears everything down on exit so the next run starts clean.
-
 ### Example: Heterogeneous Multi-Node Cluster
 
 You can run workers with different hardware backends in the same training session.
@@ -566,17 +558,3 @@ pcp --supervise -- --shepherd --config experiment.json --workers 2
 ## Documentation
 
 For detailed technical documentation, architecture guides, and API references, see [DOCUMENTATION.md](DOCUMENTATION.md).
-
-## Limitations
-
-PCP currently implements data parallelism only. Model size is constrained by individual worker node memory capacity, as each worker maintains a complete copy of the model parameters. This limits scalability for very large models without implementing model parallelism techniques.
-
-The system requires manual conversion of PyTorch models to MLIR format. New architectures may require extending the operator library and corresponding VJP (vector-Jacobian product) rules for automatic differentiation. This process demands understanding of both the model architecture and the MLIR/StableHLO representation.
-
-## Future Work
-
-- Expand to support advanced distributed training algorithms beyond DiLoCo, including StreamingDiLoCo, NoLoCo, MuLoCo, etc
-
-- MLIR integration will be extended with a dialect for distributed heterogeneous computing à la ([PLDI 2025](https://pldi25.sigplan.org/details/pldi-2025-src/3/An-MLIR-Dialect-for-Distributed-Heterogeneous-Computing)). This enables first-class representation of distributed computation patterns directly in the compiler infrastructure, allowing hardware-specific optimizations across heterogeneous clusters.
-
-- We will experiment with alternative automatic differentiation methods beyond reverse-mode AD for exploration of approaches with reduced memory pressure.

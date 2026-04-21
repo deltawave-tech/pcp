@@ -1,0 +1,26 @@
+diff --git a/runtime/src/iree/hal/drivers/metal/executable.m b/runtime/src/iree/hal/drivers/metal/executable.m
+index 5913c47..3e7d047 100644
+--- a/runtime/src/iree/hal/drivers/metal/executable.m
++++ b/runtime/src/iree/hal/drivers/metal/executable.m
+@@ -65,7 +65,7 @@ iree_status_t iree_hal_metal_executable_infer_format(iree_const_byte_span_t exec
+   }
+ 
+   // Write the format string.
+-  iree_string_view_t format = IREE_SV("PTXE");
++  iree_string_view_t format = IREE_SV("MTL1");
+   if (format.size >= executable_format_capacity) {
+     return iree_make_status(IREE_STATUS_OUT_OF_RANGE, "executable format buffer too small");
+   }
+diff --git a/runtime/src/iree/hal/drivers/metal/nop_executable_cache.m b/runtime/src/iree/hal/drivers/metal/nop_executable_cache.m
+index 61cfdd1..d6288bc 100644
+--- a/runtime/src/iree/hal/drivers/metal/nop_executable_cache.m
++++ b/runtime/src/iree/hal/drivers/metal/nop_executable_cache.m
+@@ -77,7 +77,7 @@ static bool iree_hal_metal_nop_executable_cache_can_prepare_format(
+ static bool iree_hal_metal_nop_executable_cache_can_prepare_format(
+     iree_hal_executable_cache_t* base_executable_cache,
+     iree_hal_executable_caching_mode_t caching_mode, iree_string_view_t executable_format) {
+-  return iree_string_view_equal(executable_format, iree_make_cstring_view("MTLE"));
++  return iree_string_view_equal(executable_format, iree_make_cstring_view("metal-msl-fb"));
+ }
+ 
+ static iree_status_t iree_hal_metal_nop_executable_cache_prepare_executable(

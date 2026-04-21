@@ -1,5 +1,11 @@
 {
   description = "PCP - Planetary Compute Protocol";
+  nixConfig = {
+    extra-substituters = [ "https://pcp.cachix.org" ];
+    extra-trusted-public-keys = [
+      "pcp.cachix.org-1:D/JYXqFAnVLlvVUJEBOWoGLmJKwKW58SxPD0+m/HXZk="
+    ];
+  };
   inputs = {
     nixpkgs.url = "github:nixos/nixpkgs/nixos-25.05";
     zig-overlay.url = "github:mitchellh/zig-overlay";
@@ -14,9 +20,14 @@
       "x86_64-darwin"
     ] (system:
       let
+        isDarwinSystem = builtins.elem system [ "aarch64-darwin" "x86_64-darwin" ];
+        darwinDeploymentTarget = "13.0";
         pkgs = import nixpkgs {
           inherit system overlays;
           config.allowUnfree = true;
+          # A few transitive packages still need this escape hatch on Darwin.
+          config.allowUnsupportedSystem = isDarwinSystem;
+          config.allowBroken = isDarwinSystem;
         };
         lib = pkgs.lib;
         # zig is LLVM based. In order to ensure ABI compatibility, we have base our builds on
@@ -64,12 +75,12 @@
             export IREE_SOURCE_DIR="${packages.iree-sdk.src}"
             export IREE_BUILD_DIR="${packages.iree-sdk.build}"
             ${lib.optionalString pkgs.stdenv.isDarwin ''
-              export MACOSX_DEPLOYMENT_TARGET="11.0"
+              export MACOSX_DEPLOYMENT_TARGET="${darwinDeploymentTarget}"
             ''}
           '';
         };
 
-        packages.pcp = llvmPkg.stdenv.mkDerivation {
+        packages.pcp = llvmPkg.stdenv.mkDerivation ({
           name = "pcp";
           version = "main";
           src = ./.;
@@ -93,17 +104,19 @@
             packages.iree-sdk.build
             packages.iree-sdk.src
             pkgs.capnproto
+            pkgs.zlib
+            pkgs.zstd
           ];
           propagatedBuildInputs = [
             packages.iree-sdk
+          ] ++ lib.optionals pkgs.stdenv.isLinux [
             pkgs.cudaPackages.cuda_cudart
             pkgs.elfutils
             pkgs.glibc
             pkgs.libdrm
             pkgs.numactl
-            pkgs.zlib
-            pkgs.zstd
           ];
+          env.ZIG_SYSTEM_LINKER_HACK = lib.optionalString pkgs.stdenv.isDarwin "1";
           dontConfigure = true;
           doCheck = false;
           zigBuildFlags = [ "--verbose" "--color" "off" ];
@@ -112,8 +125,20 @@
           CAPNP_DIR = "${pkgs.capnproto}";
           IREE_SOURCE_DIR = "${packages.iree-sdk.src}";
           IREE_BUILD_DIR = "${packages.iree-sdk.build}";
+          preBuild = lib.optionalString pkgs.stdenv.isDarwin ''
+            export DEVELOPER_DIR="${pkgs.apple-sdk_15}"
+            export SDKROOT="${pkgs.apple-sdk_15}/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk"
+          '';
+          preInstall = lib.optionalString pkgs.stdenv.isDarwin ''
+            export DEVELOPER_DIR="${pkgs.apple-sdk_15}"
+            export SDKROOT="${pkgs.apple-sdk_15}/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk"
+          '';
 
-          postFixup = ''
+          postFixup = if pkgs.stdenv.isDarwin then ''
+            wrapProgram $out/bin/pcp \
+              --prefix PATH : "${packages.pcp-wandb-adapter}/bin" \
+              --suffix PATH : "${packages.iree-sdk}/bin"
+          '' else ''
             patchelf --add-needed libnuma.so.1 $out/bin/pcp
             patchelf --add-needed libelf.so.1 $out/bin/pcp
             patchelf --add-needed libz.so.1 $out/bin/pcp
@@ -151,7 +176,11 @@
               --prefix PATH : "${packages.pcp-wandb-adapter}/bin" \
               --suffix PATH : "${packages.iree-sdk}/bin"
           '';
-        };
+        } // lib.optionalAttrs pkgs.stdenv.isDarwin {
+          MACOSX_DEPLOYMENT_TARGET = darwinDeploymentTarget;
+          DEVELOPER_DIR = "${pkgs.apple-sdk_15}";
+          SDKROOT = "${pkgs.apple-sdk_15}/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk";
+        });
         checks.pcp = packages.pcp;
 
         packages.pcp-wandb-adapter = let
@@ -170,7 +199,7 @@
           config = { Cmd = [ "${packages.pcp}/bin/pcp" ]; };
         };
 
-        packages.iree-sdk = llvmPkg.stdenv.mkDerivation rec {
+        packages.iree-sdk = llvmPkg.stdenv.mkDerivation (rec {
           pname = "iree-sdk";
           version = "3.9.0";
           src = pkgs.fetchFromGitHub {
@@ -180,22 +209,26 @@
             hash = "sha256-O+yp6ysHQJKlgLnoK1esGdRmce6M4nPgFTsxEck0xw0=";
             fetchSubmodules = true;
           };
-          nativeBuildInputs =
-            [ pkgs.cmake pkgs.ninja pkgs.python3 pkgs.bintools pkgs.patchelf ];
+          patches = lib.optionals pkgs.stdenv.isDarwin [
+            ./nix/patches/iree-metal-v3_9_0-format-fixes.patch
+          ];
+          nativeBuildInputs = [ pkgs.cmake pkgs.ninja pkgs.python3 pkgs.bintools ]
+            ++ lib.optionals pkgs.stdenv.isLinux [ pkgs.patchelf ]
+            ++ lib.optionals pkgs.stdenv.isDarwin [ pkgs.apple-sdk_15 ];
           # Mix together a couple of dependencies needed to build the CUDA layer.  See
           # 'build_tools/scripts/fetch_cuda_deps.sh'.
-          postUnpack = ''
+          postUnpack = lib.optionalString pkgs.stdenv.isLinux ''
             set -e
 
             echo "Copying needed cuda artifacts"
-            icd=/build/iree_cuda_deps
+            icd=$NIX_BUILD_TOP/iree_cuda_deps
             mkdir -p $icd
             cp -r ${pkgs.cudaPackages_12_2.cuda_cccl.dev}/include $icd
-            chmod --recursive u+w $icd
+            chmod -R u+w $icd
             cp -r ${pkgs.cudaPackages_12_2.cuda_cudart.dev}/include $icd
-            chmod --recursive u+w $icd
+            chmod -R u+w $icd
             cp -r ${pkgs.cudaPackages_12_2.cuda_nvcc}/include $icd
-            chmod --recursive u+w $icd
+            chmod -R u+w $icd
 
             mkdir -p $icd/nvvm/
             cp -r ${pkgs.cudaPackages_12_2.cuda_nvcc}/nvvm/libdevice/ $icd/nvvm/
@@ -208,34 +241,46 @@
             # https://iree.dev/building-from-source/getting-started/#configuration-settings
             (lib.cmakeFeature "CMAKE_BUILD_TYPE" "RelWithDebInfo")
             (lib.cmakeFeature "CMAKE_AR" "ar")
+            (lib.cmakeBool "IREE_BUILD_TESTS" false)
+            (lib.cmakeBool "IREE_BUILD_SAMPLES" false)
             (lib.cmakeBool "CMAKE_SKIP_INSTALL_RPATH" true)
 
             (lib.cmakeBool "IREE_ENABLE_ASSERTIONS" true)
             (lib.cmakeBool "IREE_ENABLE_SPLIT_DWARF" true)
-            (lib.cmakeBool "IREE_ENABLE_THIN_ARCHIVES" true)
+            (lib.cmakeBool "IREE_ENABLE_THIN_ARCHIVES" pkgs.stdenv.isLinux)
             (lib.cmakeBool "IREE_ENABLE_LLD" true)
-
-            (lib.cmakeFeature "CUDAToolkit_ROOT" "/build/iree_cuda_deps")
+            (lib.cmakeBool "IREE_HAL_DRIVER_LOCAL_SYNC" true)
+            (lib.cmakeBool "IREE_HAL_DRIVER_LOCAL_TASK" true)
+            (lib.cmakeBool "IREE_TARGET_BACKEND_METAL_SPIRV" true)
+            (lib.cmakeBool "IREE_HAL_DRIVER_METAL" pkgs.stdenv.isDarwin)
+            (lib.cmakeBool "IREE_HAL_DRIVER_VULKAN" pkgs.stdenv.isLinux)
+            "-B"
+            "build"
+          ] ++ lib.optionals pkgs.stdenv.isDarwin [
+            (lib.cmakeFeature "CMAKE_OSX_DEPLOYMENT_TARGET" darwinDeploymentTarget)
+            (lib.cmakeFeature "CMAKE_OSX_SYSROOT"
+              "${pkgs.apple-sdk_15}/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk")
+          ] ++ lib.optionals pkgs.stdenv.isLinux [
+            (lib.cmakeFeature "CUDAToolkit_ROOT" "../iree_cuda_deps")
             (lib.cmakeFeature "IREE_TARGET_BACKEND_ROCM_DEVICE_BC_PATH"
               "${packages.iree-amdgpu-device-libs}")
             (lib.cmakeBool "IREE_HAL_DRIVER_CUDA" true)
             (lib.cmakeBool "IREE_HAL_DRIVER_HIP" true)
-            (lib.cmakeBool "IREE_HAL_DRIVER_VULKAN" true)
             (lib.cmakeBool "IREE_TARGET_BACKEND_CUDA" true)
             (lib.cmakeBool "IREE_TARGET_BACKEND_ROCM" true)
-            "-B"
-            "/build/build"
           ];
-          ninjaFlags = [ "-C" "/build/build" ];
 
-          IREE_CUDA_DEPS_DIR = "/build/iree_cuda_deps";
+          ninjaFlags = [ "-C" "build" ];
+
           preConfigure = ''
-            mkdir /build/build
+            mkdir -p build
           '';
 
           outputs = [ "out" "build" ];
           postInstall = ''
             mkdir -p $build
+            cp -r build/* $build/
+          '' + lib.optionalString pkgs.stdenv.isLinux ''
             to_patch=(
               iree-compile
               iree-link
@@ -248,9 +293,10 @@
             )
 
             for f in ''${to_patch[@]}; do
-              patchelf --remove-rpath /build/build/tools/$f
+              if [ -f "$build/tools/$f" ]; then
+                patchelf --remove-rpath $build/tools/$f
+              fi
             done
-            cp -r /build/build/* $build/
           '';
 
           # Prevent the `_multioutDevs` routine to perform any action. -- It tries to move
@@ -260,9 +306,18 @@
           meta = {
             description = "IREE SDK built from source";
             homepage = "https://iree.dev/";
-            platforms = [ "aarch64-darwin" "x86_64-darwin" "x86_64-linux" ];
+            platforms = [
+              "aarch64-darwin"
+              "aarch64-linux"
+              "x86_64-darwin"
+              "x86_64-linux"
+            ];
           };
-        };
+        } // lib.optionalAttrs pkgs.stdenv.isDarwin {
+          MACOSX_DEPLOYMENT_TARGET = darwinDeploymentTarget;
+          DEVELOPER_DIR = "${pkgs.apple-sdk_15}";
+          SDKROOT = "${pkgs.apple-sdk_15}/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk";
+        });
 
         # See ${packages.iree-sdk.src}/compiler/plugins/target/ROCM/CMakeLists.txt
         packages.iree-amdgpu-device-libs = pkgs.fetchzip {

@@ -24,6 +24,35 @@ const IreeConfig = struct {
     build_dir: ?[]const u8 = null, // Path to 'iree-build'
 };
 
+fn cxxRuntimeLibName(os_tag: std.Target.Os.Tag) []const u8 {
+    return switch (os_tag) {
+        .macos => "c++",
+        else => "stdc++",
+    };
+}
+
+fn linkCxxRuntime(target: *std.Build.Step.Compile) void {
+    const os_tag = target.root_module.resolved_target.?.result.os.tag;
+    target.linkSystemLibrary(cxxRuntimeLibName(os_tag));
+}
+
+fn detectDarwinSdkRoot(b: *std.Build) ?[]const u8 {
+    if (std.process.getEnvVarOwned(b.allocator, "DEVELOPER_DIR")) |developer_dir| {
+        return b.pathJoin(&.{ developer_dir, "Platforms", "MacOSX.platform", "Developer", "SDKs", "MacOSX.sdk" });
+    } else |_| {}
+
+    return std.process.getEnvVarOwned(b.allocator, "SDKROOT") catch null;
+}
+
+fn addDarwinSdkLinkPaths(b: *std.Build, target: *std.Build.Step.Compile) void {
+    const sdk_root = detectDarwinSdkRoot(b) orelse return;
+    const sdk_lib_dir = b.pathJoin(&.{ sdk_root, "usr", "lib" });
+    const sdk_framework_dir = b.pathJoin(&.{ sdk_root, "System", "Library", "Frameworks" });
+
+    target.addLibraryPath(.{ .cwd_relative = sdk_lib_dir });
+    target.addFrameworkPath(.{ .cwd_relative = sdk_framework_dir });
+}
+
 // Attempt to find Cap'n Proto installation
 fn detectCapnp(b: *std.Build) CapnpConfig {
     var config = CapnpConfig{};
@@ -327,13 +356,13 @@ fn addIreeDependencies(target: *std.Build.Step.Compile, b: *std.Build, iree_conf
     dialect_anchors_lib.addIncludePath(.{ .cwd_relative = b.fmt("{s}/llvm-project/tools/mlir/include", .{build_dir}) });
     dialect_anchors_lib.addIncludePath(.{ .cwd_relative = b.fmt("{s}/third_party/stablehlo", .{source_dir}) });
     dialect_anchors_lib.addIncludePath(.{ .cwd_relative = b.fmt("{s}/llvm-external-projects/stablehlo", .{build_dir}) });
-    dialect_anchors_lib.linkSystemLibrary("stdc++");
+    linkCxxRuntime(dialect_anchors_lib);
 
     target.linkLibrary(dialect_anchors_lib);
     target.step.dependOn(&dialect_anchors_lib.step);
 
     // --- Link All Required Libraries ---
-    target.linkSystemLibrary("stdc++");
+    linkCxxRuntime(target);
 
     // Core IREE
     target.linkSystemLibrary("IREECompiler");
@@ -355,6 +384,7 @@ fn addIreeDependencies(target: *std.Build.Step.Compile, b: *std.Build, iree_conf
     // Platform-specific GPU drivers
     if (target.root_module.resolved_target.?.result.os.tag == .macos) {
         // Metal driver for macOS
+        addDarwinSdkLinkPaths(b, target);
         target.addLibraryPath(.{ .cwd_relative = b.fmt("{s}/runtime/src/iree/hal/drivers/metal", .{build_dir}) });
         target.addLibraryPath(.{ .cwd_relative = b.fmt("{s}/runtime/src/iree/hal/drivers/metal/registration", .{build_dir}) });
         target.addLibraryPath(.{ .cwd_relative = b.fmt("{s}/runtime/src/iree/hal/drivers/metal/builtin", .{build_dir}) });
@@ -589,7 +619,7 @@ pub fn build(b: *std.Build) void {
             },
             .flags = &.{"-std=c++17"},
         });
-        capnp_bridge_lib.linkSystemLibrary("stdc++"); // Link against libstdc++ for clang compatibility
+        linkCxxRuntime(capnp_bridge_lib);
 
         // NEW: Expose the public header directory to any executable that links this library.
         capnp_bridge_lib.addIncludePath(b.path("src/network"));
@@ -621,8 +651,8 @@ pub fn build(b: *std.Build) void {
         pcp.linkSystemLibrary("capnp");
         pcp.linkSystemLibrary("kj");
 
-        // Ensure libstdc++ is linked after Cap'n Proto libraries for proper symbol resolution
-        pcp.linkSystemLibrary("stdc++");
+        // Keep the C++ runtime linked after Cap'n Proto libraries for symbol resolution.
+        linkCxxRuntime(pcp);
 
         std.debug.print("==> Cap'n Proto bridge library configured successfully\n", .{});
     }

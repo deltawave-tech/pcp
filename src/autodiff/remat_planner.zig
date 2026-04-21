@@ -337,6 +337,10 @@ fn buildCheckmatePlanningProblem(
 
     var total_retained_before: u64 = 0;
     var base_retained_bytes: u64 = 0;
+    const forward_stage_count = graph_metadata.op_metadata.len;
+    const backward_stage_by_op = try buildBackwardStageIndexByOp(allocator, graph_metadata);
+    defer allocator.free(backward_stage_by_op);
+    const backward_stage_count = countBackwardStages(backward_stage_by_op);
     var candidate_metadata_indices = std.ArrayList(usize).init(allocator);
     defer candidate_metadata_indices.deinit();
     var candidates = std.ArrayList(checkmate_planner.Candidate).init(allocator);
@@ -348,8 +352,10 @@ fn buildCheckmatePlanningProblem(
         }
         candidates.deinit();
     }
-    var base_stage_bytes = try allocator.dupe(u64, graph_metadata.base_stage_bytes);
+    var base_stage_bytes = try allocator.alloc(u64, forward_stage_count + backward_stage_count);
     errdefer allocator.free(base_stage_bytes);
+    @memcpy(base_stage_bytes[0..forward_stage_count], graph_metadata.base_stage_bytes);
+    @memset(base_stage_bytes[forward_stage_count..], 0);
     var candidate_index_by_metadata = try allocator.alloc(?usize, metadata.len);
     defer allocator.free(candidate_index_by_metadata);
 
@@ -374,6 +380,7 @@ fn buildCheckmatePlanningProblem(
             .producer_candidate_indices = try allocator.alloc(usize, 0),
             .user_candidate_indices = try allocator.alloc(usize, 0),
             .use_stage_indices = try allocator.alloc(usize, 0),
+            .backward_use_stage_indices = try allocator.alloc(usize, 0),
         });
         for (entry.op_index..entry.last_forward_use_index + 1) |stage_idx| {
             base_stage_bytes[stage_idx] -|= entry.result_bytes;
@@ -400,6 +407,13 @@ fn buildCheckmatePlanningProblem(
             entry.user_indices,
             entry.last_forward_use_index,
         );
+        allocator.free(candidates.items[candidate_idx].backward_use_stage_indices);
+        candidates.items[candidate_idx].backward_use_stage_indices = try collectBackwardUseStageIndices(
+            allocator,
+            entry.user_indices,
+            backward_stage_by_op,
+            forward_stage_count,
+        );
     }
 
     return .{
@@ -410,6 +424,8 @@ fn buildCheckmatePlanningProblem(
         .base_retained_bytes = base_retained_bytes,
         .total_retained_bytes_before = total_retained_before,
         .budget = budget,
+        .forward_stage_count = forward_stage_count,
+        .backward_stage_count = backward_stage_count,
     };
 }
 
@@ -457,6 +473,70 @@ fn collectUseStageIndices(
         }
     }
     if (!has_last_stage) try stages.append(last_forward_use_index);
+
+    std.sort.block(usize, stages.items, {}, struct {
+        fn lessThan(_: void, lhs: usize, rhs: usize) bool {
+            return lhs < rhs;
+        }
+    }.lessThan);
+
+    return stages.toOwnedSlice();
+}
+
+fn buildBackwardStageIndexByOp(
+    allocator: Allocator,
+    graph_metadata: *const GraphMetadata,
+) ![]?usize {
+    const ops = graph_metadata.ops_in_forward_order;
+    const backward_stage_by_op = try allocator.alloc(?usize, ops.len);
+    for (backward_stage_by_op) |*entry| entry.* = null;
+
+    var backward_stage_idx: usize = 0;
+    var op_idx = ops.len;
+    while (op_idx > 0) {
+        op_idx -= 1;
+        const op = ops[op_idx];
+        const name = op.getName();
+        if (std.mem.eql(u8, name, "func.return") or std.mem.eql(u8, name, "stablehlo.constant")) {
+            continue;
+        }
+        backward_stage_by_op[op_idx] = backward_stage_idx;
+        backward_stage_idx += 1;
+    }
+
+    return backward_stage_by_op;
+}
+
+fn countBackwardStages(backward_stage_by_op: []const ?usize) usize {
+    var count: usize = 0;
+    for (backward_stage_by_op) |entry| {
+        if (entry != null) count += 1;
+    }
+    return count;
+}
+
+fn collectBackwardUseStageIndices(
+    allocator: Allocator,
+    user_indices: []const usize,
+    backward_stage_by_op: []const ?usize,
+    forward_stage_count: usize,
+) ![]usize {
+    var stages = std.ArrayList(usize).init(allocator);
+    defer stages.deinit();
+
+    for (user_indices) |user_idx| {
+        if (backward_stage_by_op[user_idx]) |backward_stage_idx| {
+            const combined_stage_idx = forward_stage_count + backward_stage_idx;
+            var seen = false;
+            for (stages.items) |existing| {
+                if (existing == combined_stage_idx) {
+                    seen = true;
+                    break;
+                }
+            }
+            if (!seen) try stages.append(combined_stage_idx);
+        }
+    }
 
     std.sort.block(usize, stages.items, {}, struct {
         fn lessThan(_: void, lhs: usize, rhs: usize) bool {

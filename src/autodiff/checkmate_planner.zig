@@ -32,6 +32,7 @@ pub const Candidate = struct {
     producer_candidate_indices: []usize,
     user_candidate_indices: []usize,
     use_stage_indices: []usize,
+    backward_use_stage_indices: []usize,
 };
 
 pub const PlanningProblem = struct {
@@ -42,12 +43,15 @@ pub const PlanningProblem = struct {
     base_retained_bytes: u64,
     total_retained_bytes_before: u64,
     budget: u64,
+    forward_stage_count: usize,
+    backward_stage_count: usize,
 
     pub fn deinit(self: *PlanningProblem) void {
         for (self.candidates) |candidate| {
             self.allocator.free(candidate.producer_candidate_indices);
             self.allocator.free(candidate.user_candidate_indices);
             self.allocator.free(candidate.use_stage_indices);
+            self.allocator.free(candidate.backward_use_stage_indices);
         }
         self.allocator.free(self.candidates);
         self.allocator.free(self.candidate_metadata_indices);
@@ -184,6 +188,7 @@ pub fn buildMilpModel(allocator: Allocator, problem: *const PlanningProblem) !Mi
     var recompute_var_count: usize = 0;
     for (problem.candidates) |candidate| {
         recompute_var_count += candidate.last_forward_use_index - candidate.op_index + 1;
+        recompute_var_count += candidate.backward_use_stage_indices.len;
     }
     const total_variable_count = keep_variable_count + recompute_var_count;
 
@@ -220,6 +225,19 @@ pub fn buildMilpModel(allocator: Allocator, problem: *const PlanningProblem) !Mi
             objective_coefficients[next_var_idx] = candidate.weighted_recompute_cost;
             next_var_idx += 1;
         }
+        for (candidate.backward_use_stage_indices) |stage_idx| {
+            recompute_variables[next_var_idx - keep_variable_count] = .{
+                .candidate_index = candidate_idx,
+                .stage_index = stage_idx,
+            };
+            variable_names[next_var_idx] = try std.fmt.allocPrintZ(
+                allocator,
+                "remat_{d}_{d}",
+                .{ candidate_idx, stage_idx },
+            );
+            objective_coefficients[next_var_idx] = candidate.weighted_recompute_cost;
+            next_var_idx += 1;
+        }
     }
 
     var stage_constraints = std.ArrayList(LinearConstraint).init(allocator);
@@ -234,7 +252,7 @@ pub fn buildMilpModel(allocator: Allocator, problem: *const PlanningProblem) !Mi
         var terms = std.ArrayList(LinearTerm).init(allocator);
         errdefer terms.deinit();
         for (problem.candidates, 0..) |candidate, candidate_idx| {
-            if (candidate.op_index <= stage_idx and candidate.last_forward_use_index >= stage_idx) {
+            if (candidateKeptAtStage(candidate, stage_idx, problem.forward_stage_count)) {
                 try terms.append(.{
                     .variable_index = candidate_idx,
                     .coefficient = @floatFromInt(candidate.bytes),
@@ -268,6 +286,29 @@ pub fn buildMilpModel(allocator: Allocator, problem: *const PlanningProblem) !Mi
     }
     for (problem.candidates, 0..) |candidate, candidate_idx| {
         for (candidate.use_stage_indices) |use_stage_idx| {
+            var terms = std.ArrayList(LinearTerm).init(allocator);
+            errdefer terms.deinit();
+            try terms.append(.{
+                .variable_index = candidate_idx,
+                .coefficient = 1.0,
+            });
+            for (recompute_variables, 0..) |recompute_var, recompute_idx| {
+                if (recompute_var.candidate_index == candidate_idx and recompute_var.stage_index <= use_stage_idx) {
+                    try terms.append(.{
+                        .variable_index = keep_variable_count + recompute_idx,
+                        .coefficient = 1.0,
+                    });
+                }
+            }
+            try availability_constraints.append(.{
+                .allocator = allocator,
+                .name = try std.fmt.allocPrintZ(allocator, "avail_{d}_{d}", .{ candidate_idx, use_stage_idx }),
+                .terms = try terms.toOwnedSlice(),
+                .rhs = 1.0,
+                .sense = .greater_equal,
+            });
+        }
+        for (candidate.backward_use_stage_indices) |use_stage_idx| {
             var terms = std.ArrayList(LinearTerm).init(allocator);
             errdefer terms.deinit();
             try terms.append(.{
@@ -796,6 +837,19 @@ fn evaluateKeepMask(candidates: []const Candidate, base_stage_bytes: []const u64
     };
 }
 
+fn candidateKeptAtStage(candidate: Candidate, stage_idx: usize, forward_stage_count: usize) bool {
+    if (stage_idx < forward_stage_count) {
+        return candidate.op_index <= stage_idx and candidate.last_forward_use_index >= stage_idx;
+    }
+    if (candidate.backward_use_stage_indices.len == 0) return false;
+
+    var max_backward_stage = candidate.backward_use_stage_indices[0];
+    for (candidate.backward_use_stage_indices[1..]) |backward_stage| {
+        max_backward_stage = @max(max_backward_stage, backward_stage);
+    }
+    return stage_idx <= max_backward_stage;
+}
+
 fn evaluateScheduledSolution(
     problem: *const PlanningProblem,
     model: *const MilpModel,
@@ -821,7 +875,7 @@ fn evaluateScheduledSolution(
     for (problem.base_stage_bytes, 0..) |base_bytes, stage_idx| {
         var stage_bytes = base_bytes;
         for (problem.candidates, 0..) |candidate, candidate_idx| {
-            if (keep_mask[candidate_idx] and candidate.op_index <= stage_idx and candidate.last_forward_use_index >= stage_idx) {
+            if (keep_mask[candidate_idx] and candidateKeptAtStage(candidate, stage_idx, problem.forward_stage_count)) {
                 stage_bytes += candidate.bytes;
             }
         }
@@ -981,6 +1035,7 @@ fn dupCandidates(allocator: Allocator, candidates: []const Candidate) ![]Candida
             .producer_candidate_indices = try allocator.dupe(usize, candidate.producer_candidate_indices),
             .user_candidate_indices = try allocator.dupe(usize, candidate.user_candidate_indices),
             .use_stage_indices = try allocator.dupe(usize, candidate.use_stage_indices),
+            .backward_use_stage_indices = try allocator.dupe(usize, candidate.backward_use_stage_indices),
         };
     }
 
@@ -999,6 +1054,7 @@ test "stage-aware exact planner prefers keeping long-lived expensive candidate" 
             .producer_candidate_indices = &.{},
             .user_candidate_indices = &.{},
             .use_stage_indices = &.{2},
+            .backward_use_stage_indices = &.{},
         },
         .{
             .bytes = 8,
@@ -1008,6 +1064,7 @@ test "stage-aware exact planner prefers keeping long-lived expensive candidate" 
             .producer_candidate_indices = &.{},
             .user_candidate_indices = &.{},
             .use_stage_indices = &.{1},
+            .backward_use_stage_indices = &.{},
         },
         .{
             .bytes = 8,
@@ -1017,6 +1074,7 @@ test "stage-aware exact planner prefers keeping long-lived expensive candidate" 
             .producer_candidate_indices = &.{},
             .user_candidate_indices = &.{},
             .use_stage_indices = &.{2},
+            .backward_use_stage_indices = &.{},
         },
     };
 
@@ -1049,6 +1107,7 @@ test "milp model captures stage constraints and dependency edges" {
             .producer_candidate_indices = &.{},
             .user_candidate_indices = &.{1},
             .use_stage_indices = &.{ 1, 2 },
+            .backward_use_stage_indices = &.{},
         },
         .{
             .bytes = 4,
@@ -1058,6 +1117,7 @@ test "milp model captures stage constraints and dependency edges" {
             .producer_candidate_indices = &.{0},
             .user_candidate_indices = &.{},
             .use_stage_indices = &.{1},
+            .backward_use_stage_indices = &.{},
         },
     };
     var problem = PlanningProblem{
@@ -1068,6 +1128,8 @@ test "milp model captures stage constraints and dependency edges" {
         .base_retained_bytes = 0,
         .total_retained_bytes_before = 14,
         .budget = 8,
+        .forward_stage_count = 3,
+        .backward_stage_count = 0,
     };
     defer problem.deinit();
 
@@ -1101,6 +1163,7 @@ test "milp model writes lp scaffold" {
             .producer_candidate_indices = &.{},
             .user_candidate_indices = &.{},
             .use_stage_indices = &.{0},
+            .backward_use_stage_indices = &.{},
         },
     };
     var problem = PlanningProblem{
@@ -1111,6 +1174,8 @@ test "milp model writes lp scaffold" {
         .base_retained_bytes = 0,
         .total_retained_bytes_before = 8,
         .budget = 8,
+        .forward_stage_count = 1,
+        .backward_stage_count = 0,
     };
     defer problem.deinit();
 
@@ -1141,6 +1206,7 @@ test "external milp solution parser reads keep assignments" {
             .producer_candidate_indices = &.{},
             .user_candidate_indices = &.{},
             .use_stage_indices = &.{0},
+            .backward_use_stage_indices = &.{},
         },
         .{
             .bytes = 8,
@@ -1150,6 +1216,7 @@ test "external milp solution parser reads keep assignments" {
             .producer_candidate_indices = &.{},
             .user_candidate_indices = &.{},
             .use_stage_indices = &.{1},
+            .backward_use_stage_indices = &.{},
         },
     };
     var problem = PlanningProblem{
@@ -1160,6 +1227,8 @@ test "external milp solution parser reads keep assignments" {
         .base_retained_bytes = 0,
         .total_retained_bytes_before = 16,
         .budget = 8,
+        .forward_stage_count = 2,
+        .backward_stage_count = 0,
     };
     defer problem.deinit();
 
@@ -1196,6 +1265,7 @@ test "planning problem exact solver handles branching lifetime tradeoff" {
             .producer_candidate_indices = &.{},
             .user_candidate_indices = &.{1},
             .use_stage_indices = &.{ 1, 3 },
+            .backward_use_stage_indices = &.{},
         },
         .{
             .bytes = 8,
@@ -1205,6 +1275,7 @@ test "planning problem exact solver handles branching lifetime tradeoff" {
             .producer_candidate_indices = &.{0},
             .user_candidate_indices = &.{},
             .use_stage_indices = &.{1},
+            .backward_use_stage_indices = &.{},
         },
         .{
             .bytes = 8,
@@ -1214,6 +1285,7 @@ test "planning problem exact solver handles branching lifetime tradeoff" {
             .producer_candidate_indices = &.{0},
             .user_candidate_indices = &.{},
             .use_stage_indices = &.{2},
+            .backward_use_stage_indices = &.{},
         },
     };
     var problem = PlanningProblem{
@@ -1224,6 +1296,8 @@ test "planning problem exact solver handles branching lifetime tradeoff" {
         .base_retained_bytes = 0,
         .total_retained_bytes_before = 24,
         .budget = 8,
+        .forward_stage_count = 4,
+        .backward_stage_count = 0,
     };
     defer problem.deinit();
 
@@ -1246,6 +1320,7 @@ test "exact backend beats greedy on overlapping intervals" {
             .producer_candidate_indices = &.{},
             .user_candidate_indices = &.{},
             .use_stage_indices = &.{2},
+            .backward_use_stage_indices = &.{},
         },
         .{
             .bytes = 8,
@@ -1255,6 +1330,7 @@ test "exact backend beats greedy on overlapping intervals" {
             .producer_candidate_indices = &.{},
             .user_candidate_indices = &.{},
             .use_stage_indices = &.{0},
+            .backward_use_stage_indices = &.{},
         },
         .{
             .bytes = 8,
@@ -1264,6 +1340,7 @@ test "exact backend beats greedy on overlapping intervals" {
             .producer_candidate_indices = &.{},
             .user_candidate_indices = &.{},
             .use_stage_indices = &.{1},
+            .backward_use_stage_indices = &.{},
         },
     };
     var problem = PlanningProblem{
@@ -1274,6 +1351,8 @@ test "exact backend beats greedy on overlapping intervals" {
         .base_retained_bytes = 0,
         .total_retained_bytes_before = 24,
         .budget = 8,
+        .forward_stage_count = 3,
+        .backward_stage_count = 0,
     };
     defer problem.deinit();
 
@@ -1299,6 +1378,7 @@ test "glpk backend matches exact bounded solver on small problem" {
             .producer_candidate_indices = &.{},
             .user_candidate_indices = &.{},
             .use_stage_indices = &.{2},
+            .backward_use_stage_indices = &.{},
         },
         .{
             .bytes = 8,
@@ -1308,6 +1388,7 @@ test "glpk backend matches exact bounded solver on small problem" {
             .producer_candidate_indices = &.{},
             .user_candidate_indices = &.{},
             .use_stage_indices = &.{0},
+            .backward_use_stage_indices = &.{},
         },
         .{
             .bytes = 8,
@@ -1317,6 +1398,7 @@ test "glpk backend matches exact bounded solver on small problem" {
             .producer_candidate_indices = &.{},
             .user_candidate_indices = &.{},
             .use_stage_indices = &.{1},
+            .backward_use_stage_indices = &.{},
         },
     };
     var problem = PlanningProblem{
@@ -1327,6 +1409,8 @@ test "glpk backend matches exact bounded solver on small problem" {
         .base_retained_bytes = 0,
         .total_retained_bytes_before = 24,
         .budget = 8,
+        .forward_stage_count = 3,
+        .backward_stage_count = 0,
     };
     defer problem.deinit();
 

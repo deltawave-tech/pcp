@@ -7,6 +7,7 @@ const graph_adapter = @import("graph_adapter.zig");
 const event_ingest = @import("event_ingest.zig");
 const policy_store = @import("../graph/policy_store.zig");
 const graph_types = @import("../graph/types.zig");
+const mutation_log = @import("../graph/mutation_log.zig");
 
 pub const FederationPeer = struct {
     gateway_id: []u8,
@@ -27,6 +28,26 @@ pub const FederationPeer = struct {
         allocator.free(self.graph_backend);
         allocator.free(self.status);
     }
+};
+
+const NamespaceReplicationStatus = struct {
+    namespace_id: []const u8,
+    default_visibility: []const u8,
+    allow_global_replication: bool,
+    allow_raw_payload_export: bool,
+    policy_updated_at: i64,
+    total_mutations: usize,
+    pending_mutations: usize,
+    local_mutations: usize,
+    shared_mutations: usize,
+    global_mutations: usize,
+    entity_mutations: usize,
+    relation_mutations: usize,
+    observation_mutations: usize,
+    policy_mutations: usize,
+    last_sequence_no: u64,
+    replicated_through_sequence: u64,
+    replication_lag: u64,
 };
 
 pub const FederationState = struct {
@@ -293,6 +314,7 @@ pub const Gateway = struct {
                 "service.rl.proxy",
                 "service.training.proxy",
                 "federation.status",
+                "federation.replication.inspect",
                 "events.ingest",
             },
         }, .{});
@@ -310,6 +332,71 @@ pub const Gateway = struct {
             self.config.lab_id,
             self.config.resolvedGlobalControllerEndpoint(),
         );
+    }
+
+    pub fn renderFederationReplicationJson(self: *Self, allocator: Allocator) ![]u8 {
+        const last_sequence_no = self.graph.lastSequence();
+        const last_replicated_sequence = self.graph.lastReplicatedSequence();
+        const pending_mutations = self.graph.countPendingReplications();
+        self.federation.updateReplicationState(last_sequence_no, last_replicated_sequence, pending_mutations);
+
+        const stats = try self.graph.listNamespaceMutationStats(allocator, last_replicated_sequence);
+        defer graph_adapter.GatewayGraph.deinitNamespaceMutationStats(allocator, stats);
+
+        const policies = try self.policy_store.listSnapshots(allocator);
+        defer allocator.free(policies);
+
+        var namespaces = std.ArrayList(NamespaceReplicationStatus).init(allocator);
+        defer namespaces.deinit();
+
+        for (stats) |stat| {
+            const snapshot = self.policy_store.getSnapshot(stat.namespace_id, defaultPolicyVisibility(self.config));
+            try namespaces.append(namespaceResponseFromStats(stat, snapshot));
+        }
+
+        for (policies) |policy| {
+            if (containsNamespace(namespaces.items, policy.namespace_id)) continue;
+            try namespaces.append(.{
+                .namespace_id = policy.namespace_id,
+                .default_visibility = policy.default_visibility,
+                .allow_global_replication = policy.allow_global_replication,
+                .allow_raw_payload_export = policy.allow_raw_payload_export,
+                .policy_updated_at = policy.updated_at,
+                .total_mutations = 0,
+                .pending_mutations = 0,
+                .local_mutations = 0,
+                .shared_mutations = 0,
+                .global_mutations = 0,
+                .entity_mutations = 0,
+                .relation_mutations = 0,
+                .observation_mutations = 0,
+                .policy_mutations = 0,
+                .last_sequence_no = 0,
+                .replicated_through_sequence = 0,
+                .replication_lag = 0,
+            });
+        }
+
+        self.federation.mutex.lock();
+        defer self.federation.mutex.unlock();
+
+        return std.json.stringifyAlloc(allocator, .{
+            .gateway_id = self.config.gateway_id,
+            .lab_id = self.config.lab_id,
+            .connected = self.federation.connected,
+            .status = self.federation.status_text,
+            .global_controller_endpoint = self.federation.upstream_endpoint orelse self.config.resolvedGlobalControllerEndpoint(),
+            .last_sync_at = self.federation.last_sync_at,
+            .last_error = self.federation.last_error,
+            .summary = .{
+                .namespace_count = namespaces.items.len,
+                .last_sequence_no = last_sequence_no,
+                .last_replicated_sequence = last_replicated_sequence,
+                .pending_mutations = pending_mutations,
+                .replication_lag = last_sequence_no -| last_replicated_sequence,
+            },
+            .namespaces = namespaces.items,
+        }, .{});
     }
 };
 
@@ -332,6 +419,38 @@ fn replaceStringLocked(state: *FederationState, target: *[]u8, value: []const u8
 fn replaceOptionalStringLocked(state: *FederationState, target: *?[]u8, value: []const u8) !void {
     if (target.*) |existing| state.allocator.free(existing);
     target.* = try state.allocator.dupe(u8, value);
+}
+
+fn containsNamespace(namespaces: []const NamespaceReplicationStatus, namespace_id: []const u8) bool {
+    for (namespaces) |namespace| {
+        if (std.mem.eql(u8, namespace.namespace_id, namespace_id)) return true;
+    }
+    return false;
+}
+
+fn namespaceResponseFromStats(
+    stat: mutation_log.NamespaceMutationStats,
+    snapshot: policy_store.NamespacePolicySnapshot,
+) NamespaceReplicationStatus {
+    return .{
+        .namespace_id = stat.namespace_id,
+        .default_visibility = snapshot.default_visibility,
+        .allow_global_replication = snapshot.allow_global_replication,
+        .allow_raw_payload_export = snapshot.allow_raw_payload_export,
+        .policy_updated_at = snapshot.updated_at,
+        .total_mutations = stat.total_mutations,
+        .pending_mutations = stat.pending_mutations,
+        .local_mutations = stat.local_mutations,
+        .shared_mutations = stat.shared_mutations,
+        .global_mutations = stat.global_mutations,
+        .entity_mutations = stat.entity_mutations,
+        .relation_mutations = stat.relation_mutations,
+        .observation_mutations = stat.observation_mutations,
+        .policy_mutations = stat.policy_mutations,
+        .last_sequence_no = stat.last_sequence_no,
+        .replicated_through_sequence = stat.replicated_through_sequence,
+        .replication_lag = stat.last_sequence_no -| stat.replicated_through_sequence,
+    };
 }
 
 fn stringField(object: std.json.ObjectMap, key: []const u8) ?[]const u8 {

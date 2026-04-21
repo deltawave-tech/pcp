@@ -170,6 +170,16 @@ pub const GraphStore = struct {
         return self.mutation_store.snapshotFrom(allocator, after_sequence_no, max_items);
     }
 
+    pub fn listNamespaceMutationStats(self: *Self, allocator: Allocator, replicated_through_sequence: ?u64) ![]mutation_log.NamespaceMutationStats {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.mutation_store.listNamespaceStats(allocator, replicated_through_sequence);
+    }
+
+    pub fn deinitNamespaceMutationStats(allocator: Allocator, stats: []mutation_log.NamespaceMutationStats) void {
+        mutation_log.GraphMutationStore.deinitNamespaceStats(allocator, stats);
+    }
+
     pub fn applyReplicatedBatch(
         self: *Self,
         allocator: Allocator,

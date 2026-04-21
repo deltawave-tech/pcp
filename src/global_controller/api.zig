@@ -170,6 +170,13 @@ pub const GlobalControllerApiServer = struct {
             return true;
         }
 
+        if (std.mem.eql(u8, req.method, "GET") and std.mem.eql(u8, req.path, "/v1/global-graph/replication")) {
+            const body = try self.controller.renderReplicationJson(self.allocator);
+            defer self.allocator.free(body);
+            try http_server.writeResponse(stream, "200 OK", &.{"Content-Type: application/json"}, body);
+            return true;
+        }
+
         if (std.mem.eql(u8, req.method, "GET") and std.mem.eql(u8, req.path, "/v1/graph/policies")) {
             const body = try self.controller.renderPoliciesJson(self.allocator);
             defer self.allocator.free(body);

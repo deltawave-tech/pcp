@@ -29,6 +29,25 @@ pub const MutationRecord = struct {
     }
 };
 
+pub const NamespaceMutationStats = struct {
+    namespace_id: []u8,
+    total_mutations: usize,
+    pending_mutations: usize,
+    local_mutations: usize,
+    shared_mutations: usize,
+    global_mutations: usize,
+    entity_mutations: usize,
+    relation_mutations: usize,
+    observation_mutations: usize,
+    policy_mutations: usize,
+    last_sequence_no: u64,
+    replicated_through_sequence: u64,
+
+    pub fn deinit(self: *NamespaceMutationStats, allocator: Allocator) void {
+        allocator.free(self.namespace_id);
+    }
+};
+
 pub fn cloneRecord(allocator: Allocator, record: MutationRecord) !MutationRecord {
     return .{
         .mutation_id = try allocator.dupe(u8, record.mutation_id),
@@ -179,6 +198,43 @@ pub const MemoryMutationStore = struct {
 
         return matches.toOwnedSlice();
     }
+
+    pub fn listNamespaceStats(self: *Self, allocator: Allocator, replicated_through_sequence: ?u64) ![]NamespaceMutationStats {
+        var stats = std.ArrayList(NamespaceMutationStats).init(allocator);
+        errdefer {
+            for (stats.items) |*item| item.deinit(allocator);
+            stats.deinit();
+        }
+
+        for (self.records.items) |record| {
+            const stat = try ensureNamespaceStat(&stats, allocator, record.namespace_id, replicated_through_sequence);
+            stat.total_mutations += 1;
+            stat.last_sequence_no = @max(stat.last_sequence_no, record.sequence_no);
+            stat.replicated_through_sequence = if (replicated_through_sequence) |value|
+                @min(value, stat.last_sequence_no)
+            else
+                stat.last_sequence_no;
+
+            switch (record.visibility) {
+                .local => stat.local_mutations += 1,
+                .shared => stat.shared_mutations += 1,
+                .global => stat.global_mutations += 1,
+            }
+
+            switch (record.mutation_type) {
+                .upsert_entity, .delete_entity => stat.entity_mutations += 1,
+                .upsert_relation, .delete_relation => stat.relation_mutations += 1,
+                .append_observation => stat.observation_mutations += 1,
+                .policy_update => stat.policy_mutations += 1,
+            }
+
+            if (replicated_through_sequence) |value| {
+                if (record.sequence_no > value) stat.pending_mutations += 1;
+            }
+        }
+
+        return stats.toOwnedSlice();
+    }
 };
 
 pub const GraphMutationStore = union(enum) {
@@ -243,4 +299,42 @@ pub const GraphMutationStore = union(enum) {
             .memory => |*store| store.snapshotFrom(allocator, after_sequence_no, max_items),
         };
     }
+
+    pub fn listNamespaceStats(self: *Self, allocator: Allocator, replicated_through_sequence: ?u64) ![]NamespaceMutationStats {
+        return switch (self.*) {
+            .memory => |*store| store.listNamespaceStats(allocator, replicated_through_sequence),
+        };
+    }
+
+    pub fn deinitNamespaceStats(allocator: Allocator, stats: []NamespaceMutationStats) void {
+        for (stats) |*item| item.deinit(allocator);
+        allocator.free(stats);
+    }
 };
+
+fn ensureNamespaceStat(
+    stats: *std.ArrayList(NamespaceMutationStats),
+    allocator: Allocator,
+    namespace_id: []const u8,
+    replicated_through_sequence: ?u64,
+) !*NamespaceMutationStats {
+    for (stats.items) |*item| {
+        if (std.mem.eql(u8, item.namespace_id, namespace_id)) return item;
+    }
+
+    try stats.append(.{
+        .namespace_id = try allocator.dupe(u8, namespace_id),
+        .total_mutations = 0,
+        .pending_mutations = 0,
+        .local_mutations = 0,
+        .shared_mutations = 0,
+        .global_mutations = 0,
+        .entity_mutations = 0,
+        .relation_mutations = 0,
+        .observation_mutations = 0,
+        .policy_mutations = 0,
+        .last_sequence_no = 0,
+        .replicated_through_sequence = replicated_through_sequence orelse 0,
+    });
+    return &stats.items[stats.items.len - 1];
+}

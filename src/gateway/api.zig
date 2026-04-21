@@ -326,6 +326,13 @@ pub const GatewayApiServer = struct {
             return true;
         }
 
+        if (std.mem.eql(u8, req.method, "GET") and std.mem.eql(u8, req.path, "/v1/federation/replication")) {
+            const body = try self.gateway.renderFederationReplicationJson(self.allocator);
+            defer self.allocator.free(body);
+            try http_server.writeResponse(stream, "200 OK", &.{"Content-Type: application/json"}, body);
+            return true;
+        }
+
         if (std.mem.eql(u8, req.method, "POST") and std.mem.eql(u8, req.path, "/v1/federation/connect")) {
             if (self.gateway.config.resolvedGlobalControllerEndpoint() == null) {
                 try http_server.writeResponse(stream, "400 Bad Request", &.{"Content-Type: text/plain"}, "global_controller_not_configured");

@@ -69,6 +69,14 @@ pub const GatewayGraph = struct {
         return self.store.snapshotMutationsFrom(allocator, after_sequence_no, max_items);
     }
 
+    pub fn listNamespaceMutationStats(self: *Self, allocator: Allocator, replicated_through_sequence: ?u64) ![]mutation_log.NamespaceMutationStats {
+        return self.store.listNamespaceMutationStats(allocator, replicated_through_sequence);
+    }
+
+    pub fn deinitNamespaceMutationStats(allocator: Allocator, stats: []mutation_log.NamespaceMutationStats) void {
+        graph_store.GraphStore.deinitNamespaceMutationStats(allocator, stats);
+    }
+
     pub fn applyReplicatedBatch(
         self: *Self,
         allocator: Allocator,

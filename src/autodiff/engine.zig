@@ -3,12 +3,15 @@ const mlir = @import("../mlir/wrapper.zig");
 const ops = @import("../core/ops.zig");
 const tensor = @import("../core/tensor.zig");
 const c = @import("../mlir/c.zig").c;
-const hlo = @import("../mlir/dialects/stablehlo.zig");
 const vjp_rules = @import("vjp_rules.zig");
+const remat_planner = @import("remat_planner.zig");
 
 const Allocator = std.mem.Allocator;
 const MLIRBuilder = ops.MLIRBuilder;
 const VJPFn = vjp_rules.VJPFn;
+pub const RematPolicy = remat_planner.RematPolicy;
+pub const RematCostModel = remat_planner.RematCostModel;
+pub const RematPlannerConfig = remat_planner.RematPlannerConfig;
 
 // ============================================================================
 // Gradient Checkpointing / Activation Rematerialization
@@ -22,47 +25,13 @@ const VJPFn = vjp_rules.VJPFn;
 // the backward pass instead of keeping them alive. This trades compute for
 // massive memory savings.
 
-const REMAT_ELEMENT_THRESHOLD: i64 = 1_000_000;
-
-fn shouldRematerialize(op: mlir.Operation) bool {
-    const name = op.getName();
-
-    const is_heavy_math = std.mem.eql(u8, name, "stablehlo.dot_general") or
-        std.mem.eql(u8, name, "stablehlo.exponential") or
-        std.mem.eql(u8, name, "stablehlo.divide") or
-        std.mem.eql(u8, name, "stablehlo.logistic") or
-        std.mem.eql(u8, name, "stablehlo.tanh") or
-        std.mem.eql(u8, name, "stablehlo.maximum") or
-        std.mem.eql(u8, name, "stablehlo.add");
-
-    if (!is_heavy_math) return false;
-
-    if (op.getNumResults() == 0) return false;
-    const res = op.getResult(0);
-    const type_val = res.getType();
-
-    if (!c.mlirTypeIsARankedTensor(type_val.handle)) return false;
-
-    const rank = c.mlirShapedTypeGetRank(type_val.handle);
-
-    if (rank >= 3) {
-        var total_elements: i64 = 1;
-        for (0..@intCast(rank)) |i| {
-            const dim = c.mlirShapedTypeGetDimSize(type_val.handle, @intCast(i));
-            if (dim > 0) total_elements *= dim;
-        }
-        return total_elements >= REMAT_ELEMENT_THRESHOLD;
-    }
-
-    return false;
-}
-
 fn rematerializeOp(
     builder: *MLIRBuilder,
     original_op: mlir.Operation,
     value_map: *std.AutoHashMap(mlir.Value, mlir.Value),
     remat_cache: *std.AutoHashMap(mlir.Operation, mlir.Value),
     dependency_token: ?mlir.Value,
+    plan: *const remat_planner.RematPlan,
 ) !mlir.Value {
     if (remat_cache.get(original_op)) |cached| {
         return cached;
@@ -80,8 +49,8 @@ fn rematerializeOp(
         if (c.mlirValueIsAOpResult(old_operand.handle)) {
             const producer = mlir.Operation{ .handle = c.mlirOpResultGetOwner(old_operand.handle) };
 
-            if (shouldRematerialize(producer)) {
-                new_operand = try rematerializeOp(builder, producer, value_map, remat_cache, dependency_token);
+            if (plan.shouldRematerialize(producer)) {
+                new_operand = try rematerializeOp(builder, producer, value_map, remat_cache, dependency_token, plan);
                 handled = true;
             }
         }
@@ -126,10 +95,8 @@ fn rematerializeOp(
     return barrier_result;
 }
 
-
 /// MLIR-based Automatic Differentiation using Graph-to-Graph Transformation
 /// This implements reverse-mode AD on MLIR computation graphs using VJP rules
-
 /// Runtime dispatch from operation name to VJP rule
 fn getVjpFn(op_name: []const u8) ?VJPFn {
     if (std.mem.eql(u8, op_name, "stablehlo.add")) {
@@ -200,6 +167,24 @@ pub fn buildGradientGraph(
     gradient_clip_min: f64,
     gradient_clip_max: f64,
 ) !mlir.Operation {
+    return buildGradientGraphWithConfig(
+        allocator,
+        builder,
+        forward_fn,
+        gradient_clip_min,
+        gradient_clip_max,
+        .{},
+    );
+}
+
+pub fn buildGradientGraphWithConfig(
+    allocator: Allocator,
+    builder: *MLIRBuilder,
+    forward_fn: mlir.Operation,
+    gradient_clip_min: f64,
+    gradient_clip_max: f64,
+    remat_config: RematPlannerConfig,
+) !mlir.Operation {
     std.debug.print("Building gradient graph from forward function...\n", .{});
 
     // Derive the gradient function name from the forward function name
@@ -260,6 +245,20 @@ pub fn buildGradientGraph(
     const ops_forward = try getOperationsInForwardOrder(allocator, forward_fn);
     defer allocator.free(ops_forward);
 
+    var remat_plan = try remat_planner.buildRematPlan(allocator, ops_forward, remat_config);
+    defer remat_plan.deinit();
+    std.log.info(
+        "Gradient checkpoint planner: policy={s} budget_bytes={} retained_before={} retained_after={} kept_candidates={} remat_candidates={}",
+        .{
+            @tagName(remat_plan.stats.policy),
+            remat_plan.stats.activation_memory_budget_bytes orelse 0,
+            remat_plan.stats.estimated_retained_bytes_before,
+            remat_plan.stats.estimated_retained_bytes_after,
+            remat_plan.stats.kept_candidate_ops,
+            remat_plan.stats.rematerialized_candidate_ops,
+        },
+    );
+
     // Track which ops are skipped for rematerialization
     var skipped_for_remat = std.AutoHashMap(mlir.Operation, void).init(allocator);
     defer skipped_for_remat.deinit();
@@ -278,7 +277,7 @@ pub fn buildGradientGraph(
             try value_map.put(op.getResult(0), cloned_op.getResult(0));
         } else if (!std.mem.eql(u8, op_name, "func.return")) {
             // 1. Skip Heavy Ops - don't clone, don't add to value_map
-            if (shouldRematerialize(op)) {
+            if (remat_plan.shouldRematerialize(op)) {
                 try skipped_for_remat.put(op, {});
                 // Do NOT add to value_map. This allows memory to be freed.
                 continue;
@@ -301,11 +300,11 @@ pub fn buildGradientGraph(
                 // This typically happens for reductions (e.g. sum(exp(x))) or normalizations.
                 else if (c.mlirValueIsAOpResult(primal_operand.handle)) {
                     const producer = mlir.Operation{ .handle = c.mlirOpResultGetOwner(primal_operand.handle) };
-                    if (shouldRematerialize(producer)) {
+                    if (remat_plan.shouldRematerialize(producer)) {
                         // Rematerialize using Phase 1 cache.
                         // This value is transient and only lives as long as this light op uses it.
                         // No anchor token in phase 1 since we don't have gradients yet.
-                        const remat_val = try rematerializeOp(builder, producer, &value_map, &phase1_remat_cache, null);
+                        const remat_val = try rematerializeOp(builder, producer, &value_map, &phase1_remat_cache, null, &remat_plan);
                         c.mlirOperationSetOperand(cloned_op.handle, @intCast(i), remat_val.handle);
                     } else {
                         // Missing mapping for a non-skipped op is a real error
@@ -336,7 +335,7 @@ pub fn buildGradientGraph(
 
     // Second pass: Compute gradients using use-counting (reverse Kahn's algorithm)
     std.debug.print("Second pass: Computing gradients using use-counting...\n", .{});
-    try processGradientsWithUseCounting(allocator, builder, forward_fn, &adjoint_map, &value_map, gradient_clip_min, gradient_clip_max);
+    try processGradientsWithUseCounting(allocator, builder, forward_fn, &adjoint_map, &value_map, gradient_clip_min, gradient_clip_max, &remat_plan);
 
     // Collect gradients and create return statement using the SHARED builder
     try finalizeGradientFunction(allocator, builder, gradient_fn, forward_fn, &adjoint_map, &value_map);
@@ -357,6 +356,7 @@ fn processOperationVJP(
     value_map: *std.AutoHashMap(mlir.Value, mlir.Value),
     gradient_clip_min: f64,
     gradient_clip_max: f64,
+    remat_plan: *const remat_planner.RematPlan,
 ) !void {
     const op_name = op.getName();
     const output_gradients = try getOutputGradients(allocator, op, adjoint_map);
@@ -403,9 +403,9 @@ fn processOperationVJP(
             if (c.mlirValueIsAOpResult(primal_operand.handle)) {
                 const producer = mlir.Operation{ .handle = c.mlirOpResultGetOwner(primal_operand.handle) };
 
-                if (shouldRematerialize(producer)) {
+                if (remat_plan.shouldRematerialize(producer)) {
                     var local_cache = std.AutoHashMap(mlir.Operation, mlir.Value).init(allocator);
-                    primal_val = try rematerializeOp(builder, producer, value_map, &local_cache, anchor_token);
+                    primal_val = try rematerializeOp(builder, producer, value_map, &local_cache, anchor_token, remat_plan);
                     local_cache.deinit();
                     is_recomputed = true;
                 }
@@ -425,7 +425,6 @@ fn processOperationVJP(
 }
 
 // Helper functions for graph traversal and manipulation
-
 
 fn createGradientFunction(builder: *MLIRBuilder, forward_fn: mlir.Operation, name: []const u8) !mlir.Operation {
     const forward_region = forward_fn.getRegion(0);
@@ -477,6 +476,7 @@ fn processGradientsWithUseCounting(
     value_map: *std.AutoHashMap(mlir.Value, mlir.Value),
     gradient_clip_min: f64,
     gradient_clip_max: f64,
+    remat_plan: *const remat_planner.RematPlan,
 ) !void {
     const forward_block = forward_fn.getRegion(0).getBlock(0);
 
@@ -511,7 +511,7 @@ fn processGradientsWithUseCounting(
         const current_op = ready_queue.orderedRemove(0);
 
         std.debug.print("Processing operation VJP for: {s}\n", .{current_op.getName()});
-        try processOperationVJP(allocator, builder, current_op, adjoint_map, value_map, gradient_clip_min, gradient_clip_max);
+        try processOperationVJP(allocator, builder, current_op, adjoint_map, value_map, gradient_clip_min, gradient_clip_max, remat_plan);
 
         for (0..current_op.getNumOperands()) |i| {
             const operand = current_op.getOperand(i);
@@ -719,7 +719,7 @@ fn finalizeGradientFunction(allocator: Allocator, builder: *MLIRBuilder, gradien
     while (adj_iter.next()) |entry| : (adj_count += 1) {
         if (adj_count < 5) { // Only print first 5 to avoid spam
             const val_ptr = @intFromPtr(entry.key_ptr.*.handle.ptr);
-            std.debug.print("  Adjoint map entry {}: value ptr={}\n", .{adj_count, val_ptr});
+            std.debug.print("  Adjoint map entry {}: value ptr={}\n", .{ adj_count, val_ptr });
         }
     }
     if (adjoint_map.count() > 5) {
@@ -731,7 +731,7 @@ fn finalizeGradientFunction(allocator: Allocator, builder: *MLIRBuilder, gradien
         const arg = forward_block.getArgument(i);
         if (i < 5) {
             const arg_ptr = @intFromPtr(arg.handle.ptr);
-            std.debug.print("  Forward arg {}: value ptr={}\n", .{i, arg_ptr});
+            std.debug.print("  Forward arg {}: value ptr={}\n", .{ i, arg_ptr });
         }
 
         const mapped_arg = value_map.get(arg) orelse {
@@ -749,7 +749,7 @@ fn finalizeGradientFunction(allocator: Allocator, builder: *MLIRBuilder, gradien
 
         if (i < 5) {
             const mapped_arg_ptr = @intFromPtr(mapped_arg.handle.ptr);
-            std.debug.print("  Mapped arg {}: value ptr={}\n", .{i, mapped_arg_ptr});
+            std.debug.print("  Mapped arg {}: value ptr={}\n", .{ i, mapped_arg_ptr });
         }
 
         if (adjoint_map.get(arg)) |gradient| {
@@ -762,7 +762,7 @@ fn finalizeGradientFunction(allocator: Allocator, builder: *MLIRBuilder, gradien
             };
             const grad_shape = try grad_type.getShape(allocator);
             defer allocator.free(grad_shape);
-            std.debug.print("  Arg {} gradient shape: {any}\n", .{i, grad_shape});
+            std.debug.print("  Arg {} gradient shape: {any}\n", .{ i, grad_shape });
         } else {
             // Create zero gradient using safe builder constant helper
             const arg_type = arg.getType();

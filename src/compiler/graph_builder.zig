@@ -11,6 +11,7 @@ const mlir_ctx = @import("../mlir/context.zig");
 // Type aliases
 const MLIRBuilder = ops.MLIRBuilder;
 const AdamMLIR = adam_mlir.AdamMLIR(f32); // Assuming f32 for DiLoCo
+pub const RematPlannerConfig = autodiff.RematPlannerConfig;
 
 pub const GraphBuilder = struct {
     /// Builds the training graph with two entry points for gradient accumulation:
@@ -23,6 +24,7 @@ pub const GraphBuilder = struct {
         forward_mlir_source: []const u8,
         optimizer: *AdamMLIR,
         num_params: usize,
+        remat_config: RematPlannerConfig,
     ) ![]u8 {
         std.debug.print("Compiling training graph via GraphBuilder (gradient accumulation mode)...\n", .{});
 
@@ -47,7 +49,7 @@ pub const GraphBuilder = struct {
         std.debug.print("GraphBuilder: Running Autodiff...\n", .{});
         const gradient_clip_min = @as(f64, @floatCast(optimizer.conf.gradient_clip_min));
         const gradient_clip_max = @as(f64, @floatCast(optimizer.conf.gradient_clip_max));
-        _ = try autodiff.buildGradientGraph(allocator, builder, cloned_forward_fn, gradient_clip_min, gradient_clip_max);
+        _ = try autodiff.buildGradientGraphWithConfig(allocator, builder, cloned_forward_fn, gradient_clip_min, gradient_clip_max, remat_config);
         const grad_fn_name = "model_forward_pass_grad";
 
         const forward_fn_type = cloned_forward_fn.getType().as(mlir.FunctionType) orelse return error.NotAFunctionType;
@@ -440,6 +442,7 @@ pub const GraphBuilder = struct {
         num_params: usize,
         micro_batch_size: i64,
         accumulation_steps: i64,
+        remat_config: RematPlannerConfig,
     ) ![]u8 {
         const c_api = @import("../mlir/c.zig").c;
         std.debug.print("Compiling accumulated training graph (SCF loop mode)...\n", .{});
@@ -465,7 +468,7 @@ pub const GraphBuilder = struct {
         std.debug.print("GraphBuilder: Running Autodiff...\n", .{});
         const gradient_clip_min = @as(f64, @floatCast(optimizer.conf.gradient_clip_min));
         const gradient_clip_max = @as(f64, @floatCast(optimizer.conf.gradient_clip_max));
-        _ = try autodiff.buildGradientGraph(allocator, builder, cloned_forward_fn, gradient_clip_min, gradient_clip_max);
+        _ = try autodiff.buildGradientGraphWithConfig(allocator, builder, cloned_forward_fn, gradient_clip_min, gradient_clip_max, remat_config);
         const grad_fn_name = "model_forward_pass_grad";
 
         const forward_fn_type = cloned_forward_fn.getType().as(mlir.FunctionType) orelse return error.NotAFunctionType;

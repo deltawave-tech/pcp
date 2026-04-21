@@ -17,6 +17,7 @@ const ops = @import("../core/ops.zig");
 const mlir = @import("../mlir/wrapper.zig");
 const model_introspection = @import("../mlir/model_introspection.zig");
 const GraphBuilder = @import("../compiler/graph_builder.zig").GraphBuilder;
+const RematPlannerConfig = @import("../compiler/graph_builder.zig").RematPlannerConfig;
 const tensor = @import("../core/tensor.zig");
 const execution = @import("../execution.zig");
 const monitoring = @import("../ui/monitoring.zig");
@@ -70,6 +71,7 @@ pub const DiLoCoConfig = struct {
     dtype: tensor.DType = .f32,
     effective_batch_size: ?usize = null,
     use_in_graph_accumulation: bool = false,
+    remat_config: RematPlannerConfig = .{},
 
     pub fn default() DiLoCoConfig {
         return DiLoCoConfig{
@@ -259,6 +261,7 @@ pub const DiLoCo = struct {
                     parameter_shapes.len,
                     micro_batch_size,
                     accumulation_steps,
+                    config.remat_config,
                 );
             } else {
                 // In-code accumulation: worker calls compute_gradients multiple times
@@ -269,6 +272,7 @@ pub const DiLoCo = struct {
                     mlir_source,
                     adam_optimizer,
                     parameter_shapes.len,
+                    config.remat_config,
                 );
             }
         } else blk: {
@@ -279,6 +283,7 @@ pub const DiLoCo = struct {
                 mlir_source,
                 adam_optimizer,
                 parameter_shapes.len,
+                config.remat_config,
             );
         };
 

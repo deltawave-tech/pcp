@@ -677,6 +677,23 @@ pub fn build(b: *std.Build) void {
     const run_isolated_vjp_tests_step = b.step("run-isolated-vjp-tests", "Run isolated VJP numerical verification tests");
     run_isolated_vjp_tests_step.dependOn(&run_isolated_vjp_tests_cmd.step);
 
+    const remat_planner_smoke = b.addExecutable(.{
+        .name = "remat_planner_smoke",
+        .root_source_file = b.path("src/examples/remat_planner_smoke.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    remat_planner_smoke.root_module.addImport("pcp", pcp_module);
+    addIreeDependencies(remat_planner_smoke, b, iree_config);
+    b.installArtifact(remat_planner_smoke);
+
+    const run_remat_planner_smoke_cmd = b.addRunArtifact(remat_planner_smoke);
+    run_remat_planner_smoke_cmd.step.dependOn(&remat_planner_smoke.step);
+
+    const run_remat_planner_smoke_step = b.step("run-remat-planner-smoke", "Run rematerialization planner smoke test");
+    run_remat_planner_smoke_step.dependOn(&run_remat_planner_smoke_cmd.step);
+
     // MLIR Optimizer Tests - Numerical verification of Adam and Nesterov optimizers
     const mlir_optimizer_tests = b.addExecutable(.{
         .name = "mlir_optimizer_tests",

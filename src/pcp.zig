@@ -72,6 +72,12 @@ const ExperimentConfig = struct {
     // In-graph accumulation uses a single compute_gradients_accumulated call with internal SCF loop
     use_in_graph_accumulation: bool = false,
 
+    // Optional: Static rematerialization planner controls
+    remat_policy: autodiff.RematPolicy = .legacy_threshold,
+    activation_memory_budget_bytes: ?u64 = null,
+    remat_cost_model: autodiff.RematCostModel = .static_heuristic,
+    remat_allow_expensive_ops: bool = true,
+
     // Optional: GRPO/RL configuration
     grpo_config: ?GRPOJsonConfig = null,
 
@@ -1054,6 +1060,17 @@ fn runShepherd(allocator: Allocator, args: Args) !void {
         print("   Gradient Accumulation: in-graph (SCF loop)\n", .{});
     } else {
         print("   Gradient Accumulation: in-code (multiple kernel calls)\n", .{});
+    }
+
+    diloco_config.remat_config = .{
+        .policy = exp_config.remat_policy,
+        .activation_memory_budget_bytes = exp_config.activation_memory_budget_bytes,
+        .cost_model = exp_config.remat_cost_model,
+        .remat_allow_expensive_ops = exp_config.remat_allow_expensive_ops,
+    };
+    print("   Rematerialization Policy: {s}\n", .{@tagName(exp_config.remat_policy)});
+    if (exp_config.activation_memory_budget_bytes) |budget| {
+        print("   Activation Memory Budget: {} bytes\n", .{budget});
     }
 
     // CLI flag overrides config file

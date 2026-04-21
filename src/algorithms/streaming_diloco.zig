@@ -129,6 +129,7 @@ pub const StreamingDiLoCo = struct {
             sanitized_mlir,
             adam_optimizer,
             parameter_shapes.len,
+            .{},
         );
         errdefer allocator.free(mlir_source);
         var host_opt = NesterovHost.init(allocator, .{

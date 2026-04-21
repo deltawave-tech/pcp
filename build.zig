@@ -17,6 +17,12 @@ const CapnpConfig = struct {
     lib_dir: ?[]const u8 = null,
 };
 
+const GlpkConfig = struct {
+    enabled: bool = false,
+    include_dir: ?[]const u8 = null,
+    lib_dir: ?[]const u8 = null,
+};
+
 // NEW: IREE configuration struct
 const IreeConfig = struct {
     enabled: bool = false,
@@ -138,6 +144,54 @@ fn detectCapnp(b: *std.Build) CapnpConfig {
 
     if (!config.enabled) {
         std.debug.print("Cap'n Proto not found in standard locations\n", .{});
+    }
+
+    return config;
+}
+
+fn detectGlpk(b: *std.Build) GlpkConfig {
+    var config = GlpkConfig{};
+
+    if (std.process.getEnvVarOwned(b.allocator, "GLPK_DIR")) |glpk_dir| {
+        defer b.allocator.free(glpk_dir);
+
+        const include_dir = std.fs.path.join(b.allocator, &[_][]const u8{ glpk_dir, "include" }) catch return config;
+        defer b.allocator.free(include_dir);
+        const lib_dir = std.fs.path.join(b.allocator, &[_][]const u8{ glpk_dir, "lib" }) catch return config;
+        defer b.allocator.free(lib_dir);
+        const header_path = std.fs.path.join(b.allocator, &[_][]const u8{ include_dir, "glpk.h" }) catch return config;
+        defer b.allocator.free(header_path);
+
+        if (std.fs.cwd().access(header_path, .{})) |_| {
+            config.enabled = true;
+            config.include_dir = b.dupe(include_dir);
+            config.lib_dir = b.dupe(lib_dir);
+            std.debug.print("Found GLPK via GLPK_DIR at: {s}\n", .{glpk_dir});
+            return config;
+        } else |_| {}
+    } else |_| {}
+
+    const candidates = [_]struct { include: []const u8, lib: []const u8 }{
+        .{ .include = "/usr/include", .lib = "/usr/lib" },
+        .{ .include = "/usr/local/include", .lib = "/usr/local/lib" },
+        .{ .include = "/opt/homebrew/include", .lib = "/opt/homebrew/lib" },
+    };
+
+    for (candidates) |candidate| {
+        const header_path = std.fs.path.join(b.allocator, &[_][]const u8{ candidate.include, "glpk.h" }) catch continue;
+        defer b.allocator.free(header_path);
+
+        if (std.fs.cwd().access(header_path, .{})) |_| {
+            config.enabled = true;
+            config.include_dir = b.dupe(candidate.include);
+            config.lib_dir = b.dupe(candidate.lib);
+            std.debug.print("Found GLPK at: include={s}, lib={s}\n", .{ candidate.include, candidate.lib });
+            break;
+        } else |_| {}
+    }
+
+    if (!config.enabled) {
+        std.debug.print("GLPK not found in standard locations\n", .{});
     }
 
     return config;
@@ -265,6 +319,13 @@ fn addIreeIncludes(mod: *std.Build.Module, b: *std.Build, iree_config: IreeConfi
     mod.addIncludePath(.{ .cwd_relative = b.fmt("{s}/llvm-external-projects/stablehlo", .{build_dir}) });
     // Add our unified header directory
     mod.addIncludePath(b.path("src/mlir/include"));
+}
+
+fn addGlpkIncludes(mod: *std.Build.Module, glpk_config: GlpkConfig) void {
+    if (!glpk_config.enabled) return;
+    if (glpk_config.include_dir) |include_dir| {
+        mod.addIncludePath(.{ .cwd_relative = include_dir });
+    }
 }
 
 // REFACTORED: Add IREE dependencies to a target
@@ -421,6 +482,21 @@ fn addCapnpDependencies(target: *std.Build.Step.Compile, b: *std.Build, capnp_co
     }
 }
 
+fn addGlpkDependencies(target: *std.Build.Step.Compile, glpk_config: GlpkConfig) void {
+    if (!glpk_config.enabled) {
+        std.debug.print("==> GLPK not found for '{s}', skipping linkage.\n", .{target.name});
+        return;
+    }
+
+    if (glpk_config.include_dir) |include_dir| {
+        target.addIncludePath(.{ .cwd_relative = include_dir });
+    }
+    if (glpk_config.lib_dir) |lib_dir| {
+        target.addLibraryPath(.{ .cwd_relative = lib_dir });
+    }
+    target.linkSystemLibrary("glpk");
+}
+
 pub fn build(b: *std.Build) void {
     std.debug.print("==> Starting build script\n", .{});
     const target = b.standardTargetOptions(.{});
@@ -430,8 +506,10 @@ pub fn build(b: *std.Build) void {
 
     // Detect dependencies
     const capnp_config = detectCapnp(b);
+    const glpk_config = detectGlpk(b);
     const iree_config = detectIree(b); // NEW
     std.debug.print("==> Cap'n Proto detected: enabled={}, include={s}, lib={s}\n", .{ capnp_config.enabled, capnp_config.include_dir orelse "null", capnp_config.lib_dir orelse "null" });
+    std.debug.print("==> GLPK detected: enabled={}, include={s}, lib={s}\n", .{ glpk_config.enabled, glpk_config.include_dir orelse "null", glpk_config.lib_dir orelse "null" });
     std.debug.print("==> IREE detected: enabled={}, source={s}, build={s}\n", .{ iree_config.enabled, iree_config.source_dir orelse "null", iree_config.build_dir orelse "null" });
 
     // Create the main PCP module
@@ -440,6 +518,7 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/main.zig"),
     });
     addIreeIncludes(pcp_module, b, iree_config); // REFACTORED
+    addGlpkIncludes(pcp_module, glpk_config);
 
     // Add network include path for @cImport in capnp_zig_wrapper.zig
     pcp_module.addIncludePath(b.path("src/network"));
@@ -490,6 +569,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     m3_pipeline_test.root_module.addImport("pcp", pcp_module);
+    addGlpkDependencies(m3_pipeline_test, glpk_config);
 
     // IREE dependencies
     addIreeDependencies(m3_pipeline_test, b, iree_config); // REFACTORED
@@ -508,6 +588,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     cpu_pipeline_test.root_module.addImport("pcp", pcp_module);
+    addGlpkDependencies(cpu_pipeline_test, glpk_config);
     addIreeDependencies(cpu_pipeline_test, b, iree_config); // REFACTORED
 
     const run_cpu_pipeline_test_cmd = b.addRunArtifact(cpu_pipeline_test);
@@ -524,6 +605,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     cuda_pipeline_test.root_module.addImport("pcp", pcp_module);
+    addGlpkDependencies(cuda_pipeline_test, glpk_config);
     addIreeDependencies(cuda_pipeline_test, b, iree_config);
 
     const run_cuda_pipeline_test_cmd = b.addRunArtifact(cuda_pipeline_test);
@@ -540,6 +622,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     rocm_pipeline_test.root_module.addImport("pcp", pcp_module);
+    addGlpkDependencies(rocm_pipeline_test, glpk_config);
     addIreeDependencies(rocm_pipeline_test, b, iree_config);
 
     const run_rocm_pipeline_test_cmd = b.addRunArtifact(rocm_pipeline_test);
@@ -557,6 +640,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     pcp.root_module.addImport("pcp", pcp_module);
+    addGlpkDependencies(pcp, glpk_config);
 
     // IREE dependencies
     addIreeDependencies(pcp, b, iree_config); // REFACTORED
@@ -642,6 +726,7 @@ pub fn build(b: *std.Build) void {
 
     // Add module dependencies for data pipeline test
     data_pipeline_test.root_module.addImport("pcp", pcp_module);
+    addGlpkDependencies(data_pipeline_test, glpk_config);
 
     // Install the executable
     b.installArtifact(data_pipeline_test);
@@ -663,6 +748,7 @@ pub fn build(b: *std.Build) void {
 
     // Add module dependencies
     isolated_vjp_tests.root_module.addImport("pcp", pcp_module);
+    addGlpkDependencies(isolated_vjp_tests, glpk_config);
 
     // IREE dependencies
     addIreeDependencies(isolated_vjp_tests, b, iree_config); // REFACTORED
@@ -685,6 +771,7 @@ pub fn build(b: *std.Build) void {
     });
 
     remat_planner_smoke.root_module.addImport("pcp", pcp_module);
+    addGlpkDependencies(remat_planner_smoke, glpk_config);
     addIreeDependencies(remat_planner_smoke, b, iree_config);
     b.installArtifact(remat_planner_smoke);
 
@@ -704,6 +791,7 @@ pub fn build(b: *std.Build) void {
 
     // Add module dependencies
     mlir_optimizer_tests.root_module.addImport("pcp", pcp_module);
+    addGlpkDependencies(mlir_optimizer_tests, glpk_config);
 
     // IREE dependencies
     addIreeDependencies(mlir_optimizer_tests, b, iree_config); // REFACTORED

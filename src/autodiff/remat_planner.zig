@@ -17,11 +17,18 @@ pub const RematCostModel = enum {
     profiled,
 };
 
+pub const CheckmateBackend = checkmate_planner.SolverBackend;
+
 pub const RematPlannerConfig = struct {
     policy: RematPolicy = .legacy_threshold,
     activation_memory_budget_bytes: ?u64 = null,
     cost_model: RematCostModel = .static_heuristic,
     remat_allow_expensive_ops: bool = true,
+    checkmate_backend: CheckmateBackend = .milp_glpk,
+    checkmate_milp_solver_command: ?[]const u8 = null,
+    checkmate_milp_lp_path: ?[]const u8 = null,
+    checkmate_milp_solution_path: ?[]const u8 = null,
+    checkmate_milp_keep_artifacts: bool = false,
 };
 
 pub const RematPlan = struct {
@@ -296,7 +303,15 @@ fn buildCheckmateExactPlan(allocator: Allocator, plan: *RematPlan, graph_metadat
         return;
     }
 
-    var exact_result = try checkmate_planner.solvePlanningProblem(allocator, &problem, .exact_bounded);
+    var exact_result = try checkmate_planner.solvePlanningProblem(allocator, &problem, .{
+        .backend = config.checkmate_backend,
+        .milp_external = .{
+            .solver_command = config.checkmate_milp_solver_command,
+            .lp_path = config.checkmate_milp_lp_path,
+            .solution_path = config.checkmate_milp_solution_path,
+            .keep_artifacts = config.checkmate_milp_keep_artifacts,
+        },
+    });
     defer exact_result.deinit(allocator);
 
     var kept_candidates: usize = 0;

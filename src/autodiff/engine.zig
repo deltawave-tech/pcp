@@ -11,6 +11,7 @@ const MLIRBuilder = ops.MLIRBuilder;
 const VJPFn = vjp_rules.VJPFn;
 pub const RematPolicy = remat_planner.RematPolicy;
 pub const RematCostModel = remat_planner.RematCostModel;
+pub const CheckmateBackend = remat_planner.CheckmateBackend;
 pub const RematPlannerConfig = remat_planner.RematPlannerConfig;
 
 // ============================================================================

@@ -77,6 +77,11 @@ const ExperimentConfig = struct {
     activation_memory_budget_bytes: ?u64 = null,
     remat_cost_model: autodiff.RematCostModel = .static_heuristic,
     remat_allow_expensive_ops: bool = true,
+    checkmate_backend: autodiff.CheckmateBackend = .milp_glpk,
+    checkmate_milp_solver_command: ?[]const u8 = null,
+    checkmate_milp_lp_path: ?[]const u8 = null,
+    checkmate_milp_solution_path: ?[]const u8 = null,
+    checkmate_milp_keep_artifacts: bool = false,
 
     // Optional: GRPO/RL configuration
     grpo_config: ?GRPOJsonConfig = null,
@@ -1067,10 +1072,27 @@ fn runShepherd(allocator: Allocator, args: Args) !void {
         .activation_memory_budget_bytes = exp_config.activation_memory_budget_bytes,
         .cost_model = exp_config.remat_cost_model,
         .remat_allow_expensive_ops = exp_config.remat_allow_expensive_ops,
+        .checkmate_backend = exp_config.checkmate_backend,
+        .checkmate_milp_solver_command = exp_config.checkmate_milp_solver_command,
+        .checkmate_milp_lp_path = exp_config.checkmate_milp_lp_path,
+        .checkmate_milp_solution_path = exp_config.checkmate_milp_solution_path,
+        .checkmate_milp_keep_artifacts = exp_config.checkmate_milp_keep_artifacts,
     };
     print("   Rematerialization Policy: {s}\n", .{@tagName(exp_config.remat_policy)});
     if (exp_config.activation_memory_budget_bytes) |budget| {
         print("   Activation Memory Budget: {} bytes\n", .{budget});
+    }
+    if (exp_config.remat_policy == .checkmate_optimal) {
+        print("   Checkmate Backend: {s}\n", .{@tagName(exp_config.checkmate_backend)});
+        if (exp_config.checkmate_milp_solver_command) |cmd| {
+            print("   Checkmate MILP Solver Command: {s}\n", .{cmd});
+        }
+        if (exp_config.checkmate_milp_lp_path) |path| {
+            print("   Checkmate LP Path: {s}\n", .{path});
+        }
+        if (exp_config.checkmate_milp_solution_path) |path| {
+            print("   Checkmate Solution Path: {s}\n", .{path});
+        }
     }
 
     // CLI flag overrides config file

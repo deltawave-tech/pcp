@@ -1,10 +1,27 @@
 const std = @import("std");
+const glpk = @cImport({
+    @cInclude("glpk.h");
+});
 
 const Allocator = std.mem.Allocator;
 
 pub const SolverBackend = enum {
+    milp_glpk,
     exact_bounded,
     greedy_stage_aware,
+    milp_external,
+};
+
+pub const MilpExternalOptions = struct {
+    solver_command: ?[]const u8 = null,
+    lp_path: ?[]const u8 = null,
+    solution_path: ?[]const u8 = null,
+    keep_artifacts: bool = false,
+};
+
+pub const SolveOptions = struct {
+    backend: SolverBackend = .exact_bounded,
+    milp_external: MilpExternalOptions = .{},
 };
 
 pub const Candidate = struct {
@@ -143,7 +160,7 @@ pub fn buildMilpModel(allocator: Allocator, problem: *const PlanningProblem) !Mi
     var variable_names = try allocator.alloc([]const u8, problem.candidates.len);
     errdefer allocator.free(variable_names);
     for (problem.candidates, 0..) |_, candidate_idx| {
-        variable_names[candidate_idx] = try std.fmt.allocPrint(allocator, "keep_{d}", .{candidate_idx});
+        variable_names[candidate_idx] = try std.fmt.allocPrintZ(allocator, "keep_{d}", .{candidate_idx});
     }
     errdefer {
         for (variable_names) |name| {
@@ -181,7 +198,7 @@ pub fn buildMilpModel(allocator: Allocator, problem: *const PlanningProblem) !Mi
         const rhs = @as(f64, @floatFromInt(problem.budget)) - @as(f64, @floatFromInt(base_bytes));
         try stage_constraints.append(.{
             .allocator = allocator,
-            .name = try std.fmt.allocPrint(allocator, "stage_{d}", .{stage_idx}),
+            .name = try std.fmt.allocPrintZ(allocator, "stage_{d}", .{stage_idx}),
             .terms = try terms.toOwnedSlice(),
             .rhs = rhs,
         });
@@ -291,11 +308,178 @@ pub fn solvePlanningProblemExact(
 pub fn solvePlanningProblem(
     allocator: Allocator,
     problem: *const PlanningProblem,
-    backend: SolverBackend,
+    options: SolveOptions,
 ) !ExactPlanResult {
-    return switch (backend) {
+    return switch (options.backend) {
+        .milp_glpk => solvePlanningProblemGlpk(allocator, problem),
         .exact_bounded => solvePlanningProblemExact(allocator, problem),
         .greedy_stage_aware => solvePlanningProblemGreedy(allocator, problem),
+        .milp_external => solvePlanningProblemMilpExternal(allocator, problem, options.milp_external),
+    };
+}
+
+pub fn solvePlanningProblemGlpk(
+    allocator: Allocator,
+    problem: *const PlanningProblem,
+) !ExactPlanResult {
+    if (problem.base_stage_bytes.len == 0) {
+        const keep_mask = try allocator.alloc(bool, problem.candidates.len);
+        @memset(keep_mask, false);
+        return .{
+            .keep_mask = keep_mask,
+            .total_retained_bytes = 0,
+            .peak_stage_bytes = 0,
+            .total_recompute_cost = 0.0,
+        };
+    }
+
+    for (problem.base_stage_bytes) |stage_bytes| {
+        if (stage_bytes > problem.budget) {
+            return error.NoFeasibleRematPlan;
+        }
+    }
+
+    var model = try buildMilpModel(allocator, problem);
+    defer model.deinit();
+
+    const lp = glpk.glp_create_prob() orelse return error.GlpkInitFailed;
+    defer glpk.glp_delete_prob(lp);
+
+    glpk.glp_set_obj_dir(lp, glpk.GLP_MIN);
+
+    const row_count: c_int = @intCast(model.stage_constraints.len);
+    const col_count: c_int = @intCast(problem.candidates.len);
+
+    _ = glpk.glp_add_rows(lp, row_count);
+    for (model.stage_constraints, 0..) |constraint, row_idx| {
+        const rhs = constraint.rhs;
+        glpk.glp_set_row_name(lp, @intCast(row_idx + 1), constraint.name.ptr);
+        if (rhs < 0.0) {
+            return error.NoFeasibleRematPlan;
+        }
+        glpk.glp_set_row_bnds(lp, @intCast(row_idx + 1), glpk.GLP_UP, 0.0, rhs);
+    }
+
+    _ = glpk.glp_add_cols(lp, col_count);
+    for (problem.candidates, 0..) |_, col_idx| {
+        glpk.glp_set_col_name(lp, @intCast(col_idx + 1), model.variable_names[col_idx].ptr);
+        glpk.glp_set_col_kind(lp, @intCast(col_idx + 1), glpk.GLP_BV);
+        glpk.glp_set_col_bnds(lp, @intCast(col_idx + 1), glpk.GLP_DB, 0.0, 1.0);
+        glpk.glp_set_obj_coef(lp, @intCast(col_idx + 1), model.objective_coefficients[col_idx]);
+    }
+
+    var nonzeros: usize = 0;
+    for (model.stage_constraints) |constraint| {
+        nonzeros += constraint.terms.len;
+    }
+
+    const ia = try allocator.alloc(c_int, nonzeros + 1);
+    defer allocator.free(ia);
+    const ja = try allocator.alloc(c_int, nonzeros + 1);
+    defer allocator.free(ja);
+    const ar = try allocator.alloc(f64, nonzeros + 1);
+    defer allocator.free(ar);
+
+    var nz_index: usize = 1;
+    for (model.stage_constraints, 0..) |constraint, row_idx| {
+        for (constraint.terms) |term| {
+            ia[nz_index] = @intCast(row_idx + 1);
+            ja[nz_index] = @intCast(term.variable_index + 1);
+            ar[nz_index] = term.coefficient;
+            nz_index += 1;
+        }
+    }
+
+    glpk.glp_load_matrix(lp, @intCast(nonzeros), ia.ptr, ja.ptr, ar.ptr);
+
+    var smcp: glpk.glp_smcp = undefined;
+    glpk.glp_init_smcp(&smcp);
+    smcp.msg_lev = glpk.GLP_MSG_OFF;
+    const simplex_rc = glpk.glp_simplex(lp, &smcp);
+    if (simplex_rc != 0) {
+        return error.GlpkSimplexFailed;
+    }
+
+    var iocp: glpk.glp_iocp = undefined;
+    glpk.glp_init_iocp(&iocp);
+    iocp.msg_lev = glpk.GLP_MSG_OFF;
+    iocp.presolve = glpk.GLP_ON;
+    const intopt_rc = glpk.glp_intopt(lp, &iocp);
+    if (intopt_rc != 0) {
+        return error.GlpkIntoptFailed;
+    }
+
+    const mip_status = glpk.glp_mip_status(lp);
+    if (mip_status != glpk.GLP_OPT) {
+        if (mip_status == glpk.GLP_NOFEAS) return error.NoFeasibleRematPlan;
+        return error.GlpkNoOptimalSolution;
+    }
+
+    const keep_mask = try allocator.alloc(bool, problem.candidates.len);
+    errdefer allocator.free(keep_mask);
+    for (problem.candidates, 0..) |_, candidate_idx| {
+        const value = glpk.glp_mip_col_val(lp, @intCast(candidate_idx + 1));
+        keep_mask[candidate_idx] = value >= 0.5;
+    }
+
+    const final_eval = evaluateKeepMask(problem.candidates, problem.base_stage_bytes, keep_mask);
+    if (final_eval.peak_stage_bytes > problem.budget) {
+        return error.InvalidMilpSolution;
+    }
+
+    return .{
+        .keep_mask = keep_mask,
+        .total_retained_bytes = final_eval.total_retained_bytes,
+        .peak_stage_bytes = final_eval.peak_stage_bytes,
+        .total_recompute_cost = final_eval.total_recompute_cost,
+    };
+}
+
+pub fn solvePlanningProblemMilpExternal(
+    allocator: Allocator,
+    problem: *const PlanningProblem,
+    options: MilpExternalOptions,
+) !ExactPlanResult {
+    var model = try buildMilpModel(allocator, problem);
+    defer model.deinit();
+
+    const lp_path = try resolveArtifactPath(allocator, options.lp_path, ".lp");
+    defer allocator.free(lp_path);
+    const solution_path = try resolveArtifactPath(allocator, options.solution_path, ".sol");
+    defer allocator.free(solution_path);
+
+    {
+        const lp_file = try std.fs.createFileAbsolute(lp_path, .{ .truncate = true });
+        defer lp_file.close();
+        try model.writeLp(lp_file.writer());
+    }
+
+    errdefer if (!options.keep_artifacts and options.lp_path == null) {
+        std.fs.deleteFileAbsolute(lp_path) catch {};
+    };
+    errdefer if (!options.keep_artifacts and options.solution_path == null) {
+        std.fs.deleteFileAbsolute(solution_path) catch {};
+    };
+
+    const solver_command = options.solver_command orelse return error.MilpSolverUnavailable;
+    try runExternalMilpSolver(allocator, solver_command, lp_path, solution_path);
+
+    const keep_mask = try parseExternalMilpSolution(allocator, problem, solution_path);
+    errdefer allocator.free(keep_mask);
+    const final_eval = evaluateKeepMask(problem.candidates, problem.base_stage_bytes, keep_mask);
+
+    if (!options.keep_artifacts and options.lp_path == null) {
+        std.fs.deleteFileAbsolute(lp_path) catch {};
+    }
+    if (!options.keep_artifacts and options.solution_path == null) {
+        std.fs.deleteFileAbsolute(solution_path) catch {};
+    }
+
+    return .{
+        .keep_mask = keep_mask,
+        .total_retained_bytes = final_eval.total_retained_bytes,
+        .peak_stage_bytes = final_eval.peak_stage_bytes,
+        .total_recompute_cost = final_eval.total_recompute_cost,
     };
 }
 
@@ -446,6 +630,82 @@ fn compareGreedyDropScore(candidates: []const Candidate, lhs_idx: usize, rhs_idx
 fn greedyDropScore(candidate: Candidate) f64 {
     const bytes_saved = @as(f64, @floatFromInt(candidate.bytes));
     return bytes_saved / candidate.weighted_recompute_cost;
+}
+
+fn resolveArtifactPath(allocator: Allocator, configured_path: ?[]const u8, extension: []const u8) ![]u8 {
+    if (configured_path) |path| return allocator.dupe(u8, path);
+    return std.fmt.allocPrint(
+        allocator,
+        "/tmp/pcp-checkmate-{d}{s}",
+        .{ std.time.nanoTimestamp(), extension },
+    );
+}
+
+fn runExternalMilpSolver(
+    allocator: Allocator,
+    solver_command: []const u8,
+    lp_path: []const u8,
+    solution_path: []const u8,
+) !void {
+    var env_map = try std.process.getEnvMap(allocator);
+    defer env_map.deinit();
+    try env_map.put("PCP_CHECKMATE_LP_PATH", lp_path);
+    try env_map.put("PCP_CHECKMATE_SOLUTION_PATH", solution_path);
+
+    var child = std.process.Child.init(&.{ "/bin/sh", "-c", solver_command }, allocator);
+    child.env_map = &env_map;
+    const term = try child.spawnAndWait();
+    switch (term) {
+        .Exited => |code| if (code != 0) return error.ExternalMilpSolverFailed,
+        else => return error.ExternalMilpSolverFailed,
+    }
+}
+
+fn parseExternalMilpSolution(
+    allocator: Allocator,
+    problem: *const PlanningProblem,
+    solution_path: []const u8,
+) ![]bool {
+    const solution_file = try std.fs.openFileAbsolute(solution_path, .{});
+    defer solution_file.close();
+    const contents = try solution_file.readToEndAlloc(allocator, 1024 * 1024);
+    defer allocator.free(contents);
+
+    const keep_mask = try allocator.alloc(bool, problem.candidates.len);
+    @memset(keep_mask, false);
+
+    var saw_status = false;
+    var saw_assignment = false;
+    var lines = std.mem.splitScalar(u8, contents, '\n');
+    while (lines.next()) |raw_line| {
+        const line = std.mem.trim(u8, raw_line, " \t\r");
+        if (line.len == 0 or line[0] == '#') continue;
+
+        if (std.mem.eql(u8, line, "status=optimal")) {
+            saw_status = true;
+            continue;
+        }
+
+        if (std.mem.indexOfScalar(u8, line, '=')) |eq_idx| {
+            const key = std.mem.trim(u8, line[0..eq_idx], " \t");
+            const value = std.mem.trim(u8, line[eq_idx + 1 ..], " \t");
+            if (!std.mem.startsWith(u8, key, "keep_")) continue;
+
+            const idx = try std.fmt.parseInt(usize, key["keep_".len..], 10);
+            if (idx >= keep_mask.len) return error.InvalidMilpSolution;
+            if (std.mem.eql(u8, value, "1")) {
+                keep_mask[idx] = true;
+            } else if (std.mem.eql(u8, value, "0")) {
+                keep_mask[idx] = false;
+            } else {
+                return error.InvalidMilpSolution;
+            }
+            saw_assignment = true;
+        }
+    }
+
+    if (!saw_status or !saw_assignment) return error.InvalidMilpSolution;
+    return keep_mask;
 }
 
 fn writeSignedTerm(writer: anytype, coefficient: f64, variable_name: []const u8) !void {
@@ -602,6 +862,59 @@ test "milp model writes lp scaffold" {
     try std.testing.expect(std.mem.indexOf(u8, buffer.items, "keep_0") != null);
 }
 
+test "external milp solution parser reads keep assignments" {
+    const allocator = std.testing.allocator;
+
+    const candidates = [_]Candidate{
+        .{
+            .bytes = 8,
+            .weighted_recompute_cost = 5.0,
+            .op_index = 0,
+            .last_forward_use_index = 0,
+            .producer_candidate_indices = &.{},
+            .user_candidate_indices = &.{},
+        },
+        .{
+            .bytes = 8,
+            .weighted_recompute_cost = 5.0,
+            .op_index = 1,
+            .last_forward_use_index = 1,
+            .producer_candidate_indices = &.{},
+            .user_candidate_indices = &.{},
+        },
+    };
+    var problem = PlanningProblem{
+        .allocator = allocator,
+        .candidates = try dupCandidates(allocator, &candidates),
+        .candidate_metadata_indices = try allocator.dupe(usize, &.{ 0, 1 }),
+        .base_stage_bytes = try allocator.dupe(u64, &.{ 0, 0 }),
+        .base_retained_bytes = 0,
+        .total_retained_bytes_before = 16,
+        .budget = 8,
+    };
+    defer problem.deinit();
+
+    const solution_path = try resolveArtifactPath(allocator, null, ".sol");
+    defer {
+        std.fs.deleteFileAbsolute(solution_path) catch {};
+        allocator.free(solution_path);
+    }
+    {
+        const file = try std.fs.createFileAbsolute(solution_path, .{ .truncate = true });
+        defer file.close();
+        try file.writeAll(
+            \\status=optimal
+            \\keep_0=1
+            \\keep_1=0
+            \\
+        );
+    }
+
+    const keep_mask = try parseExternalMilpSolution(allocator, &problem, solution_path);
+    defer allocator.free(keep_mask);
+    try std.testing.expectEqualSlices(bool, &.{ true, false }, keep_mask);
+}
+
 test "planning problem exact solver handles branching lifetime tradeoff" {
     const allocator = std.testing.allocator;
 
@@ -689,12 +1002,61 @@ test "exact backend beats greedy on overlapping intervals" {
     };
     defer problem.deinit();
 
-    var exact = try solvePlanningProblem(allocator, &problem, .exact_bounded);
+    var exact = try solvePlanningProblem(allocator, &problem, .{ .backend = .exact_bounded });
     defer exact.deinit(allocator);
-    var greedy = try solvePlanningProblem(allocator, &problem, .greedy_stage_aware);
+    var greedy = try solvePlanningProblem(allocator, &problem, .{ .backend = .greedy_stage_aware });
     defer greedy.deinit(allocator);
 
     try std.testing.expectEqualSlices(bool, &.{ false, true, true }, exact.keep_mask);
     try std.testing.expectEqualSlices(bool, &.{ true, false, false }, greedy.keep_mask);
     try std.testing.expect(exact.total_recompute_cost < greedy.total_recompute_cost);
+}
+
+test "glpk backend matches exact bounded solver on small problem" {
+    const allocator = std.testing.allocator;
+
+    const candidates = [_]Candidate{
+        .{
+            .bytes = 8,
+            .weighted_recompute_cost = 10.0,
+            .op_index = 0,
+            .last_forward_use_index = 2,
+            .producer_candidate_indices = &.{},
+            .user_candidate_indices = &.{},
+        },
+        .{
+            .bytes = 8,
+            .weighted_recompute_cost = 6.0,
+            .op_index = 0,
+            .last_forward_use_index = 0,
+            .producer_candidate_indices = &.{},
+            .user_candidate_indices = &.{},
+        },
+        .{
+            .bytes = 8,
+            .weighted_recompute_cost = 6.0,
+            .op_index = 1,
+            .last_forward_use_index = 1,
+            .producer_candidate_indices = &.{},
+            .user_candidate_indices = &.{},
+        },
+    };
+    var problem = PlanningProblem{
+        .allocator = allocator,
+        .candidates = try dupCandidates(allocator, &candidates),
+        .candidate_metadata_indices = try allocator.dupe(usize, &.{ 0, 1, 2 }),
+        .base_stage_bytes = try allocator.dupe(u64, &.{ 0, 0, 0 }),
+        .base_retained_bytes = 0,
+        .total_retained_bytes_before = 24,
+        .budget = 8,
+    };
+    defer problem.deinit();
+
+    var exact = try solvePlanningProblem(allocator, &problem, .{ .backend = .exact_bounded });
+    defer exact.deinit(allocator);
+    var glpk_result = try solvePlanningProblem(allocator, &problem, .{ .backend = .milp_glpk });
+    defer glpk_result.deinit(allocator);
+
+    try std.testing.expectEqualSlices(bool, exact.keep_mask, glpk_result.keep_mask);
+    try std.testing.expectEqual(exact.peak_stage_bytes, glpk_result.peak_stage_bytes);
 }

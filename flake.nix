@@ -61,6 +61,7 @@
             echo "ZLS version: $(zls --version)"
             export ZIG_GLOBAL_CACHE_DIR="$(pwd)/.zig-cache"
             export CAPNP_DIR="${pkgs.capnproto}"
+            export GLPK_DIR="${pkgs.glpk}"
             export IREE_SOURCE_DIR="${packages.iree-sdk.src}"
             export IREE_BUILD_DIR="${packages.iree-sdk.build}"
             ${lib.optionalString pkgs.stdenv.isDarwin ''
@@ -93,6 +94,7 @@
             packages.iree-sdk.build
             packages.iree-sdk.src
             pkgs.capnproto
+            pkgs.glpk
           ];
           propagatedBuildInputs = [
             packages.iree-sdk
@@ -110,6 +112,7 @@
           zigCheckFlags = [ "--verbose" "--color" "off" ];
           zigInstallFlags = [ "--verbose" "--color" "off" ];
           CAPNP_DIR = "${pkgs.capnproto}";
+          GLPK_DIR = "${pkgs.glpk}";
           IREE_SOURCE_DIR = "${packages.iree-sdk.src}";
           IREE_BUILD_DIR = "${packages.iree-sdk.build}";
 
@@ -126,6 +129,7 @@
               lib.makeLibraryPath [
                 packages.iree-sdk
                 pkgs.capnproto
+                pkgs.glpk
                 pkgs.cudaPackages.cuda_cudart
                 pkgs.elfutils
                 pkgs.glibc

@@ -789,7 +789,13 @@ fn runGateway(allocator: Allocator, args: Args) !void {
     var gateway_instance = gateway.Gateway.init(allocator, config);
     defer gateway_instance.deinit();
 
-    var api_server = gateway_api.GatewayApiServer.init(allocator, &gateway_instance, api_token, internal_api_token);
+    var api_server = gateway_api.GatewayApiServer.init(
+        allocator,
+        &gateway_instance,
+        api_token,
+        internal_api_token,
+        federation_token,
+    );
 
     var federation_client: ?gateway_federation_client.FederationClient = null;
     var federation_thread: ?std.Thread = null;

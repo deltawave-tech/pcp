@@ -7,6 +7,7 @@ const http_server = @import("../inference/http_server.zig");
 const graph_policy_store = @import("../graph/policy_store.zig");
 const graph_types = @import("../graph/types.zig");
 const service_registry = @import("service_registry.zig");
+const graph_adapter = @import("graph_adapter.zig");
 const gateway_mod = @import("gateway.zig");
 const event_ingest = @import("event_ingest.zig");
 
@@ -24,6 +25,7 @@ pub const GatewayApiServer = struct {
     gateway: *gateway_mod.Gateway,
     api_token: ?[]const u8,
     internal_api_token: ?[]const u8,
+    global_controller_token: ?[]const u8,
     server: ?TcpServer,
     listen_host: ?[]const u8,
     listen_port: u16,
@@ -31,12 +33,19 @@ pub const GatewayApiServer = struct {
 
     const Self = @This();
 
-    pub fn init(allocator: Allocator, gateway: *gateway_mod.Gateway, api_token: ?[]const u8, internal_api_token: ?[]const u8) Self {
+    pub fn init(
+        allocator: Allocator,
+        gateway: *gateway_mod.Gateway,
+        api_token: ?[]const u8,
+        internal_api_token: ?[]const u8,
+        global_controller_token: ?[]const u8,
+    ) Self {
         return .{
             .allocator = allocator,
             .gateway = gateway,
             .api_token = api_token,
             .internal_api_token = internal_api_token,
+            .global_controller_token = global_controller_token,
             .server = null,
             .listen_host = null,
             .listen_port = 0,
@@ -370,7 +379,23 @@ pub const GatewayApiServer = struct {
             var parsed = try std.json.parseFromSlice(graph_types.QueryRequest, self.allocator, req.body, .{ .ignore_unknown_fields = true });
             defer parsed.deinit();
 
-            const body = try self.gateway.graph.renderQueryJson(self.allocator, parsed.value);
+            const body = renderFederatedGraphQueryJson(
+                self.allocator,
+                &self.gateway.graph,
+                self.gateway.config.resolvedGlobalControllerEndpoint(),
+                self.global_controller_token,
+                parsed.value,
+            ) catch |err| switch (err) {
+                error.InvalidQueryMode, error.GlobalControllerNotConfigured => {
+                    try http_server.writeResponse(stream, "400 Bad Request", &.{"Content-Type: text/plain"}, @errorName(err));
+                    return true;
+                },
+                error.GlobalControllerQueryFailed, error.InvalidGlobalControllerResponse => {
+                    try http_server.writeResponse(stream, "502 Bad Gateway", &.{"Content-Type: text/plain"}, @errorName(err));
+                    return true;
+                },
+                else => return err,
+            };
             defer self.allocator.free(body);
             try http_server.writeResponse(stream, "200 OK", &.{"Content-Type: application/json"}, body);
             return true;
@@ -656,4 +681,162 @@ fn writeProxyErrorResponse(stream: net.Stream, err: anyerror) !void {
         else => "500 Internal Server Error",
     };
     try http_server.writeResponse(stream, status, &.{"Content-Type: text/plain"}, @errorName(err));
+}
+
+fn renderFederatedGraphQueryJson(
+    allocator: Allocator,
+    graph: *graph_adapter.GatewayGraph,
+    global_controller_endpoint: ?[]const u8,
+    global_controller_token: ?[]const u8,
+    request: graph_types.QueryRequest,
+) ![]u8 {
+    const mode = try request.resolvedMode();
+    return switch (mode) {
+        .local => graph.renderQueryJson(allocator, request.withMode(.local)),
+        .global => {
+            const endpoint = global_controller_endpoint orelse return error.GlobalControllerNotConfigured;
+            return queryGlobalController(allocator, endpoint, global_controller_token, request.withMode(.global));
+        },
+        .local_plus_global => {
+            const endpoint = global_controller_endpoint orelse return error.GlobalControllerNotConfigured;
+            const local_body = try graph.renderQueryJson(allocator, request.withMode(.local));
+            defer allocator.free(local_body);
+            const global_body = try queryGlobalController(allocator, endpoint, global_controller_token, request.withMode(.global));
+            defer allocator.free(global_body);
+            return mergeQueryResponses(allocator, local_body, global_body);
+        },
+    };
+}
+
+fn queryGlobalController(
+    allocator: Allocator,
+    endpoint: []const u8,
+    auth_token: ?[]const u8,
+    request: graph_types.QueryRequest,
+) ![]u8 {
+    var client = std.http.Client{ .allocator = allocator };
+    defer client.deinit();
+
+    const url = try std.fmt.allocPrint(
+        allocator,
+        "{s}/v1/global-graph/query",
+        .{std.mem.trimRight(u8, endpoint, "/")},
+    );
+    defer allocator.free(url);
+
+    const body = try std.json.stringifyAlloc(allocator, request, .{});
+    defer allocator.free(body);
+
+    var auth_header_value: ?[]u8 = null;
+    defer if (auth_header_value) |value| allocator.free(value);
+
+    var headers = std.ArrayList(std.http.Header).init(allocator);
+    defer headers.deinit();
+    try headers.append(.{ .name = "content-type", .value = "application/json" });
+    try headers.append(.{ .name = "accept", .value = "application/json" });
+    if (auth_token) |token| {
+        auth_header_value = try std.fmt.allocPrint(allocator, "Bearer {s}", .{token});
+        try headers.append(.{ .name = "authorization", .value = auth_header_value.? });
+    }
+
+    var response_body = std.ArrayList(u8).init(allocator);
+    errdefer response_body.deinit();
+
+    const result = client.fetch(.{
+        .location = .{ .url = url },
+        .method = .POST,
+        .payload = body,
+        .extra_headers = headers.items,
+        .response_storage = .{ .dynamic = &response_body },
+    }) catch return error.GlobalControllerQueryFailed;
+
+    if (result.status != .ok and result.status != .accepted and result.status != .created) {
+        return error.GlobalControllerQueryFailed;
+    }
+
+    return response_body.toOwnedSlice();
+}
+
+fn mergeQueryResponses(allocator: Allocator, local_body: []const u8, global_body: []const u8) ![]u8 {
+    var local_parsed = try std.json.parseFromSlice(std.json.Value, allocator, local_body, .{});
+    defer local_parsed.deinit();
+    var global_parsed = try std.json.parseFromSlice(std.json.Value, allocator, global_body, .{});
+    defer global_parsed.deinit();
+
+    const local_root = switch (local_parsed.value) {
+        .object => |object| object,
+        else => return error.InvalidGlobalControllerResponse,
+    };
+    const global_root = switch (global_parsed.value) {
+        .object => |object| object,
+        else => return error.InvalidGlobalControllerResponse,
+    };
+
+    var body = std.ArrayList(u8).init(allocator);
+    errdefer body.deinit();
+    var writer = body.writer();
+
+    try writer.writeAll("{\"entities\":[");
+    try writeMergedQueryArray(allocator, writer, local_root, global_root, "entities", "entity_id");
+    try writer.writeAll("],\"relations\":[");
+    try writeMergedQueryArray(allocator, writer, local_root, global_root, "relations", "relation_id");
+    try writer.writeAll("],\"observations\":[");
+    try writeMergedQueryArray(allocator, writer, local_root, global_root, "observations", "observation_id");
+    try writer.writeAll("]}");
+
+    return body.toOwnedSlice();
+}
+
+fn writeMergedQueryArray(
+    allocator: Allocator,
+    writer: anytype,
+    local_root: std.json.ObjectMap,
+    global_root: std.json.ObjectMap,
+    array_name: []const u8,
+    id_field: []const u8,
+) !void {
+    const local_items = try queryArrayField(local_root, array_name);
+    const global_items = try queryArrayField(global_root, array_name);
+
+    var seen = std.StringHashMap(void).init(allocator);
+    defer seen.deinit();
+
+    var emitted: usize = 0;
+    for (local_items) |item| {
+        const key = try queryItemId(item, id_field);
+        if (seen.contains(key)) continue;
+        try seen.put(key, {});
+        if (emitted > 0) try writer.writeByte(',');
+        try std.json.stringify(item, .{}, writer);
+        emitted += 1;
+    }
+
+    for (global_items) |item| {
+        const key = try queryItemId(item, id_field);
+        if (seen.contains(key)) continue;
+        try seen.put(key, {});
+        if (emitted > 0) try writer.writeByte(',');
+        try std.json.stringify(item, .{}, writer);
+        emitted += 1;
+    }
+}
+
+fn queryArrayField(root: std.json.ObjectMap, name: []const u8) ![]const std.json.Value {
+    const value = root.get(name) orelse return error.InvalidGlobalControllerResponse;
+    return switch (value) {
+        .array => |array| array.items,
+        else => return error.InvalidGlobalControllerResponse,
+    };
+}
+
+fn queryItemId(item: std.json.Value, field_name: []const u8) ![]const u8 {
+    const object = switch (item) {
+        .object => |object| object,
+        else => return error.InvalidGlobalControllerResponse,
+    };
+    const field = object.get(field_name) orelse return error.InvalidGlobalControllerResponse;
+    return switch (field) {
+        .string => |text| text,
+        else => return error.InvalidGlobalControllerResponse,
+    };
 }

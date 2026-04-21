@@ -28,6 +28,27 @@ pub const Visibility = enum {
     }
 };
 
+pub const QueryMode = enum {
+    local,
+    local_plus_global,
+    global,
+
+    pub fn parse(value: []const u8) ?QueryMode {
+        if (std.mem.eql(u8, value, "local")) return .local;
+        if (std.mem.eql(u8, value, "local_plus_global")) return .local_plus_global;
+        if (std.mem.eql(u8, value, "global")) return .global;
+        return null;
+    }
+
+    pub fn asString(self: QueryMode) []const u8 {
+        return switch (self) {
+            .local => "local",
+            .local_plus_global => "local_plus_global",
+            .global => "global",
+        };
+    }
+};
+
 pub const MutationType = enum {
     upsert_entity,
     upsert_relation,
@@ -78,6 +99,18 @@ pub const QueryRequest = struct {
     relations: ?[]const []const u8 = null,
     text: ?[]const u8 = null,
     limit: ?usize = null,
+    query_mode: ?[]const u8 = null,
+
+    pub fn resolvedMode(self: QueryRequest) !QueryMode {
+        const raw = self.query_mode orelse return .local;
+        return QueryMode.parse(raw) orelse error.InvalidQueryMode;
+    }
+
+    pub fn withMode(self: QueryRequest, mode: QueryMode) QueryRequest {
+        var copy = self;
+        copy.query_mode = mode.asString();
+        return copy;
+    }
 };
 
 pub const GraphCounts = struct {

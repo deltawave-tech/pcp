@@ -31,6 +31,7 @@ pub const Candidate = struct {
     last_forward_use_index: usize,
     producer_candidate_indices: []usize,
     user_candidate_indices: []usize,
+    use_stage_indices: []usize,
 };
 
 pub const PlanningProblem = struct {
@@ -46,6 +47,7 @@ pub const PlanningProblem = struct {
         for (self.candidates) |candidate| {
             self.allocator.free(candidate.producer_candidate_indices);
             self.allocator.free(candidate.user_candidate_indices);
+            self.allocator.free(candidate.use_stage_indices);
         }
         self.allocator.free(self.candidates);
         self.allocator.free(self.candidate_metadata_indices);
@@ -68,6 +70,12 @@ pub const LinearConstraint = struct {
     name: []const u8,
     terms: []LinearTerm,
     rhs: f64,
+    sense: Sense,
+
+    pub const Sense = enum {
+        less_equal,
+        greater_equal,
+    };
 
     pub fn deinit(self: *LinearConstraint) void {
         self.allocator.free(self.name);
@@ -80,8 +88,17 @@ pub const MilpModel = struct {
     variable_names: [][]const u8,
     objective_coefficients: []f64,
     objective_constant: f64,
+    keep_variable_count: usize,
+    recompute_variables: []RecomputeVariable,
     stage_constraints: []LinearConstraint,
+    availability_constraints: []LinearConstraint,
+    dependency_constraints: []LinearConstraint,
     dependency_edges: []DependencyEdge,
+
+    pub const RecomputeVariable = struct {
+        candidate_index: usize,
+        stage_index: usize,
+    };
 
     pub fn deinit(self: *MilpModel) void {
         for (self.variable_names) |name| {
@@ -89,10 +106,19 @@ pub const MilpModel = struct {
         }
         self.allocator.free(self.variable_names);
         self.allocator.free(self.objective_coefficients);
+        self.allocator.free(self.recompute_variables);
         for (self.stage_constraints) |*constraint| {
             constraint.deinit();
         }
         self.allocator.free(self.stage_constraints);
+        for (self.availability_constraints) |*constraint| {
+            constraint.deinit();
+        }
+        self.allocator.free(self.availability_constraints);
+        for (self.dependency_constraints) |*constraint| {
+            constraint.deinit();
+        }
+        self.allocator.free(self.dependency_constraints);
         self.allocator.free(self.dependency_edges);
     }
 
@@ -115,16 +141,13 @@ pub const MilpModel = struct {
         }
         try writer.writeAll("\nSubject To\n");
         for (self.stage_constraints) |constraint| {
-            try writer.print(" {s}:", .{constraint.name});
-            if (constraint.terms.len == 0) {
-                try writer.writeAll(" 0");
-            } else {
-                for (constraint.terms, 0..) |term, term_idx| {
-                    if (term_idx > 0) try writer.writeAll(" ");
-                    try writeSignedTerm(writer, term.coefficient, self.variable_names[term.variable_index]);
-                }
-            }
-            try writer.print(" <= {d:.6}\n", .{constraint.rhs});
+            try writeConstraint(writer, self.variable_names, constraint);
+        }
+        for (self.availability_constraints) |constraint| {
+            try writeConstraint(writer, self.variable_names, constraint);
+        }
+        for (self.dependency_constraints) |constraint| {
+            try writeConstraint(writer, self.variable_names, constraint);
         }
         if (self.dependency_edges.len > 0) {
             try writer.writeAll("\\ Dependency edges for future precedence constraints:\n");
@@ -157,7 +180,14 @@ pub const ExactPlanResult = struct {
 const MAX_EXACT_CANDIDATES: usize = 24;
 
 pub fn buildMilpModel(allocator: Allocator, problem: *const PlanningProblem) !MilpModel {
-    var variable_names = try allocator.alloc([]const u8, problem.candidates.len);
+    const keep_variable_count = problem.candidates.len;
+    var recompute_var_count: usize = 0;
+    for (problem.candidates) |candidate| {
+        recompute_var_count += candidate.last_forward_use_index - candidate.op_index + 1;
+    }
+    const total_variable_count = keep_variable_count + recompute_var_count;
+
+    var variable_names = try allocator.alloc([]const u8, total_variable_count);
     errdefer allocator.free(variable_names);
     for (problem.candidates, 0..) |_, candidate_idx| {
         variable_names[candidate_idx] = try std.fmt.allocPrintZ(allocator, "keep_{d}", .{candidate_idx});
@@ -168,12 +198,28 @@ pub fn buildMilpModel(allocator: Allocator, problem: *const PlanningProblem) !Mi
         }
     }
 
-    const objective_coefficients = try allocator.alloc(f64, problem.candidates.len);
+    const objective_coefficients = try allocator.alloc(f64, total_variable_count);
     errdefer allocator.free(objective_coefficients);
-    var objective_constant: f64 = 0.0;
+    @memset(objective_coefficients, 0.0);
+    const objective_constant: f64 = 0.0;
+    const recompute_variables = try allocator.alloc(MilpModel.RecomputeVariable, recompute_var_count);
+    errdefer allocator.free(recompute_variables);
+
+    var next_var_idx = keep_variable_count;
     for (problem.candidates, 0..) |candidate, candidate_idx| {
-        objective_constant += candidate.weighted_recompute_cost;
-        objective_coefficients[candidate_idx] = -candidate.weighted_recompute_cost;
+        for (candidate.op_index..candidate.last_forward_use_index + 1) |stage_idx| {
+            recompute_variables[next_var_idx - keep_variable_count] = .{
+                .candidate_index = candidate_idx,
+                .stage_index = stage_idx,
+            };
+            variable_names[next_var_idx] = try std.fmt.allocPrintZ(
+                allocator,
+                "remat_{d}_{d}",
+                .{ candidate_idx, stage_idx },
+            );
+            objective_coefficients[next_var_idx] = candidate.weighted_recompute_cost;
+            next_var_idx += 1;
+        }
     }
 
     var stage_constraints = std.ArrayList(LinearConstraint).init(allocator);
@@ -195,13 +241,99 @@ pub fn buildMilpModel(allocator: Allocator, problem: *const PlanningProblem) !Mi
                 });
             }
         }
+        for (recompute_variables, 0..) |recompute_var, recompute_idx| {
+            if (recompute_var.stage_index == stage_idx) {
+                try terms.append(.{
+                    .variable_index = keep_variable_count + recompute_idx,
+                    .coefficient = @floatFromInt(problem.candidates[recompute_var.candidate_index].bytes),
+                });
+            }
+        }
         const rhs = @as(f64, @floatFromInt(problem.budget)) - @as(f64, @floatFromInt(base_bytes));
         try stage_constraints.append(.{
             .allocator = allocator,
             .name = try std.fmt.allocPrintZ(allocator, "stage_{d}", .{stage_idx}),
             .terms = try terms.toOwnedSlice(),
             .rhs = rhs,
+            .sense = .less_equal,
         });
+    }
+
+    var availability_constraints = std.ArrayList(LinearConstraint).init(allocator);
+    errdefer {
+        for (availability_constraints.items) |*constraint| {
+            constraint.deinit();
+        }
+        availability_constraints.deinit();
+    }
+    for (problem.candidates, 0..) |candidate, candidate_idx| {
+        for (candidate.use_stage_indices) |use_stage_idx| {
+            var terms = std.ArrayList(LinearTerm).init(allocator);
+            errdefer terms.deinit();
+            try terms.append(.{
+                .variable_index = candidate_idx,
+                .coefficient = 1.0,
+            });
+            for (recompute_variables, 0..) |recompute_var, recompute_idx| {
+                if (recompute_var.candidate_index == candidate_idx and recompute_var.stage_index <= use_stage_idx) {
+                    try terms.append(.{
+                        .variable_index = keep_variable_count + recompute_idx,
+                        .coefficient = 1.0,
+                    });
+                }
+            }
+            try availability_constraints.append(.{
+                .allocator = allocator,
+                .name = try std.fmt.allocPrintZ(allocator, "avail_{d}_{d}", .{ candidate_idx, use_stage_idx }),
+                .terms = try terms.toOwnedSlice(),
+                .rhs = 1.0,
+                .sense = .greater_equal,
+            });
+        }
+    }
+
+    var dependency_constraints = std.ArrayList(LinearConstraint).init(allocator);
+    errdefer {
+        for (dependency_constraints.items) |*constraint| {
+            constraint.deinit();
+        }
+        dependency_constraints.deinit();
+    }
+    for (recompute_variables, 0..) |recompute_var, recompute_idx| {
+        const candidate = problem.candidates[recompute_var.candidate_index];
+        for (candidate.producer_candidate_indices) |producer_idx| {
+            var terms = std.ArrayList(LinearTerm).init(allocator);
+            errdefer terms.deinit();
+            try terms.append(.{
+                .variable_index = keep_variable_count + recompute_idx,
+                .coefficient = 1.0,
+            });
+            try terms.append(.{
+                .variable_index = producer_idx,
+                .coefficient = -1.0,
+            });
+            for (recompute_variables, 0..) |producer_recompute_var, producer_recompute_idx| {
+                if (producer_recompute_var.candidate_index == producer_idx and
+                    producer_recompute_var.stage_index <= recompute_var.stage_index)
+                {
+                    try terms.append(.{
+                        .variable_index = keep_variable_count + producer_recompute_idx,
+                        .coefficient = -1.0,
+                    });
+                }
+            }
+            try dependency_constraints.append(.{
+                .allocator = allocator,
+                .name = try std.fmt.allocPrintZ(
+                    allocator,
+                    "dep_{d}_{d}_{d}",
+                    .{ recompute_var.candidate_index, recompute_var.stage_index, producer_idx },
+                ),
+                .terms = try terms.toOwnedSlice(),
+                .rhs = 0.0,
+                .sense = .less_equal,
+            });
+        }
     }
 
     var dependency_edges = std.ArrayList(DependencyEdge).init(allocator);
@@ -220,7 +352,11 @@ pub fn buildMilpModel(allocator: Allocator, problem: *const PlanningProblem) !Mi
         .variable_names = variable_names,
         .objective_coefficients = objective_coefficients,
         .objective_constant = objective_constant,
+        .keep_variable_count = keep_variable_count,
+        .recompute_variables = recompute_variables,
         .stage_constraints = try stage_constraints.toOwnedSlice(),
+        .availability_constraints = try availability_constraints.toOwnedSlice(),
+        .dependency_constraints = try dependency_constraints.toOwnedSlice(),
         .dependency_edges = try dependency_edges.toOwnedSlice(),
     };
 }
@@ -347,29 +483,44 @@ pub fn solvePlanningProblemGlpk(
 
     glpk.glp_set_obj_dir(lp, glpk.GLP_MIN);
 
-    const row_count: c_int = @intCast(model.stage_constraints.len);
-    const col_count: c_int = @intCast(problem.candidates.len);
+    const row_count_total = model.stage_constraints.len + model.availability_constraints.len + model.dependency_constraints.len;
+    const row_count: c_int = @intCast(row_count_total);
+    const col_count: c_int = @intCast(model.variable_names.len);
 
     _ = glpk.glp_add_rows(lp, row_count);
-    for (model.stage_constraints, 0..) |constraint, row_idx| {
-        const rhs = constraint.rhs;
-        glpk.glp_set_row_name(lp, @intCast(row_idx + 1), constraint.name.ptr);
-        if (rhs < 0.0) {
-            return error.NoFeasibleRematPlan;
-        }
-        glpk.glp_set_row_bnds(lp, @intCast(row_idx + 1), glpk.GLP_UP, 0.0, rhs);
+    var row_idx: usize = 0;
+    for (model.stage_constraints) |constraint| {
+        try configureGlpkRow(lp, row_idx + 1, constraint);
+        row_idx += 1;
+    }
+    for (model.availability_constraints) |constraint| {
+        try configureGlpkRow(lp, row_idx + 1, constraint);
+        row_idx += 1;
+    }
+    for (model.dependency_constraints) |constraint| {
+        try configureGlpkRow(lp, row_idx + 1, constraint);
+        row_idx += 1;
     }
 
     _ = glpk.glp_add_cols(lp, col_count);
-    for (problem.candidates, 0..) |_, col_idx| {
+    for (model.variable_names, 0..) |name, col_idx| {
+        const is_keep_var = col_idx < model.keep_variable_count;
         glpk.glp_set_col_name(lp, @intCast(col_idx + 1), model.variable_names[col_idx].ptr);
         glpk.glp_set_col_kind(lp, @intCast(col_idx + 1), glpk.GLP_BV);
         glpk.glp_set_col_bnds(lp, @intCast(col_idx + 1), glpk.GLP_DB, 0.0, 1.0);
         glpk.glp_set_obj_coef(lp, @intCast(col_idx + 1), model.objective_coefficients[col_idx]);
+        _ = name;
+        _ = is_keep_var;
     }
 
     var nonzeros: usize = 0;
     for (model.stage_constraints) |constraint| {
+        nonzeros += constraint.terms.len;
+    }
+    for (model.availability_constraints) |constraint| {
+        nonzeros += constraint.terms.len;
+    }
+    for (model.dependency_constraints) |constraint| {
         nonzeros += constraint.terms.len;
     }
 
@@ -381,13 +532,18 @@ pub fn solvePlanningProblemGlpk(
     defer allocator.free(ar);
 
     var nz_index: usize = 1;
-    for (model.stage_constraints, 0..) |constraint, row_idx| {
-        for (constraint.terms) |term| {
-            ia[nz_index] = @intCast(row_idx + 1);
-            ja[nz_index] = @intCast(term.variable_index + 1);
-            ar[nz_index] = term.coefficient;
-            nz_index += 1;
-        }
+    row_idx = 0;
+    for (model.stage_constraints) |constraint| {
+        appendConstraintTermsToGlpkMatrix(constraint, row_idx + 1, ia, ja, ar, &nz_index);
+        row_idx += 1;
+    }
+    for (model.availability_constraints) |constraint| {
+        appendConstraintTermsToGlpkMatrix(constraint, row_idx + 1, ia, ja, ar, &nz_index);
+        row_idx += 1;
+    }
+    for (model.dependency_constraints) |constraint| {
+        appendConstraintTermsToGlpkMatrix(constraint, row_idx + 1, ia, ja, ar, &nz_index);
+        row_idx += 1;
     }
 
     glpk.glp_load_matrix(lp, @intCast(nonzeros), ia.ptr, ja.ptr, ar.ptr);
@@ -421,8 +577,14 @@ pub fn solvePlanningProblemGlpk(
         const value = glpk.glp_mip_col_val(lp, @intCast(candidate_idx + 1));
         keep_mask[candidate_idx] = value >= 0.5;
     }
+    const recompute_mask = try allocator.alloc(bool, model.recompute_variables.len);
+    defer allocator.free(recompute_mask);
+    for (model.recompute_variables, 0..) |_, recompute_idx| {
+        const value = glpk.glp_mip_col_val(lp, @intCast(model.keep_variable_count + recompute_idx + 1));
+        recompute_mask[recompute_idx] = value >= 0.5;
+    }
 
-    const final_eval = evaluateKeepMask(problem.candidates, problem.base_stage_bytes, keep_mask);
+    const final_eval = evaluateScheduledSolution(problem, &model, keep_mask, recompute_mask);
     if (final_eval.peak_stage_bytes > problem.budget) {
         return error.InvalidMilpSolution;
     }
@@ -433,6 +595,35 @@ pub fn solvePlanningProblemGlpk(
         .peak_stage_bytes = final_eval.peak_stage_bytes,
         .total_recompute_cost = final_eval.total_recompute_cost,
     };
+}
+
+fn configureGlpkRow(lp: ?*glpk.glp_prob, row_idx: usize, constraint: LinearConstraint) !void {
+    glpk.glp_set_row_name(lp, @intCast(row_idx), constraint.name.ptr);
+    switch (constraint.sense) {
+        .less_equal => {
+            if (constraint.rhs < 0.0) return error.NoFeasibleRematPlan;
+            glpk.glp_set_row_bnds(lp, @intCast(row_idx), glpk.GLP_UP, 0.0, constraint.rhs);
+        },
+        .greater_equal => {
+            glpk.glp_set_row_bnds(lp, @intCast(row_idx), glpk.GLP_LO, constraint.rhs, 0.0);
+        },
+    }
+}
+
+fn appendConstraintTermsToGlpkMatrix(
+    constraint: LinearConstraint,
+    row_idx: usize,
+    ia: []c_int,
+    ja: []c_int,
+    ar: []f64,
+    nz_index: *usize,
+) void {
+    for (constraint.terms) |term| {
+        ia[nz_index.*] = @intCast(row_idx);
+        ja[nz_index.*] = @intCast(term.variable_index + 1);
+        ar[nz_index.*] = term.coefficient;
+        nz_index.* += 1;
+    }
 }
 
 pub fn solvePlanningProblemMilpExternal(
@@ -605,6 +796,50 @@ fn evaluateKeepMask(candidates: []const Candidate, base_stage_bytes: []const u64
     };
 }
 
+fn evaluateScheduledSolution(
+    problem: *const PlanningProblem,
+    model: *const MilpModel,
+    keep_mask: []const bool,
+    recompute_mask: []const bool,
+) StageEval {
+    var peak_stage_bytes: u64 = 0;
+    var total_retained_bytes: u64 = 0;
+    var total_recompute_cost: f64 = 0.0;
+
+    for (problem.candidates, 0..) |candidate, candidate_idx| {
+        if (keep_mask[candidate_idx]) {
+            total_retained_bytes += candidate.bytes;
+        }
+    }
+
+    for (model.recompute_variables, 0..) |recompute_var, recompute_idx| {
+        if (recompute_mask[recompute_idx]) {
+            total_recompute_cost += problem.candidates[recompute_var.candidate_index].weighted_recompute_cost;
+        }
+    }
+
+    for (problem.base_stage_bytes, 0..) |base_bytes, stage_idx| {
+        var stage_bytes = base_bytes;
+        for (problem.candidates, 0..) |candidate, candidate_idx| {
+            if (keep_mask[candidate_idx] and candidate.op_index <= stage_idx and candidate.last_forward_use_index >= stage_idx) {
+                stage_bytes += candidate.bytes;
+            }
+        }
+        for (model.recompute_variables, 0..) |recompute_var, recompute_idx| {
+            if (recompute_mask[recompute_idx] and recompute_var.stage_index == stage_idx) {
+                stage_bytes += problem.candidates[recompute_var.candidate_index].bytes;
+            }
+        }
+        peak_stage_bytes = @max(peak_stage_bytes, stage_bytes);
+    }
+
+    return .{
+        .total_retained_bytes = total_retained_bytes,
+        .peak_stage_bytes = peak_stage_bytes,
+        .total_recompute_cost = total_recompute_cost,
+    };
+}
+
 fn stageWeightedKeepSum(candidates: []const Candidate, mask: u64) usize {
     var total: usize = 0;
     for (candidates, 0..) |candidate, candidate_idx| {
@@ -716,6 +951,23 @@ fn writeSignedTerm(writer: anytype, coefficient: f64, variable_name: []const u8)
     }
 }
 
+fn writeConstraint(writer: anytype, variable_names: [][]const u8, constraint: LinearConstraint) !void {
+    try writer.print(" {s}:", .{constraint.name});
+    if (constraint.terms.len == 0) {
+        try writer.writeAll(" 0");
+    } else {
+        for (constraint.terms, 0..) |term, term_idx| {
+            if (term_idx > 0) try writer.writeAll(" ");
+            try writeSignedTerm(writer, term.coefficient, variable_names[term.variable_index]);
+        }
+    }
+    const sense_text = switch (constraint.sense) {
+        .less_equal => "<=",
+        .greater_equal => ">=",
+    };
+    try writer.print(" {s} {d:.6}\n", .{ sense_text, constraint.rhs });
+}
+
 fn dupCandidates(allocator: Allocator, candidates: []const Candidate) ![]Candidate {
     var owned = try allocator.alloc(Candidate, candidates.len);
     errdefer allocator.free(owned);
@@ -728,6 +980,7 @@ fn dupCandidates(allocator: Allocator, candidates: []const Candidate) ![]Candida
             .last_forward_use_index = candidate.last_forward_use_index,
             .producer_candidate_indices = try allocator.dupe(usize, candidate.producer_candidate_indices),
             .user_candidate_indices = try allocator.dupe(usize, candidate.user_candidate_indices),
+            .use_stage_indices = try allocator.dupe(usize, candidate.use_stage_indices),
         };
     }
 
@@ -745,6 +998,7 @@ test "stage-aware exact planner prefers keeping long-lived expensive candidate" 
             .last_forward_use_index = 2,
             .producer_candidate_indices = &.{},
             .user_candidate_indices = &.{},
+            .use_stage_indices = &.{2},
         },
         .{
             .bytes = 8,
@@ -753,6 +1007,7 @@ test "stage-aware exact planner prefers keeping long-lived expensive candidate" 
             .last_forward_use_index = 1,
             .producer_candidate_indices = &.{},
             .user_candidate_indices = &.{},
+            .use_stage_indices = &.{1},
         },
         .{
             .bytes = 8,
@@ -761,6 +1016,7 @@ test "stage-aware exact planner prefers keeping long-lived expensive candidate" 
             .last_forward_use_index = 2,
             .producer_candidate_indices = &.{},
             .user_candidate_indices = &.{},
+            .use_stage_indices = &.{2},
         },
     };
 
@@ -792,6 +1048,7 @@ test "milp model captures stage constraints and dependency edges" {
             .last_forward_use_index = 2,
             .producer_candidate_indices = &.{},
             .user_candidate_indices = &.{1},
+            .use_stage_indices = &.{ 1, 2 },
         },
         .{
             .bytes = 4,
@@ -800,6 +1057,7 @@ test "milp model captures stage constraints and dependency edges" {
             .last_forward_use_index = 1,
             .producer_candidate_indices = &.{0},
             .user_candidate_indices = &.{},
+            .use_stage_indices = &.{1},
         },
     };
     var problem = PlanningProblem{
@@ -816,13 +1074,19 @@ test "milp model captures stage constraints and dependency edges" {
     var model = try buildMilpModel(allocator, &problem);
     defer model.deinit();
 
-    try std.testing.expectEqual(@as(f64, 13.0), model.objective_constant);
-    try std.testing.expectEqual(@as(usize, 2), model.variable_names.len);
+    try std.testing.expectEqual(@as(f64, 0.0), model.objective_constant);
+    try std.testing.expectEqual(@as(usize, 2), model.keep_variable_count);
+    try std.testing.expectEqual(@as(usize, 3), model.recompute_variables.len);
+    try std.testing.expectEqual(@as(usize, 5), model.variable_names.len);
     try std.testing.expectEqual(@as(usize, 3), model.stage_constraints.len);
+    try std.testing.expectEqual(@as(usize, 3), model.availability_constraints.len);
+    try std.testing.expectEqual(@as(usize, 2), model.dependency_constraints.len);
     try std.testing.expectEqual(@as(usize, 1), model.dependency_edges.len);
-    try std.testing.expectEqual(@as(usize, 2), model.stage_constraints[1].terms.len);
+    try std.testing.expectEqual(@as(usize, 4), model.stage_constraints[1].terms.len);
     try std.testing.expectEqual(@as(f64, 6.0), model.stage_constraints[0].rhs);
     try std.testing.expectEqualStrings("keep_0", model.variable_names[0]);
+    try std.testing.expectEqualStrings("remat_0_0", model.variable_names[2]);
+    try std.testing.expectEqual(LinearConstraint.Sense.greater_equal, model.availability_constraints[0].sense);
 }
 
 test "milp model writes lp scaffold" {
@@ -836,6 +1100,7 @@ test "milp model writes lp scaffold" {
             .last_forward_use_index = 0,
             .producer_candidate_indices = &.{},
             .user_candidate_indices = &.{},
+            .use_stage_indices = &.{0},
         },
     };
     var problem = PlanningProblem{
@@ -858,8 +1123,10 @@ test "milp model writes lp scaffold" {
 
     try std.testing.expect(std.mem.indexOf(u8, buffer.items, "Minimize") != null);
     try std.testing.expect(std.mem.indexOf(u8, buffer.items, "stage_0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buffer.items, "avail_0_0") != null);
     try std.testing.expect(std.mem.indexOf(u8, buffer.items, "Binary") != null);
     try std.testing.expect(std.mem.indexOf(u8, buffer.items, "keep_0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buffer.items, "remat_0_0") != null);
 }
 
 test "external milp solution parser reads keep assignments" {
@@ -873,6 +1140,7 @@ test "external milp solution parser reads keep assignments" {
             .last_forward_use_index = 0,
             .producer_candidate_indices = &.{},
             .user_candidate_indices = &.{},
+            .use_stage_indices = &.{0},
         },
         .{
             .bytes = 8,
@@ -881,6 +1149,7 @@ test "external milp solution parser reads keep assignments" {
             .last_forward_use_index = 1,
             .producer_candidate_indices = &.{},
             .user_candidate_indices = &.{},
+            .use_stage_indices = &.{1},
         },
     };
     var problem = PlanningProblem{
@@ -926,6 +1195,7 @@ test "planning problem exact solver handles branching lifetime tradeoff" {
             .last_forward_use_index = 3,
             .producer_candidate_indices = &.{},
             .user_candidate_indices = &.{1},
+            .use_stage_indices = &.{ 1, 3 },
         },
         .{
             .bytes = 8,
@@ -934,6 +1204,7 @@ test "planning problem exact solver handles branching lifetime tradeoff" {
             .last_forward_use_index = 1,
             .producer_candidate_indices = &.{0},
             .user_candidate_indices = &.{},
+            .use_stage_indices = &.{1},
         },
         .{
             .bytes = 8,
@@ -942,6 +1213,7 @@ test "planning problem exact solver handles branching lifetime tradeoff" {
             .last_forward_use_index = 2,
             .producer_candidate_indices = &.{0},
             .user_candidate_indices = &.{},
+            .use_stage_indices = &.{2},
         },
     };
     var problem = PlanningProblem{
@@ -973,6 +1245,7 @@ test "exact backend beats greedy on overlapping intervals" {
             .last_forward_use_index = 2,
             .producer_candidate_indices = &.{},
             .user_candidate_indices = &.{},
+            .use_stage_indices = &.{2},
         },
         .{
             .bytes = 8,
@@ -981,6 +1254,7 @@ test "exact backend beats greedy on overlapping intervals" {
             .last_forward_use_index = 0,
             .producer_candidate_indices = &.{},
             .user_candidate_indices = &.{},
+            .use_stage_indices = &.{0},
         },
         .{
             .bytes = 8,
@@ -989,6 +1263,7 @@ test "exact backend beats greedy on overlapping intervals" {
             .last_forward_use_index = 1,
             .producer_candidate_indices = &.{},
             .user_candidate_indices = &.{},
+            .use_stage_indices = &.{1},
         },
     };
     var problem = PlanningProblem{
@@ -1023,6 +1298,7 @@ test "glpk backend matches exact bounded solver on small problem" {
             .last_forward_use_index = 2,
             .producer_candidate_indices = &.{},
             .user_candidate_indices = &.{},
+            .use_stage_indices = &.{2},
         },
         .{
             .bytes = 8,
@@ -1031,6 +1307,7 @@ test "glpk backend matches exact bounded solver on small problem" {
             .last_forward_use_index = 0,
             .producer_candidate_indices = &.{},
             .user_candidate_indices = &.{},
+            .use_stage_indices = &.{0},
         },
         .{
             .bytes = 8,
@@ -1039,6 +1316,7 @@ test "glpk backend matches exact bounded solver on small problem" {
             .last_forward_use_index = 1,
             .producer_candidate_indices = &.{},
             .user_candidate_indices = &.{},
+            .use_stage_indices = &.{1},
         },
     };
     var problem = PlanningProblem{

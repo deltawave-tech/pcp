@@ -344,6 +344,7 @@ fn buildCheckmatePlanningProblem(
         for (candidates.items) |candidate| {
             allocator.free(candidate.producer_candidate_indices);
             allocator.free(candidate.user_candidate_indices);
+            allocator.free(candidate.use_stage_indices);
         }
         candidates.deinit();
     }
@@ -372,6 +373,7 @@ fn buildCheckmatePlanningProblem(
             .last_forward_use_index = entry.last_forward_use_index,
             .producer_candidate_indices = try allocator.alloc(usize, 0),
             .user_candidate_indices = try allocator.alloc(usize, 0),
+            .use_stage_indices = try allocator.alloc(usize, 0),
         });
         for (entry.op_index..entry.last_forward_use_index + 1) |stage_idx| {
             base_stage_bytes[stage_idx] -|= entry.result_bytes;
@@ -391,6 +393,12 @@ fn buildCheckmatePlanningProblem(
             allocator,
             entry.user_indices,
             candidate_index_by_metadata,
+        );
+        allocator.free(candidates.items[candidate_idx].use_stage_indices);
+        candidates.items[candidate_idx].use_stage_indices = try collectUseStageIndices(
+            allocator,
+            entry.user_indices,
+            entry.last_forward_use_index,
         );
     }
 
@@ -420,6 +428,43 @@ fn collectCandidateNeighborIndices(
     }
 
     return neighbors.toOwnedSlice();
+}
+
+fn collectUseStageIndices(
+    allocator: Allocator,
+    user_indices: []const usize,
+    last_forward_use_index: usize,
+) ![]usize {
+    var stages = std.ArrayList(usize).init(allocator);
+    defer stages.deinit();
+
+    for (user_indices) |user_idx| {
+        var seen = false;
+        for (stages.items) |existing| {
+            if (existing == user_idx) {
+                seen = true;
+                break;
+            }
+        }
+        if (!seen) try stages.append(user_idx);
+    }
+
+    var has_last_stage = false;
+    for (stages.items) |existing| {
+        if (existing == last_forward_use_index) {
+            has_last_stage = true;
+            break;
+        }
+    }
+    if (!has_last_stage) try stages.append(last_forward_use_index);
+
+    std.sort.block(usize, stages.items, {}, struct {
+        fn lessThan(_: void, lhs: usize, rhs: usize) bool {
+            return lhs < rhs;
+        }
+    }.lessThan);
+
+    return stages.toOwnedSlice();
 }
 
 fn compareCandidateScore(metadata: []const OpMetadata, lhs_idx: usize, rhs_idx: usize) bool {

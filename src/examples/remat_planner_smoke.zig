@@ -73,12 +73,23 @@ pub fn main() !void {
     });
     defer greedy_plan.deinit();
 
+    var checkmate_plan = try remat_planner.buildRematPlan(allocator, ops_forward, .{
+        .policy = .checkmate_optimal,
+        .activation_memory_budget_bytes = 8 * 1024 * 1024,
+        .cost_model = .static_heuristic,
+        .remat_allow_expensive_ops = true,
+    });
+    defer checkmate_plan.deinit();
+
     const legacy_remat = countRematerialized(&legacy_plan, ops_forward);
     const greedy_remat = countRematerialized(&greedy_plan, ops_forward);
+    const checkmate_remat = countRematerialized(&checkmate_plan, ops_forward);
 
     try std.testing.expectEqual(@as(usize, 0), legacy_remat);
     try std.testing.expect(greedy_remat >= 1);
+    try std.testing.expect(checkmate_remat >= 1);
     try std.testing.expect(greedy_plan.stats.estimated_retained_bytes_after <= 8 * 1024 * 1024);
+    try std.testing.expect(checkmate_plan.stats.estimated_retained_bytes_after <= 8 * 1024 * 1024);
 
     _ = try autodiff.buildGradientGraphWithConfig(
         allocator,
@@ -95,12 +106,14 @@ pub fn main() !void {
     );
 
     std.debug.print(
-        "legacy_remat={} greedy_remat={} retained_before={} retained_after={}\n",
+        "legacy_remat={} greedy_remat={} checkmate_remat={} retained_before={} greedy_after={} checkmate_after={}\n",
         .{
             legacy_remat,
             greedy_remat,
+            checkmate_remat,
             greedy_plan.stats.estimated_retained_bytes_before,
             greedy_plan.stats.estimated_retained_bytes_after,
+            checkmate_plan.stats.estimated_retained_bytes_after,
         },
     );
 }

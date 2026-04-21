@@ -1,6 +1,7 @@
 const std = @import("std");
 const mlir = @import("../mlir/wrapper.zig");
 const tensor = @import("../core/tensor.zig");
+const checkmate_planner = @import("checkmate_planner.zig");
 
 const Allocator = std.mem.Allocator;
 const c = @import("../mlir/c.zig").c;
@@ -52,20 +53,41 @@ pub const PlanStats = struct {
     rematerialized_candidate_ops: usize = 0,
 };
 
-const CostClass = enum {
+pub const CostClass = enum {
     cheap,
     moderate,
     expensive,
 };
 
-const OpMetadata = struct {
+pub const OpMetadata = struct {
     op: mlir.Operation,
+    op_index: usize,
     result_bytes: u64,
     fanout: usize,
     dependency_penalty: f64,
     recompute_cost: f64,
+    weighted_recompute_cost: f64,
     remat_legal: bool,
     candidate: bool,
+    cost_class: CostClass,
+    producer_indices: []usize,
+    user_indices: []usize,
+    last_forward_use_index: usize,
+};
+
+pub const GraphMetadata = struct {
+    allocator: Allocator,
+    ops_in_forward_order: []mlir.Operation,
+    op_metadata: []OpMetadata,
+
+    pub fn deinit(self: *GraphMetadata) void {
+        for (self.op_metadata) |entry| {
+            self.allocator.free(entry.producer_indices);
+            self.allocator.free(entry.user_indices);
+        }
+        self.allocator.free(self.op_metadata);
+        self.allocator.free(self.ops_in_forward_order);
+    }
 };
 
 pub fn buildRematPlan(
@@ -79,64 +101,101 @@ pub fn buildRematPlan(
     plan.stats.policy = config.policy;
     plan.stats.activation_memory_budget_bytes = config.activation_memory_budget_bytes;
 
-    var metadata = try allocator.alloc(OpMetadata, ops_forward.len);
-    defer allocator.free(metadata);
+    var graph_metadata = try collectGraphMetadata(allocator, ops_forward, config);
+    defer graph_metadata.deinit();
+
+    switch (config.policy) {
+        .legacy_threshold => try buildLegacyThresholdPlan(&plan, graph_metadata.op_metadata),
+        .budget_greedy => try buildBudgetGreedyPlan(allocator, &plan, graph_metadata.op_metadata, config),
+        .checkmate_optimal => try buildCheckmateExactPlan(allocator, &plan, graph_metadata.op_metadata, config),
+    }
+
+    return plan;
+}
+
+pub fn collectGraphMetadata(
+    allocator: Allocator,
+    ops_forward: []const mlir.Operation,
+    config: RematPlannerConfig,
+) !GraphMetadata {
+    const owned_ops = try allocator.dupe(mlir.Operation, ops_forward);
+    errdefer allocator.free(owned_ops);
+
+    var op_metadata = try allocator.alloc(OpMetadata, owned_ops.len);
+    errdefer allocator.free(op_metadata);
 
     var op_to_index = std.AutoHashMap(mlir.Operation, usize).init(allocator);
     defer op_to_index.deinit();
 
-    for (ops_forward, 0..) |op, i| {
+    for (owned_ops, 0..) |op, i| {
         try op_to_index.put(op, i);
-        metadata[i] = .{
+        op_metadata[i] = .{
             .op = op,
+            .op_index = i,
             .result_bytes = computeResultBytes(op),
             .fanout = 0,
             .dependency_penalty = 1.0,
             .recompute_cost = 0.0,
+            .weighted_recompute_cost = 0.0,
             .remat_legal = isRematerializableOp(op),
             .candidate = false,
+            .cost_class = .cheap,
+            .producer_indices = try allocator.alloc(usize, 0),
+            .user_indices = try allocator.alloc(usize, 0),
+            .last_forward_use_index = i,
         };
     }
 
-    for (ops_forward) |op| {
+    for (owned_ops, 0..) |op, op_idx| {
+        var producer_indices = std.ArrayList(usize).init(allocator);
+        defer producer_indices.deinit();
+
         for (0..op.getNumOperands()) |operand_idx| {
             const operand = op.getOperand(operand_idx);
             if (!c.mlirValueIsAOpResult(operand.handle)) continue;
             const producer = mlir.Operation{ .handle = c.mlirOpResultGetOwner(operand.handle) };
             if (op_to_index.get(producer)) |producer_idx| {
-                metadata[producer_idx].fanout += 1;
+                try producer_indices.append(producer_idx);
+                op_metadata[producer_idx].fanout += 1;
+
+                var user_indices = std.ArrayList(usize).init(allocator);
+                defer user_indices.deinit();
+                try user_indices.appendSlice(op_metadata[producer_idx].user_indices);
+                try user_indices.append(op_idx);
+                allocator.free(op_metadata[producer_idx].user_indices);
+                op_metadata[producer_idx].user_indices = try user_indices.toOwnedSlice();
+                op_metadata[producer_idx].last_forward_use_index = @max(op_metadata[producer_idx].last_forward_use_index, op_idx);
             }
         }
+
+        allocator.free(op_metadata[op_idx].producer_indices);
+        op_metadata[op_idx].producer_indices = try producer_indices.toOwnedSlice();
     }
 
-    for (metadata, 0..) |*entry, i| {
+    for (op_metadata) |*entry| {
+        entry.cost_class = costClassForOp(entry.op.getName());
         entry.recompute_cost = estimateRecomputeCost(entry.op, entry.result_bytes, config);
-        const cost_class = costClassForOp(entry.op.getName());
-        const expensive_allowed = config.remat_allow_expensive_ops or cost_class != .expensive;
+
+        const expensive_allowed = config.remat_allow_expensive_ops or entry.cost_class != .expensive;
         entry.candidate = entry.remat_legal and entry.result_bytes > 0 and expensive_allowed;
 
         var dependency_penalty: f64 = 1.0;
-        for (0..entry.op.getNumOperands()) |operand_idx| {
-            const operand = entry.op.getOperand(operand_idx);
-            if (!c.mlirValueIsAOpResult(operand.handle)) continue;
-            const producer = mlir.Operation{ .handle = c.mlirOpResultGetOwner(operand.handle) };
-            if (op_to_index.get(producer)) |producer_idx| {
-                if (metadata[producer_idx].remat_legal) {
-                    dependency_penalty += 0.5;
-                }
+        for (entry.producer_indices) |producer_idx| {
+            if (op_metadata[producer_idx].remat_legal) {
+                dependency_penalty += 0.5;
             }
         }
-        _ = i;
         entry.dependency_penalty = dependency_penalty;
+
+        const fanout_penalty = 1.0 + 0.35 * @as(f64, @floatFromInt(entry.fanout));
+        entry.weighted_recompute_cost = entry.recompute_cost * fanout_penalty * entry.dependency_penalty;
     }
 
-    switch (config.policy) {
-        .legacy_threshold => try buildLegacyThresholdPlan(&plan, metadata),
-        .budget_greedy => try buildBudgetGreedyPlan(allocator, &plan, metadata, config),
-        .checkmate_optimal => return error.CheckmatePlannerNotImplemented,
-    }
-
-    return plan;
+    return .{
+        .allocator = allocator,
+        .ops_in_forward_order = owned_ops,
+        .op_metadata = op_metadata,
+    };
 }
 
 fn buildLegacyThresholdPlan(plan: *RematPlan, metadata: []const OpMetadata) !void {
@@ -204,6 +263,63 @@ fn buildBudgetGreedyPlan(
     plan.stats.rematerialized_candidate_ops = candidate_indices.items.len - kept_candidates;
 }
 
+fn buildCheckmateExactPlan(
+    allocator: Allocator,
+    plan: *RematPlan,
+    metadata: []const OpMetadata,
+    config: RematPlannerConfig,
+) !void {
+    var total_retained_before: u64 = 0;
+    var base_retained: u64 = 0;
+    var candidate_indices = std.ArrayList(usize).init(allocator);
+    defer candidate_indices.deinit();
+    var exact_candidates = std.ArrayList(checkmate_planner.Candidate).init(allocator);
+    defer exact_candidates.deinit();
+
+    for (metadata, 0..) |entry, idx| {
+        total_retained_before += entry.result_bytes;
+        try plan.should_keep.put(entry.op, true);
+        if (entry.candidate) {
+            try candidate_indices.append(idx);
+            try exact_candidates.append(.{
+                .bytes = entry.result_bytes,
+                .weighted_recompute_cost = entry.weighted_recompute_cost,
+                .last_forward_use_index = entry.last_forward_use_index,
+            });
+        } else {
+            base_retained += entry.result_bytes;
+        }
+    }
+
+    plan.stats.estimated_retained_bytes_before = total_retained_before;
+
+    if (config.activation_memory_budget_bytes == null) {
+        plan.stats.kept_candidate_ops = candidate_indices.items.len;
+        plan.stats.rematerialized_candidate_ops = 0;
+        plan.stats.estimated_retained_bytes_after = total_retained_before;
+        return;
+    }
+
+    var exact_result = try checkmate_planner.solveExactSmallGraph(
+        allocator,
+        exact_candidates.items,
+        base_retained,
+        config.activation_memory_budget_bytes.?,
+    );
+    defer exact_result.deinit(allocator);
+
+    var kept_candidates: usize = 0;
+    for (candidate_indices.items, 0..) |metadata_idx, candidate_idx| {
+        const keep = exact_result.keep_mask[candidate_idx];
+        try plan.should_keep.put(metadata[metadata_idx].op, keep);
+        if (keep) kept_candidates += 1;
+    }
+
+    plan.stats.kept_candidate_ops = kept_candidates;
+    plan.stats.rematerialized_candidate_ops = candidate_indices.items.len - kept_candidates;
+    plan.stats.estimated_retained_bytes_after = exact_result.total_retained_bytes;
+}
+
 fn compareCandidateScore(metadata: []const OpMetadata, lhs_idx: usize, rhs_idx: usize) bool {
     const lhs = metadata[lhs_idx];
     const rhs = metadata[rhs_idx];
@@ -218,8 +334,7 @@ fn compareCandidateScore(metadata: []const OpMetadata, lhs_idx: usize, rhs_idx: 
 
 fn candidateScore(entry: OpMetadata) f64 {
     const bytes_saved = @as(f64, @floatFromInt(entry.result_bytes));
-    const fanout_penalty = 1.0 + 0.35 * @as(f64, @floatFromInt(entry.fanout));
-    return bytes_saved / (entry.recompute_cost * fanout_penalty * entry.dependency_penalty);
+    return bytes_saved / entry.weighted_recompute_cost;
 }
 
 fn isRematerializableOp(op: mlir.Operation) bool {
@@ -279,21 +394,7 @@ fn legacyShouldRematerialize(op: mlir.Operation) bool {
 fn computeResultBytes(op: mlir.Operation) u64 {
     if (op.getNumResults() != 1) return 0;
     const ranked_type = op.getResult(0).getType().as(mlir.RankedTensorType) orelse return 0;
-
-    var elements: u64 = 1;
-    const rank = ranked_type.getRank();
-    if (rank == 0) {
-        elements = 1;
-    } else {
-        for (0..rank) |dim_idx| {
-            const dim = ranked_type.getDimension(dim_idx);
-            if (dim <= 0) return 0;
-            elements *= @intCast(dim);
-        }
-    }
-
-    const dtype = tensor.DType.fromMlirType(ranked_type.getElementType());
-    return elements * dtype.sizeInBytes();
+    return computeTypeBytes(ranked_type);
 }
 
 fn estimateRecomputeCost(op: mlir.Operation, result_bytes: u64, config: RematPlannerConfig) f64 {
@@ -322,21 +423,33 @@ fn costClassForOp(name: []const u8) CostClass {
 test "budget greedy prefers larger cheaper candidates" {
     const candidate_a = OpMetadata{
         .op = undefined,
+        .op_index = 0,
         .result_bytes = 32 * 1024 * 1024,
         .fanout = 1,
         .dependency_penalty = 1.0,
         .recompute_cost = 2.0,
+        .weighted_recompute_cost = 2.7,
         .remat_legal = true,
         .candidate = true,
+        .cost_class = .moderate,
+        .producer_indices = &.{},
+        .user_indices = &.{},
+        .last_forward_use_index = 3,
     };
     const candidate_b = OpMetadata{
         .op = undefined,
+        .op_index = 1,
         .result_bytes = 8 * 1024 * 1024,
         .fanout = 3,
         .dependency_penalty = 2.0,
         .recompute_cost = 12.0,
+        .weighted_recompute_cost = 44.4,
         .remat_legal = true,
         .candidate = true,
+        .cost_class = .expensive,
+        .producer_indices = &.{},
+        .user_indices = &.{},
+        .last_forward_use_index = 4,
     };
 
     try std.testing.expect(candidateScore(candidate_a) > candidateScore(candidate_b));

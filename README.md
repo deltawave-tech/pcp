@@ -301,7 +301,6 @@ zig build run-rocm-pipeline-test
 - Topology: `--workers`, `--scale`
 - Supervision: `--supervise`, `--resume`
 - Topology modes: `--gateway`, `--federation-hub`, `--worker`, `--node-manager`
-- Legacy standalone controller modes: `--shepherd`, `--inference`
 
 **Experiment (JSON File):**
 - Model: `model_path`
@@ -355,28 +354,21 @@ PCP automatically logs training metrics to [Weights & Biases](https://wandb.ai) 
 
 If no API key is provided, WandB logging will be disabled and training will continue normally.
 
-### Starting the Legacy Training Controller
+### Starting a Gateway-Owned Training Controller
 
-The legacy training controller coordinates training, aggregates gradients, and manages the worker-fabric state. Running with `--supervise` enables automatic crash recovery.
+The canonical topology is `Federation Hub -> Gateway -> Workers`. Training, RL, and inference controllers now live inside the gateway and own the worker-fabric endpoint from there.
 
 ```sh
-pcp --supervise -- \
-  --shepherd \
-  --config experiment.json \
-  --host 0.0.0.0 \
-  --port 8080 \
-  --workers 2
+pcp --gateway \
+  --gateway-config experiments/gateway_local.json \
+  --gateway-host 0.0.0.0 \
+  --gateway-port 18010
 ```
 
-To resume from a previous training run:
+Workers connect to the gateway worker-fabric endpoint declared in the gateway config:
+
 ```sh
-pcp --supervise -- \
-  --shepherd \
-  --config experiment.json \
-  --host 0.0.0.0 \
-  --port 8080 \
-  --workers 2 \
-  --resume
+pcp --worker --connect <GATEWAY_WORKER_FABRIC_HOST>:<PORT> --backend cuda
 ```
 
 ### Starting Workers
@@ -425,7 +417,7 @@ pcp --worker --device-id 0 --connect <SHEPHERD_IP>:8080 --backend cuda
 
 ### Inference API
 
-PCP also supports an inference mode that exposes an OpenAI-compatible `/v1/chat/completions` API. In this mode, the inference controller owns request routing, sessions, prompt tokenization, and HTTP endpoints, while standard PCP workers execute autoregressive decoding on the configured backend.
+PCP exposes inference through a gateway-hosted inference controller subsystem. The controller owns request routing, sessions, prompt tokenization, and HTTP endpoints, while standard PCP workers execute autoregressive decoding on the configured backend.
 
 For Qwen inference, the controller uses the Qwen tokenizer files from `tokenizers/qwen2.5-0.5b-instruct`, spawns `tools/qwen_tokenizer_server.py` for encode/decode, and renders prompts in Qwen's instruct chat format:
 
@@ -451,17 +443,17 @@ Use `experiments/inference_qwen.json` as the reference config for Qwen 2.5 0.5B 
 You can run workers with different hardware backends in the same training session.
 
 ```sh
-# Legacy training controller node: start coordinator expecting 11 total workers
-pcp --shepherd --config experiments/nanogpt_small.json --workers 11
+# Gateway node: start site-local control plane and worker-fabric endpoint
+pcp --gateway --gateway-config experiments/gateway_local.json --gateway-host 0.0.0.0 --gateway-port 18010
 
 # Node 1: 8xH100 server (Runs 8 workers)
-pcp --node-manager --scale 8 --host <SHEPHERD_IP> --port 8080 --backend cuda --target sm_90a
+pcp --node-manager --host <GATEWAY_WORKER_FABRIC_IP> --port 8080 --scale 8 --backend cuda --target sm_90a
 
 # Node 2: Single A100 server (Runs 1 worker)
-pcp --node-manager --host <SHEPHERD_IP> --port 8080 --backend cuda --target sm_80
+pcp --node-manager --host <GATEWAY_WORKER_FABRIC_IP> --port 8080 --backend cuda --target sm_80
 
 # Node 3: 2xMI300X server (Runs 2 workers)
-pcp --node-manager --scale 2 --host <SHEPHERD_IP> --port 8080 --backend rocm --target gfx942
+pcp --node-manager --host <GATEWAY_WORKER_FABRIC_IP> --port 8080 --scale 2 --backend rocm --target gfx942
 ```
 
 ## Adding Custom Models
@@ -553,10 +545,10 @@ Create or update your experiment.json file:
 
 ### 4. Run Training
 
-Start the legacy training controller with your new configuration:
+Start a gateway with an embedded training controller using a gateway config that references your experiment JSON:
 
 ```sh
-pcp --supervise -- --shepherd --config experiment.json --workers 2
+pcp --gateway --gateway-config gateway_training.json
 ```
 
 ## Documentation

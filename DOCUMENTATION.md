@@ -17,7 +17,7 @@ The system leverages MLIR (Multi-Level Intermediate Representation) for graph co
 
 ## Architecture Overview
 
-PCP separates the definition of computation (MLIR) from its execution (IREE). The coordinator ("Shepherd") constructs the training graph, compiles it to a platform-agnostic bytecode (VMFB), and distributes it to workers.
+PCP separates the definition of computation (MLIR) from its execution (IREE). In the public topology, gateways host controller subsystems for training, RL, and inference and own the worker-fabric endpoint. Internally, parts of the training worker-fabric controller are still historically named "Shepherd" in code.
 
 ```
 ┌──────────────────────────────────────────────────────────────────────┐
@@ -296,19 +296,18 @@ pub fn setWorkerInfo(workers: []const WorkerInfo) void
 
 ### CLI Arguments
 
-The PCP binary (`pcp`) handles all roles (Shepherd, NodeManager, Worker).
+The PCP binary (`pcp`) handles the public topology roles `gateway`, `federation-hub`, `worker`, and `node-manager`.
 
-#### 1. Start the Legacy Training Controller
+#### 1. Start a Gateway
 
-The legacy training controller coordinates the training session.
+The gateway owns the site-local controller subsystems and worker-fabric endpoint.
 
 ```bash
 pcp \
-  --shepherd \
-  --config experiment.json \
-  --host 0.0.0.0 \
-  --port 8080 \
-  --workers 8
+  --gateway \
+  --gateway-config gateway.json \
+  --gateway-host 0.0.0.0 \
+  --gateway-port 18010
 ```
 
 #### 2. Start Compute Nodes (Node Manager)
@@ -322,7 +321,7 @@ By default, this spawns 1 worker on Device 0.
 ```bash
 pcp \
   --node-manager \
-  --host <GATEWAY_CONTROLLER_IP> \
+  --host <GATEWAY_WORKER_FABRIC_IP> \
   --port 8080 \
   --backend cuda \
   --target sm_80

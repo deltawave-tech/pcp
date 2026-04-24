@@ -1,5 +1,6 @@
-/// Main entry point for distributed training
-/// This file handles command-line arguments and launches either Shepherd or Worker
+/// Main entry point for PCP node runtimes.
+/// This file handles command-line arguments and launches gateway, federation hub,
+/// worker, or node-manager roles.
 const std = @import("std");
 const print = std.debug.print;
 const ArrayList = std.ArrayList;
@@ -135,10 +136,8 @@ const Args = struct {
     child_args: std.ArrayList([]const u8),
 
     const Mode = enum {
-        shepherd,
         worker,
         node_manager,
-        inference,
         gateway,
         federation_hub,
     };
@@ -148,7 +147,7 @@ const Args = struct {
 
         if (args.len < 2) {
             return Args{
-                .mode = .shepherd,
+                .mode = .gateway,
                 .host = "127.0.0.1",
                 .port = 8080,
                 .workers = 2,
@@ -177,7 +176,7 @@ const Args = struct {
             };
         }
 
-        var mode: Mode = .shepherd;
+        var mode: Mode = .gateway;
         var host: []const u8 = "127.0.0.1";
         var port: u16 = 8080;
         var workers: usize = 2;
@@ -208,12 +207,13 @@ const Args = struct {
             if (std.mem.eql(u8, args[i], "--worker")) {
                 mode = .worker;
             } else if (std.mem.eql(u8, args[i], "--shepherd")) {
-                mode = .shepherd;
+                print("Error: --shepherd has been removed. Use --gateway with an embedded training or RL controller config.\n", .{});
+                return error.LegacyStandaloneModeRemoved;
             } else if (std.mem.eql(u8, args[i], "--node-manager")) {
                 mode = .node_manager;
             } else if (std.mem.eql(u8, args[i], "--inference")) {
-                mode = .inference;
-                enable_api = true;
+                print("Error: --inference has been removed. Use --gateway with an embedded inference controller config.\n", .{});
+                return error.LegacyStandaloneModeRemoved;
             } else if (std.mem.eql(u8, args[i], "--gateway")) {
                 mode = .gateway;
                 enable_api = true;
@@ -403,30 +403,28 @@ const Args = struct {
         print("Options:\n", .{});
         print("  --gateway            Run gateway node with controller subsystems and local APIs\n", .{});
         print("  --federation-hub     Run federation hub (global gateway coordination plane)\n", .{});
-        print("  --shepherd           Run training controller / worker-fabric coordinator (legacy standalone mode)\n", .{});
-        print("  --worker             Run worker node and connect to a gateway/controller\n", .{});
+        print("  --worker             Run worker node and connect to a gateway worker-fabric endpoint\n", .{});
         print("  --node-manager       Run as Node Manager (spawns multiple supervised workers)\n", .{});
-        print("  --inference          Run inference controller (legacy standalone mode)\n", .{});
         print("  --supervise -- <child_args>  Run with supervision (spawns child with args after --)\n", .{});
-        print("  --config <path>      Path to experiment JSON config file (Training controller only)\n", .{});
-        print("  --inference-config <path>  Path to inference JSON config file (Inference only)\n", .{});
-        print("  --gateway-config <path>  Path to gateway JSON config file (Gateway only)\n", .{});
-        print("  --connect <host:port> Connect worker to controller at host:port\n", .{});
+        print("  --config <path>      Path to training/RL experiment JSON file used by embedded gateway controllers\n", .{});
+        print("  --inference-config <path>  Path to inference JSON file used by embedded gateway controllers\n", .{});
+        print("  --gateway-config <path>  Path to gateway JSON config file\n", .{});
+        print("  --connect <host:port> Connect worker to gateway worker-fabric endpoint at host:port\n", .{});
         print("  --host <host>        Host to bind/connect to (default: 127.0.0.1)\n", .{});
         print("  --port <port>        Port to bind/connect to (default: 8080)\n", .{});
-        print("  --api-host <host>    API host to bind for controller/operator APIs (default: 127.0.0.1)\n", .{});
-        print("  --api-port <port>    API port to bind for controller/operator APIs (default: 8000)\n", .{});
+        print("  --api-host <host>    API host to bind for gateway/federation APIs (default: 127.0.0.1)\n", .{});
+        print("  --api-port <port>    API port to bind for gateway/federation APIs (default: 8000)\n", .{});
         print("  --gateway-host <host> Gateway API host to bind (Gateway only, default: 127.0.0.1)\n", .{});
         print("  --gateway-port <port> Gateway API port to bind (Gateway only, default: 18010)\n", .{});
-        print("  --control-host <host> Controller host to bind (Inference or embedded Gateway controller fallback, default: 127.0.0.1)\n", .{});
-        print("  --control-port <port> Controller port to bind (Inference or embedded Gateway controller fallback, default: 8080)\n", .{});
-        print("  --api-token-env <ENV> API token env var name for controller/operator auth\n", .{});
+        print("  --control-host <host> Worker-fabric host to bind or connect (default: 127.0.0.1)\n", .{});
+        print("  --control-port <port> Worker-fabric port to bind or connect (default: 8080)\n", .{});
+        print("  --api-token-env <ENV> API token env var name for gateway/federation auth\n", .{});
         print("  --workers <count>    Number of workers to wait for (default: 2)\n", .{});
-        print("  --model <path>       Path to MLIR model file (Training controller only, overrides config)\n", .{});
+        print("  --model <path>       Path to MLIR model file (embedded training controller only, overrides config)\n", .{});
         print("  --resume             Resume from previous training state\n", .{});
-        print("  --rl                 Enable RL mode with GRPO algorithm (Training controller only)\n", .{});
-        print("  --no-dashboard       Disable TUI dashboard for clean log output (Training/RL controller only)\n", .{});
-        print("  --terminate          Auto-terminate training/RL controller when work completes\n", .{});
+        print("  --rl                 Internal legacy flag; use gateway RL controller config instead\n", .{});
+        print("  --no-dashboard       Disable TUI dashboard for embedded training/RL controller output\n", .{});
+        print("  --terminate          Internal legacy flag for standalone training/RL teardown\n", .{});
         print("  --streaming          Enable Streaming DiLoCo mode for asynchronous fragment updates\n", .{});
         print("  --backend <type>     Backend to use: cpu, cuda, metal, vulkan, rocm (default: auto)\n", .{});
         print("  --target <arch>      GPU target architecture (e.g., gfx942 for MI300X, sm_80 for A100)\n", .{});
@@ -439,16 +437,16 @@ const Args = struct {
         print("  ./pcp --gateway --gateway-config experiments/gateway_local.json --gateway-host 127.0.0.1 --gateway-port 18010\n", .{});
         print("\n  # Run federation hub:\n", .{});
         print("  ./pcp --federation-hub --api-host 127.0.0.1 --api-port 19010\n", .{});
-        print("\n  # Run legacy standalone training controller:\n", .{});
-        print("  ./pcp --supervise -- --shepherd --config experiment.json\n", .{});
+        print("\n  # Run a gateway node:\n", .{});
+        print("  ./pcp --gateway --gateway-config gateway.json --gateway-host 127.0.0.1 --gateway-port 18010\n", .{});
         print("\n  # Run resilient worker on GPU 0:\n", .{});
         print("  ./pcp --supervise -- --worker --host 127.0.0.1 --port 8080 --device-id 0\n", .{});
         print("\n  # Run 8 workers on an 8xH100 node (one per GPU):\n", .{});
         print("  for i in {{0..7}}; do ./pcp --worker --device-id $i & done\n", .{});
         print("\n  # Run node manager with 8 supervised workers:\n", .{});
         print("  ./pcp --node-manager --scale 8 --backend cuda\n", .{});
-        print("\n  # Run inference controller:\n", .{});
-        print("  ./pcp --inference --inference-config inference.json --api-host 0.0.0.0 --api-port 8000\n", .{});
+        print("\n  # Run worker against a gateway worker-fabric endpoint:\n", .{});
+        print("  ./pcp --worker --connect 127.0.0.1:18080 --backend cpu\n", .{});
     }
 };
 
@@ -1722,10 +1720,8 @@ pub fn main() !void {
     }
 
     switch (args.mode) {
-        .shepherd => try runShepherd(allocator, args),
         .worker => try runWorker(allocator, args),
         .node_manager => try runNodeManager(allocator, args),
-        .inference => try runInferenceController(allocator, args),
         .gateway => try runGateway(allocator, args),
         .federation_hub => try runFederationHub(allocator, args),
     }

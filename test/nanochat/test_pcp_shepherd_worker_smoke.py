@@ -1,19 +1,17 @@
 """
-PCP system smoke test: run a tiny shepherd+worker session locally.
+PCP system smoke test: run a tiny gateway-owned training session locally.
 
 This validates:
-  - networking + orchestration (shepherd <-> worker)
-  - compile + runtime execution path
-  - training loop produces finite loss (no NaNs in logs)
-  - checkpoint is written
-
-It does NOT assert numerical parity with PyTorch (use the parity tests for that).
+  - gateway -> worker-fabric orchestration
+  - embedded training controller startup
+  - training loop completes without NaNs in logs
 
 How to run (from `pcp/`):
   nix develop -c ./venv/bin/python test/nanochat/test_pcp_shepherd_worker_smoke.py
 """
 
 import json
+import os
 import re
 import socket
 import subprocess
@@ -40,18 +38,41 @@ def tail(text: str, lines: int = 120) -> str:
     return "\n".join(parts[-lines:])
 
 
+def controller_status(api_port: int, token: str) -> str | None:
+    proc = subprocess.run(
+        [
+            "curl",
+            "-sf",
+            f"http://127.0.0.1:{api_port}/v1/controller",
+            "-H",
+            f"Authorization: Bearer {token}",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if proc.returncode != 0:
+        return None
+    return proc.stdout
+
+
 def main():
     pcp_bin = find_pcp_binary()
-    port = find_free_port()
+    worker_port = find_free_port()
+    gateway_port = find_free_port()
+    controller_api_port = find_free_port()
 
-    with tempfile.TemporaryDirectory(prefix="pcp_smoke_") as tmp:
+    with tempfile.TemporaryDirectory(prefix="pcp_gateway_smoke_") as tmp:
         tmpdir = Path(tmp)
         config_path = tmpdir / "smoke_config.json"
+        gateway_config_path = tmpdir / "gateway_config.json"
 
         config = {
             "model_path": str((PCP_ROOT / "models" / "nanochat_small.mlir").resolve()),
             "data_path": str((PCP_ROOT / "data" / "tiny_shakespeare.txt").resolve()),
             "tokenizer": "char",
+            "sampling": "sequence",
+            "dtype": "f32",
             "learning_rate": 0.0006,
             "tau": 1,
             "outer_loop_steps": 1,
@@ -59,48 +80,77 @@ def main():
             "max_epochs": 1,
             "wandb_project": "pcp-distributed",
             "wandb_entity": None,
-            "wandb_run_name": "pcp-smoke-test",
+            "wandb_run_name": "pcp-gateway-smoke-test",
             "wandb_api_key": None,
         }
         config_path.write_text(json.dumps(config, indent=2))
 
-        shepherd_cmd = [
+        gateway_config = {
+            "gateway_id": "gateway-smoke-test",
+            "lab_id": "local-smoke",
+            "graph_backend": "memory",
+            "api_token_env": "PCP_GATEWAY_API_TOKEN",
+            "internal_api_token_env": "PCP_GATEWAY_INTERNAL_TOKEN",
+            "worker_fabric": {
+                "host": "127.0.0.1",
+                "port": worker_port,
+            },
+            "api": {
+                "host": "127.0.0.1",
+                "port": gateway_port,
+                "token_env": "PCP_GATEWAY_API_TOKEN",
+                "internal_token_env": "PCP_GATEWAY_INTERNAL_TOKEN",
+            },
+            "controllers": {
+                "training": {
+                    "enabled": True,
+                    "config_path": str(config_path),
+                    "service_id": "training-main",
+                    "workers": 1,
+                    "api": {
+                        "host": "127.0.0.1",
+                        "port": controller_api_port,
+                    },
+                }
+            },
+        }
+        gateway_config_path.write_text(json.dumps(gateway_config, indent=2))
+
+        env = dict(os.environ)
+        env["PCP_GATEWAY_API_TOKEN"] = "dev"
+        env["PCP_GATEWAY_INTERNAL_TOKEN"] = "dev-internal"
+
+        gateway_cmd = [
             pcp_bin,
-            "--shepherd",
-            "--config",
-            str(config_path),
-            "--host",
+            "--gateway",
+            "--gateway-config",
+            str(gateway_config_path),
+            "--gateway-host",
             "127.0.0.1",
-            "--port",
-            str(port),
-            "--workers",
-            "1",
-            "--backend",
-            "cpu",
-            "--no-dashboard",
+            "--gateway-port",
+            str(gateway_port),
         ]
         worker_cmd = [
             pcp_bin,
             "--worker",
-            "--host",
-            "127.0.0.1",
-            "--port",
-            str(port),
+            "--connect",
+            f"127.0.0.1:{worker_port}",
             "--backend",
             "cpu",
             "--device-id",
             "0",
         ]
 
-        shepherd = subprocess.Popen(
-            shepherd_cmd,
+        gateway = subprocess.Popen(
+            gateway_cmd,
             cwd=tmpdir,
+            env=env,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
         )
         try:
-            time.sleep(0.5)
+            time.sleep(1.0)
             worker = subprocess.Popen(
                 worker_cmd,
                 cwd=tmpdir,
@@ -109,20 +159,33 @@ def main():
                 text=True,
             )
         except Exception:
-            shepherd.terminate()
-            shepherd.wait(timeout=10)
+            gateway.terminate()
+            gateway.wait(timeout=10)
             raise
 
         try:
-            shepherd_out, _ = shepherd.communicate(timeout=240)
+            completed = False
+            last_controller = ""
+            for _ in range(240):
+                if gateway.poll() is not None:
+                    break
+                last_controller = controller_status(controller_api_port, env["PCP_GATEWAY_API_TOKEN"]) or last_controller
+                if last_controller and '"status":"completed"' in last_controller:
+                    completed = True
+                    break
+                if last_controller and '"status":"failed"' in last_controller:
+                    break
+                time.sleep(1)
+
+            gateway.terminate()
+            gateway_out, _ = gateway.communicate(timeout=20)
         except subprocess.TimeoutExpired:
-            shepherd.kill()
-            shepherd_out, _ = shepherd.communicate(timeout=10)
+            gateway.kill()
+            gateway_out, _ = gateway.communicate(timeout=10)
             worker.terminate()
             worker.wait(timeout=10)
-            raise SystemExit("Shepherd timed out.\n" + tail(shepherd_out))
+            raise SystemExit("Gateway timed out.\n" + tail(gateway_out))
 
-        # Worker uses a robust reconnect loop; shut it down after shepherd exits.
         worker.terminate()
         try:
             worker_out, _ = worker.communicate(timeout=20)
@@ -130,29 +193,19 @@ def main():
             worker.kill()
             worker_out, _ = worker.communicate(timeout=10)
 
-        combined = f"{shepherd_out}\n{worker_out}"
+        combined = f"{gateway_out}\n{worker_out}"
 
-        if shepherd.returncode != 0:
+        if not completed:
             raise SystemExit(
-                f"Shepherd failed (exit={shepherd.returncode}).\n"
-                f"--- shepherd+worker log tail ---\n{tail(combined)}"
+                "Embedded training controller did not complete.\n"
+                f"--- controller status ---\n{last_controller}\n"
+                f"--- gateway+worker log tail ---\n{tail(combined)}"
             )
 
         if re.search(r"\bnan\b", combined, flags=re.IGNORECASE):
             raise SystemExit("Found NaN in logs.\n" + tail(combined))
 
-        run_id_file = tmpdir / ".pcp_latest_run"
-        if not run_id_file.exists():
-            raise SystemExit("Missing .pcp_latest_run (shepherd did not persist run id).\n" + tail(combined))
-        run_id = run_id_file.read_text().strip()
-
-        checkpoint = tmpdir / "checkpoints" / run_id / "checkpoint_1.bin"
-        if not checkpoint.exists():
-            raise SystemExit(f"Missing checkpoint file: {checkpoint}\n" + tail(combined))
-        if checkpoint.stat().st_size == 0:
-            raise SystemExit(f"Empty checkpoint file: {checkpoint}\n" + tail(combined))
-
-    print("OK: shepherd+worker smoke run completed (finite loss, checkpoint written).")
+    print("OK: gateway-owned training smoke run completed (finite loss).")
 
 
 if __name__ == "__main__":

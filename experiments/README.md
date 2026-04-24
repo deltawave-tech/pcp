@@ -179,12 +179,12 @@ Run the fixed smoke test on a machine with CUDA access:
 ```
 
 The script:
-1. Kills stale `pcp --inference` and `pcp --worker` processes for the test ports.
-2. Starts a fresh controller and worker using `experiments/inference_qwen.json`.
+1. Kills stale gateway-owned inference workers for the test ports.
+2. Starts a fresh gateway with an embedded inference controller and one worker using `experiments/inference_qwen.json`.
 3. Waits for `healthz` and `readyz`.
 4. Sends a constrained chat completion request.
 5. Fails if the decoded response looks like token garbage.
-6. Cleans up controller and worker processes on exit.
+6. Cleans up gateway and worker processes on exit.
 
 ## Qwen RL Test
 

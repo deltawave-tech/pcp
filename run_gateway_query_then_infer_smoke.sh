@@ -6,7 +6,7 @@ cd "$ROOT_DIR"
 
 HOST="${HOST:-127.0.0.1}"
 GATEWAY_PORT="${GATEWAY_PORT:-18113}"
-GLOBAL_PORT="${GLOBAL_PORT:-19111}"
+HUB_PORT="${HUB_PORT:-19111}"
 INF_API_PORT="${INF_API_PORT:-18001}"
 INF_CTRL_PORT="${INF_CTRL_PORT:-18081}"
 LOG_DIR="${LOG_DIR:-/tmp/pcp_gateway_query_then_infer_smoke}"
@@ -14,27 +14,25 @@ CONFIG_PATH="$LOG_DIR/gateway_federated_smoke.json"
 
 GATEWAY_TOKEN="${PCP_GATEWAY_API_TOKEN:-dev-gateway}"
 INTERNAL_TOKEN="${PCP_GATEWAY_INTERNAL_TOKEN:-dev-internal}"
-GLOBAL_TOKEN="${PCP_GLOBAL_CONTROLLER_TOKEN:-dev-global}"
+HUB_TOKEN="${PCP_FEDERATION_HUB_TOKEN:-dev-global}"
 
 GATEWAY_LOG="$LOG_DIR/gateway.log"
-GLOBAL_LOG="$LOG_DIR/global_controller.log"
-INFERENCE_LOG="$LOG_DIR/inference.log"
+HUB_LOG="$LOG_DIR/federation_hub.log"
 WORKER_LOG="$LOG_DIR/worker.log"
 
 SERVICES_JSON="$LOG_DIR/services.json"
-GLOBAL_STATUS_JSON="$LOG_DIR/global_status.json"
+HUB_STATUS_JSON="$LOG_DIR/hub_status.json"
 RESPONSE_JSON="$LOG_DIR/query_then_infer.json"
 
 GATEWAY_PID=""
-GLOBAL_PID=""
-INFERENCE_PID=""
+HUB_PID=""
 WORKER_PID=""
 
 cleanup() {
   local exit_code=$?
   set +e
 
-  for pid in "$WORKER_PID" "$INFERENCE_PID" "$GATEWAY_PID" "$GLOBAL_PID"; do
+  for pid in "$WORKER_PID" "$GATEWAY_PID" "$HUB_PID"; do
     if [[ -n "$pid" ]]; then
       kill "$pid" >/dev/null 2>&1 || true
       wait "$pid" 2>/dev/null || true
@@ -42,8 +40,7 @@ cleanup() {
   done
 
   pkill -f "pcp --gateway --gateway-config $CONFIG_PATH --gateway-host ${HOST} --gateway-port ${GATEWAY_PORT}" >/dev/null 2>&1 || true
-  pkill -f "pcp --global-controller --api-host ${HOST} --api-port ${GLOBAL_PORT} --api-token-env PCP_GLOBAL_CONTROLLER_TOKEN" >/dev/null 2>&1 || true
-  pkill -f "pcp --inference --inference-config experiments/inference_qwen.json --api-host ${HOST} --api-port ${INF_API_PORT} --control-host ${HOST} --control-port ${INF_CTRL_PORT}" >/dev/null 2>&1 || true
+  pkill -f "pcp --federation-hub --api-host ${HOST} --api-port ${HUB_PORT} --api-token-env PCP_FEDERATION_HUB_TOKEN" >/dev/null 2>&1 || true
   pkill -f "pcp --worker --connect ${HOST}:${INF_CTRL_PORT} --backend cuda --target sm_80" >/dev/null 2>&1 || true
 
   if [[ $exit_code -ne 0 ]]; then
@@ -51,11 +48,8 @@ cleanup() {
     echo "Gateway log tail:"
     tail -n 120 "$GATEWAY_LOG" 2>/dev/null || true
     echo
-    echo "Global controller log tail:"
-    tail -n 120 "$GLOBAL_LOG" 2>/dev/null || true
-    echo
-    echo "Inference log tail:"
-    tail -n 120 "$INFERENCE_LOG" 2>/dev/null || true
+    echo "Federation hub log tail:"
+    tail -n 120 "$HUB_LOG" 2>/dev/null || true
     echo
     echo "Worker log tail:"
     tail -n 120 "$WORKER_LOG" 2>/dev/null || true
@@ -65,22 +59,49 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
+clean_start() {
+  set +e
+  pkill -f "pcp" >/dev/null 2>&1 || true
+  pkill -f "pcp --federation-hub --api-host ${HOST} --api-port ${HUB_PORT} --api-token-env PCP_FEDERATION_HUB_TOKEN" >/dev/null 2>&1 || true
+  pkill -f "pcp --gateway --gateway-config $CONFIG_PATH --gateway-host ${HOST} --gateway-port ${GATEWAY_PORT}" >/dev/null 2>&1 || true
+  pkill -f "pcp --worker --connect ${HOST}:${INF_CTRL_PORT} --backend cuda --target sm_80" >/dev/null 2>&1 || true
+  sleep 1
+  set -e
+}
+
 mkdir -p "$LOG_DIR"
+rm -f "$GATEWAY_LOG" "$HUB_LOG" "$WORKER_LOG" "$SERVICES_JSON" "$HUB_STATUS_JSON" "$RESPONSE_JSON"
+clean_start
 
 cat >"$CONFIG_PATH" <<EOF
 {
   "gateway_id": "lab-alpha-gateway",
   "lab_id": "lab-alpha",
   "graph_backend": "memory",
-  "global_controller_endpoint": "http://${HOST}:${GLOBAL_PORT}",
+  "federation_hub_endpoint": "http://${HOST}:${HUB_PORT}",
   "federation": {
     "enabled": true,
-    "upstream": "http://${HOST}:${GLOBAL_PORT}",
-    "token_env": "PCP_GLOBAL_CONTROLLER_TOKEN",
+    "upstream": "http://${HOST}:${HUB_PORT}",
+    "token_env": "PCP_FEDERATION_HUB_TOKEN",
     "heartbeat_interval_ms": 250
   },
   "api_token_env": "PCP_GATEWAY_API_TOKEN",
-  "internal_api_token_env": "PCP_GATEWAY_INTERNAL_TOKEN"
+  "internal_api_token_env": "PCP_GATEWAY_INTERNAL_TOKEN",
+  "worker_fabric": {
+    "host": "${HOST}",
+    "port": ${INF_CTRL_PORT}
+  },
+  "controllers": {
+    "inference": {
+      "enabled": true,
+      "config_path": "experiments/inference_qwen.json",
+      "service_id": "inference-main",
+      "api": {
+        "host": "${HOST}",
+        "port": ${INF_API_PORT}
+      }
+    }
+  }
 }
 EOF
 
@@ -121,18 +142,18 @@ wait_for_json_match() {
   return 1
 }
 
-env PCP_GLOBAL_CONTROLLER_TOKEN="$GLOBAL_TOKEN" \
+env PCP_FEDERATION_HUB_TOKEN="$HUB_TOKEN" \
   ./result/bin/pcp \
-    --global-controller \
+    --federation-hub \
     --api-host "$HOST" \
-    --api-port "$GLOBAL_PORT" \
-    --api-token-env PCP_GLOBAL_CONTROLLER_TOKEN \
-    >"$GLOBAL_LOG" 2>&1 &
-GLOBAL_PID="$!"
+    --api-port "$HUB_PORT" \
+    --api-token-env PCP_FEDERATION_HUB_TOKEN \
+    >"$HUB_LOG" 2>&1 &
+HUB_PID="$!"
 
 env PCP_GATEWAY_API_TOKEN="$GATEWAY_TOKEN" \
   PCP_GATEWAY_INTERNAL_TOKEN="$INTERNAL_TOKEN" \
-  PCP_GLOBAL_CONTROLLER_TOKEN="$GLOBAL_TOKEN" \
+  PCP_FEDERATION_HUB_TOKEN="$HUB_TOKEN" \
   ./result/bin/pcp \
     --gateway \
     --gateway-config "$CONFIG_PATH" \
@@ -140,22 +161,6 @@ env PCP_GATEWAY_API_TOKEN="$GATEWAY_TOKEN" \
     --gateway-port "$GATEWAY_PORT" \
     >"$GATEWAY_LOG" 2>&1 &
 GATEWAY_PID="$!"
-
-env PCP_API_TOKEN="$GATEWAY_TOKEN" \
-  PCP_GATEWAY_URL="http://${HOST}:${GATEWAY_PORT}" \
-  PCP_GATEWAY_TOKEN="$GATEWAY_TOKEN" \
-  PCP_GATEWAY_INTERNAL_TOKEN="$INTERNAL_TOKEN" \
-  PCP_GATEWAY_SERVICE_ID="inference-main" \
-  PCP_GATEWAY_NAMESPACE="lab-alpha/shared" \
-  ./result/bin/pcp \
-    --inference \
-    --inference-config experiments/inference_qwen.json \
-    --api-host "$HOST" \
-    --api-port "$INF_API_PORT" \
-    --control-host "$HOST" \
-    --control-port "$INF_CTRL_PORT" \
-    >"$INFERENCE_LOG" 2>&1 &
-INFERENCE_PID="$!"
 
 ./result/bin/pcp \
   --worker \
@@ -165,9 +170,8 @@ INFERENCE_PID="$!"
   >"$WORKER_LOG" 2>&1 &
 WORKER_PID="$!"
 
-wait_for_url "http://${HOST}:${GLOBAL_PORT}/healthz"
+wait_for_url "http://${HOST}:${HUB_PORT}/healthz"
 wait_for_url "http://${HOST}:${GATEWAY_PORT}/healthz"
-wait_for_url "http://${HOST}:${INF_API_PORT}/readyz"
 wait_for_json_match "http://${HOST}:${GATEWAY_PORT}/v1/federation/status" "$GATEWAY_TOKEN" '"connected":true' "$SERVICES_JSON"
 wait_for_json_match "http://${HOST}:${GATEWAY_PORT}/v1/services" "$GATEWAY_TOKEN" '"service_id":"inference-main"' "$SERVICES_JSON"
 wait_for_json_match "http://${HOST}:${GATEWAY_PORT}/v1/services" "$GATEWAY_TOKEN" '"health_status":"ok"' "$SERVICES_JSON"
@@ -189,7 +193,7 @@ curl -sf \
   "http://${HOST}:${GATEWAY_PORT}/v1/graph/mutate" \
   >/dev/null
 
-wait_for_json_match "http://${HOST}:${GLOBAL_PORT}/v1/global-graph/status" "$GLOBAL_TOKEN" '"entities":1' "$GLOBAL_STATUS_JSON"
+wait_for_json_match "http://${HOST}:${HUB_PORT}/v1/global-graph/status" "$HUB_TOKEN" '"entities":1' "$HUB_STATUS_JSON"
 
 curl -sf \
   -X POST \
@@ -210,5 +214,5 @@ grep -q '"object":"chat.completion"' "$RESPONSE_JSON"
 grep -q '"session_id":"' "$RESPONSE_JSON"
 
 printf 'services: %s\n' "$(cat "$SERVICES_JSON")"
-printf 'global_status: %s\n' "$(cat "$GLOBAL_STATUS_JSON")"
+printf 'hub_status: %s\n' "$(cat "$HUB_STATUS_JSON")"
 printf 'query_then_infer: %s\n' "$(cat "$RESPONSE_JSON")"

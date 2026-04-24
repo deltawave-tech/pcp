@@ -4,7 +4,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const ArrayList = std.ArrayList;
 const training_algorithm = @import("training_algorithm.zig");
-const shepherd = @import("../nodes/controllers/shepherd.zig");
+const training_controller = @import("../nodes/gateway/controllers/training_controller.zig");
 const message = @import("../network/message.zig");
 const binary_protocol = @import("../network/capnp_zig_wrapper.zig");
 const nesterov_mlir = @import("../optimizers/nesterov_mlir.zig");
@@ -24,14 +24,14 @@ const data_loader = @import("../data/loader.zig");
 const backend_selection = @import("../backends/selection.zig");
 const wandb = @import("../ui/wandb.zig");
 const control_state_mod = @import("../control_plane/state.zig");
-const gateway_service_client = @import("../gateway/service_client.zig");
+const gateway_service_client = @import("../nodes/gateway/service_client.zig");
 
 const TrainingAlgorithm = training_algorithm.TrainingAlgorithm;
 const TrainingStatus = training_algorithm.TrainingStatus;
 const TrainingConfig = training_algorithm.TrainingConfig;
 const TrainingMetrics = training_algorithm.TrainingMetrics;
-const Shepherd = shepherd.Shepherd;
-const WorkerConfig = shepherd.WorkerConfig;
+const Shepherd = training_controller.WorkerFabricController;
+const WorkerConfig = training_controller.WorkerConfig;
 const MessageType = message.MessageType;
 const MessageContext = message.MessageContext;
 const NesterovMLIR = nesterov_mlir.NesterovMLIR(f32);
@@ -653,7 +653,7 @@ pub const DiLoCo = struct {
 
     /// Broadcast to snapshot participants only
     /// Returns the request/round context plus the number of workers actually assigned chunks.
-    fn broadcastToSnapshot(self: *Self, workers: []const shepherd.WorkerConnection, round_id: message.RoundId) !RoundDispatch {
+    fn broadcastToSnapshot(self: *Self, workers: []const training_controller.WorkerConnection, round_id: message.RoundId) !RoundDispatch {
         if (self.master_param_raw_data == null) {
             return error.ParametersNotInitialized;
         }

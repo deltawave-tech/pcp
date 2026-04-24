@@ -5,9 +5,9 @@ const gateway_config = @import("config.zig");
 const service_registry = @import("service_registry.zig");
 const graph_adapter = @import("graph_adapter.zig");
 const event_ingest = @import("event_ingest.zig");
-const policy_store = @import("../graph/policy_store.zig");
-const graph_types = @import("../graph/types.zig");
-const mutation_log = @import("../graph/mutation_log.zig");
+const policy_store = @import("../../graph/policy_store.zig");
+const graph_types = @import("../../graph/types.zig");
+const mutation_log = @import("../../graph/mutation_log.zig");
 
 pub const FederationPeer = struct {
     gateway_id: []u8,
@@ -175,7 +175,7 @@ pub const FederationState = struct {
             .peer_count = self.peers.items.len,
             .last_sync_at = self.last_sync_at,
             .last_error = self.last_error,
-            .global_controller_endpoint = self.upstream_endpoint orelse configured_endpoint,
+            .federation_hub_endpoint = self.upstream_endpoint orelse configured_endpoint,
             .replication_enabled = false,
             .last_sequence_no = self.last_sequence_no,
             .last_replicated_sequence = self.last_replicated_sequence,
@@ -297,7 +297,7 @@ pub const Gateway = struct {
             .started_at = self.started_at,
             .auth_enabled = auth_enabled,
             .registered_services = self.service_registry.count(),
-            .global_controller_endpoint = self.config.resolvedGlobalControllerEndpoint(),
+            .federation_hub_endpoint = self.config.resolvedFederationHubEndpoint(),
         }, .{});
     }
 
@@ -330,7 +330,7 @@ pub const Gateway = struct {
             allocator,
             self.config.gateway_id,
             self.config.lab_id,
-            self.config.resolvedGlobalControllerEndpoint(),
+            self.config.resolvedFederationHubEndpoint(),
         );
     }
 
@@ -385,7 +385,7 @@ pub const Gateway = struct {
             .lab_id = self.config.lab_id,
             .connected = self.federation.connected,
             .status = self.federation.status_text,
-            .global_controller_endpoint = self.federation.upstream_endpoint orelse self.config.resolvedGlobalControllerEndpoint(),
+            .federation_hub_endpoint = self.federation.upstream_endpoint orelse self.config.resolvedFederationHubEndpoint(),
             .last_sync_at = self.federation.last_sync_at,
             .last_error = self.federation.last_error,
             .summary = .{

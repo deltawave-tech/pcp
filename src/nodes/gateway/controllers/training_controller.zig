@@ -4,15 +4,15 @@ const std = @import("std");
 const net = std.net;
 const Allocator = std.mem.Allocator;
 const ArrayList = std.ArrayList;
-const tcp_stream = @import("../../network/tcp_stream.zig");
-const message = @import("../../network/message.zig");
-const training_algorithm = @import("../../algorithms/training_algorithm.zig");
-const execution = @import("../../execution.zig");
-const monitoring = @import("../../ui/monitoring.zig");
-const backend_selection = @import("../../backends/selection.zig");
+const tcp_stream = @import("../../../network/tcp_stream.zig");
+const message = @import("../../../network/message.zig");
+const training_algorithm = @import("../../../algorithms/training_algorithm.zig");
+const execution = @import("../../../execution.zig");
+const monitoring = @import("../../../ui/monitoring.zig");
+const backend_selection = @import("../../../backends/selection.zig");
 const data_manager = @import("data_manager.zig");
-const mlir_ctx = @import("../../mlir/context.zig");
-const tensor = @import("../../core/tensor.zig");
+const mlir_ctx = @import("../../../mlir/context.zig");
+const tensor = @import("../../../core/tensor.zig");
 
 const TcpServer = tcp_stream.TcpServer;
 const TcpStreamManager = tcp_stream.TcpStreamManager;
@@ -27,6 +27,9 @@ const RoundId = message.RoundId;
 const TaskId = message.TaskId;
 const Executor = execution.Executor;
 const Backend = backend_selection.Backend;
+
+pub const WorkerFabricController = Shepherd;
+pub const TrainingController = Shepherd;
 
 /// Worker readiness status
 pub const WorkerStatus = enum {
@@ -317,7 +320,7 @@ pub const Shepherd = struct {
         self.server = try TcpServer.init(self.allocator, host, port);
         self.is_running = true;
 
-        std.log.info("Shepherd listening on {s}:{} for worker connections", .{ host, port });
+        std.log.info("Training controller listening on {s}:{} for worker connections", .{ host, port });
 
         // Start accepting connections
         while (self.is_running) {

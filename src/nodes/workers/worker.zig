@@ -341,7 +341,7 @@ pub const Worker = struct {
 
         // Connect to the master
         try self.client.connect(master_host, master_port);
-        std.log.info("Connected to Shepherd at {s}:{}", .{ master_host, master_port });
+        std.log.info("Connected to controller at {s}:{}", .{ master_host, master_port });
 
         // Get our backend type from the backend instance
         const my_backend = self.backend.getBackendType();

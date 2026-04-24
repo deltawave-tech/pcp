@@ -2,10 +2,10 @@ const std = @import("std");
 const net = std.net;
 
 const Allocator = std.mem.Allocator;
-const TcpServer = @import("../network/tcp_stream.zig").TcpServer;
-const http_server = @import("../inference/http_server.zig");
-const graph_policy_store = @import("../graph/policy_store.zig");
-const graph_types = @import("../graph/types.zig");
+const TcpServer = @import("../../network/tcp_stream.zig").TcpServer;
+const http_server = @import("../../inference/http_server.zig");
+const graph_policy_store = @import("../../graph/policy_store.zig");
+const graph_types = @import("../../graph/types.zig");
 const service_registry = @import("service_registry.zig");
 const graph_adapter = @import("graph_adapter.zig");
 const gateway_mod = @import("gateway.zig");
@@ -30,7 +30,7 @@ pub const GatewayApiServer = struct {
     gateway: *gateway_mod.Gateway,
     api_token: ?[]const u8,
     internal_api_token: ?[]const u8,
-    global_controller_token: ?[]const u8,
+    federation_hub_token: ?[]const u8,
     server: ?TcpServer,
     listen_host: ?[]const u8,
     listen_port: u16,
@@ -43,14 +43,14 @@ pub const GatewayApiServer = struct {
         gateway: *gateway_mod.Gateway,
         api_token: ?[]const u8,
         internal_api_token: ?[]const u8,
-        global_controller_token: ?[]const u8,
+        federation_hub_token: ?[]const u8,
     ) Self {
         return .{
             .allocator = allocator,
             .gateway = gateway,
             .api_token = api_token,
             .internal_api_token = internal_api_token,
-            .global_controller_token = global_controller_token,
+            .federation_hub_token = federation_hub_token,
             .server = null,
             .listen_host = null,
             .listen_port = 0,
@@ -253,14 +253,14 @@ pub const GatewayApiServer = struct {
         if (std.mem.eql(u8, req.method, "POST") and std.mem.eql(u8, req.path, "/v1/inference/query/chat/completions")) {
             self.handleQueryThenInfer(stream, req) catch |err| switch (err) {
                 error.InvalidQueryMode,
-                error.GlobalControllerNotConfigured,
+                error.FederationHubNotConfigured,
                 error.MissingMessages,
                 error.InvalidMessages,
                 error.InvalidInferenceRequest,
                 error.StreamingNotSupported,
                 => try http_server.writeResponse(stream, "400 Bad Request", &.{"Content-Type: text/plain"}, @errorName(err)),
-                error.GlobalControllerQueryFailed,
-                error.InvalidGlobalControllerResponse,
+                error.FederationHubQueryFailed,
+                error.InvalidFederationHubResponse,
                 error.InvalidDownstreamResponse,
                 => try http_server.writeResponse(stream, "502 Bad Gateway", &.{"Content-Type: text/plain"}, @errorName(err)),
                 error.ServiceUnavailable,
@@ -334,8 +334,8 @@ pub const GatewayApiServer = struct {
         }
 
         if (std.mem.eql(u8, req.method, "POST") and std.mem.eql(u8, req.path, "/v1/federation/connect")) {
-            if (self.gateway.config.resolvedGlobalControllerEndpoint() == null) {
-                try http_server.writeResponse(stream, "400 Bad Request", &.{"Content-Type: text/plain"}, "global_controller_not_configured");
+            if (self.gateway.config.resolvedFederationHubEndpoint() == null) {
+                try http_server.writeResponse(stream, "400 Bad Request", &.{"Content-Type: text/plain"}, "federation_hub_not_configured");
                 return true;
             }
 
@@ -416,15 +416,15 @@ pub const GatewayApiServer = struct {
             const body = renderFederatedGraphQueryJson(
                 self.allocator,
                 &self.gateway.graph,
-                self.gateway.config.resolvedGlobalControllerEndpoint(),
-                self.global_controller_token,
+                self.gateway.config.resolvedFederationHubEndpoint(),
+                self.federation_hub_token,
                 parsed.value,
             ) catch |err| switch (err) {
-                error.InvalidQueryMode, error.GlobalControllerNotConfigured => {
+                error.InvalidQueryMode, error.FederationHubNotConfigured => {
                     try http_server.writeResponse(stream, "400 Bad Request", &.{"Content-Type: text/plain"}, @errorName(err));
                     return true;
                 },
-                error.GlobalControllerQueryFailed, error.InvalidGlobalControllerResponse => {
+                error.FederationHubQueryFailed, error.InvalidFederationHubResponse => {
                     try http_server.writeResponse(stream, "502 Bad Gateway", &.{"Content-Type: text/plain"}, @errorName(err));
                     return true;
                 },
@@ -515,8 +515,8 @@ pub const GatewayApiServer = struct {
         const graph_body = try renderFederatedGraphQueryJson(
             self.allocator,
             &self.gateway.graph,
-            self.gateway.config.resolvedGlobalControllerEndpoint(),
-            self.global_controller_token,
+            self.gateway.config.resolvedFederationHubEndpoint(),
+            self.federation_hub_token,
             parsed.value.graph_query,
         );
         defer self.allocator.free(graph_body);
@@ -830,7 +830,7 @@ fn wrapQueryThenInferResponse(
     var completion_parsed = try std.json.parseFromSlice(std.json.Value, allocator, completion_body, .{});
     defer completion_parsed.deinit();
 
-    if (graph_parsed.value != .object) return error.InvalidGlobalControllerResponse;
+    if (graph_parsed.value != .object) return error.InvalidFederationHubResponse;
     if (completion_parsed.value != .object) return error.InvalidDownstreamResponse;
 
     var root = std.json.ObjectMap.init(allocator);
@@ -851,29 +851,29 @@ fn jsonStringifyValue(allocator: Allocator, value: std.json.Value) ![]u8 {
 fn renderFederatedGraphQueryJson(
     allocator: Allocator,
     graph: *graph_adapter.GatewayGraph,
-    global_controller_endpoint: ?[]const u8,
-    global_controller_token: ?[]const u8,
+    federation_hub_endpoint: ?[]const u8,
+    federation_hub_token: ?[]const u8,
     request: graph_types.QueryRequest,
 ) ![]u8 {
     const mode = try request.resolvedMode();
     return switch (mode) {
         .local => graph.renderQueryJson(allocator, request.withMode(.local)),
         .global => {
-            const endpoint = global_controller_endpoint orelse return error.GlobalControllerNotConfigured;
-            return queryGlobalController(allocator, endpoint, global_controller_token, request.withMode(.global));
+            const endpoint = federation_hub_endpoint orelse return error.FederationHubNotConfigured;
+            return queryFederationHub(allocator, endpoint, federation_hub_token, request.withMode(.global));
         },
         .local_plus_global => {
-            const endpoint = global_controller_endpoint orelse return error.GlobalControllerNotConfigured;
+            const endpoint = federation_hub_endpoint orelse return error.FederationHubNotConfigured;
             const local_body = try graph.renderQueryJson(allocator, request.withMode(.local));
             defer allocator.free(local_body);
-            const global_body = try queryGlobalController(allocator, endpoint, global_controller_token, request.withMode(.global));
+            const global_body = try queryFederationHub(allocator, endpoint, federation_hub_token, request.withMode(.global));
             defer allocator.free(global_body);
             return mergeQueryResponses(allocator, local_body, global_body);
         },
     };
 }
 
-fn queryGlobalController(
+fn queryFederationHub(
     allocator: Allocator,
     endpoint: []const u8,
     auth_token: ?[]const u8,
@@ -913,10 +913,10 @@ fn queryGlobalController(
         .payload = body,
         .extra_headers = headers.items,
         .response_storage = .{ .dynamic = &response_body },
-    }) catch return error.GlobalControllerQueryFailed;
+    }) catch return error.FederationHubQueryFailed;
 
     if (result.status != .ok and result.status != .accepted and result.status != .created) {
-        return error.GlobalControllerQueryFailed;
+        return error.FederationHubQueryFailed;
     }
 
     return response_body.toOwnedSlice();
@@ -930,11 +930,11 @@ fn mergeQueryResponses(allocator: Allocator, local_body: []const u8, global_body
 
     const local_root = switch (local_parsed.value) {
         .object => |object| object,
-        else => return error.InvalidGlobalControllerResponse,
+        else => return error.InvalidFederationHubResponse,
     };
     const global_root = switch (global_parsed.value) {
         .object => |object| object,
-        else => return error.InvalidGlobalControllerResponse,
+        else => return error.InvalidFederationHubResponse,
     };
 
     var body = std.ArrayList(u8).init(allocator);
@@ -987,21 +987,21 @@ fn writeMergedQueryArray(
 }
 
 fn queryArrayField(root: std.json.ObjectMap, name: []const u8) ![]const std.json.Value {
-    const value = root.get(name) orelse return error.InvalidGlobalControllerResponse;
+    const value = root.get(name) orelse return error.InvalidFederationHubResponse;
     return switch (value) {
         .array => |array| array.items,
-        else => return error.InvalidGlobalControllerResponse,
+        else => return error.InvalidFederationHubResponse,
     };
 }
 
 fn queryItemId(item: std.json.Value, field_name: []const u8) ![]const u8 {
     const object = switch (item) {
         .object => |object| object,
-        else => return error.InvalidGlobalControllerResponse,
+        else => return error.InvalidFederationHubResponse,
     };
-    const field = object.get(field_name) orelse return error.InvalidGlobalControllerResponse;
+    const field = object.get(field_name) orelse return error.InvalidFederationHubResponse;
     return switch (field) {
         .string => |text| text,
-        else => return error.InvalidGlobalControllerResponse,
+        else => return error.InvalidFederationHubResponse,
     };
 }

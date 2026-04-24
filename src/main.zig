@@ -16,11 +16,18 @@ pub const backends = struct {
 // Data loading and processing
 pub const data_loader = @import("data/loader.zig");
 
-// Distributed training system
+// Distributed runtime
 pub const controllers = struct {
-    pub const shepherd = @import("nodes/controllers/shepherd.zig");
+    pub const training = @import("nodes/gateway/controllers/training_controller.zig");
+    pub const rl = @import("nodes/gateway/controllers/rl_controller.zig");
+    pub const inference = @import("nodes/gateway/controllers/inference_controller.zig");
 };
 pub const inference = @import("inference/config.zig");
+pub const gateway = @import("nodes/gateway/gateway.zig");
+pub const federation = struct {
+    pub const hub = @import("nodes/federation_hub/hub.zig");
+    pub const types = @import("federation/types.zig");
+};
 pub const worker = @import("nodes/workers/worker.zig");
 pub const algorithms = struct {
     pub const diloco = @import("algorithms/diloco.zig");

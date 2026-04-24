@@ -298,9 +298,9 @@ pub fn setWorkerInfo(workers: []const WorkerInfo) void
 
 The PCP binary (`pcp`) handles all roles (Shepherd, NodeManager, Worker).
 
-#### 1. Start the Shepherd (Coordinator)
+#### 1. Start the Legacy Training Controller
 
-The Shepherd coordinates the training session.
+The legacy training controller coordinates the training session.
 
 ```bash
 pcp \
@@ -322,7 +322,7 @@ By default, this spawns 1 worker on Device 0.
 ```bash
 pcp \
   --node-manager \
-  --host <SHEPHERD_IP> \
+  --host <GATEWAY_CONTROLLER_IP> \
   --port 8080 \
   --backend cuda \
   --target sm_80
@@ -337,7 +337,7 @@ Use `--scale` to spawn multiple workers (one per GPU).
 pcp \
   --node-manager \
   --scale 8 \
-  --host <SHEPHERD_IP> \
+  --host <GATEWAY_CONTROLLER_IP> \
   --port 8080 \
   --backend cuda \
   --target sm_90a

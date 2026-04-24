@@ -1,9 +1,9 @@
 const std = @import("std");
 
 const Allocator = std.mem.Allocator;
-const federation_types = @import("../federation/types.zig");
-const mutation_log = @import("../graph/mutation_log.zig");
-const graph_policy_store = @import("../graph/policy_store.zig");
+const federation_types = @import("../../federation/types.zig");
+const mutation_log = @import("../../graph/mutation_log.zig");
+const graph_policy_store = @import("../../graph/policy_store.zig");
 const gateway_mod = @import("gateway.zig");
 
 pub const FederationClient = struct {
@@ -108,7 +108,7 @@ pub const FederationClient = struct {
             .response_storage = .{ .dynamic = &response_body },
         });
         if (result.status != .ok and result.status != .accepted and result.status != .created) {
-            return error.GlobalControllerRequestFailed;
+            return error.FederationHubRequestFailed;
         }
 
         var parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, response_body.items, .{});
@@ -210,7 +210,7 @@ pub const FederationClient = struct {
             .response_storage = .{ .dynamic = &response_body },
         });
         if (result.status != .ok and result.status != .accepted and result.status != .created) {
-            return error.GlobalControllerRequestFailed;
+            return error.FederationHubRequestFailed;
         }
 
         const parsed = try std.json.parseFromSlice(federation_types.MutationBatchAck, self.allocator, response_body.items, .{ .ignore_unknown_fields = true });

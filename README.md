@@ -101,25 +101,28 @@ pip install -r requirements.txt
 export WANDB_API_KEY=your_api_key_here
 ```
 
-### 5. Start the Shepherd
+### 5. Start the Gateway
 
-Use example experiment configuration file `experiments/nanogpt_small.json`, or use a bigger model configuration with a larger dataset: [nanogpt_medium](experiments/README.md#nanogpt-medium)
-
-Start a supervised Shepherd expecting (8) workers:
+Start a gateway for the site:
 ```shell
-pcp --supervise -- --shepherd --config experiments/nanogpt_small.json --host 0.0.0.0 --port 8080 --workers 8
+pcp --gateway --gateway-config experiments/gateway_local.json --gateway-host 0.0.0.0 --gateway-port 18010
+```
+
+Optional federation entrypoint:
+```shell
+pcp --federation-hub --api-host 0.0.0.0 --api-port 19010
 ```
 
 ### 6. Start Worker Nodes
 
 **Single GPU node:**
 ```shell
-pcp --node-manager --host <SHEPHERD_IP> --port 8080 --backend cuda --target sm_80
+pcp --node-manager --host <GATEWAY_CONTROLLER_IP> --port 8080 --backend cuda --target sm_80
 ```
 
 **Multi-GPU node (8xH100):**
 ```shell
-pcp --node-manager --scale 8 --host <SHEPHERD_IP> --port 8080 --backend cuda --target sm_90a
+pcp --node-manager --scale 8 --host <GATEWAY_CONTROLLER_IP> --port 8080 --backend cuda --target sm_90a
 ```
 
 See [Starting Workers](#starting-workers) for more details on GPU target architectures.
@@ -297,7 +300,8 @@ zig build run-rocm-pipeline-test
 - Hardware: `--backend`, `--target`, `--device-id`
 - Topology: `--workers`, `--scale`
 - Supervision: `--supervise`, `--resume`
-- Modes: `--shepherd`, `--worker`, `--node-manager`
+- Topology modes: `--gateway`, `--federation-hub`, `--worker`, `--node-manager`
+- Legacy standalone controller modes: `--shepherd`, `--inference`
 
 **Experiment (JSON File):**
 - Model: `model_path`
@@ -351,9 +355,9 @@ PCP automatically logs training metrics to [Weights & Biases](https://wandb.ai) 
 
 If no API key is provided, WandB logging will be disabled and training will continue normally.
 
-### Starting the Shepherd
+### Starting the Legacy Training Controller
 
-The Shepherd coordinates training, aggregates gradients, and manages the global model state. Running with `--supervise` enables automatic crash recovery.
+The legacy training controller coordinates training, aggregates gradients, and manages the worker-fabric state. Running with `--supervise` enables automatic crash recovery.
 
 ```sh
 pcp --supervise -- \
@@ -377,7 +381,7 @@ pcp --supervise -- \
 
 ### Starting Workers
 
-Workers connect to the Shepherd and execute training on their local hardware. We use the Node Manager to launch and monitor workers. The Node Manager automatically handles process supervision, crash recovery, and GPU assignment.
+In the canonical topology, workers connect to the active gateway worker-fabric endpoint and execute work on their local hardware. We use the Node Manager to launch and monitor workers. The Node Manager automatically handles process supervision, crash recovery, and GPU assignment.
 
 **GPU Target Architectures:**
 
@@ -447,7 +451,7 @@ Use `experiments/inference_qwen.json` as the reference config for Qwen 2.5 0.5B 
 You can run workers with different hardware backends in the same training session.
 
 ```sh
-# Shepherd Node: Start coordinator expecting 11 total workers
+# Legacy training controller node: start coordinator expecting 11 total workers
 pcp --shepherd --config experiments/nanogpt_small.json --workers 11
 
 # Node 1: 8xH100 server (Runs 8 workers)
@@ -549,7 +553,7 @@ Create or update your experiment.json file:
 
 ### 4. Run Training
 
-Start the Shepherd with your new configuration:
+Start the legacy training controller with your new configuration:
 
 ```sh
 pcp --supervise -- --shepherd --config experiment.json --workers 2

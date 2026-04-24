@@ -1,12 +1,12 @@
 const std = @import("std");
 
 const Allocator = std.mem.Allocator;
-const federation_types = @import("../federation/types.zig");
+const federation_types = @import("../../federation/types.zig");
 const gateway_registry = @import("gateway_registry.zig");
-const graph_store = @import("../graph/store.zig");
-const mutation_log = @import("../graph/mutation_log.zig");
-const policy_store = @import("../graph/policy_store.zig");
-const graph_types = @import("../graph/types.zig");
+const graph_store = @import("../../graph/store.zig");
+const mutation_log = @import("../../graph/mutation_log.zig");
+const policy_store = @import("../../graph/policy_store.zig");
+const graph_types = @import("../../graph/types.zig");
 
 const NamespaceReplicationStatus = struct {
     namespace_id: []const u8,
@@ -28,7 +28,7 @@ const NamespaceReplicationStatus = struct {
     replication_lag: u64,
 };
 
-pub const GlobalController = struct {
+pub const FederationHub = struct {
     allocator: Allocator,
     registry: gateway_registry.GatewayRegistry,
     graph: graph_store.GraphStore,
@@ -43,11 +43,11 @@ pub const GlobalController = struct {
             .registry = gateway_registry.GatewayRegistry.init(allocator),
             .graph = graph_store.GraphStore.init(allocator, .{
                 .backend = "memory",
-                .gateway_id = "global-controller",
-                .lab_id = "global",
+                .gateway_id = "federation-hub",
+                .lab_id = "federation",
                 .neo4j = null,
-            }) catch @panic("failed to initialize global graph store"),
-            .policy_store = policy_store.GraphPolicyStore.init(allocator, null) catch @panic("failed to initialize global policy store"),
+            }) catch @panic("failed to initialize federation graph store"),
+            .policy_store = policy_store.GraphPolicyStore.init(allocator, null) catch @panic("failed to initialize federation policy store"),
             .started_at = std.time.timestamp(),
         };
     }
@@ -61,7 +61,7 @@ pub const GlobalController = struct {
     pub fn renderReadyJson(self: *Self, allocator: Allocator, auth_enabled: bool) ![]u8 {
         return std.json.stringifyAlloc(allocator, .{
             .ready = true,
-            .mode = "global-controller",
+            .mode = "federation-hub",
             .registered_gateways = self.registry.count(),
             .auth_enabled = auth_enabled,
         }, .{});
@@ -69,7 +69,7 @@ pub const GlobalController = struct {
 
     pub fn renderControllerJson(self: *Self, allocator: Allocator, auth_enabled: bool) ![]u8 {
         return std.json.stringifyAlloc(allocator, .{
-            .mode = "global-controller",
+            .mode = "federation-hub",
             .status = "running",
             .registered_gateways = self.registry.count(),
             .started_at = self.started_at,
@@ -80,7 +80,7 @@ pub const GlobalController = struct {
     pub fn renderGlobalGraphStatusJson(self: *Self, allocator: Allocator) ![]u8 {
         const counts = self.graph.counts();
         return std.json.stringifyAlloc(allocator, .{
-            .mode = "global-controller",
+            .mode = "federation-hub",
             .registered_gateways = self.registry.count(),
             .replication_enabled = true,
             .max_replication_lag = self.registry.maxReplicationLag(),
@@ -175,7 +175,7 @@ pub const GlobalController = struct {
         }
 
         return std.json.stringifyAlloc(allocator, .{
-            .mode = "global-controller",
+            .mode = "federation-hub",
             .registered_gateways = gateways.len,
             .max_replication_lag = self.registry.maxReplicationLag(),
             .global_graph = .{

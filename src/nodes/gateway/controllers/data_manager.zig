@@ -1,6 +1,6 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const message = @import("../../network/message.zig");
+const message = @import("../../../network/message.zig");
 const NodeId = message.NodeId;
 
 pub const ChunkState = enum { Unassigned, Assigned, Completed };

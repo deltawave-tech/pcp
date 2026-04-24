@@ -1,11 +1,11 @@
 const std = @import("std");
 
 const Allocator = std.mem.Allocator;
-const federation_types = @import("../federation/types.zig");
+const federation_types = @import("../../federation/types.zig");
 const gateway_config = @import("config.zig");
-const graph_store = @import("../graph/store.zig");
-const mutation_log = @import("../graph/mutation_log.zig");
-const graph_types = @import("../graph/types.zig");
+const graph_store = @import("../../graph/store.zig");
+const mutation_log = @import("../../graph/mutation_log.zig");
+const graph_types = @import("../../graph/types.zig");
 
 pub const GatewayGraph = struct {
     store: graph_store.GraphStore,

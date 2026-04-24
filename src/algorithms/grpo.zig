@@ -5,11 +5,11 @@ const TrainingAlgorithm = @import("training_algorithm.zig").TrainingAlgorithm;
 const TrainingStatus = @import("training_algorithm.zig").TrainingStatus;
 const backend_selection = @import("../backends/selection.zig");
 const control_state_mod = @import("../control_plane/state.zig");
-const gateway_service_client = @import("../gateway/service_client.zig");
+const gateway_service_client = @import("../nodes/gateway/service_client.zig");
 
-// Forward declaration - RLShepherd will be defined in src/nodes/controllers/rl_shepherd.zig
-pub const RLShepherd = @import("../nodes/controllers/rl_shepherd.zig").RLShepherd;
-pub const RolloutData = @import("../nodes/controllers/rl_shepherd.zig").RolloutData;
+// RL orchestration is now exposed under the gateway controller namespace.
+pub const RLShepherd = @import("../nodes/gateway/controllers/rl_controller.zig").RLController;
+pub const RolloutData = @import("../nodes/gateway/controllers/rl_controller.zig").RolloutData;
 
 pub const GRPOConfig = struct {
     num_iterations: usize,

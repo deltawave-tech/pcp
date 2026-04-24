@@ -11,7 +11,7 @@ const worker_backend = @import("worker_backend.zig");
 
 // Algorithm implementations
 const diloco = @import("../algorithms/diloco.zig");
-const shepherd = @import("../nodes/controllers/shepherd.zig");
+const training_controller = @import("../nodes/gateway/controllers/training_controller.zig");
 const worker = @import("../nodes/workers/worker.zig");
 
 // Backend implementations
@@ -25,7 +25,7 @@ const tensor = @import("../core/tensor.zig");
 const Executor = execution.Executor;
 const WorkerBackend = worker_backend.WorkerBackend;
 const DiLoCo = diloco.DiLoCo;
-const Shepherd = shepherd.Shepherd;
+const Shepherd = training_controller.WorkerFabricController;
 const Worker = worker.Worker;
 
 /// Compile-time backend selection based on target platform and build options

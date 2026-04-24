@@ -1,7 +1,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const training_algorithm = @import("training_algorithm.zig");
-const shepherd = @import("../nodes/controllers/shepherd.zig");
+const training_controller = @import("../nodes/gateway/controllers/training_controller.zig");
 const message = @import("../network/message.zig");
 const tensor = @import("../core/tensor.zig");
 const execution = @import("../execution.zig");
@@ -9,14 +9,14 @@ const nesterov_host = @import("../optimizers/nesterov.zig");
 const model_introspection = @import("../mlir/model_introspection.zig");
 const ops = @import("../core/ops.zig");
 
-const WorkerConnection = shepherd.WorkerConnection;
+const WorkerConnection = training_controller.WorkerConnection;
 const ModelSanitizer = @import("../compiler/sanitizer.zig").ModelSanitizer;
 const ModelInspector = model_introspection.ModelInspector;
 const GraphBuilder = @import("../compiler/graph_builder.zig").GraphBuilder;
 
 const TrainingAlgorithm = training_algorithm.TrainingAlgorithm;
 const TrainingStatus = training_algorithm.TrainingStatus;
-const Shepherd = shepherd.Shepherd;
+const Shepherd = training_controller.WorkerFabricController;
 const NesterovHost = nesterov_host.Nesterov;
 const Tensor = tensor.Tensor(void);
 const MessageContext = message.MessageContext;

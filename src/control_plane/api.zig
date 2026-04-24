@@ -2,8 +2,9 @@ const std = @import("std");
 const net = std.net;
 
 const Allocator = std.mem.Allocator;
-const Shepherd = @import("../nodes/controllers/shepherd.zig").Shepherd;
-const WorkerStatus = @import("../nodes/controllers/shepherd.zig").WorkerStatus;
+const training_controller = @import("../nodes/gateway/controllers/training_controller.zig");
+const Shepherd = training_controller.WorkerFabricController;
+const WorkerStatus = training_controller.WorkerStatus;
 const TcpServer = @import("../network/tcp_stream.zig").TcpServer;
 const http_server = @import("../inference/http_server.zig");
 const control_state = @import("state.zig");
@@ -152,12 +153,13 @@ pub const ControlApiServer = struct {
             return true;
         }
 
-        if (std.mem.eql(u8, req.method, "GET") and
+        if ((std.mem.eql(u8, req.method, "GET") or std.mem.eql(u8, req.method, "POST")) and
             (std.mem.eql(u8, req.path, "/v1/job") or std.mem.eql(u8, req.path, "/v1/jobs/current")))
         {
             const body = try self.state.renderJobJson(self.allocator, connected_workers);
             defer self.allocator.free(body);
-            try http_server.writeResponse(stream, "200 OK", &.{"Content-Type: application/json"}, body);
+            const status = if (std.mem.eql(u8, req.method, "POST")) "202 Accepted" else "200 OK";
+            try http_server.writeResponse(stream, status, &.{"Content-Type: application/json"}, body);
             return true;
         }
 

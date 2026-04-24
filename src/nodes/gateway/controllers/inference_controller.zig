@@ -2,22 +2,23 @@ const std = @import("std");
 const net = std.net;
 const Allocator = std.mem.Allocator;
 
-const Shepherd = @import("shepherd.zig").Shepherd;
-const WorkerMessageHook = @import("shepherd.zig").WorkerMessageHook;
-const WorkerConnectionHook = @import("shepherd.zig").WorkerConnectionHook;
-const inference_config = @import("../../inference/config.zig");
-const inference_types = @import("../../inference/types.zig");
-const model_registry = @import("../../inference/model_registry.zig");
-const session_manager = @import("../../inference/session_manager.zig");
-const router = @import("../../inference/router.zig");
-const tokenizer_mod = @import("../../inference/tokenizer.zig");
-const http_server = @import("../../inference/http_server.zig");
-const control_api = @import("../../control_plane/api.zig");
-const control_state = @import("../../control_plane/state.zig");
-const gateway_service_client = @import("../../gateway/service_client.zig");
-const tcp_stream = @import("../../network/tcp_stream.zig");
-const message = @import("../../network/message.zig");
-const model_introspection = @import("../../mlir/model_introspection.zig");
+const Shepherd = @import("training_controller.zig").Shepherd;
+const WorkerMessageHook = @import("training_controller.zig").WorkerMessageHook;
+const WorkerConnectionHook = @import("training_controller.zig").WorkerConnectionHook;
+const inference_config = @import("../../../inference/config.zig");
+const inference_types = @import("../../../inference/types.zig");
+const model_registry = @import("../../../inference/model_registry.zig");
+const session_manager = @import("../../../inference/session_manager.zig");
+const router = @import("../../../inference/router.zig");
+const tokenizer_mod = @import("../../../inference/tokenizer.zig");
+const http_server = @import("../../../inference/http_server.zig");
+const control_api = @import("../../../control_plane/api.zig");
+const control_state = @import("../../../control_plane/state.zig");
+const gateway_service_client = @import("../service_client.zig");
+const gateway_service_registry = @import("../service_registry.zig");
+const tcp_stream = @import("../../../network/tcp_stream.zig");
+const message = @import("../../../network/message.zig");
+const model_introspection = @import("../../../mlir/model_introspection.zig");
 
 const ArrayList = std.ArrayList;
 const MessageType = message.MessageType;
@@ -25,6 +26,8 @@ const MessageContext = message.MessageContext;
 const NodeId = message.NodeId;
 const RequestId = message.RequestId;
 const TcpServer = tcp_stream.TcpServer;
+
+pub const InferenceController = InferenceShepherd;
 
 const WorkerSet = struct {
     allocator: Allocator,
@@ -133,6 +136,17 @@ pub const Metrics = struct {
     cache_misses: u64 = 0,
 };
 
+const EmbeddedGatewayRegistration = struct {
+    registry: *gateway_service_registry.ServiceRegistry,
+    service_id: []u8,
+    base_url: []u8,
+
+    fn deinit(self: *EmbeddedGatewayRegistration, allocator: Allocator) void {
+        allocator.free(self.service_id);
+        allocator.free(self.base_url);
+    }
+};
+
 pub const InferenceShepherd = struct {
     base: Shepherd,
     config: inference_config.InferenceConfig,
@@ -149,6 +163,7 @@ pub const InferenceShepherd = struct {
     metrics_mutex: std.Thread.Mutex,
     operator_state: ?*control_state.ControllerState,
     gateway_client: ?*gateway_service_client.GatewayClient,
+    embedded_gateway_registration: ?EmbeddedGatewayRegistration,
     api_server: ?TcpServer,
     api_host: ?[]const u8,
     api_port: u16,
@@ -184,6 +199,7 @@ pub const InferenceShepherd = struct {
             .metrics_mutex = std.Thread.Mutex{},
             .operator_state = operator_state,
             .gateway_client = gateway_client,
+            .embedded_gateway_registration = null,
             .api_server = null,
             .api_host = null,
             .api_port = 0,
@@ -215,6 +231,9 @@ pub const InferenceShepherd = struct {
         self.active.deinit();
         self.pending.deinit();
 
+        if (self.embedded_gateway_registration) |*registration| {
+            registration.deinit(self.base.allocator);
+        }
         self.base.allocator.free(self.api_token);
     }
 
@@ -511,7 +530,7 @@ pub const InferenceShepherd = struct {
         return .{ .array = outer };
     }
 
-    fn dtypesToJson(allocator: Allocator, dtypes: []const @import("../../core/tensor.zig").DType) std.json.Value {
+    fn dtypesToJson(allocator: Allocator, dtypes: []const @import("../../../core/tensor.zig").DType) std.json.Value {
         var arr = std.json.Array.init(allocator);
         for (dtypes) |dt| {
             const s = switch (dt) {
@@ -875,13 +894,43 @@ pub const InferenceShepherd = struct {
         try self.refreshGatewayServiceRegistration();
     }
 
+    pub fn registerEmbeddedGatewayService(self: *Self, registry: *gateway_service_registry.ServiceRegistry, service_id: []const u8, host: []const u8, port: u16) !void {
+        if (self.embedded_gateway_registration) |*existing| {
+            existing.deinit(self.base.allocator);
+        }
+        self.api_host = host;
+        self.api_port = port;
+        self.embedded_gateway_registration = .{
+            .registry = registry,
+            .service_id = try self.base.allocator.dupe(u8, service_id),
+            .base_url = try std.fmt.allocPrint(self.base.allocator, "http://{s}:{d}", .{ host, port }),
+        };
+        try self.refreshGatewayServiceRegistration();
+    }
+
     fn refreshGatewayServiceRegistration(self: *Self) !void {
+        const ready_workers = self.getReadyWorkerCount();
+        if (self.embedded_gateway_registration) |registration| {
+            var service = try registration.registry.register(.{
+                .service_id = registration.service_id,
+                .service_type = "inference",
+                .base_url = registration.base_url,
+                .auth_mode = "bearer",
+                .health_status = if (ready_workers > 0) "ok" else "starting",
+                .job_status = "running",
+                .worker_count = self.base.getWorkerCount(),
+                .ready_worker_count = ready_workers,
+                .capabilities = &[_][]const u8{ "chat.completions", "models.list", "controller.status" },
+            });
+            service.deinit(self.base.allocator);
+            return;
+        }
+
         const client = self.gateway_client orelse return;
         const host = self.api_host orelse return;
         const port = self.api_port;
         const base_url = try std.fmt.allocPrint(self.base.allocator, "http://{s}:{d}", .{ host, port });
         defer self.base.allocator.free(base_url);
-        const ready_workers = self.getReadyWorkerCount();
         try client.registerService(
             "inference",
             base_url,

@@ -2,7 +2,7 @@ const std = @import("std");
 
 const Allocator = std.mem.Allocator;
 const graph_adapter = @import("graph_adapter.zig");
-const graph_types = @import("../graph/types.zig");
+const graph_types = @import("../../graph/types.zig");
 
 pub const InternalEventRequest = struct {
     event_id: []const u8,

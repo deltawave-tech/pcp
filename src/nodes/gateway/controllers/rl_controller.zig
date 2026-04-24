@@ -1,18 +1,18 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const Shepherd = @import("shepherd.zig").Shepherd;
-const MessageType = @import("../../network/message.zig").MessageType;
-const MessageEnvelope = @import("../../network/message.zig").MessageEnvelope;
+const Shepherd = @import("training_controller.zig").Shepherd;
+const MessageType = @import("../../../network/message.zig").MessageType;
+const MessageEnvelope = @import("../../../network/message.zig").MessageEnvelope;
 const ArrayList = std.ArrayList;
-const backend_selection = @import("../../backends/selection.zig");
-const IreeBackend = @import("../../backends/iree.zig").IreeBackend;
-const mlir_ctx = @import("../../mlir/context.zig");
-const model_introspection = @import("../../mlir/model_introspection.zig");
-const Nesterov = @import("../../optimizers/nesterov.zig").Nesterov;
-const tensor = @import("../../core/tensor.zig");
-const GraphBuilder = @import("../../compiler/graph_builder.zig").GraphBuilder;
-const ops = @import("../../core/ops.zig");
-const mlir = @import("../../mlir/wrapper.zig");
+const backend_selection = @import("../../../backends/selection.zig");
+const IreeBackend = @import("../../../backends/iree.zig").IreeBackend;
+const mlir_ctx = @import("../../../mlir/context.zig");
+const model_introspection = @import("../../../mlir/model_introspection.zig");
+const Nesterov = @import("../../../optimizers/nesterov.zig").Nesterov;
+const tensor = @import("../../../core/tensor.zig");
+const GraphBuilder = @import("../../../compiler/graph_builder.zig").GraphBuilder;
+const ops = @import("../../../core/ops.zig");
+const mlir = @import("../../../mlir/wrapper.zig");
 
 pub const RolloutData = struct {
     prompt: []const i64,
@@ -24,6 +24,8 @@ pub const RolloutData = struct {
         self.allocator.free(self.completion);
     }
 };
+
+pub const RLController = RLShepherd;
 
 pub const RLShepherd = struct {
     base: Shepherd, // Composition

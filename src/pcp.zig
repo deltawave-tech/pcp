@@ -6,14 +6,15 @@ const ArrayList = std.ArrayList;
 const Allocator = std.mem.Allocator;
 
 // Import our distributed training components
-const shepherd = @import("nodes/controllers/shepherd.zig");
+const training_controller = @import("nodes/gateway/controllers/training_controller.zig");
 const worker = @import("nodes/workers/worker.zig");
 const diloco = @import("algorithms/diloco.zig");
 const grpo = @import("algorithms/grpo.zig");
-const rl_shepherd = @import("nodes/controllers/rl_shepherd.zig");
-const inference_shepherd = @import("nodes/controllers/inference_shepherd.zig");
+const rl_controller = @import("nodes/gateway/controllers/rl_controller.zig");
+const inference_controller = @import("nodes/gateway/controllers/inference_controller.zig");
 const training_algorithm = @import("algorithms/training_algorithm.zig");
 const backend_selection = @import("backends/selection.zig");
+const message = @import("network/message.zig");
 const ops = @import("core/ops.zig");
 const mlir = @import("mlir/wrapper.zig");
 const autodiff = @import("autodiff/engine.zig");
@@ -21,15 +22,16 @@ const dashboard = @import("ui/dashboard.zig");
 const inference_config = @import("inference/config.zig");
 const control_api = @import("control_plane/api.zig");
 const control_state = @import("control_plane/state.zig");
-const gateway = @import("gateway/gateway.zig");
-const gateway_api = @import("gateway/api.zig");
-const gateway_config = @import("gateway/config.zig");
-const gateway_federation_client = @import("gateway/federation_client.zig");
-const gateway_service_client = @import("gateway/service_client.zig");
-const global_controller = @import("global_controller/controller.zig");
-const global_controller_api = @import("global_controller/api.zig");
+const gateway = @import("nodes/gateway/gateway.zig");
+const gateway_api = @import("nodes/gateway/api.zig");
+const gateway_config = @import("nodes/gateway/config.zig");
+const gateway_federation_client = @import("nodes/gateway/federation_client.zig");
+const gateway_service_client = @import("nodes/gateway/service_client.zig");
+const gateway_service_registry = @import("nodes/gateway/service_registry.zig");
+const federation_hub = @import("nodes/federation_hub/hub.zig");
+const federation_hub_api = @import("nodes/federation_hub/api.zig");
 
-const Shepherd = shepherd.Shepherd;
+const Shepherd = training_controller.WorkerFabricController;
 const Worker = worker.Worker;
 const DiLoCo = diloco.DiLoCo;
 const DiLoCoConfig = diloco.DiLoCoConfig;
@@ -138,7 +140,7 @@ const Args = struct {
         node_manager,
         inference,
         gateway,
-        global_controller,
+        federation_hub,
     };
 
     pub fn parse(allocator: Allocator, args: [][:0]u8) !Args {
@@ -215,8 +217,8 @@ const Args = struct {
             } else if (std.mem.eql(u8, args[i], "--gateway")) {
                 mode = .gateway;
                 enable_api = true;
-            } else if (std.mem.eql(u8, args[i], "--global-controller")) {
-                mode = .global_controller;
+            } else if (std.mem.eql(u8, args[i], "--federation-hub")) {
+                mode = .federation_hub;
                 enable_api = true;
             } else if (std.mem.eql(u8, args[i], "--config")) {
                 i += 1;
@@ -399,32 +401,32 @@ const Args = struct {
     pub fn printUsage() void {
         print("Usage: pcp_distributed [options]\n", .{});
         print("Options:\n", .{});
-        print("  --shepherd           Run as Shepherd coordinator (default)\n", .{});
-        print("  --worker             Run as Worker\n", .{});
+        print("  --gateway            Run gateway node with controller subsystems and local APIs\n", .{});
+        print("  --federation-hub     Run federation hub (global gateway coordination plane)\n", .{});
+        print("  --shepherd           Run training controller / worker-fabric coordinator (legacy standalone mode)\n", .{});
+        print("  --worker             Run worker node and connect to a gateway/controller\n", .{});
         print("  --node-manager       Run as Node Manager (spawns multiple supervised workers)\n", .{});
-        print("  --inference          Run inference controller (OpenAI-compatible API)\n", .{});
-        print("  --gateway            Run gateway controller (local gateway API)\n", .{});
-        print("  --global-controller  Run global controller (gateway federation registry)\n", .{});
+        print("  --inference          Run inference controller (legacy standalone mode)\n", .{});
         print("  --supervise -- <child_args>  Run with supervision (spawns child with args after --)\n", .{});
-        print("  --config <path>      Path to experiment JSON config file (Shepherd only)\n", .{});
+        print("  --config <path>      Path to experiment JSON config file (Training controller only)\n", .{});
         print("  --inference-config <path>  Path to inference JSON config file (Inference only)\n", .{});
         print("  --gateway-config <path>  Path to gateway JSON config file (Gateway only)\n", .{});
-        print("  --connect <host:port> Connect to Shepherd at host:port\n", .{});
+        print("  --connect <host:port> Connect worker to controller at host:port\n", .{});
         print("  --host <host>        Host to bind/connect to (default: 127.0.0.1)\n", .{});
         print("  --port <port>        Port to bind/connect to (default: 8080)\n", .{});
         print("  --api-host <host>    API host to bind for controller/operator APIs (default: 127.0.0.1)\n", .{});
         print("  --api-port <port>    API port to bind for controller/operator APIs (default: 8000)\n", .{});
         print("  --gateway-host <host> Gateway API host to bind (Gateway only, default: 127.0.0.1)\n", .{});
         print("  --gateway-port <port> Gateway API port to bind (Gateway only, default: 18010)\n", .{});
-        print("  --control-host <host> Control host to bind (Inference only, default: 127.0.0.1)\n", .{});
-        print("  --control-port <port> Control port to bind (Inference only, default: 8080)\n", .{});
+        print("  --control-host <host> Controller host to bind (Inference or embedded Gateway controller fallback, default: 127.0.0.1)\n", .{});
+        print("  --control-port <port> Controller port to bind (Inference or embedded Gateway controller fallback, default: 8080)\n", .{});
         print("  --api-token-env <ENV> API token env var name for controller/operator auth\n", .{});
         print("  --workers <count>    Number of workers to wait for (default: 2)\n", .{});
-        print("  --model <path>       Path to MLIR model file (Shepherd only, overrides config)\n", .{});
+        print("  --model <path>       Path to MLIR model file (Training controller only, overrides config)\n", .{});
         print("  --resume             Resume from previous training state\n", .{});
-        print("  --rl                 Enable RL mode with GRPO algorithm (Shepherd only)\n", .{});
-        print("  --no-dashboard       Disable TUI dashboard for clean log output (Shepherd only)\n", .{});
-        print("  --terminate          Auto-terminate shepherd when training completes\n", .{});
+        print("  --rl                 Enable RL mode with GRPO algorithm (Training controller only)\n", .{});
+        print("  --no-dashboard       Disable TUI dashboard for clean log output (Training/RL controller only)\n", .{});
+        print("  --terminate          Auto-terminate training/RL controller when work completes\n", .{});
         print("  --streaming          Enable Streaming DiLoCo mode for asynchronous fragment updates\n", .{});
         print("  --backend <type>     Backend to use: cpu, cuda, metal, vulkan, rocm (default: auto)\n", .{});
         print("  --target <arch>      GPU target architecture (e.g., gfx942 for MI300X, sm_80 for A100)\n", .{});
@@ -433,7 +435,11 @@ const Args = struct {
         print("  --supervisor-id <id> Internal: Supervisor ID (used by spawned workers)\n", .{});
         print("  --help               Show this help message\n", .{});
         print("\nExamples:\n", .{});
-        print("  # Run resilient shepherd:\n", .{});
+        print("  # Run gateway:\n", .{});
+        print("  ./pcp --gateway --gateway-config experiments/gateway_local.json --gateway-host 127.0.0.1 --gateway-port 18010\n", .{});
+        print("\n  # Run federation hub:\n", .{});
+        print("  ./pcp --federation-hub --api-host 127.0.0.1 --api-port 19010\n", .{});
+        print("\n  # Run legacy standalone training controller:\n", .{});
         print("  ./pcp --supervise -- --shepherd --config experiment.json\n", .{});
         print("\n  # Run resilient worker on GPU 0:\n", .{});
         print("  ./pcp --supervise -- --worker --host 127.0.0.1 --port 8080 --device-id 0\n", .{});
@@ -443,10 +449,6 @@ const Args = struct {
         print("  ./pcp --node-manager --scale 8 --backend cuda\n", .{});
         print("\n  # Run inference controller:\n", .{});
         print("  ./pcp --inference --inference-config inference.json --api-host 0.0.0.0 --api-port 8000\n", .{});
-        print("\n  # Run gateway:\n", .{});
-        print("  ./pcp --gateway --gateway-config experiments/gateway_local.json --gateway-host 127.0.0.1 --gateway-port 18010\n", .{});
-        print("\n  # Run global controller:\n", .{});
-        print("  ./pcp --global-controller --api-host 127.0.0.1 --api-port 19010\n", .{});
     }
 };
 
@@ -470,10 +472,10 @@ fn loadConfig(allocator: Allocator, path: ?[]const u8) !ConfigResult {
 }
 
 fn runRLShepherd(allocator: Allocator, args: Args) !void {
-    print("Starting RL Shepherd coordinator with GRPO...\n", .{});
+    print("Starting RL controller with GRPO...\n", .{});
 
     const training_backend = args.backend orelse {
-        print("Error: --backend flag is required for RL Shepherd mode\n", .{});
+        print("Error: --backend flag is required for RL controller mode\n", .{});
         return error.BackendRequired;
     };
 
@@ -501,7 +503,7 @@ fn runRLShepherd(allocator: Allocator, args: Args) !void {
     defer operator_state.deinit();
     operator_state.setStatus(.starting);
 
-    var rl_shepherd_controller = rl_shepherd.RLShepherd.init(allocator);
+    var rl_shepherd_controller = rl_controller.RLController.init(allocator);
     defer rl_shepherd_controller.deinit();
 
     rl_shepherd_controller.training_backend_type = training_backend;
@@ -636,7 +638,7 @@ fn runInferenceController(allocator: Allocator, args: Args) !void {
     var gateway_client = try gateway_service_client.GatewayClient.initFromEnv(allocator, "inference-main");
     defer if (gateway_client) |*client| client.deinit();
 
-    var controller = try inference_shepherd.InferenceShepherd.init(
+    var controller = try inference_controller.InferenceController.init(
         allocator,
         config,
         api_token,
@@ -684,11 +686,11 @@ fn runInferenceController(allocator: Allocator, args: Args) !void {
     }
 }
 
-fn inferenceListenThread(controller: *inference_shepherd.InferenceShepherd, host: []const u8, port: u16) !void {
+fn inferenceListenThread(controller: *inference_controller.InferenceController, host: []const u8, port: u16) !void {
     try controller.listen(host, port);
 }
 
-fn inferenceApiThread(controller: *inference_shepherd.InferenceShepherd, host: []const u8, port: u16) !void {
+fn inferenceApiThread(controller: *inference_controller.InferenceController, host: []const u8, port: u16) !void {
     try controller.startApi(host, port);
 }
 
@@ -696,7 +698,7 @@ fn gatewayApiThread(server: *gateway_api.GatewayApiServer, host: []const u8, por
     try server.start(host, port);
 }
 
-fn globalControllerApiThread(server: *global_controller_api.GlobalControllerApiServer, host: []const u8, port: u16) !void {
+fn federationHubApiThread(server: *federation_hub_api.FederationHubApiServer, host: []const u8, port: u16) !void {
     try server.start(host, port);
 }
 
@@ -725,6 +727,133 @@ fn maybeLoadApiTokenByEnv(allocator: Allocator, env_name: ?[]const u8) !?[]u8 {
         print("Error: missing required API token env var {s}: {}\n", .{ name, err });
         return error.MissingApiToken;
     };
+}
+
+const EmbeddedGatewayServiceRegistration = struct {
+    allocator: Allocator,
+    registry: *gateway_service_registry.ServiceRegistry,
+    shepherd: *Shepherd,
+    state: *control_state.ControllerState,
+    service_id: []u8,
+    service_type: []const u8,
+    base_url: []u8,
+    capabilities: []const []const u8,
+
+    fn init(
+        allocator: Allocator,
+        registry: *gateway_service_registry.ServiceRegistry,
+        shepherd: *Shepherd,
+        state: *control_state.ControllerState,
+        service_id: []const u8,
+        service_type: []const u8,
+        base_url: []const u8,
+        capabilities: []const []const u8,
+    ) !*EmbeddedGatewayServiceRegistration {
+        const registration = try allocator.create(EmbeddedGatewayServiceRegistration);
+        registration.* = .{
+            .allocator = allocator,
+            .registry = registry,
+            .shepherd = shepherd,
+            .state = state,
+            .service_id = try allocator.dupe(u8, service_id),
+            .service_type = service_type,
+            .base_url = try allocator.dupe(u8, base_url),
+            .capabilities = capabilities,
+        };
+        return registration;
+    }
+
+    fn deinit(self: *EmbeddedGatewayServiceRegistration) void {
+        self.allocator.free(self.service_id);
+        self.allocator.free(self.base_url);
+        self.allocator.destroy(self);
+    }
+};
+
+const EmbeddedTrainingThreadContext = struct {
+    shepherd: *Shepherd,
+    state: *control_state.ControllerState,
+    required_workers: usize,
+};
+
+const EmbeddedRLThreadContext = struct {
+    algorithm: *training_algorithm.TrainingAlgorithm,
+    state: *control_state.ControllerState,
+};
+
+fn parseBackendName(name: []const u8) !backend_selection.Backend {
+    if (std.mem.eql(u8, name, "metal")) return .metal;
+    if (std.mem.eql(u8, name, "cuda")) return .cuda;
+    if (std.mem.eql(u8, name, "vulkan")) return .vulkan;
+    if (std.mem.eql(u8, name, "rocm")) return .rocm;
+    if (std.mem.eql(u8, name, "cpu")) return .cpu;
+    return error.UnknownBackend;
+}
+
+fn refreshEmbeddedGatewayServiceRegistration(registration: *EmbeddedGatewayServiceRegistration) !void {
+    const worker_count = registration.shepherd.getWorkerCount();
+    registration.state.mutex.lock();
+    const status = registration.state.status;
+    registration.state.mutex.unlock();
+    var service = try registration.registry.register(.{
+        .service_id = registration.service_id,
+        .service_type = registration.service_type,
+        .base_url = registration.base_url,
+        .auth_mode = "bearer",
+        .health_status = if (worker_count > 0) "ok" else "starting",
+        .job_status = control_state.ControllerState.statusString(status),
+        .worker_count = worker_count,
+        .ready_worker_count = worker_count,
+        .capabilities = registration.capabilities,
+    });
+    service.deinit(registration.allocator);
+}
+
+fn embeddedServiceConnectHook(ctx: *anyopaque, _: message.NodeId) anyerror!void {
+    const registration: *EmbeddedGatewayServiceRegistration = @ptrCast(@alignCast(ctx));
+    try refreshEmbeddedGatewayServiceRegistration(registration);
+}
+
+fn embeddedServiceDisconnectHook(ctx: *anyopaque, _: message.NodeId) void {
+    const registration: *EmbeddedGatewayServiceRegistration = @ptrCast(@alignCast(ctx));
+    refreshEmbeddedGatewayServiceRegistration(registration) catch |err| {
+        std.log.warn("Failed to refresh embedded gateway service registration after disconnect: {}", .{err});
+    };
+}
+
+fn embeddedTrainingRunThread(ctx: *EmbeddedTrainingThreadContext) !void {
+    ctx.state.setStatus(.waiting_for_workers);
+    ctx.shepherd.startTraining(ctx.required_workers) catch |err| {
+        if (err == error.Cancelled) {
+            ctx.state.setCancelled();
+            return;
+        }
+        try ctx.state.setFailed(@errorName(err));
+        return err;
+    };
+
+    if (ctx.state.isCancellationRequested()) {
+        ctx.state.setCancelled();
+    } else {
+        ctx.state.setStatus(.completed);
+    }
+}
+
+fn embeddedRLRunThread(ctx: *EmbeddedRLThreadContext) !void {
+    ctx.algorithm.run() catch |err| {
+        if (err == error.Cancelled) {
+            ctx.state.setCancelled();
+            return;
+        }
+        try ctx.state.setFailed(@errorName(err));
+        return err;
+    };
+
+    if (ctx.state.isCancellationRequested()) {
+        ctx.state.setCancelled();
+    } else {
+        ctx.state.setStatus(.completed);
+    }
 }
 
 fn registerGatewayServiceIfConfigured(
@@ -780,7 +909,7 @@ fn runGateway(allocator: Allocator, args: Args) !void {
     defer if (api_token) |token| allocator.free(token);
     const internal_api_token = try maybeLoadApiTokenByEnv(allocator, config.resolvedInternalApiTokenEnv());
     defer if (internal_api_token) |token| allocator.free(token);
-    const federation_token = if (config.resolvedGlobalControllerEndpoint() != null)
+    const federation_token = if (config.resolvedFederationHubEndpoint() != null)
         try maybeLoadApiTokenByEnv(allocator, config.resolvedFederationTokenEnv())
     else
         null;
@@ -788,6 +917,8 @@ fn runGateway(allocator: Allocator, args: Args) !void {
 
     var gateway_instance = gateway.Gateway.init(allocator, config);
     defer gateway_instance.deinit();
+    const worker_fabric_host = config.resolvedWorkerFabricHost(args.control_host);
+    const worker_fabric_port = config.resolvedWorkerFabricPort(args.control_port);
 
     var api_server = gateway_api.GatewayApiServer.init(
         allocator,
@@ -799,7 +930,7 @@ fn runGateway(allocator: Allocator, args: Args) !void {
 
     var federation_client: ?gateway_federation_client.FederationClient = null;
     var federation_thread: ?std.Thread = null;
-    if (config.resolvedGlobalControllerEndpoint()) |endpoint| {
+    if (config.resolvedFederationHubEndpoint()) |endpoint| {
         const gateway_base_url = try std.fmt.allocPrint(allocator, "http://{s}:{d}", .{ args.api_host, args.api_port });
         defer allocator.free(gateway_base_url);
         federation_client = try gateway_federation_client.FederationClient.init(
@@ -820,6 +951,339 @@ fn runGateway(allocator: Allocator, args: Args) !void {
         }
     }
 
+    var embedded_inference_config_result: ?inference_config.ConfigResult = null;
+    defer if (embedded_inference_config_result) |*result| result.deinit();
+    var embedded_inference_state: ?control_state.ControllerState = null;
+    defer if (embedded_inference_state) |*state| state.deinit();
+    var embedded_inference: ?inference_controller.InferenceController = null;
+    defer if (embedded_inference) |*controller| {
+        controller.requestShutdown();
+        controller.deinit();
+    };
+
+    var embedded_training_config_result: ?ConfigResult = null;
+    defer if (embedded_training_config_result) |*result| result.deinit();
+    var embedded_training_state: ?control_state.ControllerState = null;
+    defer if (embedded_training_state) |*state| state.deinit();
+    var embedded_training_system: ?backend_selection.DistributedTrainingSystem = null;
+    defer if (embedded_training_system) |*system| {
+        system.shepherd.stop();
+        system.deinit();
+    };
+    var embedded_training_mlir_builder: ?MLIRBuilder = null;
+    defer if (embedded_training_mlir_builder) |*builder| builder.deinit();
+    var embedded_training_diloco: ?DiLoCo = null;
+    defer if (embedded_training_diloco) |*algo| algo.deinit();
+    var embedded_training_algo: ?training_algorithm.TrainingAlgorithm = null;
+    var embedded_training_api_server: ?control_api.ControlApiServer = null;
+    defer if (embedded_training_api_server) |*server| server.stop();
+    var embedded_training_registration: ?*EmbeddedGatewayServiceRegistration = null;
+    defer if (embedded_training_registration) |registration| registration.deinit();
+    var embedded_training_thread_ctx: ?*EmbeddedTrainingThreadContext = null;
+    defer if (embedded_training_thread_ctx) |ctx| allocator.destroy(ctx);
+
+    var embedded_rl_config_result: ?ConfigResult = null;
+    defer if (embedded_rl_config_result) |*result| result.deinit();
+    var embedded_rl_state: ?control_state.ControllerState = null;
+    defer if (embedded_rl_state) |*state| state.deinit();
+    var embedded_rl_controller: ?rl_controller.RLController = null;
+    defer if (embedded_rl_controller) |*controller| {
+        controller.base.stop();
+        controller.deinit();
+    };
+    var embedded_rl_algo: ?grpo.GRPO = null;
+    var embedded_rl_training_algo: ?training_algorithm.TrainingAlgorithm = null;
+    var embedded_rl_api_server: ?control_api.ControlApiServer = null;
+    defer if (embedded_rl_api_server) |*server| server.stop();
+    var embedded_rl_registration: ?*EmbeddedGatewayServiceRegistration = null;
+    defer if (embedded_rl_registration) |registration| registration.deinit();
+    var embedded_rl_thread_ctx: ?*EmbeddedRLThreadContext = null;
+    defer if (embedded_rl_thread_ctx) |ctx| allocator.destroy(ctx);
+
+    if (config.resolvedEmbeddedInference()) |embedded_cfg| {
+        const shared_api_token = api_token orelse {
+            print("Error: embedded gateway inference requires a gateway API token\n", .{});
+            return error.MissingApiToken;
+        };
+
+        embedded_inference_config_result = try inference_config.loadInferenceConfig(allocator, embedded_cfg.config_path);
+        var embedded_inference_config = embedded_inference_config_result.?.config;
+        if (config.resolvedApiTokenEnv()) |token_env| {
+            embedded_inference_config.api_token_env = token_env;
+        }
+
+        embedded_inference_state = try control_state.ControllerState.init(
+            allocator,
+            .inference,
+            .inference,
+            embedded_cfg.config_path,
+            null,
+            embedded_inference_config.model_id,
+            false,
+            1,
+        );
+        const embedded_api_host = if (embedded_cfg.api) |api_cfg|
+            api_cfg.host orelse "127.0.0.1"
+        else
+            "127.0.0.1";
+        const embedded_api_port = if (embedded_cfg.api) |api_cfg|
+            api_cfg.port orelse args.api_port + 1
+        else
+            args.api_port + 1;
+        const embedded_service_id = embedded_cfg.service_id orelse "inference-main";
+
+        if (embedded_inference_state) |*state| {
+            state.setStatus(.running);
+            embedded_inference = try inference_controller.InferenceController.init(
+                allocator,
+                embedded_inference_config,
+                shared_api_token,
+                state,
+                null,
+            );
+        } else unreachable;
+
+        if (embedded_inference) |*controller| {
+            controller.attachHooks();
+            const listen_thread = try std.Thread.spawn(.{}, inferenceListenThread, .{ controller, worker_fabric_host, worker_fabric_port });
+            listen_thread.detach();
+            try controller.startMaintenance();
+            const api_thread = try std.Thread.spawn(.{}, inferenceApiThread, .{ controller, embedded_api_host, embedded_api_port });
+            api_thread.detach();
+            try controller.registerEmbeddedGatewayService(
+                &gateway_instance.service_registry,
+                embedded_service_id,
+                embedded_api_host,
+                embedded_api_port,
+            );
+        } else unreachable;
+
+        print("   Embedded Inference Controller: enabled\n", .{});
+        print("   Worker Fabric: {s}:{d}\n", .{ worker_fabric_host, worker_fabric_port });
+        print("   Embedded Inference API: {s}:{d}\n", .{ embedded_api_host, embedded_api_port });
+    } else if (config.resolvedEmbeddedTraining()) |embedded_cfg| {
+        embedded_training_config_result = try loadConfig(allocator, embedded_cfg.config_path);
+        const exp_config = embedded_training_config_result.?.config;
+        const required_workers = embedded_cfg.workers orelse args.workers;
+        const embedded_api_host = if (embedded_cfg.api) |api_cfg|
+            api_cfg.host orelse "127.0.0.1"
+        else
+            "127.0.0.1";
+        const embedded_api_port = if (embedded_cfg.api) |api_cfg|
+            api_cfg.port orelse args.api_port + 1
+        else
+            args.api_port + 1;
+        const embedded_service_id = embedded_cfg.service_id orelse "training-main";
+        const backend = backend_selection.Backend.selectDefault();
+
+        embedded_training_state = try control_state.ControllerState.init(
+            allocator,
+            .training,
+            .training,
+            embedded_cfg.config_path,
+            null,
+            exp_config.model_path,
+            embedded_cfg.should_resume,
+            required_workers,
+        );
+        embedded_training_state.?.setTrainingProgress(0, 0, exp_config.outer_loop_steps, 0.0, exp_config.learning_rate);
+        embedded_training_state.?.setStatus(.starting);
+
+        embedded_training_system = try backend_selection.DistributedTrainingSystem.init(allocator, backend);
+        embedded_training_mlir_builder = try MLIRBuilder.init(allocator, embedded_training_system.?.executor.getContext());
+
+        const file = try std.fs.cwd().openFile(exp_config.data_path, .{});
+        defer file.close();
+        const stat = try file.stat();
+        const total_size = stat.size;
+        try embedded_training_system.?.shepherd.initDataManager(total_size, 64 * 1024 * 1024, exp_config.max_epochs);
+
+        var diloco_config = DiLoCoConfig.default();
+        diloco_config.model_mlir_path = exp_config.model_path;
+        diloco_config.data_path = exp_config.data_path;
+        diloco_config.tokenizer_type = exp_config.tokenizer;
+        diloco_config.sampling_type = exp_config.sampling;
+        diloco_config.tau = exp_config.tau;
+        diloco_config.base_config.learning_rate = exp_config.learning_rate;
+        diloco_config.base_config.outer_loop_steps = exp_config.outer_loop_steps;
+        diloco_config.nesterov_momentum = exp_config.nesterov_momentum;
+        diloco_config.wandb_project = exp_config.wandb_project orelse "pcp-distributed";
+        diloco_config.wandb_entity = exp_config.wandb_entity;
+        diloco_config.wandb_run_name = exp_config.wandb_run_name;
+        diloco_config.wandb_api_key = exp_config.wandb_api_key;
+        diloco_config.resume_training = embedded_cfg.should_resume;
+        if (std.mem.eql(u8, exp_config.dtype, "bf16")) {
+            diloco_config.dtype = .bf16;
+        } else if (std.mem.eql(u8, exp_config.dtype, "f16")) {
+            diloco_config.dtype = .f16;
+        } else if (std.mem.eql(u8, exp_config.dtype, "f32")) {
+            diloco_config.dtype = .f32;
+        } else {
+            return error.InvalidDType;
+        }
+        if (exp_config.effective_batch_size) |ebs| {
+            diloco_config.effective_batch_size = ebs;
+        }
+        diloco_config.use_in_graph_accumulation = exp_config.use_in_graph_accumulation;
+
+        embedded_training_diloco = try DiLoCo.init(
+            allocator,
+            &embedded_training_system.?.shepherd,
+            diloco_config,
+            embedded_training_system.?.executor,
+            &embedded_training_mlir_builder.?,
+        );
+        embedded_training_diloco.?.setControlState(&embedded_training_state.?);
+        embedded_training_algo = embedded_training_diloco.?.asTrainingAlgorithm();
+        embedded_training_system.?.shepherd.setAlgorithm(&embedded_training_algo.?);
+
+        const training_base_url = try std.fmt.allocPrint(allocator, "http://{s}:{d}", .{ embedded_api_host, embedded_api_port });
+        defer allocator.free(training_base_url);
+        embedded_training_registration = try EmbeddedGatewayServiceRegistration.init(
+            allocator,
+            &gateway_instance.service_registry,
+            &embedded_training_system.?.shepherd,
+            &embedded_training_state.?,
+            embedded_service_id,
+            "training",
+            training_base_url,
+            &[_][]const u8{ "controller.status", "job.current", "job.cancel" },
+        );
+        embedded_training_system.?.shepherd.setConnectionHook(.{
+            .ctx = embedded_training_registration.?,
+            .on_connect = embeddedServiceConnectHook,
+            .on_disconnect = embeddedServiceDisconnectHook,
+        });
+        try refreshEmbeddedGatewayServiceRegistration(embedded_training_registration.?);
+
+        embedded_training_api_server = control_api.ControlApiServer.init(
+            allocator,
+            &embedded_training_state.?,
+            &embedded_training_system.?.shepherd,
+            api_token,
+            null,
+            null,
+            .{
+                .ctx = &embedded_training_system.?.shepherd,
+                .cancel = cancelShepherd,
+            },
+        );
+
+        const training_listen_thread = try std.Thread.spawn(.{}, shepherdListenThread, .{ &embedded_training_system.?.shepherd, worker_fabric_host, worker_fabric_port });
+        training_listen_thread.detach();
+        const training_api_thread = try std.Thread.spawn(.{}, controlApiThread, .{ &embedded_training_api_server.?, embedded_api_host, embedded_api_port });
+        training_api_thread.detach();
+        embedded_training_thread_ctx = try allocator.create(EmbeddedTrainingThreadContext);
+        embedded_training_thread_ctx.?.* = .{
+            .shepherd = &embedded_training_system.?.shepherd,
+            .state = &embedded_training_state.?,
+            .required_workers = required_workers,
+        };
+        const training_run_thread = try std.Thread.spawn(.{}, embeddedTrainingRunThread, .{embedded_training_thread_ctx.?});
+        training_run_thread.detach();
+
+        print("   Embedded Training Controller: enabled\n", .{});
+        print("   Worker Fabric: {s}:{d}\n", .{ worker_fabric_host, worker_fabric_port });
+        print("   Embedded Training API: {s}:{d}\n", .{ embedded_api_host, embedded_api_port });
+    } else if (config.resolvedEmbeddedRL()) |embedded_cfg| {
+        embedded_rl_config_result = try loadConfig(allocator, embedded_cfg.config_path);
+        const exp_config = embedded_rl_config_result.?.config;
+        const json_grpo = exp_config.grpo_config orelse return error.GRPOConfigRequired;
+        const required_workers = embedded_cfg.workers orelse args.workers;
+        const embedded_api_host = if (embedded_cfg.api) |api_cfg|
+            api_cfg.host orelse "127.0.0.1"
+        else
+            "127.0.0.1";
+        const embedded_api_port = if (embedded_cfg.api) |api_cfg|
+            api_cfg.port orelse args.api_port + 1
+        else
+            args.api_port + 1;
+        const embedded_service_id = embedded_cfg.service_id orelse "rl-main";
+        const training_backend = try parseBackendName(embedded_cfg.backend);
+
+        embedded_rl_state = try control_state.ControllerState.init(
+            allocator,
+            .rl,
+            .rl,
+            embedded_cfg.config_path,
+            null,
+            exp_config.model_path,
+            false,
+            required_workers,
+        );
+        embedded_rl_state.?.setStatus(.starting);
+
+        embedded_rl_controller = rl_controller.RLController.init(allocator);
+        embedded_rl_controller.?.training_backend_type = training_backend;
+
+        const rl_base_url = try std.fmt.allocPrint(allocator, "http://{s}:{d}", .{ embedded_api_host, embedded_api_port });
+        defer allocator.free(rl_base_url);
+        embedded_rl_registration = try EmbeddedGatewayServiceRegistration.init(
+            allocator,
+            &gateway_instance.service_registry,
+            &embedded_rl_controller.?.base,
+            &embedded_rl_state.?,
+            embedded_service_id,
+            "rl",
+            rl_base_url,
+            &[_][]const u8{ "controller.status", "job.current", "job.cancel" },
+        );
+        embedded_rl_controller.?.base.setConnectionHook(.{
+            .ctx = embedded_rl_registration.?,
+            .on_connect = embeddedServiceConnectHook,
+            .on_disconnect = embeddedServiceDisconnectHook,
+        });
+        try refreshEmbeddedGatewayServiceRegistration(embedded_rl_registration.?);
+
+        embedded_rl_api_server = control_api.ControlApiServer.init(
+            allocator,
+            &embedded_rl_state.?,
+            &embedded_rl_controller.?.base,
+            api_token,
+            null,
+            null,
+            .{
+                .ctx = &embedded_rl_controller.?.base,
+                .cancel = cancelShepherd,
+            },
+        );
+
+        const grpo_config = grpo.GRPOConfig{
+            .num_iterations = json_grpo.num_iterations,
+            .group_size = json_grpo.group_size,
+            .learning_rate = json_grpo.learning_rate,
+            .beta = json_grpo.beta,
+            .required_workers = required_workers,
+            .prompt_file = json_grpo.prompt_file,
+            .num_prompts = json_grpo.num_prompts,
+            .weights_path = json_grpo.weights_path,
+            .generation_vmfb_path = json_grpo.generation_vmfb_path,
+            .generation_mlir_path = json_grpo.generation_mlir_path,
+            .training_mlir_path = json_grpo.training_mlir_path,
+            .num_gen_data_inputs = json_grpo.num_gen_data_inputs,
+        };
+
+        embedded_rl_algo = grpo.GRPO.init(allocator, &embedded_rl_controller.?, grpo_config);
+        embedded_rl_algo.?.setControlState(&embedded_rl_state.?);
+        embedded_rl_training_algo = embedded_rl_algo.?.asTrainingAlgorithm();
+
+        const rl_listen_thread = try std.Thread.spawn(.{}, rlShepherdListenThread, .{ &embedded_rl_controller.?, worker_fabric_host, worker_fabric_port });
+        rl_listen_thread.detach();
+        const rl_api_thread = try std.Thread.spawn(.{}, controlApiThread, .{ &embedded_rl_api_server.?, embedded_api_host, embedded_api_port });
+        rl_api_thread.detach();
+        embedded_rl_thread_ctx = try allocator.create(EmbeddedRLThreadContext);
+        embedded_rl_thread_ctx.?.* = .{
+            .algorithm = &embedded_rl_training_algo.?,
+            .state = &embedded_rl_state.?,
+        };
+        const rl_run_thread = try std.Thread.spawn(.{}, embeddedRLRunThread, .{embedded_rl_thread_ctx.?});
+        rl_run_thread.detach();
+
+        print("   Embedded RL Controller: enabled\n", .{});
+        print("   Worker Fabric: {s}:{d}\n", .{ worker_fabric_host, worker_fabric_port });
+        print("   Embedded RL API: {s}:{d}\n", .{ embedded_api_host, embedded_api_port });
+    }
+
     print("🌉 Starting Gateway\n", .{});
     print("   Gateway ID: {s}\n", .{config.gateway_id});
     print("   Lab ID: {s}\n", .{config.lab_id});
@@ -835,10 +1299,13 @@ fn runGateway(allocator: Allocator, args: Args) !void {
     if (config.resolvedInternalApiTokenEnv()) |env_name| {
         print("   Internal Event Token Env: {s}\n", .{env_name});
     }
-    if (config.resolvedGlobalControllerEndpoint()) |endpoint| {
-        print("   Global Controller: {s}\n", .{endpoint});
+    if (config.resolvedFederationHubEndpoint()) |endpoint| {
+        print("   Federation Hub: {s}\n", .{endpoint});
     } else {
-        print("   Global Controller: not configured\n", .{});
+        print("   Federation Hub: not configured\n", .{});
+    }
+    if (config.enabledEmbeddedControllerCount() == 0) {
+        print("   Embedded Controllers: disabled\n", .{});
     }
     print("   Federation: handshake enabled\n", .{});
 
@@ -849,28 +1316,28 @@ fn federationClientThread(client: *gateway_federation_client.FederationClient) !
     try client.run();
 }
 
-fn runGlobalController(allocator: Allocator, args: Args) !void {
+fn runFederationHub(allocator: Allocator, args: Args) !void {
     var owned_api_token: ?[]u8 = null;
     defer if (owned_api_token) |token| allocator.free(token);
     owned_api_token = try maybeLoadApiToken(allocator, args);
 
-    var controller = global_controller.GlobalController.init(allocator);
+    var controller = federation_hub.FederationHub.init(allocator);
     defer controller.deinit();
 
-    var api_server = global_controller_api.GlobalControllerApiServer.init(allocator, &controller, owned_api_token);
+    var api_server = federation_hub_api.FederationHubApiServer.init(allocator, &controller, owned_api_token);
 
-    print("🌐 Starting Global Controller\n", .{});
+    print("🌐 Starting Federation Hub\n", .{});
     print("   API: {s}:{d}\n", .{ args.api_host, args.api_port });
 
-    try globalControllerApiThread(&api_server, args.api_host, args.api_port);
+    try federationHubApiThread(&api_server, args.api_host, args.api_port);
 }
 
-/// RL Shepherd listening thread
-fn rlShepherdListenThread(rl_shepherd_controller: *rl_shepherd.RLShepherd, host: []const u8, port: u16) !void {
+/// RL controller listening thread
+fn rlShepherdListenThread(rl_shepherd_controller: *rl_controller.RLController, host: []const u8, port: u16) !void {
     try rl_shepherd_controller.listen(host, port);
 }
 
-/// Run as Shepherd coordinator
+/// Run as training controller / worker-fabric coordinator
 fn runShepherd(allocator: Allocator, args: Args) !void {
     // Check if RL mode is enabled
     if (args.rl_mode) {
@@ -919,7 +1386,7 @@ fn runShepherd(allocator: Allocator, args: Args) !void {
     defer config_result.deinit();
     const exp_config = config_result.config;
 
-    print("👹 Starting Shepherd coordinator...\n", .{});
+    print("👹 Starting Training Controller...\n", .{});
     print("   Run ID: {s}\n", .{run_id});
     print("   Output Dir: {s}\n", .{run_dir_path});
     print("   Resume: {}\n", .{args.should_resume});
@@ -1260,7 +1727,7 @@ pub fn main() !void {
         .node_manager => try runNodeManager(allocator, args),
         .inference => try runInferenceController(allocator, args),
         .gateway => try runGateway(allocator, args),
-        .global_controller => try runGlobalController(allocator, args),
+        .federation_hub => try runFederationHub(allocator, args),
     }
 }
 
@@ -1268,8 +1735,8 @@ pub fn main() !void {
 pub fn testDistributedSystem(allocator: Allocator) !void {
     std.log.info("Testing distributed system components...");
 
-    // Test Shepherd
-    try shepherd.testShepherd(allocator);
+    // Test worker fabric controller
+    try training_controller.WorkerFabricController.testShepherd(allocator);
 
     // Test DiLoCo
     try diloco.testDiLoCo(allocator);

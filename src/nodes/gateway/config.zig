@@ -26,6 +26,48 @@ pub const FederationConfig = struct {
     heartbeat_interval_ms: u64 = 5_000,
 };
 
+pub const WorkerFabricConfig = struct {
+    host: ?[]const u8 = null,
+    port: ?u16 = null,
+};
+
+pub const ControllerEndpointConfig = struct {
+    host: ?[]const u8 = null,
+    port: ?u16 = null,
+};
+
+pub const EmbeddedInferenceControllerConfig = struct {
+    enabled: bool = false,
+    config_path: []const u8,
+    service_id: ?[]const u8 = null,
+    api: ?ControllerEndpointConfig = null,
+};
+
+pub const EmbeddedTrainingControllerConfig = struct {
+    enabled: bool = false,
+    config_path: []const u8,
+    service_id: ?[]const u8 = null,
+    api: ?ControllerEndpointConfig = null,
+    workers: ?usize = null,
+    should_resume: bool = false,
+    no_dashboard: bool = true,
+};
+
+pub const EmbeddedRLControllerConfig = struct {
+    enabled: bool = false,
+    config_path: []const u8,
+    service_id: ?[]const u8 = null,
+    api: ?ControllerEndpointConfig = null,
+    workers: ?usize = null,
+    backend: []const u8 = "cpu",
+};
+
+pub const ControllersConfig = struct {
+    inference: ?EmbeddedInferenceControllerConfig = null,
+    training: ?EmbeddedTrainingControllerConfig = null,
+    rl: ?EmbeddedRLControllerConfig = null,
+};
+
 pub const SharingDefaults = struct {
     default_visibility: []const u8 = "local",
 };
@@ -38,8 +80,10 @@ pub const GatewayConfig = struct {
     neo4j: ?Neo4jConfig = null,
     api: ?ApiConfig = null,
     federation: ?FederationConfig = null,
+    worker_fabric: ?WorkerFabricConfig = null,
+    controllers: ?ControllersConfig = null,
     sharing_defaults: ?SharingDefaults = null,
-    global_controller_endpoint: ?[]const u8 = null,
+    federation_hub_endpoint: ?[]const u8 = null,
     api_token_env: ?[]const u8 = null,
     internal_api_token_env: ?[]const u8 = null,
 
@@ -50,11 +94,11 @@ pub const GatewayConfig = struct {
         return self.api_token_env;
     }
 
-    pub fn resolvedGlobalControllerEndpoint(self: GatewayConfig) ?[]const u8 {
+    pub fn resolvedFederationHubEndpoint(self: GatewayConfig) ?[]const u8 {
         if (self.federation) |federation| {
             if (federation.upstream) |upstream| return upstream;
         }
-        return self.global_controller_endpoint;
+        return self.federation_hub_endpoint;
     }
 
     pub fn resolvedFederationTokenEnv(self: GatewayConfig) ?[]const u8 {
@@ -74,6 +118,55 @@ pub const GatewayConfig = struct {
             if (api.internal_token_env) |token_env| return token_env;
         }
         return self.internal_api_token_env;
+    }
+
+    pub fn resolvedWorkerFabricHost(self: GatewayConfig, fallback: []const u8) []const u8 {
+        if (self.worker_fabric) |worker_fabric| {
+            if (worker_fabric.host) |host| return host;
+        }
+        return fallback;
+    }
+
+    pub fn resolvedWorkerFabricPort(self: GatewayConfig, fallback: u16) u16 {
+        if (self.worker_fabric) |worker_fabric| {
+            if (worker_fabric.port) |port| return port;
+        }
+        return fallback;
+    }
+
+    pub fn resolvedEmbeddedInference(self: GatewayConfig) ?EmbeddedInferenceControllerConfig {
+        if (self.controllers) |controllers| {
+            if (controllers.inference) |inference| {
+                if (inference.enabled) return inference;
+            }
+        }
+        return null;
+    }
+
+    pub fn resolvedEmbeddedTraining(self: GatewayConfig) ?EmbeddedTrainingControllerConfig {
+        if (self.controllers) |controllers| {
+            if (controllers.training) |training| {
+                if (training.enabled) return training;
+            }
+        }
+        return null;
+    }
+
+    pub fn resolvedEmbeddedRL(self: GatewayConfig) ?EmbeddedRLControllerConfig {
+        if (self.controllers) |controllers| {
+            if (controllers.rl) |rl| {
+                if (rl.enabled) return rl;
+            }
+        }
+        return null;
+    }
+
+    pub fn enabledEmbeddedControllerCount(self: GatewayConfig) usize {
+        var count: usize = 0;
+        if (self.resolvedEmbeddedInference() != null) count += 1;
+        if (self.resolvedEmbeddedTraining() != null) count += 1;
+        if (self.resolvedEmbeddedRL() != null) count += 1;
+        return count;
     }
 
     pub fn validate(self: GatewayConfig) !void {
@@ -100,9 +193,28 @@ pub const GatewayConfig = struct {
         }
 
         if (self.federation) |federation| {
-            if (federation.enabled and self.resolvedGlobalControllerEndpoint() == null) {
-                return error.GlobalControllerEndpointRequired;
+            if (federation.enabled and self.resolvedFederationHubEndpoint() == null) {
+                return error.FederationHubEndpointRequired;
             }
+        }
+
+        if (self.resolvedEmbeddedInference()) |inference| {
+            if (inference.config_path.len == 0) {
+                return error.InvalidEmbeddedInferenceConfig;
+            }
+        }
+        if (self.resolvedEmbeddedTraining()) |training| {
+            if (training.config_path.len == 0) {
+                return error.InvalidEmbeddedTrainingConfig;
+            }
+        }
+        if (self.resolvedEmbeddedRL()) |rl| {
+            if (rl.config_path.len == 0) {
+                return error.InvalidEmbeddedRLConfig;
+            }
+        }
+        if (self.enabledEmbeddedControllerCount() > 1) {
+            return error.MultipleEmbeddedWorkerFabricControllersUnsupported;
         }
     }
 };

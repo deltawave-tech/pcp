@@ -2,16 +2,16 @@ const std = @import("std");
 const net = std.net;
 
 const Allocator = std.mem.Allocator;
-const federation_types = @import("../federation/types.zig");
-const TcpServer = @import("../network/tcp_stream.zig").TcpServer;
-const http_server = @import("../inference/http_server.zig");
-const controller_mod = @import("controller.zig");
+const federation_types = @import("../../federation/types.zig");
+const TcpServer = @import("../../network/tcp_stream.zig").TcpServer;
+const http_server = @import("../../inference/http_server.zig");
+const hub_mod = @import("hub.zig");
 const gateway_registry = @import("gateway_registry.zig");
-const graph_types = @import("../graph/types.zig");
+const graph_types = @import("../../graph/types.zig");
 
-pub const GlobalControllerApiServer = struct {
+pub const FederationHubApiServer = struct {
     allocator: Allocator,
-    controller: *controller_mod.GlobalController,
+    controller: *hub_mod.FederationHub,
     api_token: ?[]const u8,
     server: ?TcpServer,
     listen_host: ?[]const u8,
@@ -20,7 +20,7 @@ pub const GlobalControllerApiServer = struct {
 
     const Self = @This();
 
-    pub fn init(allocator: Allocator, controller: *controller_mod.GlobalController, api_token: ?[]const u8) Self {
+    pub fn init(allocator: Allocator, controller: *hub_mod.FederationHub, api_token: ?[]const u8) Self {
         return .{
             .allocator = allocator,
             .controller = controller,
@@ -42,7 +42,7 @@ pub const GlobalControllerApiServer = struct {
             const connection = if (self.server) |*server|
                 server.accept() catch |err| {
                     if (self.is_running.load(.acquire) == 0) break;
-                    std.log.err("Global controller API accept failed: {}", .{err});
+                    std.log.err("Federation Hub API accept failed: {}", .{err});
                     continue;
                 }
             else
@@ -54,7 +54,7 @@ pub const GlobalControllerApiServer = struct {
             }
 
             const thread = std.Thread.spawn(.{}, handleConnection, .{ self, connection.stream }) catch |err| {
-                std.log.err("Failed to spawn global controller API handler thread: {}", .{err});
+                std.log.err("Failed to spawn federation hub API handler thread: {}", .{err});
                 connection.stream.close();
                 continue;
             };
@@ -80,13 +80,13 @@ pub const GlobalControllerApiServer = struct {
         defer stream.close();
 
         var req = http_server.readRequest(stream, self.allocator, 1024 * 1024) catch |err| {
-            std.log.warn("Global controller API failed to read request: {}", .{err});
+            std.log.warn("Federation Hub API failed to read request: {}", .{err});
             return;
         };
         defer req.deinit();
 
         _ = self.handleRequest(stream, &req) catch |err| {
-            std.log.err("Global controller API route failed: {}", .{err});
+            std.log.err("Federation Hub API route failed: {}", .{err});
             _ = http_server.writeResponse(stream, "500 Internal Server Error", &.{"Content-Type: text/plain"}, "error") catch {};
             return;
         };

@@ -1,0 +1,18 @@
+{
+  "model_id": "nanochat-smoke",
+  "pool_name": "default",
+  "generation_vmfb_path": "models/REPLACE_WITH_VMFB.vmfb",
+  "generation_mlir_path": "models/REPLACE_WITH_GENERATION.mlir",
+  "weights_path": "checkpoints/initial_weights/REPLACE_WITH_WEIGHTS.bin",
+  "tokenizer_source": "byte",
+  "tokenizer_path": null,
+  "num_gen_data_inputs": 2,
+  "max_context_tokens": 2048,
+  "default_max_output_tokens": 256,
+  "eos_token": 0,
+  "session_ttl_seconds": 600,
+  "request_timeout_seconds": 60,
+  "worker_backend": "cpu",
+  "worker_target_arch": "",
+  "api_token_env": "PCP_API_TOKEN"
+}

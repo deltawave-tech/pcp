@@ -1,0 +1,83 @@
+# Zig build files and cache
+.zig-cache/
+.zig-out/
+build-*/
+build/
+zig-cache/
+zig-out/
+
+# Compiled binary files
+*.o
+*.obj
+*.exe
+*.out
+*.app
+*.dll
+*.so
+*.dylib
+
+# Dependency directories
+deps/
+
+# Python virtual environment
+venv/
+.venv/
+.venv-hf/
+__pycache__/
+*.pyc
+*.pyo
+
+# Editor and system files
+.DS_Store
+.dir-locals.el
+.vscode/
+.idea/
+.env
+.env.*
+*.swp
+*~
+
+# Debug files
+*.dSYM/
+*.su
+*.idb
+*.pdb
+
+# Local runtime artifacts
+.codex
+.pcp_latest_run
+checkpoints/
+wandb/
+tokenizers/
+
+# Data files (not tracked)
+data/*
+!data/*.sh
+checkpoint_*.bin
+worker_fabric_state.bin
+
+# Large generated model artifacts
+models/*.vmfb
+models/*.meta.json
+models/qwen_rl_generation.mlir
+
+# Nix artifacts
+result
+build*.log
+
+# Local working notes
+NOTES.md
+PF_API.md
+PF_KG.md
+docs/
+!docs/
+docs/*
+!docs/public-private-cut.md
+!docs/public-copy-include.txt
+!docs/public-copy-required-custom-hook-paths.txt
+!docs/public-cut-private-paths.txt
+!docs/materialize-public-copy.sh
+!docs/verify-public-cut.sh
+!docs/public-copy-stubs/
+!docs/public-copy-stubs/**
+run_gateway_replication_inspect_smoke.sh

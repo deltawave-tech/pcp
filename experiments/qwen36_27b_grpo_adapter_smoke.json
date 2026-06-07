@@ -1,0 +1,42 @@
+{
+  "model_path": "models/qwen36_27b_adapter_grpo_training.mlir",
+  "data_path": "data/rl_prompts.bin",
+  "tokenizer": "qwen",
+  "sampling": "random",
+  "dtype": "bf16",
+  "learning_rate": 0.000001,
+  "tau": 1,
+  "outer_loop_steps": 1,
+  "nesterov_momentum": 0.9,
+  "max_epochs": 1,
+  "grpo_config": {
+    "num_iterations": 1,
+    "group_size": 4,
+    "learning_rate": 0.000001,
+    "beta": 0.1,
+    "prompt_file": "data/rl_prompts.bin",
+    "num_prompts": 1,
+    "rollout_max_tokens": 1,
+    "weights_path": "checkpoints/initial_weights/qwen36_27b_adapter_f32.bin",
+    "training_weights_path": "checkpoints/initial_weights/qwen36_27b_adapter_f32.bin",
+    "generation_weights_path": "checkpoints/initial_weights/qwen36_27b_bf16_streamed.bin",
+    "generation_weights_format": "bf16_streamed",
+    "adapter_state_path": "/tmp/pcp_qwen36_27b_grpo_adapter_state.bin",
+    "grpo_weight_mode": "adapter_only",
+    "generation_vmfb_path": "models/qwen36_27b_one_token_nocache_linalg_cuda.vmfb",
+    "generation_mlir_path": "models/qwen36_27b_one_token_nocache_linalg.mlir",
+    "training_mlir_path": "models/qwen36_27b_adapter_grpo_training.mlir",
+    "weight_refresh_strategy": "local_path",
+    "trainable_parameter_indices": [0]
+  },
+  "rollout_config": {
+    "max_tokens": 1,
+    "temperature": 0.7,
+    "top_p": 0.9,
+    "batch_size": 4
+  },
+  "wandb_project": "pcp-qwen36-rl",
+  "wandb_entity": null,
+  "wandb_run_name": "qwen36-27b-adapter-grpo-smoke",
+  "wandb_api_key": null
+}

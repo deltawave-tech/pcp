@@ -90,6 +90,36 @@ Start workers:
 ./result/bin/pcp --node-manager --host <gateway-ip> --port 8080 --scale 8 --backend cuda --target sm_90a
 ```
 
+### Kubernetes Runtime Environment
+
+PCP treats Kubernetes as the owner of pod lifecycle, resources, secrets, and
+mounted storage. Runtime knobs are therefore env-driven:
+
+- `WORKER_MAX_CONCURRENCY` limits in-flight worker task handling. Local
+  development defaults to `1`; production mode requires it.
+- `STATE_DIR` is the root for stateful runtime files. Production defaults to
+  `/var/lib/pcp`; local development defaults to `/tmp/pcp-dev`. Current
+  subpaths are `compiler/` for MLIR/IREE compiler temporaries, `compiled/` for
+  cached VMFBs, `grpo/` for GRPO snapshots, and `workers/` for worker-local
+  materializations.
+- `PCP_PROBE_PORT` controls the gateway probe listener. It defaults to `8081`
+  and is independent of the user-facing gateway API port.
+- `PCP_API_TOKEN_FILE`, `PCP_INTERNAL_TOKEN_FILE`, and
+  `PCP_FEDERATION_HUB_TOKEN_FILE` point to mounted secret files. File-backed
+  tokens take precedence over token env vars and are re-read during gateway
+  authorization, so projected-secret rotation is picked up without restarting
+  the pod. If a config names a custom token env var, `<ENV>_FILE` is also
+  honored.
+
+Production mode is enabled by `PCP_ENV=production`, `PCP_MODE=production`,
+`PCP_PRODUCTION=true`, or the Kubernetes-provided `KUBERNETES_SERVICE_HOST`.
+Production gateway boot requires configured tokens. Production worker boot
+requires `WORKER_MAX_CONCURRENCY`.
+
+PCP has no embedded Postgres worker-side dependency. A repository audit for
+`postgres`, `psql`, `5432`, `libpq`, and Postgres env names is clean; graph
+storage is `memory` or external Neo4j through gateway config.
+
 ## Backend Runtime
 
 Backend selection lives in `src/backends/selection.zig`.
@@ -260,6 +290,10 @@ Gateway endpoints in `src/nodes/gateway/api.zig`:
 - `POST /v1/graph/mutate`
 - `POST /v1/graph/query`
 
+The gateway also starts a probe-only listener on `PCP_PROBE_PORT` for
+`/healthz`, `/readyz`, and `/metrics`, so charts can keep probes off the
+user-facing Service.
+
 Federation Hub endpoints in `src/nodes/federation_hub/api.zig`:
 
 - `GET /healthz`
@@ -364,7 +398,7 @@ The image includes:
 - a Python runtime with `transformers` and `wandb`
 - `/app/tools/qwen_tokenizer_server.py`
 - `/app/tools/wandb_adapter.py`
-- conventional directories `/models` and `/etc/pcp`
+- conventional directories `/models`, `/etc/pcp`, and `/var/lib/pcp`
 
 The image entrypoint is `pcp-entrypoint`, which changes to `/app` and execs
 the wrapped PCP binary. Chart commands can pass the normal PCP CLI args
@@ -377,18 +411,27 @@ directly:
 ```
 
 `/models` is the conventional mount path for model assets: weights, VMFBs,
-tokenizer directories, Hugging Face caches, and exported contracts/metadata.
+tokenizer directories, and exported contracts/metadata.
 PCP does not prescribe how those files arrive; use an init container, mounted
 volume, or model-registry sync process. Config files should be mounted under
-`/etc/pcp` and referenced explicitly from CLI flags.
+`/etc/pcp` and referenced explicitly from CLI flags. Stateful runtime files and
+caches should live under `STATE_DIR`.
 
 The image sets:
 
 - `PCP_MODEL_ROOT=/models`
 - `PCP_CONFIG_ROOT=/etc/pcp`
-- `TRANSFORMERS_CACHE=/models/hf-cache`
-- `HF_HOME=/models/hf-home`
+- `STATE_DIR=/var/lib/pcp`
+- `TRANSFORMERS_CACHE=/var/lib/pcp/hf-cache`
+- `HF_HOME=/var/lib/pcp/hf-home`
 
+## Public Copy
+
+The public `deltawave-tech/pcp` copy is materialized from `pcp-internal` using
+`docs/materialize-public-copy.sh` and checked with `docs/verify-public-cut.sh`.
+Cut the public copy after each release candidate and after major deployability
+or API-boundary changes that downstream charts need to consume. Routine private
+experiments do not require a public cut.
 
 ## Topology Simulator
 

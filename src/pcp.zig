@@ -19,6 +19,7 @@ const gateway_federation_client = @import("nodes/gateway/federation_client.zig")
 const federation_hub = @import("nodes/federation_hub/hub.zig");
 const federation_hub_api = @import("nodes/federation_hub/api.zig");
 const shutdown = @import("runtime/shutdown.zig");
+const runtime_config = @import("runtime/config.zig");
 const node_manager_mod = @import("nodes/node_manager.zig");
 const pcp_extensions = @import("pcp_extensions.zig");
 
@@ -513,20 +514,18 @@ fn federationHubApiThread(server: *federation_hub_api.FederationHubApiServer, ho
     try server.start(host, port);
 }
 
-fn maybeLoadApiToken(allocator: Allocator, args: Args) !?[]u8 {
-    const env_name = args.api_token_env orelse return null;
-    return std.process.getEnvVarOwned(allocator, env_name) catch |err| {
-        print("Error: missing required API token env var {s}: {}\n", .{ env_name, err });
-        return error.MissingApiToken;
-    };
+fn maybeLoadFederationHubToken(allocator: Allocator, args: Args) !?[]u8 {
+    const env_name = args.api_token_env orelse if (runtime_config.isProductionMode()) "PCP_FEDERATION_HUB_TOKEN" else return null;
+    return try runtime_config.loadSecretFromEnvOrFile(allocator, env_name, "PCP_FEDERATION_HUB_TOKEN_FILE", runtime_config.isProductionMode());
 }
 
-fn maybeLoadApiTokenByEnv(allocator: Allocator, env_name: ?[]const u8) !?[]u8 {
+fn maybeLoadApiTokenByEnv(allocator: Allocator, env_name: ?[]const u8, canonical_file_env: ?[]const u8) !?[]u8 {
     const name = env_name orelse return null;
-    return std.process.getEnvVarOwned(allocator, name) catch |err| {
-        print("Error: missing required API token env var {s}: {}\n", .{ name, err });
-        return error.MissingApiToken;
-    };
+    return try runtime_config.loadSecretFromEnvOrFile(allocator, name, canonical_file_env, runtime_config.isProductionMode());
+}
+
+fn tokenEnvOrProductionDefault(env_name: ?[]const u8, production_default: []const u8) ?[]const u8 {
+    return env_name orelse if (runtime_config.isProductionMode()) production_default else null;
 }
 
 fn envOrDefault(allocator: Allocator, name: []const u8, default_value: []const u8) ![]u8 {
@@ -655,6 +654,10 @@ fn gatewayShutdownWatcher(gateway_instance: *gateway.Gateway, api_server: *gatew
     api_server.stop();
 }
 
+fn gatewayProbeThread(server: *gateway_api.GatewayProbeServer, host: []const u8, port: u16) !void {
+    try server.start(host, port);
+}
+
 fn runGateway(allocator: Allocator, args: Args) !void {
     const config_path = args.gateway_config_path orelse {
         print("Error: --gateway-config is required for gateway mode\n", .{});
@@ -673,12 +676,16 @@ fn runGateway(allocator: Allocator, args: Args) !void {
         }
     }
 
-    const api_token = try maybeLoadApiTokenByEnv(allocator, config.resolvedApiTokenEnv());
+    const api_token_env = tokenEnvOrProductionDefault(config.resolvedApiTokenEnv(), "PCP_API_TOKEN");
+    const internal_api_token_env = tokenEnvOrProductionDefault(config.resolvedInternalApiTokenEnv(), "PCP_INTERNAL_TOKEN");
+    const federation_token_env = tokenEnvOrProductionDefault(config.resolvedFederationTokenEnv(), "PCP_FEDERATION_HUB_TOKEN");
+
+    const api_token = try maybeLoadApiTokenByEnv(allocator, api_token_env, "PCP_API_TOKEN_FILE");
     defer if (api_token) |token| allocator.free(token);
-    const internal_api_token = try maybeLoadApiTokenByEnv(allocator, config.resolvedInternalApiTokenEnv());
+    const internal_api_token = try maybeLoadApiTokenByEnv(allocator, internal_api_token_env, "PCP_INTERNAL_TOKEN_FILE");
     defer if (internal_api_token) |token| allocator.free(token);
     const federation_token = if (config.resolvedFederationHubEndpoint() != null)
-        try maybeLoadApiTokenByEnv(allocator, config.resolvedFederationTokenEnv())
+        try maybeLoadApiTokenByEnv(allocator, federation_token_env, "PCP_FEDERATION_HUB_TOKEN_FILE")
     else
         null;
     defer if (federation_token) |token| allocator.free(token);
@@ -692,11 +699,25 @@ fn runGateway(allocator: Allocator, args: Args) !void {
         allocator,
         &gateway_instance,
         api_token,
+        api_token_env,
+        "PCP_API_TOKEN_FILE",
         internal_api_token,
+        internal_api_token_env,
+        "PCP_INTERNAL_TOKEN_FILE",
         federation_token,
+        federation_token_env,
+        "PCP_FEDERATION_HUB_TOKEN_FILE",
     );
     try api_server.listen(args.api_host, args.api_port);
     defer api_server.stop();
+
+    const probe_port = (try runtime_config.parseOptionalPortEnv(allocator, "PCP_PROBE_PORT")) orelse 8081;
+    var probe_server = gateway_api.GatewayProbeServer.init(allocator, &api_server);
+    const probe_thread = try std.Thread.spawn(.{}, gatewayProbeThread, .{ &probe_server, args.api_host, probe_port });
+    defer {
+        probe_server.stop();
+        probe_thread.join();
+    }
 
     var federation_client: ?gateway_federation_client.FederationClient = null;
     var federation_thread: ?std.Thread = null;
@@ -749,7 +770,8 @@ fn runGateway(allocator: Allocator, args: Args) !void {
         }
     }
     print("   API: {s}:{d}\n", .{ args.api_host, args.api_port });
-    if (config.resolvedInternalApiTokenEnv()) |env_name| {
+    print("   Probes: {s}:{d}\n", .{ args.api_host, probe_port });
+    if (internal_api_token_env) |env_name| {
         print("   Internal Event Token Env: {s}\n", .{env_name});
     }
     if (config.resolvedFederationHubEndpoint()) |endpoint| {
@@ -772,7 +794,7 @@ fn federationClientThread(client: *gateway_federation_client.FederationClient) !
 fn runFederationHub(allocator: Allocator, args: Args) !void {
     var owned_api_token: ?[]u8 = null;
     defer if (owned_api_token) |token| allocator.free(token);
-    owned_api_token = try maybeLoadApiToken(allocator, args);
+    owned_api_token = try maybeLoadFederationHubToken(allocator, args);
 
     var controller = federation_hub.FederationHub.init(allocator);
     defer controller.deinit();
@@ -810,7 +832,15 @@ fn runWorker(allocator: Allocator, args: Args) !void {
 
     const worker_backend_instance = try backend_selection.createWorkerBackend(allocator, backend, args.device_id);
 
-    var worker_instance = try Worker.init(allocator, worker_backend_instance, args.supervisor_id, stable_worker_id);
+    const max_concurrency = try runtime_config.parsePositiveUsizeEnv(
+        allocator,
+        "WORKER_MAX_CONCURRENCY",
+        if (runtime_config.isProductionMode()) null else 1,
+        runtime_config.isProductionMode(),
+    );
+    print("   Max Concurrency: {}\n", .{max_concurrency});
+
+    var worker_instance = try Worker.init(allocator, worker_backend_instance, args.supervisor_id, stable_worker_id, max_concurrency);
     defer worker_instance.deinit();
 
     const shutdown_thread = try std.Thread.spawn(.{}, workerShutdownWatcher, .{&worker_instance});

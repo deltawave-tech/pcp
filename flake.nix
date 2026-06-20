@@ -179,7 +179,13 @@
         packages.pcp-container-entrypoint =
           pkgs.writeShellScriptBin "pcp-entrypoint" ''
             set -euo pipefail
-            mkdir -p /models /etc/pcp
+            : "''${STATE_DIR:=/var/lib/pcp}"
+            : "''${TRANSFORMERS_CACHE:=$STATE_DIR/hf-cache}"
+            : "''${HF_HOME:=$STATE_DIR/hf-home}"
+            export STATE_DIR
+            export TRANSFORMERS_CACHE
+            export HF_HOME
+            mkdir -p /models /etc/pcp "$STATE_DIR"
             cd /app
             exec /bin/pcp "$@"
           '';
@@ -207,12 +213,14 @@
               "PATH=/bin"
               "PCP_MODEL_ROOT=/models"
               "PCP_CONFIG_ROOT=/etc/pcp"
-              "TRANSFORMERS_CACHE=/models/hf-cache"
-              "HF_HOME=/models/hf-home"
+              "STATE_DIR=/var/lib/pcp"
+              "TRANSFORMERS_CACHE=/var/lib/pcp/hf-cache"
+              "HF_HOME=/var/lib/pcp/hf-home"
             ];
             Volumes = {
               "/models" = { };
               "/etc/pcp" = { };
+              "/var/lib/pcp" = { };
             };
             Labels = {
               "org.opencontainers.image.title" = "pcp";

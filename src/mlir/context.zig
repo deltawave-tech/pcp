@@ -1,6 +1,8 @@
 const std = @import("std");
 const mlir = @import("wrapper.zig");
 const c = @import("c.zig").c;
+const runtime_config = @import("../runtime/config.zig");
+const file_util = @import("../protocol/file_util.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -132,22 +134,35 @@ pub const MLIRContext = struct {
         const timestamp = std.time.timestamp();
         const unique_id = compile_temp_counter.fetchAdd(1, .acq_rel);
         const process_id = std.os.linux.getpid();
-        const temp_mlir_path = try std.fmt.allocPrint(allocator, "/tmp/pcp_module_{d}_{d}_{d}.mlir", .{ timestamp, process_id, unique_id });
+        const compiler_state_dir = try runtime_config.statePath(allocator, &.{"compiler"});
+        defer allocator.free(compiler_state_dir);
+        try file_util.ensureDirAtPath(compiler_state_dir);
+
+        const module_mlir_name = try std.fmt.allocPrint(allocator, "pcp_module_{d}_{d}_{d}.mlir", .{ timestamp, process_id, unique_id });
+        defer allocator.free(module_mlir_name);
+        const module_vmfb_name = try std.fmt.allocPrint(allocator, "pcp_module_{d}_{d}_{d}.vmfb", .{ timestamp, process_id, unique_id });
+        defer allocator.free(module_vmfb_name);
+        const tiling_name = try std.fmt.allocPrint(allocator, "pcp_tiling_{d}_{d}_{d}.mlir", .{ timestamp, process_id, unique_id });
+        defer allocator.free(tiling_name);
+        const mapping_name = try std.fmt.allocPrint(allocator, "pcp_mapping_{d}_{d}_{d}.mlir", .{ timestamp, process_id, unique_id });
+        defer allocator.free(mapping_name);
+
+        const temp_mlir_path = try std.fs.path.join(allocator, &.{ compiler_state_dir, module_mlir_name });
         defer allocator.free(temp_mlir_path);
-        const temp_vmfb_path = try std.fmt.allocPrint(allocator, "/tmp/pcp_module_{d}_{d}_{d}.vmfb", .{ timestamp, process_id, unique_id });
+        const temp_vmfb_path = try std.fs.path.join(allocator, &.{ compiler_state_dir, module_vmfb_name });
         defer allocator.free(temp_vmfb_path);
 
         // Write transform dialect scripts to temp files
-        const temp_tiling_path = try std.fmt.allocPrint(allocator, "/tmp/pcp_tiling_{d}_{d}_{d}.mlir", .{ timestamp, process_id, unique_id });
+        const temp_tiling_path = try std.fs.path.join(allocator, &.{ compiler_state_dir, tiling_name });
         defer allocator.free(temp_tiling_path);
-        const temp_mapping_path = try std.fmt.allocPrint(allocator, "/tmp/pcp_mapping_{d}_{d}_{d}.mlir", .{ timestamp, process_id, unique_id });
+        const temp_mapping_path = try std.fs.path.join(allocator, &.{ compiler_state_dir, mapping_name });
         defer allocator.free(temp_mapping_path);
 
-        try std.fs.cwd().writeFile(.{ .sub_path = temp_tiling_path, .data = TILING_TRANSFORM_SCRIPT });
-        try std.fs.cwd().writeFile(.{ .sub_path = temp_mapping_path, .data = GPU_MAPPING_SCRIPT });
+        try file_util.writeFileAtPath(temp_tiling_path, TILING_TRANSFORM_SCRIPT);
+        try file_util.writeFileAtPath(temp_mapping_path, GPU_MAPPING_SCRIPT);
 
         // 3. Write MLIR to temporary file
-        try std.fs.cwd().writeFile(.{ .sub_path = temp_mlir_path, .data = mlir_source });
+        try file_util.writeFileAtPath(temp_mlir_path, mlir_source);
 
         // 4. Call the IREE compiler as a subprocess
         const iree_compile_path = "iree-compile";
@@ -265,13 +280,13 @@ pub const MLIRContext = struct {
             return error.IREECompilationFailed;
         }
 
-        const vmfb_binary = try std.fs.cwd().readFileAlloc(allocator, temp_vmfb_path, 2 * 1024 * 1024 * 1024); // 2GB limit
+        const vmfb_binary = try file_util.readFileAllocAtPath(allocator, temp_vmfb_path, 2 * 1024 * 1024 * 1024); // 2GB limit
 
         // Cleanup temp files
-        std.fs.deleteFileAbsolute(temp_mlir_path) catch {};
-        std.fs.deleteFileAbsolute(temp_vmfb_path) catch {};
-        std.fs.deleteFileAbsolute(temp_tiling_path) catch {};
-        std.fs.deleteFileAbsolute(temp_mapping_path) catch {};
+        deleteFileAtPath(temp_mlir_path);
+        deleteFileAtPath(temp_vmfb_path);
+        deleteFileAtPath(temp_tiling_path);
+        deleteFileAtPath(temp_mapping_path);
 
         return vmfb_binary;
     }
@@ -281,6 +296,14 @@ pub const MLIRContext = struct {
         return mlir.Context{ .handle = self.context };
     }
 };
+
+fn deleteFileAtPath(path: []const u8) void {
+    if (std.fs.path.isAbsolute(path)) {
+        std.fs.deleteFileAbsolute(path) catch {};
+    } else {
+        std.fs.cwd().deleteFile(path) catch {};
+    }
+}
 
 /// Serialize an MLIR module to a string representation for network transfer.
 pub fn serializeMLIRModule(allocator: Allocator, module: mlir.Module) ![]u8 {

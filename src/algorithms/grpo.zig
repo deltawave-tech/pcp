@@ -8,6 +8,7 @@ const control_state_mod = @import("../nodes/gateway/control_plane/state.zig");
 const gateway_service_client = @import("../nodes/gateway/service_client.zig");
 const file_util = @import("../protocol/file_util.zig");
 const protocol_limits = @import("../protocol/limits.zig");
+const runtime_config = @import("../runtime/config.zig");
 
 // RL orchestration is now exposed under the gateway controller namespace.
 pub const RLController = @import("../nodes/gateway/controllers/rl_controller.zig").RLController;
@@ -414,7 +415,7 @@ pub const GRPO = struct {
         if (self.config.updated_weights_path) |path| {
             return self.allocator.dupe(u8, path);
         }
-        return std.fmt.allocPrint(self.allocator, "/tmp/pcp_grpo_updated_weights_iter_{d}.bin", .{iteration});
+        return self.grpoStatePath("pcp_grpo_updated_weights_iter_{d}.bin", iteration);
     }
 
     fn trainingWeightsPath(self: *Self) []const u8 {
@@ -441,14 +442,23 @@ pub const GRPO = struct {
         if (self.config.adapter_state_path) |path| {
             return self.allocator.dupe(u8, path);
         }
-        return std.fmt.allocPrint(self.allocator, "/tmp/pcp_grpo_adapter_state_iter_{d}.bin", .{iteration});
+        return self.grpoStatePath("pcp_grpo_adapter_state_iter_{d}.bin", iteration);
     }
 
     fn adapterOptimizerStatePath(self: *Self, iteration: usize) ![]u8 {
         if (self.config.adapter_state_path) |path| {
             return std.fmt.allocPrint(self.allocator, "{s}.optimizer_state.bin", .{path});
         }
-        return std.fmt.allocPrint(self.allocator, "/tmp/pcp_grpo_adapter_state_iter_{d}.optimizer_state.bin", .{iteration});
+        return self.grpoStatePath("pcp_grpo_adapter_state_iter_{d}.optimizer_state.bin", iteration);
+    }
+
+    fn grpoStatePath(self: *Self, comptime pattern: []const u8, iteration: usize) ![]u8 {
+        const dir = try runtime_config.statePath(self.allocator, &.{"grpo"});
+        defer self.allocator.free(dir);
+        try file_util.ensureDirAtPath(dir);
+        const filename = try std.fmt.allocPrint(self.allocator, pattern, .{iteration});
+        defer self.allocator.free(filename);
+        return try std.fs.path.join(self.allocator, &.{ dir, filename });
     }
 
     fn resumeAdapterOptimizerState(self: *Self) !void {

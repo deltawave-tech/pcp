@@ -21,6 +21,7 @@ const experiment_config = common.experiment_config;
 const inference_config = common.inference_config;
 const training_window = common.training_window;
 const training_workload = common.training_workload;
+const service_registry = common.service_registry;
 const model_introspection = common.model_introspection;
 const message = common.message;
 const message_registry = common.message_registry;
@@ -35,7 +36,6 @@ const scheduling = common.scheduling;
 const inference_controller = common.inference_controller;
 const rl_controller = common.rl_controller;
 const training_controller = common.training_controller;
-const service_registry = common.service_registry;
 const DiLoCo = common.DiLoCo;
 const DiLoCoConfig = common.DiLoCoConfig;
 const MLIRBuilder = common.MLIRBuilder;
@@ -149,7 +149,7 @@ pub const EmbeddedTrainingService = struct {
     }
 
     pub fn deinit(self: *Self) void {
-        self.gateway_instance.setLocalJobHook(.training, null);
+        self.gateway_instance.setLocalJobHook(service_registry.ServiceType.training.asString(), null);
         self.reservations.releaseAll(self.shared_worker_fabric);
         self.jobs.requestStop();
         if (self.state) |*state| state.requestCancel();
@@ -221,10 +221,10 @@ pub const EmbeddedTrainingService = struct {
         const base_url = try std.fmt.allocPrint(self.allocator, "http://{s}:{d}", .{ api_host, api_port });
         defer self.allocator.free(base_url);
 
-        self.gateway_instance.setLocalJobHook(.training, .{
+        self.gateway_instance.setLocalJobHook(service_registry.ServiceType.training.asString(), .{
             .service_id = self.service_id.?,
             .executor_id = self.executor_id.?,
-            .service_type = .training,
+            .service_type = service_registry.ServiceType.training.asString(),
             .ctx = self,
             .submit = submitJobHook,
             .list = listJobsHook,

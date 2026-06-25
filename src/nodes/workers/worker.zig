@@ -266,6 +266,10 @@ pub const Worker = struct {
     stable_worker_id: []u8,
     state: WorkerState,
     is_running: bool,
+    max_concurrency: usize,
+    in_flight: usize,
+    concurrency_mutex: std.Thread.Mutex,
+    concurrency_cond: std.Thread.Condition,
 
     // Backend abstraction - handles all MLIR compilation and execution
     backend: WorkerBackend,
@@ -351,7 +355,7 @@ pub const Worker = struct {
 
     const Self = @This();
 
-    pub fn init(allocator: Allocator, backend: WorkerBackend, supervisor_id: ?i64, stable_worker_id: []const u8) !Self {
+    pub fn init(allocator: Allocator, backend: WorkerBackend, supervisor_id: ?i64, stable_worker_id: []const u8, max_concurrency: usize) !Self {
         return Self{
             .allocator = allocator,
             .client = TcpClient.init(allocator),
@@ -359,6 +363,10 @@ pub const Worker = struct {
             .stable_worker_id = try allocator.dupe(u8, stable_worker_id),
             .state = .disconnected,
             .is_running = false,
+            .max_concurrency = max_concurrency,
+            .in_flight = 0,
+            .concurrency_mutex = std.Thread.Mutex{},
+            .concurrency_cond = std.Thread.Condition{},
             .backend = backend,
             .target_arch = null,
             .cached_vmfb = null,
@@ -844,6 +852,9 @@ pub const Worker = struct {
     }
 
     fn dispatchTaskMessage(self: *Self, msg: MessageEnvelope) !void {
+        self.acquireWorkSlot();
+        defer self.releaseWorkSlot();
+
         const handled = switch (task_handlers.familyForMessageType(msg.msg_type)) {
             .graph => try task_handlers.graph.dispatch(self, msg),
             .transfer => try task_handlers.transfer.dispatch(self, msg),
@@ -857,6 +868,24 @@ pub const Worker = struct {
             .unknown => false,
         };
         if (!handled) std.log.warn("Unknown message type: {s}", .{msg.msg_type});
+    }
+
+    fn acquireWorkSlot(self: *Self) void {
+        self.concurrency_mutex.lock();
+        defer self.concurrency_mutex.unlock();
+
+        while (self.in_flight >= self.max_concurrency and self.is_running) {
+            self.concurrency_cond.wait(&self.concurrency_mutex);
+        }
+        self.in_flight += 1;
+    }
+
+    fn releaseWorkSlot(self: *Self) void {
+        self.concurrency_mutex.lock();
+        defer self.concurrency_mutex.unlock();
+
+        if (self.in_flight > 0) self.in_flight -= 1;
+        self.concurrency_cond.signal();
     }
 
     /// Robust entry point with automatic reconnection on failure
@@ -4255,6 +4284,9 @@ pub const Worker = struct {
     pub fn disconnect(self: *Self) void {
         self.is_running = false;
         self.state = .shutting_down;
+        self.concurrency_mutex.lock();
+        self.concurrency_cond.signal();
+        self.concurrency_mutex.unlock();
         self.client.disconnect();
     }
 };

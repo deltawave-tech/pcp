@@ -1,4 +1,5 @@
 const std = @import("std");
+const runtime_config = @import("../../runtime/config.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -20,16 +21,11 @@ pub const GatewayClient = struct {
         };
         errdefer allocator.free(gateway_url);
 
-        const external_token = std.process.getEnvVarOwned(allocator, "PCP_GATEWAY_TOKEN") catch |err| switch (err) {
-            error.EnvironmentVariableNotFound => null,
-            else => return err,
-        };
+        const external_token = try runtime_config.loadSecretFromEnvOrFile(allocator, "PCP_GATEWAY_TOKEN", "PCP_API_TOKEN_FILE", false);
         errdefer if (external_token) |token| allocator.free(token);
 
-        const internal_token = std.process.getEnvVarOwned(allocator, "PCP_GATEWAY_INTERNAL_TOKEN") catch |err| switch (err) {
-            error.EnvironmentVariableNotFound => if (external_token) |token| try allocator.dupe(u8, token) else null,
-            else => return err,
-        };
+        const internal_token = (try runtime_config.loadSecretFromEnvOrFile(allocator, "PCP_GATEWAY_INTERNAL_TOKEN", "PCP_INTERNAL_TOKEN_FILE", false)) orelse
+            if (external_token) |token| try allocator.dupe(u8, token) else null;
         errdefer if (internal_token) |token| allocator.free(token);
 
         const service_id = std.process.getEnvVarOwned(allocator, "PCP_GATEWAY_SERVICE_ID") catch |err| switch (err) {

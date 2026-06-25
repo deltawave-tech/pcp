@@ -14,6 +14,7 @@ const graph_adapter = @import("graph_adapter.zig");
 const gateway_mod = @import("gateway.zig");
 const event_ingest = @import("event_ingest.zig");
 const custom_extensions = @import("custom_extensions.zig");
+const runtime_config = @import("../../runtime/config.zig");
 const bearerToken = http_util.bearerToken;
 const parseHttpMethod = http_util.parseHttpMethod;
 const statusText = http_util.statusText;
@@ -43,8 +44,14 @@ pub const GatewayApiServer = struct {
     allocator: Allocator,
     gateway: *gateway_mod.Gateway,
     api_token: ?[]const u8,
+    api_token_env: ?[]const u8,
+    api_token_file_env: ?[]const u8,
     internal_api_token: ?[]const u8,
+    internal_api_token_env: ?[]const u8,
+    internal_api_token_file_env: ?[]const u8,
     federation_hub_token: ?[]const u8,
+    federation_hub_token_env: ?[]const u8,
+    federation_hub_token_file_env: ?[]const u8,
     server: ?TcpServer,
     listen_host: ?[]const u8,
     listen_port: u16,
@@ -59,15 +66,27 @@ pub const GatewayApiServer = struct {
         allocator: Allocator,
         gateway: *gateway_mod.Gateway,
         api_token: ?[]const u8,
+        api_token_env: ?[]const u8,
+        api_token_file_env: ?[]const u8,
         internal_api_token: ?[]const u8,
+        internal_api_token_env: ?[]const u8,
+        internal_api_token_file_env: ?[]const u8,
         federation_hub_token: ?[]const u8,
+        federation_hub_token_env: ?[]const u8,
+        federation_hub_token_file_env: ?[]const u8,
     ) Self {
         return .{
             .allocator = allocator,
             .gateway = gateway,
             .api_token = api_token,
+            .api_token_env = api_token_env,
+            .api_token_file_env = api_token_file_env,
             .internal_api_token = internal_api_token,
+            .internal_api_token_env = internal_api_token_env,
+            .internal_api_token_file_env = internal_api_token_file_env,
             .federation_hub_token = federation_hub_token,
+            .federation_hub_token_env = federation_hub_token_env,
+            .federation_hub_token_file_env = federation_hub_token_file_env,
             .server = null,
             .listen_host = null,
             .listen_port = 0,
@@ -436,7 +455,7 @@ pub const GatewayApiServer = struct {
 
         if (std.mem.eql(u8, req.method, "POST") and std.mem.eql(u8, req.path, "/v1/inference/chat/completions")) {
             var service = self.requireServiceByType(
-                .inference,
+                service_registry.ServiceType.inference.asString(),
                 req.header("x-pcp-service-id"),
                 req.header("x-pcp-executor-id"),
             ) catch |err| {
@@ -704,26 +723,56 @@ pub const GatewayApiServer = struct {
     }
 
     fn authorize(self: *Self, req: *http_server.HttpRequest) bool {
-        if (self.api_token == null) return true;
+        if (self.api_token == null and !self.hasFileBackedSecret(self.api_token_env, self.api_token_file_env)) return true;
         const header = req.header("authorization") orelse return false;
         const token = bearerToken(header) orelse return false;
-        return std.mem.eql(u8, token, self.api_token.?);
+        return self.secretMatches(token, self.api_token, self.api_token_env, self.api_token_file_env);
     }
 
     fn authorizeInternal(self: *Self, req: *http_server.HttpRequest) bool {
-        if (self.internal_api_token) |token| {
+        if (self.internal_api_token != null or self.hasFileBackedSecret(self.internal_api_token_env, self.internal_api_token_file_env)) {
             const header = req.header("authorization") orelse return false;
             const bearer = bearerToken(header) orelse return false;
-            return std.mem.eql(u8, bearer, token);
+            return self.secretMatches(bearer, self.internal_api_token, self.internal_api_token_env, self.internal_api_token_file_env);
         }
         return self.authorize(req);
     }
 
     fn authorizeFederationHub(self: *Self, req: *http_server.HttpRequest) bool {
-        const token = self.federation_hub_token orelse return false;
         const header = req.header("authorization") orelse return false;
         const bearer = bearerToken(header) orelse return false;
-        return std.mem.eql(u8, bearer, token);
+        return self.secretMatches(bearer, self.federation_hub_token, self.federation_hub_token_env, self.federation_hub_token_file_env);
+    }
+
+    fn secretMatches(
+        self: *Self,
+        presented: []const u8,
+        cached: ?[]const u8,
+        env_name: ?[]const u8,
+        file_env: ?[]const u8,
+    ) bool {
+        if (runtime_config.loadSecretFromEnvOrFile(self.allocator, env_name, file_env, false)) |maybe_secret| {
+            if (maybe_secret) |secret| {
+                defer self.allocator.free(secret);
+                return std.mem.eql(u8, presented, secret);
+            }
+        } else |err| {
+            std.log.warn("Failed to refresh token from file-backed secret: {}", .{err});
+        }
+        if (cached) |token| return std.mem.eql(u8, presented, token);
+        return false;
+    }
+
+    fn hasFileBackedSecret(_: *Self, env_name: ?[]const u8, file_env: ?[]const u8) bool {
+        if (file_env) |name| {
+            if (std.posix.getenv(name) != null) return true;
+        }
+        if (env_name) |name| {
+            var buf: [256]u8 = undefined;
+            const derived = std.fmt.bufPrint(&buf, "{s}_FILE", .{name}) catch return false;
+            return std.posix.getenv(derived) != null;
+        }
+        return false;
     }
 
     fn handleJobSubmit(self: *Self, stream: net.Stream, req: *http_server.HttpRequest, service_type: []const u8) !void {
@@ -923,7 +972,7 @@ pub const GatewayApiServer = struct {
         defer self.allocator.free(forward_body);
 
         var service = try self.requireServiceByType(
-            .inference,
+            service_registry.ServiceType.inference.asString(),
             req.header("x-pcp-service-id"),
             req.header("x-pcp-executor-id"),
         );
@@ -1077,6 +1126,92 @@ pub const GatewayApiServer = struct {
             .status = result.status,
             .body = try response_body.toOwnedSlice(),
         };
+    }
+};
+
+pub const GatewayProbeServer = struct {
+    allocator: Allocator,
+    api_server: *GatewayApiServer,
+    server: ?TcpServer,
+    listen_host: ?[]const u8,
+    listen_port: u16,
+    is_running: std.atomic.Value(u8),
+
+    const Self = @This();
+
+    pub fn init(allocator: Allocator, api_server: *GatewayApiServer) Self {
+        return .{
+            .allocator = allocator,
+            .api_server = api_server,
+            .server = null,
+            .listen_host = null,
+            .listen_port = 0,
+            .is_running = std.atomic.Value(u8).init(0),
+        };
+    }
+
+    pub fn start(self: *Self, host: []const u8, port: u16) !void {
+        self.listen_host = host;
+        self.listen_port = port;
+        std.log.info("Starting gateway probe server on {s}:{d}", .{ host, port });
+        self.server = try TcpServer.init(self.allocator, host, port);
+        self.is_running.store(1, .release);
+
+        while (self.is_running.load(.acquire) == 1) {
+            const connection = if (self.server) |*server|
+                server.accept() catch |err| {
+                    if (self.is_running.load(.acquire) == 0) break;
+                    std.log.err("Gateway probe accept failed: {}", .{err});
+                    continue;
+                }
+            else
+                break;
+
+            if (self.is_running.load(.acquire) == 0) {
+                connection.stream.close();
+                break;
+            }
+
+            const thread = std.Thread.spawn(.{}, handleProbeConnection, .{ self, connection.stream }) catch |err| {
+                std.log.err("Failed to spawn gateway probe handler thread: {}", .{err});
+                connection.stream.close();
+                continue;
+            };
+            thread.detach();
+        }
+
+        if (self.server) |*server| {
+            server.deinit();
+            self.server = null;
+        }
+    }
+
+    pub fn stop(self: *Self) void {
+        self.is_running.store(0, .release);
+        if (self.listen_host) |host| {
+            const address = net.Address.parseIp(host, self.listen_port) catch return;
+            const stream = net.tcpConnectToAddress(address) catch return;
+            stream.close();
+        }
+    }
+
+    fn handleProbeConnection(self: *Self, stream: net.Stream) void {
+        defer stream.close();
+
+        var req = http_server.readRequest(stream, self.allocator, 1024 * 1024) catch |err| {
+            std.log.warn("Gateway probe failed to read request: {}", .{err});
+            return;
+        };
+        defer req.deinit();
+
+        const handled = self.api_server.handleProbeRequest(stream, &req) catch |err| {
+            std.log.err("Gateway probe route failed: {}", .{err});
+            _ = http_server.writeResponse(stream, "500 Internal Server Error", &.{"Content-Type: text/plain"}, "error") catch {};
+            return;
+        };
+        if (!handled) {
+            _ = http_server.writeResponse(stream, "404 Not Found", &.{"Content-Type: text/plain"}, "not_found") catch {};
+        }
     }
 };
 

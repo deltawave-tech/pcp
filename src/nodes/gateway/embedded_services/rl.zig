@@ -145,7 +145,7 @@ pub const EmbeddedRLService = struct {
     }
 
     pub fn deinit(self: *Self) void {
-        self.gateway_instance.setLocalJobHook(.rl, null);
+        self.gateway_instance.setLocalJobHook(service_registry.ServiceType.rl.asString(), null);
         self.reservations.releaseAll(self.shared_worker_fabric);
         self.jobs.requestStop();
         if (self.state) |*state| state.requestCancel();
@@ -213,10 +213,10 @@ pub const EmbeddedRLService = struct {
         const base_url = try std.fmt.allocPrint(self.allocator, "http://{s}:{d}", .{ api_host, api_port });
         defer self.allocator.free(base_url);
 
-        self.gateway_instance.setLocalJobHook(.rl, .{
+        self.gateway_instance.setLocalJobHook(service_registry.ServiceType.rl.asString(), .{
             .service_id = self.service_id.?,
             .executor_id = self.executor_id.?,
-            .service_type = .rl,
+            .service_type = service_registry.ServiceType.rl.asString(),
             .ctx = self,
             .submit = submitJobHook,
             .list = listJobsHook,

@@ -1452,6 +1452,21 @@ pub fn embeddedTrainingRunThread(ctx: *TrainingRunContext) !void {
     }
 }
 
+pub fn applyPrivateTargetEma(target_weights: []u8, online_weights: []const u8, momentum: f32) void {
+    if (target_weights.len != online_weights.len or target_weights.len % @sizeOf(f32) != 0) return;
+
+    var offset: usize = 0;
+    while (offset < target_weights.len) : (offset += @sizeOf(f32)) {
+        const target_bits = std.mem.readInt(u32, target_weights[offset..][0..4], .little);
+        const online_bits = std.mem.readInt(u32, online_weights[offset..][0..4], .little);
+        const target_value: f32 = @bitCast(target_bits);
+        const online_value: f32 = @bitCast(online_bits);
+        const updated = momentum * target_value + (1.0 - momentum) * online_value;
+        const updated_bits: u32 = @bitCast(updated);
+        std.mem.writeInt(u32, target_weights[offset..][0..4], updated_bits, .little);
+    }
+}
+
 pub fn embeddedRLRunThread(ctx: *RLRunContext) !void {
     const leased_workers = resolveEmbeddedJobWorkers(
         ctx.worker_fabric.allocator,

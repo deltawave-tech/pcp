@@ -19,6 +19,8 @@ const tensor = @import("../../../core/tensor.zig");
 const protocol_invariants = @import("../../../protocol/invariants.zig");
 const protocol_limits = @import("../../../protocol/limits.zig");
 const message_registry = @import("../../../protocol/message_registry.zig");
+const file_util = @import("../../../protocol/file_util.zig");
+const runtime_config = @import("../../../runtime/config.zig");
 
 const TcpServer = tcp_stream.TcpServer;
 const TcpStreamManager = tcp_stream.TcpStreamManager;
@@ -2556,20 +2558,19 @@ pub const WorkerFabricController = struct {
         vmfb_bytes: []const u8,
     ) ![]u8 {
         const label = config.target_arch orelse config.backend.toString();
-        const vmfb_path = try std.fmt.allocPrint(
-            self.allocator,
-            "/tmp/pcp_compiled_{s}_{d}.vmfb",
-            .{ label, program_key },
-        );
+        const compiled_dir = try runtime_config.statePath(self.allocator, &.{"compiled"});
+        defer self.allocator.free(compiled_dir);
+        try file_util.ensureDirAtPath(compiled_dir);
 
-        if (std.fs.cwd().access(vmfb_path, .{})) |_| {
+        const filename = try std.fmt.allocPrint(self.allocator, "pcp_compiled_{s}_{d}.vmfb", .{ label, program_key });
+        defer self.allocator.free(filename);
+        const vmfb_path = try std.fs.path.join(self.allocator, &.{ compiled_dir, filename });
+
+        if (file_util.fileExistsAtPath(vmfb_path)) {
             return vmfb_path;
-        } else |_| {}
+        }
 
-        try std.fs.cwd().writeFile(.{
-            .sub_path = vmfb_path,
-            .data = vmfb_bytes,
-        });
+        try file_util.writeFileAtPath(vmfb_path, vmfb_bytes);
         std.log.info("Saved compiled VMFB for {s} to {s}", .{ label, vmfb_path });
         return vmfb_path;
     }

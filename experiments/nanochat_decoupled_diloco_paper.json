@@ -1,0 +1,40 @@
+{
+  "artifacts": {
+    "model_path": "models/nanochat_small.mlir"
+  },
+  "dataset": {
+    "path": "data/tiny_shakespeare.txt",
+    "tokenizer": "char",
+    "sampling": "random"
+  },
+  "distributed": {
+    "aggregation_strategy": "decoupled_diloco",
+    "outer_loop_steps": 2,
+    "local_steps_per_round": 24,
+    "learning_rate": 0.0006,
+    "outer_momentum": 0.9,
+    "max_epochs": 10,
+    "dtype": "f32"
+  },
+  "decoupled_diloco": {
+    "num_fragments": 24,
+    "sync_interval_h": 24,
+    "overlap_tau": 2,
+    "min_quorum": 1,
+    "grace_window_ms": 0,
+    "grace_gamma": 1.0,
+    "max_grace_steps": 1,
+    "adaptive_grace_enabled": true,
+    "merge_strategy": "avg_embedding_rda_model",
+    "fragment_strategy": "balanced_tensor",
+    "learner_alpha": 0.0,
+    "outer_learning_rate": 0.7,
+    "outer_gradient_compression": "none",
+    "max_recovery_syncer_steps": 24
+  },
+  "outputs": {
+    "checkpoint_dir": "checkpoints/nanochat_decoupled_diloco_paper",
+    "wandb_project": "pcp-distributed",
+    "wandb_run_name": "nanochat-decoupled-diloco-paper"
+  }
+}

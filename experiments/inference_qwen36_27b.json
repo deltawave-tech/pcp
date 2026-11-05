@@ -1,0 +1,23 @@
+{
+  "model_id": "qwen36-27b",
+  "pool_name": "default",
+  "generation_vmfb_path": "models/qwen36_27b_one_token_nocache_linalg_cuda.vmfb",
+  "generation_mlir_path": "models/qwen36_27b_one_token_nocache_linalg.mlir",
+  "generation_contract_path": "models/qwen36_27b_text_generation.contract.json",
+  "weights_path": "checkpoints/initial_weights/qwen36_27b_bf16_streamed.bin",
+  "weights_format": "bf16_streamed",
+  "weights_dtype": "bf16",
+  "tokenizer_source": "qwen",
+  "tokenizer_path": "tokenizers/qwen36-27b",
+  "chat_template": "qwen_text_only",
+  "vision_enabled": false,
+  "mtp_enabled": false,
+  "full_conditional_generation_enabled": false,
+  "max_context_tokens": 1024,
+  "default_max_output_tokens": 128,
+  "session_ttl_seconds": 600,
+  "request_timeout_seconds": 120,
+  "worker_backend": "cuda",
+  "worker_target_arch": "sm_80",
+  "api_token_env": "PCP_API_TOKEN"
+}

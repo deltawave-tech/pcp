@@ -1,0 +1,355 @@
+const std = @import("std");
+const Allocator = std.mem.Allocator;
+const json = std.json;
+const decoupled_fields = @import("../protocol/decoupled_fields.zig");
+const json_util = @import("../protocol/json_util.zig");
+
+pub const ProtocolVersion = u16;
+pub const current_protocol_version: ProtocolVersion = 1;
+
+/// A (possibly random) node id.
+pub const NodeId = u16;
+pub const ServiceId = []const u8;
+
+/// A (possibly random) message id.
+pub const MessageId = u64;
+pub const RequestId = u64;
+pub const RoundId = u64;
+pub const TaskId = u64;
+
+pub const MessageContext = struct {
+    request_id: RequestId = 0,
+    round_id: RoundId = 0,
+    task_id: TaskId = 0,
+};
+
+pub const MessageFilter = struct {
+    msg_type: []const u8,
+    request_id: ?RequestId = null,
+    round_id: ?RoundId = null,
+    task_id: ?TaskId = null,
+
+    pub fn matches(self: @This(), envelope: MessageEnvelope) bool {
+        if (!std.mem.eql(u8, self.msg_type, envelope.msg_type)) return false;
+        if (self.request_id) |request_id| {
+            if (envelope.request_id != request_id) return false;
+        }
+        if (self.round_id) |round_id| {
+            if (envelope.round_id != round_id) return false;
+        }
+        if (self.task_id) |task_id| {
+            if (envelope.task_id != task_id) return false;
+        }
+        return true;
+    }
+};
+
+pub const DecoupledDiLoCoField = decoupled_fields.DecoupledDiLoCoField;
+
+pub const MessageEnvelope = struct {
+    recipient_node: NodeId,
+    recipient_service: ServiceId,
+    sender_node: NodeId,
+    sender_service: ServiceId,
+    msg_type: []const u8,
+    msg_id: MessageId,
+    protocol_version: ProtocolVersion = current_protocol_version,
+    request_id: RequestId = 0,
+    round_id: RoundId = 0,
+    task_id: TaskId = 0,
+    data: std.json.Value,
+
+    const Self = @This();
+
+    pub fn asJsonString(self: Self, allocator: Allocator) error{OutOfMemory}!std.ArrayList(u8) {
+        var buffer = std.ArrayList(u8).init(allocator);
+        errdefer buffer.deinit();
+        try std.json.stringify(self, .{}, buffer.writer());
+        return buffer;
+    }
+
+    pub fn fromJsonString(json_str: []u8, allocator: Allocator) json.ParseError(json.Scanner)!json.Parsed(MessageEnvelope) {
+        return try json.parseFromSlice(MessageEnvelope, allocator, json_str, .{});
+    }
+
+    /// Deep clone a MessageEnvelope with owned copies of all string/JSON data
+    pub fn clone(self: Self, allocator: Allocator) !Self {
+        // Clone string fields
+        const msg_type_copy = try allocator.dupe(u8, self.msg_type);
+        errdefer allocator.free(msg_type_copy);
+
+        const recipient_service_copy = try allocator.dupe(u8, self.recipient_service);
+        errdefer allocator.free(recipient_service_copy);
+
+        const sender_service_copy = try allocator.dupe(u8, self.sender_service);
+        errdefer allocator.free(sender_service_copy);
+
+        // Deep clone JSON value
+        const data_copy = try json_util.cloneJsonValue(allocator, self.data);
+
+        return Self{
+            .recipient_node = self.recipient_node,
+            .recipient_service = recipient_service_copy,
+            .sender_node = self.sender_node,
+            .sender_service = sender_service_copy,
+            .msg_type = msg_type_copy,
+            .msg_id = self.msg_id,
+            .protocol_version = self.protocol_version,
+            .request_id = self.request_id,
+            .round_id = self.round_id,
+            .task_id = self.task_id,
+            .data = data_copy,
+        };
+    }
+
+    /// Free owned copies created by clone()
+    pub fn deinitClone(self: Self, allocator: Allocator) void {
+        allocator.free(self.msg_type);
+        allocator.free(self.recipient_service);
+        allocator.free(self.sender_service);
+        json_util.freeOwnedJsonValue(allocator, self.data);
+    }
+
+    /// Create MessageEnvelope with binary data (Base64 encoded)
+    pub fn createWithBinaryData(
+        recipient_node: NodeId,
+        recipient_service: ServiceId,
+        sender_node: NodeId,
+        sender_service: ServiceId,
+        msg_type: []const u8,
+        msg_id: MessageId,
+        binary_data: []const u8,
+        allocator: Allocator,
+    ) !Self {
+        // Base64 encode the binary data
+        const b64_len = std.base64.standard.Encoder.calcSize(binary_data.len);
+        const b64_encoded = try allocator.alloc(u8, b64_len);
+        defer allocator.free(b64_encoded);
+
+        const encoded_len = std.base64.standard.Encoder.encode(b64_encoded, binary_data).len;
+        const final_encoded = try allocator.dupe(u8, b64_encoded[0..encoded_len]);
+
+        return Self{
+            .recipient_node = recipient_node,
+            .recipient_service = recipient_service,
+            .sender_node = sender_node,
+            .sender_service = sender_service,
+            .msg_type = msg_type,
+            .msg_id = msg_id,
+            .protocol_version = current_protocol_version,
+            .request_id = 0,
+            .round_id = 0,
+            .task_id = 0,
+            .data = std.json.Value{ .string = final_encoded },
+        };
+    }
+
+    /// Extract binary data from MessageEnvelope (Base64 decode)
+    pub fn extractBinaryData(self: Self, allocator: Allocator) ![]u8 {
+        const b64_string = switch (self.data) {
+            .string => |s| s,
+            else => return error.InvalidMessageFormat,
+        };
+
+        const decoded_len = try std.base64.standard.Decoder.calcSizeForSlice(b64_string);
+        const decoded = try allocator.alloc(u8, decoded_len);
+
+        try std.base64.standard.Decoder.decode(decoded, b64_string);
+        return decoded;
+    }
+};
+
+/// Message types for DiLoCo distributed training
+pub const MessageType = struct {
+    pub const JOIN_REQUEST = "JoinRequest";
+    pub const JOIN_ACCEPT = "JoinAccept";
+    pub const INITIALIZE_GRAPH = "InitializeGraph";
+    pub const START_INNER_LOOP = "StartInnerLoop";
+    pub const INNER_LOOP_COMPLETE = "InnerLoopComplete";
+    pub const SHUTDOWN = "Shutdown";
+    pub const HEARTBEAT = "Heartbeat";
+
+    // Supervisor Control Protocol
+    pub const SUPERVISOR_HANDSHAKE = "SupervisorHandshake"; // Supervisor -> worker fabric (ID: u64)
+    pub const RESTART_WORKER = "RestartWorker"; // Worker fabric -> supervisor (force restart)
+
+    // RL / GRPO Protocol
+    pub const START_ROLLOUT = "StartRollout"; // Controller -> Worker: "Generate text for these prompts"
+    pub const ROLLOUT_COMPLETE = "RolloutComplete"; // Worker -> Controller: "Here are the token IDs and LogProbs"
+    pub const UPDATE_WEIGHTS = "UpdateWeights"; // Controller -> Worker: "Here are the new model weights"
+
+    // Chunked Data Transfer Protocol (for large models > Cap'n Proto limits)
+    pub const WEIGHT_CHUNK = "WeightChunk"; // Controller -> Worker: { chunk_index, total_chunks, total_bytes, data: "base64..." }
+    pub const UPDATE_CHUNK = "UpdateChunk"; // Worker -> Controller: { chunk_index, total_chunks, total_bytes, data: "base64...", loss }
+
+    // Streaming DiLoCo Protocol
+    pub const START_STREAMING_LOOP = "StartStreamingLoop"; // Controller -> Worker: "Start continuous streaming mode"
+    pub const FRAGMENT_UPDATE = "FragmentUpdate"; // Worker -> Controller: "Here is the gradient delta for fragment P"
+    pub const FRAGMENT_READY = "FragmentReady"; // Controller -> Worker: "Here are the merged global weights for fragment P"
+
+    // Decoupled DiLoCo Protocol
+    pub const START_DECOUPLED_DILOCO_LOOP = "StartDecoupledDilocoLoop"; // Controller -> Worker: start continuous decoupled learner loop
+    pub const DECOUPLED_LEARNER_METADATA = "DecoupledLearnerMetadata"; // Worker -> Controller: local learner step and fragment counters
+    pub const DECOUPLED_FRAGMENT_PULL = "DecoupledFragmentPull"; // Controller -> Worker: request one learner fragment at a learner step
+    pub const DECOUPLED_FRAGMENT_UPDATE = "DecoupledFragmentUpdate"; // Worker -> Controller: learner fragment values or chunk handles
+    pub const DECOUPLED_FRAGMENT_READY = "DecoupledFragmentReady"; // Controller -> Worker: outer-optimized global fragment
+    pub const STOP_DECOUPLED_DILOCO_LOOP = "StopDecoupledDilocoLoop"; // Controller -> Worker: stop continuous decoupled learner loop
+
+    // Inference Protocol
+    pub const LOAD_MODEL = "LoadModel"; // Controller -> Worker: load model artifacts
+    pub const MODEL_READY = "ModelReady"; // Worker -> Controller: model loaded
+    pub const INITIALIZE_GRAPH_COMPLETE = "InitializeGraphComplete"; // Worker -> Controller: graph / weights ready
+    pub const START_GENERATION = "StartGeneration"; // Controller -> Worker: begin decoding
+    pub const GENERATION_CHUNK = "GenerationChunk"; // Worker -> Controller: one token or chunk
+    pub const GENERATION_COMPLETE = "GenerationComplete"; // Worker -> Controller: generation finished
+    pub const GENERATION_ERROR = "GenerationError"; // Worker -> Controller: error during generation
+    pub const CANCEL_GENERATION = "CancelGeneration"; // Controller -> Worker: cancel active generation
+    pub const FLUSH_SESSION = "FlushSession"; // Controller -> Worker: drop session KV
+
+};
+
+pub fn isDecoupledDilocoWorkerMessage(msg_type: []const u8) bool {
+    return std.mem.eql(u8, msg_type, MessageType.DECOUPLED_LEARNER_METADATA) or
+        std.mem.eql(u8, msg_type, MessageType.DECOUPLED_FRAGMENT_UPDATE);
+}
+
+pub const MessageHandler = *const fn (MessageEnvelope) anyerror!void;
+
+pub const MessageHandlerRegistry = struct {
+    registry: MapT,
+
+    const MapT = std.StringHashMap(MessageHandler);
+    const Self = @This();
+
+    pub fn init(allocator: Allocator) Self {
+        return Self{ .registry = MapT.init(allocator) };
+    }
+
+    pub fn deinit(self: *Self) void {
+        self.registry.deinit();
+    }
+
+    pub fn register(self: *Self, msg_type: []const u8, handler: MessageHandler) error{OutOfMemory}!void {
+        try self.registry.put(msg_type, handler);
+    }
+
+    pub fn handle(self: Self, msg: MessageEnvelope) anyerror!void {
+        const handler = self.registry.get(msg.msg_type).?;
+        try handler(msg);
+    }
+};
+
+pub fn expectEqualMessages(expected: MessageEnvelope, actual: MessageEnvelope) error{TestExpectedEqual}!void {
+    try std.testing.expectEqual(expected.recipient_node, actual.recipient_node);
+    try std.testing.expectEqualStrings(expected.recipient_service, actual.recipient_service);
+    try std.testing.expectEqual(expected.sender_node, actual.sender_node);
+    try std.testing.expectEqualStrings(expected.sender_service, actual.sender_service);
+    try std.testing.expectEqualStrings(expected.msg_type, actual.msg_type);
+    try std.testing.expectEqual(expected.msg_id, actual.msg_id);
+    try std.testing.expectEqual(expected.protocol_version, actual.protocol_version);
+    try std.testing.expectEqual(expected.request_id, actual.request_id);
+    try std.testing.expectEqual(expected.round_id, actual.round_id);
+    try std.testing.expectEqual(expected.task_id, actual.task_id);
+
+    try std.testing.expectEqual(@tagName(expected.data), @tagName(actual.data));
+    switch (actual.data) {
+        json.Value.string => {
+            try std.testing.expectEqualStrings(expected.data.string, actual.data.string);
+        },
+        else => {
+            _ = undefined;
+        },
+    }
+}
+
+test "MessageEnvelope round trip JSON" {
+    const allocator = std.testing.allocator;
+
+    const original = MessageEnvelope{
+        .recipient_node = 1,
+        .recipient_service = "serviceA",
+        .sender_node = 2,
+        .sender_service = "serviceB",
+        .msg_type = "text",
+        .msg_id = 3,
+        .protocol_version = current_protocol_version,
+        .request_id = 7,
+        .round_id = 11,
+        .task_id = 13,
+        .data = std.json.Value{ .string = "foo" },
+    };
+
+    var registry = MessageHandlerRegistry.init(allocator);
+    defer registry.deinit();
+    // A handler to parse JSON string back to MessageEnvelope
+    const myHandler = struct {
+        fn test_handler(msg: MessageEnvelope) error{TestExpectedEqual}!void {
+            try expectEqualMessages(original, msg);
+        }
+    }.test_handler;
+    try registry.register("text", myHandler);
+
+    // Serialize to JSON string
+    const buffer = try original.asJsonString(allocator);
+    defer buffer.deinit();
+    const json_str = buffer.items;
+
+    // Debug print (optional)
+    // std.debug.print("Serialized JSON: {s}\n", .{json_str});
+
+    const parsed = try MessageEnvelope.fromJsonString(json_str, allocator);
+    defer parsed.deinit();
+
+    try registry.handle(parsed.value);
+}
+
+test "Decoupled DiLoCo payload fields round trip through JSON" {
+    const allocator = std.testing.allocator;
+
+    var vector_clock = std.json.Array.init(allocator);
+    defer vector_clock.deinit();
+    try vector_clock.append(.{ .integer = 3 });
+    try vector_clock.append(.{ .integer = 5 });
+
+    var payload = std.json.ObjectMap.init(allocator);
+    defer payload.deinit();
+    try payload.put(DecoupledDiLoCoField.FRAGMENT_ID, .{ .integer = 2 });
+    try payload.put(DecoupledDiLoCoField.FRAGMENT_ROUND, .{ .integer = 7 });
+    try payload.put(DecoupledDiLoCoField.GLOBAL_STEP, .{ .integer = 24 });
+    try payload.put(DecoupledDiLoCoField.SYNCER_STEP, .{ .integer = 24 });
+    try payload.put(DecoupledDiLoCoField.LEARNER_STEP, .{ .integer = 31 });
+    try payload.put(DecoupledDiLoCoField.STEPS_SINCE_FRAGMENT_UPDATE, .{ .integer = 4 });
+    try payload.put(DecoupledDiLoCoField.TOKENS_SINCE_FRAGMENT_UPDATE, .{ .integer = 8192 });
+    try payload.put(DecoupledDiLoCoField.MERGE_WEIGHT, .{ .float = 16777216.0 });
+    try payload.put(DecoupledDiLoCoField.VECTOR_CLOCK, .{ .array = vector_clock });
+
+    const original = MessageEnvelope{
+        .recipient_node = 0,
+        .recipient_service = "controller",
+        .sender_node = 9,
+        .sender_service = "worker",
+        .msg_type = MessageType.DECOUPLED_LEARNER_METADATA,
+        .msg_id = 42,
+        .protocol_version = current_protocol_version,
+        .request_id = 100,
+        .round_id = 24,
+        .task_id = 2,
+        .data = .{ .object = payload },
+    };
+
+    const buffer = try original.asJsonString(allocator);
+    defer buffer.deinit();
+
+    const parsed = try MessageEnvelope.fromJsonString(buffer.items, allocator);
+    defer parsed.deinit();
+
+    try std.testing.expect(isDecoupledDilocoWorkerMessage(parsed.value.msg_type));
+    try std.testing.expectEqualStrings(MessageType.DECOUPLED_LEARNER_METADATA, parsed.value.msg_type);
+
+    const parsed_payload = parsed.value.data.object;
+    try std.testing.expectEqual(@as(i64, 2), parsed_payload.get(DecoupledDiLoCoField.FRAGMENT_ID).?.integer);
+    try std.testing.expectEqual(@as(i64, 7), parsed_payload.get(DecoupledDiLoCoField.FRAGMENT_ROUND).?.integer);
+    try std.testing.expectEqual(@as(i64, 31), parsed_payload.get(DecoupledDiLoCoField.LEARNER_STEP).?.integer);
+    try std.testing.expectEqual(@as(i64, 8192), parsed_payload.get(DecoupledDiLoCoField.TOKENS_SINCE_FRAGMENT_UPDATE).?.integer);
+    try std.testing.expectEqual(@as(usize, 2), parsed_payload.get(DecoupledDiLoCoField.VECTOR_CLOCK).?.array.items.len);
+}
